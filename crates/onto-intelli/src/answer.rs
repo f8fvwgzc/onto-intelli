@@ -4,10 +4,11 @@
 use std::collections::BTreeMap;
 
 use onto_core::deps::DepDirection;
+use onto_core::metrics::{Measure, MetricFilter, MetricQuery, MetricResult};
 use onto_core::query::FindSpec;
-use onto_core::schema::Category;
-use onto_core::time::fmt_date;
-use onto_core::{Entity, EventFilter, Ontology, Principal};
+use onto_core::schema::{Category, Dir, Schema};
+use onto_core::time::{fmt_date, now_ms};
+use onto_core::{ActionContext, Entity, EntityPatch, EventFilter, Mutation, Ontology, Principal};
 
 use crate::intent::{Classified, Intent, StateFilter};
 use crate::memory::clip;
@@ -44,6 +45,7 @@ fn plural(kind: &str, n: usize) -> String {
 
 pub fn try_answer(
     onto: &Ontology,
+    question: &str,
     p: &Principal,
     ws: &str,
     c: &Classified,
@@ -164,6 +166,96 @@ pub fn try_answer(
             let facts = members.iter().map(|(_, e)| format!("{} member_of {}", e.id, team.id)).collect();
             Some(Direct { answer, facts })
         }
+        Intent::Count | Intent::List if c.group_by.is_some() => grouped(onto, p, ws, c, &confident, me()),
+        Intent::Metric => metric_answer(onto, p, ws, c, &confident, me()),
+        Intent::Expert => {
+            let seeds: Vec<String> = confident
+                .iter()
+                .filter(|r| schema.category(&r.kind) != Category::Actor)
+                .map(|r| r.id.clone())
+                .collect();
+            let topic = confident.first().map(|r| r.title.clone()).unwrap_or_else(|| question.to_string());
+            let ex = onto.experts(p, Some(ws), question, &seeds, 5).ok()?;
+            if ex.is_empty() {
+                return Some(Direct { answer: format!("I couldn't find anyone connected to {topic}."), facts: vec![] });
+            }
+            let lines: Vec<String> =
+                ex.iter().take(3).map(|e| format!("{} ({}) — {}", e.title, e.id, e.reasons.join("; "))).collect();
+            Some(Direct {
+                answer: format!("People who know about {topic}:\n• {}", lines.join("\n• ")), facts: lines
+            })
+        }
+        Intent::Changes => {
+            let days = c.since_days.unwrap_or(7);
+            let since = now_ms() - i64::from(days) * 86_400_000;
+            let within = first();
+            let kinds: Vec<String> = c.kind.iter().cloned().collect();
+            let ch = onto.changes(p, since, Some(ws), &kinds, within.as_ref().map(|e| e.id.as_str()), 25).ok()?;
+            let scope = within.as_ref().map(|e| format!(" in {}", label(e))).unwrap_or_default();
+            if ch.is_empty() {
+                return Some(Direct { answer: format!("No changes{scope} in the last {days} day(s)."), facts: vec![] });
+            }
+            let lines: Vec<String> = ch
+                .iter()
+                .map(|x| {
+                    let what = if x.created && !x.changed.is_empty() {
+                        format!("created, then changed {}", x.changed.join(", "))
+                    } else if x.created {
+                        "created".to_string()
+                    } else if x.deleted {
+                        "deleted".to_string()
+                    } else if x.from_state != x.to_state && x.to_state.is_some() {
+                        format!("{} → {}", x.from_state.as_deref().unwrap_or("∅"), x.to_state.as_deref().unwrap_or("∅"))
+                    } else {
+                        format!("updated {}", x.changed.join(", "))
+                    };
+                    format!("{} ({}): {what} — by {}", x.title, x.id, x.actors.join(", "))
+                })
+                .collect();
+            Some(Direct {
+                answer: format!("{} change(s){scope} in the last {days} day(s):\n• {}", ch.len(), lines.join("\n• ")),
+                facts: lines,
+            })
+        }
+        Intent::Quality => {
+            let q = question.to_lowercase();
+            let focus = if q.contains("stale") {
+                Some("stale")
+            } else if q.contains("duplicate") || q.contains("dupe") {
+                Some("duplicate")
+            } else if q.contains("orphan") {
+                Some("orphan")
+            } else if q.contains("missing link") || q.contains("missing relation") {
+                Some("missing_link")
+            } else {
+                None
+            };
+            let r = onto.quality(p, Some(ws), c.kind.as_deref(), 500).ok()?;
+            let picked: Vec<String> = r
+                .violations
+                .iter()
+                .filter(|v| focus.is_none_or(|f| v.rule == f))
+                .take(10)
+                .map(|v| v.message.clone())
+                .collect();
+            let answer = match focus {
+                Some(f) if picked.is_empty() => format!("No {} problems found.", f.replace('_', " ")),
+                Some(f) => format!("{} {} problem(s):\n• {}", picked.len(), f.replace('_', " "), picked.join("\n• ")),
+                None => {
+                    let rules: Vec<String> =
+                        r.by_rule.iter().map(|(k, n)| format!("{n} {}", k.replace('_', " "))).collect();
+                    format!(
+                        "Data quality score {:.1}/100 across {} entities{}.{}",
+                        r.score,
+                        r.entities,
+                        if rules.is_empty() { String::new() } else { format!(" — {}", rules.join(", ")) },
+                        if picked.is_empty() { String::new() } else { format!("\n• {}", picked.join("\n• ")) }
+                    )
+                }
+            };
+            Some(Direct { answer, facts: picked })
+        }
+        Intent::WhatIf => what_if(onto, p, ws, c, first()?),
         Intent::Count | Intent::List => {
             let kind = c.kind.clone()?;
             let scope = confident
@@ -348,6 +440,12 @@ pub fn try_answer(
         }
         Intent::History => {
             let x = first()?;
+            let versions: Vec<String> = onto
+                .history(p, &x.id, 6)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| format!("{} rev {} by {}: {}", &h.at[..10], h.revision, h.actor, h.changed.join(", ")))
+                .collect();
             let events = onto
                 .events(
                     p,
@@ -359,10 +457,18 @@ pub fn try_answer(
                     },
                 )
                 .ok()?;
-            if events.is_empty() {
+            let events: Vec<_> = events
+                .into_iter()
+                .filter(|e| {
+                    !(e.action.starts_with("entity.")
+                        || e.action.starts_with("link.")
+                        || e.action.starts_with("intelli."))
+                })
+                .collect();
+            if events.is_empty() && versions.is_empty() {
                 return Some(Direct { answer: format!("No recorded activity for {}.", label(&x)), facts: vec![] });
             }
-            let lines: Vec<String> = events
+            let mut lines: Vec<String> = events
                 .iter()
                 .map(|e| {
                     let detail = e
@@ -378,6 +484,7 @@ pub fn try_answer(
                     format!("{} {} {} ({}){detail}", fmt_date(e.ts), e.actor, e.action, e.outcome.as_str())
                 })
                 .collect();
+            lines.extend(versions);
             Some(Direct {
                 answer: format!("Recent activity on {}:\n• {}", label(&x), lines.join("\n• ")),
                 facts: lines,
@@ -404,6 +511,16 @@ pub fn try_answer(
                 .collect();
             if !props.is_empty() {
                 answer.push_str(&format!("\n{}", props.join(" · ")));
+            }
+            let derived: Vec<String> = onto
+                .derived(p, &x.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(k, v)| k != "age_days" && !v.is_null())
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            if !derived.is_empty() {
+                answer.push_str(&format!("\nComputed — {}", derived.join(" · ")));
             }
             let mut by_rel: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (rel, e) in onto.neighbors(p, &x.id, None).unwrap_or_default() {
@@ -437,4 +554,251 @@ pub fn try_answer(
         }
         _ => None,
     }
+}
+
+fn state_filter(c: &Classified) -> (Option<bool>, Vec<String>) {
+    match &c.state {
+        Some(StateFilter::Open) => (Some(true), vec![]),
+        Some(StateFilter::Closed) => (Some(false), vec![]),
+        Some(StateFilter::Is(s)) => (None, vec![s.clone()]),
+        None => (None, vec![]),
+    }
+}
+
+/// "issues", "work items", "people".
+pub fn kind_label(kind: &str, n: usize) -> String {
+    let base = kind.replace('_', " ");
+    if n == 1 {
+        base
+    } else if base == "person" {
+        "people".into()
+    } else if base.ends_with('y') && !base.ends_with("ey") {
+        format!("{}ies", &base[..base.len() - 1])
+    } else if base.ends_with('s') {
+        format!("{base}es")
+    } else {
+        format!("{base}s")
+    }
+}
+
+fn scope_of(
+    onto: &Ontology,
+    p: &Principal,
+    confident: &[&Resolved],
+    kind: &str,
+    mine: Option<Entity>,
+) -> Option<Entity> {
+    confident.iter().filter_map(|r| onto.get(p, &r.id).ok()).find(|e| !onto.schema().kind_is(&e.kind, kind)).or(mine)
+}
+
+fn rows_text(r: &MetricResult, unit: &str) -> Vec<String> {
+    r.rows
+        .iter()
+        .map(|row| {
+            let g: Vec<&str> = row.group.values().map(String::as_str).collect();
+            format!("{}: {}{unit}", g.join(" / "), fmt_num(row.value))
+        })
+        .collect()
+}
+
+fn fmt_num(x: f64) -> String {
+    if x.fract() == 0.0 { format!("{x:.0}") } else { format!("{x:.2}") }
+}
+
+fn grouped(
+    onto: &Ontology,
+    p: &Principal,
+    ws: &str,
+    c: &Classified,
+    confident: &[&Resolved],
+    me: Option<Entity>,
+) -> Option<Direct> {
+    let dim = c.group_by.clone()?;
+    let kind = c.kind.clone().unwrap_or_else(|| "work_item".into());
+    let scope = scope_of(onto, p, confident, &kind, if c.mine { me } else { None });
+    let (open, state) = state_filter(c);
+    let q = MetricQuery {
+        kind: Some(kind.clone()),
+        measure: Some(Measure::Count),
+        filter: Some(MetricFilter { open, state, props: Default::default() }),
+        group_by: vec![dim.clone()],
+        within: scope.as_ref().map(|e| e.id.clone()),
+        workspace: Some(ws.to_string()),
+        limit: Some(20),
+        ..Default::default()
+    };
+    let r = onto.metric(p, &q).ok()?;
+    let qualifier = match open {
+        Some(true) => "Open ",
+        Some(false) => "Closed ",
+        None => "",
+    };
+    let scope_txt = scope.as_ref().map(|e| format!(" in {}", label(e))).unwrap_or_default();
+    let lines = rows_text(&r, "");
+    let answer = if r.count == 0 {
+        format!("No {}{}{scope_txt}.", qualifier.to_lowercase(), kind_label(&kind, 2))
+    } else {
+        format!(
+            "{qualifier}{} by {dim}{scope_txt} ({} in total):\n• {}",
+            kind_label(&kind, 2),
+            r.count,
+            lines.join("\n• ")
+        )
+    };
+    Some(Direct { answer: answer.trim_start().to_string(), facts: lines })
+}
+
+fn metric_answer(
+    onto: &Ontology,
+    p: &Principal,
+    ws: &str,
+    c: &Classified,
+    confident: &[&Resolved],
+    me: Option<Entity>,
+) -> Option<Direct> {
+    let schema = onto.schema();
+    let measure = c.measure?;
+    let named = schema.metrics.values().filter(|m| m.measure == measure).find(|m| match (&c.kind, &m.kind) {
+        (Some(k), Some(mk)) => schema.kind_is(k, mk) || k == mk,
+        (None, _) => true,
+        (Some(_), None) => measure == Measure::FailureRate || measure == Measure::EventCount,
+    });
+    let kind = c.kind.clone().or_else(|| named.and_then(|m| m.kind.clone())).or_else(|| match measure {
+        Measure::LeadTime => Some("issue".into()),
+        Measure::Throughput => Some("work_item".into()),
+        _ => None,
+    });
+    let scope = scope_of(onto, p, confident, kind.as_deref().unwrap_or("work_item"), if c.mine { me } else { None });
+    let q = MetricQuery {
+        metric: named.map(|m| m.name.clone()),
+        kind: kind.clone(),
+        measure: Some(measure),
+        group_by: c.group_by.iter().cloned().collect(),
+        within: scope.as_ref().map(|e| e.id.clone()),
+        workspace: Some(ws.to_string()),
+        window_days: c.since_days.or_else(|| named.and_then(|m| m.window_days)).or(Some(90)),
+        event_action: named
+            .and_then(|m| m.event_action.clone())
+            .or_else(|| (measure == Measure::FailureRate).then(|| kind.clone().unwrap_or_else(|| "deployment".into()))),
+        limit: Some(10),
+        ..Default::default()
+    };
+    let r = onto.metric(p, &q).ok()?;
+    let window = r.window_days.map(|d| format!(" over the last {d} days")).unwrap_or_default();
+    let what = kind.as_deref().map(|k| kind_label(k, 2)).unwrap_or_else(|| "events".into());
+    let certified = if r.certified { " [certified metric]" } else { "" };
+    let head = match measure {
+        Measure::LeadTime if r.count == 0 => format!("No {what} reached a finished state{window}."),
+        Measure::LeadTime => {
+            let p50 = r.rows.first().and_then(|x| x.p50).map(|v| format!(", median {v:.2}")).unwrap_or_default();
+            let p90 = r.rows.first().and_then(|x| x.p90).map(|v| format!(", p90 {v:.2}")).unwrap_or_default();
+            format!("Average lead time for {what}{window}: {:.2} days{p50}{p90} ({} finished).", r.value, r.count)
+        }
+        Measure::Throughput => {
+            format!("{} {} finished{window}.", r.count, kind_label(kind.as_deref().unwrap_or("item"), r.count))
+        }
+        Measure::FailureRate => format!(
+            "Failure rate{window}: {:.0}% of {} {} event(s) failed or were denied.",
+            r.value * 100.0,
+            r.count,
+            q.event_action.clone().unwrap_or_default()
+        ),
+        Measure::EventCount => format!("{} event(s){window}.", r.count),
+        _ => format!("{}: {}", r.metric, fmt_num(r.value)),
+    };
+    let lines = if c.group_by.is_some() || matches!(measure, Measure::FailureRate | Measure::EventCount) {
+        rows_text(&r, if measure == Measure::FailureRate { " (rate)" } else { "" })
+    } else {
+        Vec::new()
+    };
+    let answer = if lines.is_empty() {
+        format!("{head}{certified}")
+    } else {
+        format!("{head}{certified}\n• {}", lines.join("\n• "))
+    };
+    Some(Direct { answer, facts: lines })
+}
+
+/// Map a word like "done" or "fixed" to a real state of the kind.
+pub fn hypothetical_state(schema: &Schema, kind: &str, word: &str) -> Option<String> {
+    let ty = schema.object_type(kind)?;
+    let w = word.to_lowercase().replace(' ', "_");
+    if ty.states.contains(&w) {
+        return Some(w);
+    }
+    let finished = [
+        "done",
+        "finished",
+        "completed",
+        "complete",
+        "closed",
+        "resolved",
+        "fixed",
+        "shipped",
+        "delivered",
+        "succeeded",
+    ];
+    if finished.contains(&w.as_str()) {
+        if ty.states.iter().any(|s| s == "done") {
+            return Some("done".into());
+        }
+        return ty.terminal_states.first().cloned();
+    }
+    let pick = |cands: &[&str]| cands.iter().find(|c| ty.states.iter().any(|s| s == *c)).map(|s| s.to_string());
+    match w.as_str() {
+        "blocked" | "stuck" => pick(&["blocked"]),
+        "started" | "in_progress" | "progressing" | "underway" => pick(&["in_progress", "active", "running"]),
+        "failed" | "broken" | "down" => pick(&["failed", "down", "degraded"]),
+        "healthy" | "fixed_up" | "up" => pick(&["healthy", "succeeded"]),
+        _ => None,
+    }
+}
+
+fn what_if(onto: &Ontology, p: &Principal, ws: &str, c: &Classified, x: Entity) -> Option<Direct> {
+    let schema = onto.schema();
+    let state = hypothetical_state(schema, &x.kind, c.whatif_state.as_deref().unwrap_or("done"))?;
+    let fork = onto.fork();
+    fork.apply(
+        &ActionContext::system(ws).with_source("scenario"),
+        vec![Mutation::Patch(EntityPatch { id: x.id.clone(), state: Some(state.clone()), ..Default::default() })],
+    )
+    .ok()?;
+    let mut lines = Vec::new();
+    let containers: Vec<String> = onto.read(|g, _| {
+        g.steps_via(&x.id, "belongs_to", Dir::Out)
+            .into_iter()
+            .chain(g.steps_via(&x.id, "part_of", Dir::Out))
+            .map(|s| s.other.to_string())
+            .collect()
+    });
+    for cid in containers {
+        let (Ok(before), Ok(after)) = (onto.critical_path(p, &cid), fork.critical_path(p, &cid)) else { continue };
+        if (before.cost - after.cost).abs() > f64::EPSILON {
+            let path: Vec<&str> = after.path.iter().map(|n| n.id.as_str()).collect();
+            let name = onto.get(p, &cid).map(|e| label(&e)).unwrap_or(cid.clone());
+            lines.push(format!(
+                "{name}: critical path {:.1} → {:.1} days{}",
+                before.cost,
+                after.cost,
+                if path.is_empty() { String::new() } else { format!(" (then {})", path.join(" → ")) }
+            ));
+        }
+    }
+    if let Ok(down) = onto.dependencies(p, &x.id, DepDirection::Downstream, 4) {
+        for n in down.nodes.iter().filter(|n| n.open) {
+            let before = onto.dependencies(p, &n.id, DepDirection::Upstream, 4).map(|d| d.open.len()).unwrap_or(0);
+            let after = fork.dependencies(p, &n.id, DepDirection::Upstream, 4).map(|d| d.open.len()).unwrap_or(0);
+            if before > 0 && after == 0 {
+                lines.push(format!("{} [{}] would have no open blockers", n.title, n.id));
+            } else if after < before {
+                lines.push(format!("{} [{}] would wait on {after} instead of {before} item(s)", n.title, n.id));
+            }
+        }
+    }
+    let answer = if lines.is_empty() {
+        format!("If {} were {state}, nothing that depends on it would change.", label(&x))
+    } else {
+        format!("If {} were {state}:\n• {}", label(&x), lines.join("\n• "))
+    };
+    Some(Direct { answer, facts: lines })
 }

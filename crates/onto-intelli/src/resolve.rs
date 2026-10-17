@@ -41,14 +41,19 @@ pub fn resolve(onto: &Ontology, p: &Principal, ws: &str, question: &str) -> Vec<
     onto.read(|g, schema| resolve_in(g, schema, p, ws, question))
 }
 
-fn resolve_in(g: &Graph, schema: &Schema, p: &Principal, ws: &str, question: &str) -> Vec<Resolved> {
-    let words: Vec<String> = question
+/// The question's words as positions in [`Resolved::position`] refer to them.
+pub fn words(question: &str) -> Vec<String> {
+    question
         .split(|c: char| {
             c.is_whitespace() || c == ',' || c == '?' || c == '!' || c == ';' || c == '(' || c == ')' || c == '"'
         })
         .map(clean_word)
         .filter(|w| !w.is_empty())
-        .collect();
+        .collect()
+}
+
+fn resolve_in(g: &Graph, schema: &Schema, p: &Principal, ws: &str, question: &str) -> Vec<Resolved> {
+    let words = words(question);
     let usable = |e: &Entity| e.workspace == ws && policy::visible(p, e, g);
     let kind_words: Vec<&str> = words.iter().map(String::as_str).filter(|w| schema.object_type(w).is_some()).collect();
     let mut covered = vec![false; words.len()];

@@ -3,7 +3,7 @@
 class OntoIntelli < Formula
   desc "Ontology-based Enterprise Execution Intelligence: gRPC, memory, context graphs, LLM"
   homepage "https://github.com/f8fvwgzc/onto-intelli"
-  url "https://github.com/f8fvwgzc/onto-intelli/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/f8fvwgzc/onto-intelli/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
   license "MIT"
   head "https://github.com/f8fvwgzc/onto-intelli.git", branch: "main"

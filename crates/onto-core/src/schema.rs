@@ -8,6 +8,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::action_types::ActionType;
+use crate::metrics::{DerivedDef, MetricDef};
+use crate::quality::Constraints;
 use crate::{Error, Result};
 
 /// The built-in Enterprise Execution ontology.
@@ -74,6 +77,76 @@ pub struct ObjectType {
     /// States meaning "something is wrong": candidates in root-cause analysis.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alert_states: Vec<String>,
+    /// Interfaces this type implements (polymorphism across types).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implements: Vec<String>,
+    /// Computed properties (aggregations over relations), evaluated on read.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub derived: BTreeMap<String, DerivedDef>,
+    /// Data-quality rules checked by the quality report.
+    #[serde(default, skip_serializing_if = "Constraints::is_empty")]
+    pub constraints: Constraints,
+}
+
+impl ObjectType {
+    /// Layer an extension onto this type: properties, interfaces, derived
+    /// properties and constraints are added; non-empty lists replace.
+    pub fn merge(&mut self, other: ObjectType) {
+        if !other.description.is_empty() {
+            self.description = other.description;
+        }
+        if other.category != Category::Thing {
+            self.category = other.category;
+        }
+        if other.extends.is_some() {
+            self.extends = other.extends;
+        }
+        self.properties.extend(other.properties);
+        if !other.states.is_empty() {
+            self.states = other.states;
+        }
+        if !other.terminal_states.is_empty() {
+            self.terminal_states = other.terminal_states;
+        }
+        if !other.alert_states.is_empty() {
+            self.alert_states = other.alert_states;
+        }
+        for i in other.implements {
+            if !self.implements.contains(&i) {
+                self.implements.push(i);
+            }
+        }
+        self.derived.extend(other.derived);
+        self.constraints.merge(&other.constraints);
+    }
+}
+
+/// A shape shared by several object types: common properties and relations.
+/// `kind = "work_item"` in queries matches every implementing type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InterfaceType {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Properties every implementer has (inherited when not redeclared).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, PropertyDef>,
+    /// Relations every implementer must be allowed to use as the source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
+}
+
+/// Business vocabulary: words people use for kinds and relations.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Glossary {
+    #[serde(default)]
+    pub kinds: BTreeMap<String, String>,
+    #[serde(default)]
+    pub relations: BTreeMap<String, String>,
+    /// Named slices for metrics, e.g. `team = "assigned_to.member_of"`.
+    #[serde(default)]
+    pub dimensions: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +239,10 @@ pub struct Schema {
     pub link_types: BTreeMap<String, LinkType>,
     pub rules: Vec<Rule>,
     pub analysis: Analysis,
+    pub interfaces: BTreeMap<String, InterfaceType>,
+    pub glossary: Glossary,
+    pub metrics: BTreeMap<String, MetricDef>,
+    pub action_types: BTreeMap<String, ActionType>,
     /// inverse name -> canonical relation
     #[serde(skip)]
     inverses: BTreeMap<String, String>,
@@ -183,6 +260,13 @@ struct SchemaFile {
     #[serde(default)]
     rules: Vec<Rule>,
     analysis: Option<Analysis>,
+    #[serde(default)]
+    interfaces: BTreeMap<String, InterfaceType>,
+    glossary: Option<Glossary>,
+    #[serde(default)]
+    metrics: BTreeMap<String, MetricDef>,
+    #[serde(default)]
+    action_types: BTreeMap<String, ActionType>,
 }
 
 impl Schema {
@@ -228,7 +312,14 @@ impl Schema {
         if let Some(version) = file.version {
             self.version = version;
         }
-        self.object_types.extend(file.object_types);
+        for (name, t) in file.object_types {
+            match self.object_types.get_mut(&name) {
+                Some(cur) => cur.merge(t),
+                None => {
+                    self.object_types.insert(name, t);
+                }
+            }
+        }
         self.link_types.extend(file.link_types);
         for rule in file.rules {
             self.rules.retain(|r| r.name != rule.name);
@@ -237,6 +328,14 @@ impl Schema {
         if let Some(analysis) = file.analysis {
             self.analysis = analysis;
         }
+        self.interfaces.extend(file.interfaces);
+        if let Some(g) = file.glossary {
+            self.glossary.kinds.extend(g.kinds);
+            self.glossary.relations.extend(g.relations);
+            self.glossary.dimensions.extend(g.dimensions);
+        }
+        self.metrics.extend(file.metrics);
+        self.action_types.extend(file.action_types);
         self.finish()
     }
 
@@ -251,6 +350,20 @@ impl Schema {
         for (name, ty) in self.object_types.iter_mut() {
             ty.name = name.clone();
         }
+        for (name, iface) in self.interfaces.iter_mut() {
+            iface.name = name.clone();
+        }
+        for (name, m) in self.metrics.iter_mut() {
+            m.name = name.clone();
+        }
+        for (name, a) in self.action_types.iter_mut() {
+            a.name = name.clone();
+        }
+        for name in self.interfaces.keys() {
+            if self.object_types.contains_key(name) {
+                return Err(Error::Config(format!("interface {name} collides with an object type")));
+            }
+        }
         self.inverses.clear();
         for (name, lt) in self.link_types.iter_mut() {
             lt.name = name.clone();
@@ -260,7 +373,7 @@ impl Schema {
         }
         for (name, lt) in &self.link_types {
             for kind in lt.from.iter().chain(&lt.to) {
-                if !self.object_types.contains_key(kind) {
+                if !self.is_type_or_interface(kind) {
                     return Err(Error::Config(format!("link type {name} references unknown type {kind}")));
                 }
             }
@@ -290,7 +403,115 @@ impl Schema {
                 }
             }
         }
+        self.check_interfaces()?;
+        for (word, kind) in &self.glossary.kinds {
+            if !self.is_type_or_interface(kind) {
+                return Err(Error::Config(format!("glossary maps '{word}' to unknown type {kind}")));
+            }
+        }
+        for (word, rel) in &self.glossary.relations {
+            if self.resolve_rel(rel).is_none() {
+                return Err(Error::Config(format!("glossary maps '{word}' to unknown relation {rel}")));
+            }
+        }
+        for ty in self.object_types.values() {
+            for (prop, d) in &ty.derived {
+                d.validate(self).map_err(|e| Error::Config(format!("{}.derived.{prop}: {e}", ty.name)))?;
+            }
+            for rel in &ty.constraints.required_links {
+                if self.resolve_rel(rel).is_none() {
+                    return Err(Error::Config(format!("{}.constraints: unknown relation {rel}", ty.name)));
+                }
+            }
+        }
+        for m in self.metrics.values() {
+            m.validate(self).map_err(|e| Error::Config(format!("metric {}: {e}", m.name)))?;
+        }
+        for a in self.action_types.values() {
+            a.validate(self).map_err(|e| Error::Config(format!("action type {}: {e}", a.name)))?;
+        }
         Ok(())
+    }
+
+    fn check_interfaces(&self) -> Result<()> {
+        for ty in self.object_types.values() {
+            for iname in &ty.implements {
+                let Some(iface) = self.interfaces.get(iname) else {
+                    return Err(Error::Config(format!("type {} implements unknown interface {iname}", ty.name)));
+                };
+                for (prop, def) in &iface.properties {
+                    if let Some(own) = self.own_prop_def(&ty.name, prop)
+                        && own.ty != def.ty
+                    {
+                        return Err(Error::Config(format!(
+                            "type {} declares {prop} as {:?} but interface {iname} requires {:?}",
+                            ty.name, own.ty, def.ty
+                        )));
+                    }
+                }
+                for rel in &iface.links {
+                    let Some((base, _)) = self.resolve_rel(rel) else {
+                        return Err(Error::Config(format!("interface {iname} requires unknown relation {rel}")));
+                    };
+                    let lt = &self.link_types[&base];
+                    if !lt.from.is_empty() && !lt.from.iter().any(|k| self.kind_is(&ty.name, k)) {
+                        return Err(Error::Config(format!(
+                            "type {} implements {iname} but may not use relation {base}",
+                            ty.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_interface(&self, name: &str) -> bool {
+        self.interfaces.contains_key(name)
+    }
+
+    pub fn is_type_or_interface(&self, name: &str) -> bool {
+        self.object_types.contains_key(name) || self.interfaces.contains_key(name)
+    }
+
+    /// Map a word from a question to a kind or interface: exact names,
+    /// glossary synonyms and simple plurals ("tickets" → issue, "people" → person).
+    pub fn canonical_kind(&self, word: &str) -> Option<String> {
+        let w = word.trim().to_lowercase().replace([' ', '-'], "_");
+        let lookup = |c: &str| -> Option<String> {
+            if self.is_type_or_interface(c) {
+                return Some(c.to_string());
+            }
+            self.glossary.kinds.get(c).cloned()
+        };
+        if let Some(k) = lookup(&w) {
+            return Some(k);
+        }
+        let mut stems = Vec::new();
+        if let Some(s) = w.strip_suffix("ies") {
+            stems.push(format!("{s}y"));
+        }
+        if let Some(s) = w.strip_suffix("es") {
+            stems.push(s.to_string());
+        }
+        if let Some(s) = w.strip_suffix('s') {
+            stems.push(s.to_string());
+        }
+        stems.iter().find_map(|s| lookup(s))
+    }
+
+    /// Map a word to a relation via names, inverses and the glossary.
+    pub fn canonical_rel(&self, word: &str) -> Option<String> {
+        let w = word.trim().to_lowercase();
+        if self.resolve_rel(&w).is_some() {
+            return Some(w);
+        }
+        self.glossary.relations.get(&w).or_else(|| self.glossary.relations.get(w.trim_end_matches('s'))).cloned()
+    }
+
+    /// Concrete object types matching a kind or interface name.
+    pub fn concrete_kinds(&self, name: &str) -> Vec<String> {
+        self.object_types.keys().filter(|k| self.kind_is(k, name)).cloned().collect()
     }
 
     pub fn object_type(&self, kind: &str) -> Option<&ObjectType> {
@@ -349,7 +570,8 @@ impl Schema {
         self.link_types.values().filter(|lt| lt.dependency).map(|lt| lt.name.clone()).collect()
     }
 
-    /// Is `kind` the same as, or a subtype of, `ancestor`?
+    /// Is `kind` the same as, a subtype of, or an implementer of `ancestor`
+    /// (an object type or an interface)?
     pub fn kind_is(&self, kind: &str, ancestor: &str) -> bool {
         let mut cur = Some(kind);
         let mut hops = 0;
@@ -357,29 +579,61 @@ impl Schema {
             if k == ancestor {
                 return true;
             }
+            let ty = self.object_types.get(k);
+            if ty.is_some_and(|t| t.implements.iter().any(|i| i == ancestor)) {
+                return true;
+            }
             hops += 1;
             if hops > 16 {
                 break;
             }
-            cur = self.object_types.get(k).and_then(|t| t.extends.as_deref());
+            cur = ty.and_then(|t| t.extends.as_deref());
         }
         false
     }
 
+    /// Property definition from the type, its ancestors, then its interfaces.
     pub fn prop_def(&self, kind: &str, prop: &str) -> Option<&PropertyDef> {
+        self.own_prop_def(kind, prop).or_else(|| {
+            self.type_chain(kind)
+                .iter()
+                .flat_map(|t| t.implements.iter())
+                .filter_map(|i| self.interfaces.get(i))
+                .find_map(|i| i.properties.get(prop))
+        })
+    }
+
+    fn own_prop_def(&self, kind: &str, prop: &str) -> Option<&PropertyDef> {
+        self.type_chain(kind).into_iter().find_map(|t| t.properties.get(prop))
+    }
+
+    /// The type followed by its `extends` ancestors.
+    pub fn type_chain(&self, kind: &str) -> Vec<&ObjectType> {
+        let mut out = Vec::new();
         let mut cur = self.object_types.get(kind);
-        let mut hops = 0;
-        while let Some(ty) = cur {
-            if let Some(def) = ty.properties.get(prop) {
-                return Some(def);
-            }
-            hops += 1;
-            if hops > 16 {
+        while let Some(t) = cur {
+            if out.len() > 16 {
                 break;
             }
-            cur = ty.extends.as_deref().and_then(|p| self.object_types.get(p));
+            out.push(t);
+            cur = t.extends.as_deref().and_then(|p| self.object_types.get(p));
         }
-        None
+        out
+    }
+
+    /// Derived property definitions for a kind (including ancestors).
+    pub fn derived_defs(&self, kind: &str) -> Vec<(&String, &DerivedDef)> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.type_chain(kind).into_iter().flat_map(|t| t.derived.iter()).filter(|(k, _)| seen.insert(*k)).collect()
+    }
+
+    /// Constraints for a kind, merged over ancestors.
+    pub fn constraints(&self, kind: &str) -> Constraints {
+        let mut c = Constraints::default();
+        for t in self.type_chain(kind).into_iter().rev() {
+            c.merge(&t.constraints);
+        }
+        c
     }
 
     pub fn category(&self, kind: &str) -> Category {
@@ -455,17 +709,27 @@ impl Schema {
             }
         }
         if creating {
-            let mut cur = Some(ty);
-            while let Some(t) = cur {
-                for (name, def) in &t.properties {
-                    if def.required && props.get(name).is_none_or(Value::is_null) {
-                        return Err(Error::invalid(format!("{kind}.{name} is required")));
-                    }
+            for (name, def) in self.all_props(kind) {
+                if def.required && props.get(name).is_none_or(Value::is_null) {
+                    return Err(Error::invalid(format!("{kind}.{name} is required")));
                 }
-                cur = t.extends.as_deref().and_then(|p| self.object_types.get(p));
             }
         }
+        let _ = ty;
         Ok(())
+    }
+
+    /// Every property definition that applies to a kind (type, ancestors, interfaces).
+    pub fn all_props(&self, kind: &str) -> Vec<(&String, &PropertyDef)> {
+        let mut seen = std::collections::BTreeSet::new();
+        let chain = self.type_chain(kind);
+        let own = chain.iter().flat_map(|t| t.properties.iter());
+        let ifaces = chain
+            .iter()
+            .flat_map(|t| t.implements.iter())
+            .filter_map(|i| self.interfaces.get(i))
+            .flat_map(|i| i.properties.iter());
+        own.chain(ifaces).filter(|(k, _)| seen.insert(*k)).collect()
     }
 
     pub fn validate_link(&self, from_kind: &str, base: &str, to_kind: &str, strict: bool) -> Result<()> {
@@ -548,6 +812,25 @@ impl Schema {
                 let _ = writeln!(out, "  {} = {}", r.infer, r.chain.join(" > "));
             }
         }
+        if !self.interfaces.is_empty() {
+            let _ = writeln!(out, "\nInterfaces:");
+            for i in self.interfaces.values() {
+                let _ = writeln!(out, "  {:<15} implemented by {}", i.name, self.concrete_kinds(&i.name).join(", "));
+            }
+        }
+        if !self.action_types.is_empty() {
+            let _ = writeln!(out, "\nAction types:");
+            for a in self.action_types.values() {
+                let params: Vec<String> = a.parameters.keys().cloned().collect();
+                let _ = writeln!(out, "  {:<15} ({}) risk {:?}", a.name, params.join(", "), a.risk);
+            }
+        }
+        if !self.metrics.is_empty() {
+            let _ = writeln!(out, "\nMetrics:");
+            for m in self.metrics.values() {
+                let _ = writeln!(out, "  {:<24} {:?} {}", m.name, m.measure, m.kind.as_deref().unwrap_or(""));
+            }
+        }
         out
     }
 }
@@ -617,6 +900,27 @@ mod tests {
         assert!(s.prop_def("incident", "priority").is_some());
         assert!(s.validate_link("incident", "assigned_to", "person", true).is_ok());
         assert_eq!(s.resolve_rel("paged_by"), Some(("pages".into(), Dir::In)));
+    }
+
+    #[test]
+    fn interfaces_glossary_and_extensions_validate() {
+        let s = Schema::enterprise();
+        assert!(s.kind_is("task", "work_item"));
+        assert!(s.kind_is("issue", "work_item"));
+        assert!(!s.kind_is("person", "work_item"));
+        assert!(s.prop_def("task", "priority").is_some(), "interface properties are inherited");
+        assert_eq!(s.canonical_kind("tickets").as_deref(), Some("issue"));
+        assert_eq!(s.canonical_kind("People").as_deref(), Some("person"));
+        assert_eq!(s.canonical_kind("work items").as_deref(), Some("work_item"));
+        assert_eq!(s.canonical_rel("owner").as_deref(), Some("owned_by"));
+        assert!(s.concrete_kinds("work_item").contains(&"milestone".to_string()));
+        let bad = Schema::from_toml("[object_types.a]\nimplements = ['nope']\n").unwrap_err();
+        assert!(bad.to_string().contains("unknown interface"));
+        let mut s2 = Schema::enterprise();
+        let err = s2
+            .extend_toml("[object_types.bug]\nimplements = ['work_item']\nproperties.priority = { type = 'int' }\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("interface work_item requires"));
     }
 
     #[test]

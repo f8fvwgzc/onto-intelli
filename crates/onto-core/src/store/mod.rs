@@ -26,6 +26,20 @@ pub struct Snapshot {
     pub links: Vec<Link>,
 }
 
+/// One historical state of an entity (`doc = None` marks a deletion).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VersionRecord {
+    pub id: Id,
+    pub revision: u64,
+    pub ts: i64,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<Entity>,
+}
+
 /// Atomic unit of persistence.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
@@ -34,6 +48,10 @@ pub struct WriteBatch {
     pub put_links: Vec<Link>,
     pub del_links: Vec<LinkKey>,
     pub events: Vec<Event>,
+    /// Entity history written in the same transaction.
+    pub versions: Vec<VersionRecord>,
+    /// KV writes that must commit together with the graph change (ns, key, value).
+    pub kv: Vec<(String, String, Value)>,
 }
 
 impl WriteBatch {
@@ -43,6 +61,8 @@ impl WriteBatch {
             && self.put_links.is_empty()
             && self.del_links.is_empty()
             && self.events.is_empty()
+            && self.versions.is_empty()
+            && self.kv.is_empty()
     }
 }
 
@@ -67,6 +87,10 @@ pub trait Store: Send + Sync {
     /// All live entries of a namespace whose key starts with `prefix`, key order.
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>>;
     fn stats(&self) -> Result<StoreStats>;
+    /// Version history of one entity, newest first.
+    fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>>;
+    /// Versions written at or after `since`, newest first.
+    fn versions_since(&self, since: i64, limit: usize) -> Result<Vec<VersionRecord>>;
 }
 
 pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
@@ -91,6 +115,7 @@ pub struct MemoryStore {
 #[derive(Default)]
 struct MemInner {
     events: VecDeque<Event>,
+    versions: VecDeque<VersionRecord>,
     kv: HashMap<String, std::collections::BTreeMap<String, (Value, Option<i64>)>>,
 }
 
@@ -118,6 +143,15 @@ impl Store for MemoryStore {
                 inner.events.pop_front();
             }
             inner.events.push_back(e.clone());
+        }
+        for v in &batch.versions {
+            if inner.versions.len() >= self.max_events {
+                inner.versions.pop_front();
+            }
+            inner.versions.push_back(v.clone());
+        }
+        for (ns, key, value) in &batch.kv {
+            inner.kv.entry(ns.clone()).or_default().insert(key.clone(), (value.clone(), None));
         }
         Ok(())
     }
@@ -167,6 +201,16 @@ impl Store for MemoryStore {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner.versions.iter().rev().filter(|v| v.id == id).take(limit).cloned().collect())
+    }
+
+    fn versions_since(&self, since: i64, limit: usize) -> Result<Vec<VersionRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner.versions.iter().rev().take_while(|v| v.ts >= since).take(limit).cloned().collect())
     }
 
     fn stats(&self) -> Result<StoreStats> {

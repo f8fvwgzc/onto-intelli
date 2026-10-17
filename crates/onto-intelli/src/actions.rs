@@ -4,12 +4,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use serde_json::Map;
+
+use onto_core::action_types::ApplyOptions;
 use onto_core::deps::DepDirection;
+use onto_core::metrics::MetricQuery;
 use onto_core::query::{FindSpec, TraverseSpec};
 use onto_core::{
     ActionContext, EntityInput, EntityPatch, EntityRef, Error, EventFilter, EventInput, Id, LinkInput, Mutation,
     Principal, Result, one_or_many,
 };
+use onto_core::{Ontology, SearchMode};
 
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
@@ -69,6 +74,39 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("ingest.batch", true, "Ingest records (mutations, entities, GitHub webhooks). Input: {records: [...], async?}."),
     a("ingest.flush", false, "Wait until queued ingestion is applied."),
     a("conversation.get", false, "Fetch a conversation with its turns. Input: {id}."),
+    a("action.list", false, "Action types (governed edits) defined in the schema."),
+    a("action.describe", false, "One action type: parameters, checks, effects, risk. Input: {name}."),
+    a("action.plan", false, "Validate an action and preview its edits and reversibility. Input: {action, params}."),
+    a(
+        "action.apply",
+        true,
+        "Apply an action type (high-risk/irreversible ones need confirm=true). Input: {action, params, confirm?, dry_run?}.",
+    ),
+    a("action.undo", true, "Undo an applied action from its receipt. Input: {receipt, force?}."),
+    a("action.receipt", false, "Fetch an action receipt. Input: {id}."),
+    a("entity.derived", false, "Computed properties of an entity. Input: {id}."),
+    a("entity.history", false, "Version history with changed fields. Input: {id, limit?}."),
+    a("entity.as_of", false, "An entity as it was at a time. Input: {id, ts? | days_ago?}."),
+    a("graph.changes", false, "What changed in a window. Input: {since_days? | since?, within?, kinds?, limit?}."),
+    a("metric.list", false, "Governed metrics defined in the schema."),
+    a(
+        "metric.query",
+        false,
+        "Evaluate a metric, named or ad hoc. Input: {metric? | kind, measure, filter, group_by, within, window_days}.",
+    ),
+    a("entity.duplicates", false, "Likely duplicate entities. Input: {kind?, threshold?}."),
+    a("entity.merge", true, "Merge a duplicate into the entity to keep; the old id redirects. Input: {keep, merge}."),
+    a("quality.report", false, "Data-quality report with scores. Input: {kind?, limit?}."),
+    a(
+        "scenario.run",
+        false,
+        "What-if: apply mutations to a fork and compare read queries. Input: {mutations, queries: [{action, input}]}.",
+    ),
+    a("people.experts", false, "Who knows about a topic. Input: {topic, entities?, limit?}."),
+    a("schema.profile", false, "Populated patterns, kinds, properties and states."),
+    a("schema.suggest", false, "Schema additions proposed from data the schema does not describe."),
+    a("export.graph", false, "Export as Mermaid, Turtle (RDF/OWL + PROV-O) or JSON. Input: {format, start?, depth?}."),
+    a("eval.run", false, "Run competency questions and report pass rate, tokens, latency. Input: {cases? | toml?}."),
     a("schema.get", false, "The active ontology schema."),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
@@ -82,6 +120,10 @@ struct IdIn {
 
 #[derive(Deserialize)]
 struct SearchIn {
+    #[serde(default)]
+    mode: Option<SearchMode>,
+    #[serde(default)]
+    personalize: Option<bool>,
     query: String,
     #[serde(default, deserialize_with = "one_or_many")]
     kinds: Vec<String>,
@@ -193,8 +235,146 @@ impl Intelli {
     /// Run a named action. See [`ACTIONS`].
     pub async fn call(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
+        if GRAPH_READS.contains(&action) {
+            return graph_call(onto, p, self.default_workspace(), action, input);
+        }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
+            "action.list" => Ok(json!({ "action_types": onto.schema().action_types.values().collect::<Vec<_>>() })),
+            "action.describe" => {
+                let i: NameIn = parse(action, input)?;
+                let at = onto
+                    .schema()
+                    .action_types
+                    .get(&i.name)
+                    .ok_or_else(|| Error::not_found(format!("action type {}", i.name)))?;
+                to_json(at)
+            }
+            "action.plan" => {
+                let i: ActionIn = parse(action, input)?;
+                to_json(&onto.plan_action(&self.ctx(p, i.workspace), &i.action, &i.params)?)
+            }
+            "action.apply" => {
+                let i: ActionIn = parse(action, input)?;
+                let opts = ApplyOptions { dry_run: i.dry_run, confirm: i.confirm };
+                to_json(&onto.apply_action(&self.ctx(p, i.workspace), &i.action, &i.params, opts)?)
+            }
+            "action.undo" => {
+                let i: UndoIn = parse(action, input)?;
+                to_json(&onto.undo_action(&self.ctx(p, i.workspace), &i.receipt, i.force)?)
+            }
+            "action.receipt" => {
+                let i: IdIn = parse(action, input)?;
+                to_json(&onto.action_receipt(p, &i.id)?)
+            }
+            "entity.history" => {
+                let i: HistoryIn = parse(action, input)?;
+                Ok(json!({ "id": onto.resolve_id(&i.id), "history": onto.history(p, &i.id, i.limit.unwrap_or(50))? }))
+            }
+            "entity.as_of" => {
+                let i: AsOfIn = parse(action, input)?;
+                let ts = i
+                    .ts
+                    .unwrap_or_else(|| onto_core::time::now_ms() - (i.days_ago.unwrap_or(0.0) * 86_400_000.0) as i64);
+                Ok(
+                    json!({ "id": i.id, "ts": ts, "at": onto_core::time::fmt_ts(ts), "entity": onto.as_of(p, &i.id, ts)? }),
+                )
+            }
+            "graph.changes" => {
+                let i: ChangesIn = parse(action, input)?;
+                let since = i
+                    .since
+                    .unwrap_or_else(|| onto_core::time::now_ms() - (i.since_days.unwrap_or(7.0) * 86_400_000.0) as i64);
+                let changes = onto.changes(
+                    p,
+                    since,
+                    i.workspace.as_deref(),
+                    &i.kinds,
+                    i.within.as_deref(),
+                    i.limit.unwrap_or(100),
+                )?;
+                Ok(json!({ "since": since, "changes": changes }))
+            }
+            "metric.list" => Ok(json!({ "metrics": onto.schema().metrics.values().collect::<Vec<_>>() })),
+            "entity.duplicates" => {
+                let i: DupesIn = parse(action, input)?;
+                let pairs =
+                    onto.duplicates(p, i.workspace.as_deref(), i.kind.as_deref(), i.threshold.unwrap_or(0.8))?;
+                Ok(json!({ "pairs": pairs }))
+            }
+            "entity.merge" => {
+                let i: MergeIn = parse(action, input)?;
+                to_json(&onto.merge(&self.ctx(p, i.workspace), &i.keep, &i.merge)?)
+            }
+            "scenario.run" => {
+                let i: ScenarioIn = parse(action, input)?;
+                let ws = self.ws_or_default(i.workspace);
+                let fork = onto.fork();
+                let ctx = ActionContext::new(p.clone(), ws.clone()).with_source("scenario");
+                let applied = fork.apply(&ctx, i.mutations)?;
+                let mut results = Vec::new();
+                for q in i.queries {
+                    let before = graph_call(onto, p, &ws, &q.action, q.input.clone())?;
+                    let after = graph_call(&fork, p, &ws, &q.action, q.input)?;
+                    results.push(
+                        json!({ "action": q.action, "changed": before != after, "before": before, "after": after }),
+                    );
+                }
+                Ok(json!({ "applied": applied, "results": results }))
+            }
+            "people.experts" => {
+                let i: ExpertsIn = parse(action, input)?;
+                let ws = self.ws_or_default(i.workspace);
+                Ok(json!({ "experts": onto.experts(p, Some(&ws), &i.topic, &i.entities, i.limit.unwrap_or(5))? }))
+            }
+            "schema.profile" => {
+                let w: WsIn = parse(action, input)?;
+                to_json(&onto.profile(p, w.workspace.as_deref())?)
+            }
+            "schema.suggest" => {
+                let w: WsIn = parse(action, input)?;
+                to_json(&onto.suggest_schema(p, w.workspace.as_deref())?)
+            }
+            "export.graph" => {
+                let i: ExportIn = parse(action, input)?;
+                let spec = (!i.start.is_empty()).then(|| TraverseSpec {
+                    start: i.start.clone(),
+                    rels: i.rels.clone(),
+                    depth: i.depth.unwrap_or(2),
+                    limit: i.limit.unwrap_or(200),
+                    ..Default::default()
+                });
+                let content = match i.format.as_str() {
+                    "mermaid" => {
+                        let spec = spec.ok_or_else(|| Error::invalid("mermaid export needs `start`"))?;
+                        onto.export_mermaid(p, &spec)?
+                    }
+                    "turtle" | "ttl" | "rdf" => onto.export_turtle(
+                        p,
+                        i.workspace.as_deref(),
+                        i.include_schema.unwrap_or(true),
+                        i.include_data.unwrap_or(true),
+                        spec.as_ref(),
+                    )?,
+                    "json" => {
+                        let spec = spec.ok_or_else(|| Error::invalid("json export needs `start`"))?;
+                        serde_json::to_string_pretty(&onto.traverse(p, &spec)?)?
+                    }
+                    other => {
+                        return Err(Error::invalid(format!("unknown export format '{other}' (mermaid, turtle, json)")));
+                    }
+                };
+                Ok(json!({ "format": i.format, "content": content }))
+            }
+            "eval.run" => {
+                let i: EvalIn = parse(action, input)?;
+                let cases = match (i.cases.is_empty(), &i.toml) {
+                    (false, _) => i.cases,
+                    (true, Some(t)) => crate::eval::parse_suite(t)?,
+                    (true, None) => crate::eval::parse_suite(crate::eval::DEMO_EVALS)?,
+                };
+                to_json(&self.eval(p, cases).await?)
+            }
             "entity.upsert" => {
                 let e: EntityInput = parse(action, input)?;
                 to_json(&onto.upsert(&self.ctx(p, ws_hint), e)?)
@@ -203,24 +383,10 @@ impl Intelli {
                 let patch: EntityPatch = parse(action, input)?;
                 to_json(&onto.patch(&self.ctx(p, ws_hint), patch)?)
             }
-            "entity.get" => {
-                let i: IdIn = parse(action, input)?;
-                to_json(&onto.get(p, &i.id)?)
-            }
             "entity.delete" => {
                 let i: IdIn = parse(action, input)?;
                 let r = onto.apply(&self.ctx(p, ws_hint), vec![Mutation::Delete(EntityRef { id: i.id.clone() })])?;
                 Ok(json!({ "id": i.id, "deleted": true, "revision": r.revision }))
-            }
-            "entity.find" => {
-                let spec: FindSpec = parse(action, input)?;
-                let (entities, total) = onto.find(p, &spec)?;
-                Ok(json!({ "entities": entities, "total": total }))
-            }
-            "entity.search" => {
-                let s: SearchIn = parse(action, input)?;
-                let hits = onto.search(p, &s.query, &s.kinds, s.workspace.as_deref(), s.limit.unwrap_or(10))?;
-                Ok(json!({ "hits": hits }))
             }
             "link.create" => {
                 let l: LinkInput = parse(action, input)?;
@@ -241,50 +407,6 @@ impl Intelli {
             "graph.apply" => {
                 let a: ApplyIn = parse(action, input)?;
                 to_json(&onto.apply(&self.ctx(p, a.workspace), a.mutations)?)
-            }
-            "graph.neighbors" => {
-                let n: NeighborsIn = parse(action, input)?;
-                let list: Vec<Value> = onto
-                    .neighbors(p, &n.id, n.rel.as_deref())?
-                    .into_iter()
-                    .map(|(rel, entity)| json!({ "rel": rel, "entity": entity }))
-                    .collect();
-                Ok(json!({ "neighbors": list }))
-            }
-            "graph.traverse" => {
-                let spec: TraverseSpec = parse(action, input)?;
-                to_json(&onto.traverse(p, &spec)?)
-            }
-            "graph.path" => {
-                let i: PathIn = parse(action, input)?;
-                match onto.path(p, &i.from, &i.to, i.depth.unwrap_or(5))? {
-                    Some(hops) => Ok(json!({ "found": true, "text": onto.path_text(&hops), "hops": hops })),
-                    None => Ok(json!({ "found": false, "hops": [] })),
-                }
-            }
-            "graph.infer" => {
-                let i: IdIn = parse(action, input)?;
-                Ok(json!({ "inferred": onto.infer(p, &i.id)? }))
-            }
-            "graph.dependencies" => {
-                let d: DepsIn = parse(action, input)?;
-                to_json(&onto.dependencies(p, &d.id, d.direction.unwrap_or_default(), d.depth.unwrap_or(4))?)
-            }
-            "graph.impact" => {
-                let d: DepsIn = parse(action, input)?;
-                to_json(&onto.impact(p, &d.id, d.depth.unwrap_or(4))?)
-            }
-            "graph.root_cause" => {
-                let d: DepsIn = parse(action, input)?;
-                to_json(&onto.root_cause(p, &d.id, d.depth.unwrap_or(6))?)
-            }
-            "graph.cycles" => {
-                let w: WsIn = parse(action, input)?;
-                Ok(json!({ "cycles": onto.cycles(p, w.workspace.as_deref())? }))
-            }
-            "graph.critical_path" => {
-                let i: IdIn = parse(action, input)?;
-                to_json(&onto.critical_path(p, &i.id)?)
             }
             "context.build" => {
                 let c: ContextIn = parse(action, input)?;
@@ -371,4 +493,271 @@ impl Intelli {
 
 pub fn find(name: &str) -> Option<&'static ActionInfo> {
     ACTIONS.iter().find(|a| a.name == name)
+}
+
+#[derive(Deserialize)]
+struct NameIn {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct GetIn {
+    id: String,
+    #[serde(default)]
+    derived: bool,
+}
+
+#[derive(Deserialize)]
+struct ActionIn {
+    action: String,
+    #[serde(default)]
+    params: Map<String, Value>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize)]
+struct UndoIn {
+    receipt: String,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HistoryIn {
+    id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct AsOfIn {
+    id: String,
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    days_ago: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct ChangesIn {
+    #[serde(default)]
+    since: Option<i64>,
+    #[serde(default)]
+    since_days: Option<f64>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    kinds: Vec<String>,
+    #[serde(default)]
+    within: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct DupesIn {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    threshold: Option<f32>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MergeIn {
+    keep: String,
+    merge: String,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QueryIn {
+    action: String,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Deserialize)]
+struct ScenarioIn {
+    #[serde(default)]
+    mutations: Vec<Mutation>,
+    #[serde(default)]
+    queries: Vec<QueryIn>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpertsIn {
+    topic: String,
+    #[serde(default)]
+    entities: Vec<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ExportIn {
+    #[serde(default = "default_format")]
+    format: String,
+    #[serde(default, deserialize_with = "one_or_many")]
+    start: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    rels: Vec<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    include_schema: Option<bool>,
+    #[serde(default)]
+    include_data: Option<bool>,
+}
+
+fn default_format() -> String {
+    "turtle".into()
+}
+
+#[derive(Deserialize)]
+struct EvalIn {
+    #[serde(default)]
+    cases: Vec<crate::eval::EvalCase>,
+    #[serde(default)]
+    toml: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QualityIn {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Read-only graph actions; these also run inside what-if scenarios on a fork.
+pub const GRAPH_READS: &[&str] = &[
+    "entity.get",
+    "entity.find",
+    "entity.search",
+    "entity.derived",
+    "graph.neighbors",
+    "graph.traverse",
+    "graph.path",
+    "graph.infer",
+    "graph.dependencies",
+    "graph.impact",
+    "graph.root_cause",
+    "graph.cycles",
+    "graph.critical_path",
+    "metric.query",
+    "quality.report",
+];
+
+/// Run a read-only graph action against any ontology (live or a scenario fork).
+pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str, input: Value) -> Result<Value> {
+    match action {
+        "entity.get" => {
+            let i: GetIn = parse(action, input)?;
+            let e = onto.get(p, &i.id)?;
+            let mut v = to_json(&e)?;
+            if i.derived {
+                v["derived"] = Value::Object(onto.derived(p, &e.id)?);
+            }
+            Ok(v)
+        }
+        "entity.derived" => {
+            let i: IdIn = parse(action, input)?;
+            Ok(json!({ "id": i.id, "derived": onto.derived(p, &i.id)? }))
+        }
+        "entity.find" => {
+            let spec: FindSpec = parse(action, input)?;
+            let (entities, total) = onto.find(p, &spec)?;
+            Ok(json!({ "entities": entities, "total": total }))
+        }
+        "entity.search" => {
+            let s: SearchIn = parse(action, input)?;
+            let hits = onto.search_with(
+                p,
+                &s.query,
+                &s.kinds,
+                s.workspace.as_deref(),
+                s.limit.unwrap_or(10),
+                s.mode.unwrap_or_default(),
+                s.personalize.unwrap_or(true),
+            )?;
+            Ok(json!({ "hits": hits }))
+        }
+        "graph.neighbors" => {
+            let n: NeighborsIn = parse(action, input)?;
+            let list: Vec<Value> = onto
+                .neighbors(p, &n.id, n.rel.as_deref())?
+                .into_iter()
+                .map(|(rel, entity)| json!({ "rel": rel, "entity": entity }))
+                .collect();
+            Ok(json!({ "neighbors": list }))
+        }
+        "graph.traverse" => {
+            let spec: TraverseSpec = parse(action, input)?;
+            to_json(&onto.traverse(p, &spec)?)
+        }
+        "graph.path" => {
+            let i: PathIn = parse(action, input)?;
+            match onto.path(p, &i.from, &i.to, i.depth.unwrap_or(5))? {
+                Some(hops) => Ok(json!({ "found": true, "text": onto.path_text(&hops), "hops": hops })),
+                None => Ok(json!({ "found": false, "hops": [] })),
+            }
+        }
+        "graph.infer" => {
+            let i: IdIn = parse(action, input)?;
+            Ok(json!({ "inferred": onto.infer(p, &i.id)? }))
+        }
+        "graph.dependencies" => {
+            let d: DepsIn = parse(action, input)?;
+            to_json(&onto.dependencies(p, &d.id, d.direction.unwrap_or_default(), d.depth.unwrap_or(4))?)
+        }
+        "graph.impact" => {
+            let d: DepsIn = parse(action, input)?;
+            to_json(&onto.impact(p, &d.id, d.depth.unwrap_or(4))?)
+        }
+        "graph.root_cause" => {
+            let d: DepsIn = parse(action, input)?;
+            to_json(&onto.root_cause(p, &d.id, d.depth.unwrap_or(6))?)
+        }
+        "graph.cycles" => {
+            let w: WsIn = parse(action, input)?;
+            Ok(json!({ "cycles": onto.cycles(p, w.workspace.as_deref())? }))
+        }
+        "graph.critical_path" => {
+            let i: IdIn = parse(action, input)?;
+            to_json(&onto.critical_path(p, &i.id)?)
+        }
+        "metric.query" => {
+            let mut q: MetricQuery = parse(action, input)?;
+            if q.workspace.is_none() {
+                q.workspace = Some(default_ws.to_string());
+            }
+            to_json(&onto.metric(p, &q)?)
+        }
+        "quality.report" => {
+            let i: QualityIn = parse(action, input)?;
+            let ws = i.workspace.unwrap_or_else(|| default_ws.to_string());
+            to_json(&onto.quality(p, Some(&ws), i.kind.as_deref(), i.limit.unwrap_or(200))?)
+        }
+        other => Err(Error::invalid(format!("{other} is not a read-only graph action"))),
+    }
 }

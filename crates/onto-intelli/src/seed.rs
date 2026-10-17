@@ -67,6 +67,21 @@ pub fn demo_mutations() -> Vec<Mutation> {
             .link("belongs_to", "project:alpha").link("assigned_to", "person:aiko").link("depends_on", "task:32").link("depends_on", "task:33"),
         e("task", "35", "Roll back PostgreSQL 16.4").state("done").prop("estimate", 1.0)
             .link("belongs_to", "project:beacon").link("assigned_to", "person:maria"),
+        e("person", "kenji.t", "Kenji T.")
+            .prop("email", "kenji@acme.test")
+            .prop("role", "Backend Engineer")
+            .link("member_of", "team:payments"),
+        e("issue", "182", "Status page shows stale uptime")
+            .state("open")
+            .prop("priority", "low")
+            .link("belongs_to", "project:beacon")
+            .link("assigned_to", "person:john"),
+        e("issue", "380", "Login latency spike")
+            .state("open")
+            .prop("priority", "high")
+            .link("belongs_to", "project:beacon")
+            .link("assigned_to", "person:maria")
+            .link("affects", "service:auth-service"),
         e("knowledge", "runbook-payments", "Payments incident runbook")
             .prop("body", "When Payment API latency exceeds 2s, check PostgreSQL replication lag and the connection pool first. Fail over to the standby if lag exceeds 30s.")
             .prop("tags", json!(["runbook", "payments", "incident"]))
@@ -137,6 +152,15 @@ pub struct SeedReport {
 pub async fn load_demo(intelli: &Intelli, workspace: &str) -> Result<SeedReport> {
     let ctx = ActionContext::system(workspace).with_source("seed");
     let graph = intelli.ontology().apply(&ctx, demo_mutations())?;
+    // A second write gives version history (lead time, change feeds).
+    intelli.ontology().apply(
+        &ctx,
+        vec![Mutation::Patch(onto_core::EntityPatch {
+            id: "issue:380".into(),
+            state: Some("resolved".into()),
+            ..Default::default()
+        })],
+    )?;
     let events: Vec<Mutation> = demo_events().into_iter().map(Mutation::Event).collect();
     let n_events = events.len();
     intelli.ontology().apply(&ctx, events)?;

@@ -201,7 +201,18 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
         for (id, s, hop) in &ranked {
             let e = g.get(id).expect("ranked ids exist");
             naive += estimate(&serde_json::to_string(e).unwrap_or_default());
-            add(&mut facts, node_fact(schema, e), *s, "entity", *hop == 0);
+            let mut fact = node_fact(schema, e);
+            if *hop == 0 {
+                let derived: Vec<String> = onto_core::metrics::compute_derived(schema, g, e, &can)
+                    .into_iter()
+                    .filter(|(k, v)| k != "age_days" && !v.is_null())
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                if !derived.is_empty() {
+                    fact.push_str(&format!("; computed: {}", derived.join(", ")));
+                }
+            }
+            add(&mut facts, fact, *s, "entity", *hop == 0);
             nodes.push(CtxNode {
                 id: id.clone(),
                 kind: e.kind.clone(),
@@ -333,7 +344,11 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
     }
 
     // Knowledge that matches the question text.
-    let knowledge_kinds = ["knowledge", "decision", "artifact", "conversation"].map(String::from).to_vec();
+    let knowledge_kinds: Vec<String> = if onto.schema().is_interface("knowledge_item") {
+        vec!["knowledge_item".to_string()]
+    } else {
+        ["knowledge", "decision", "artifact", "conversation"].map(String::from).to_vec()
+    };
     let hits = onto.search(p, input.question, &knowledge_kinds, Some(ws), cfg.knowledge_hits).unwrap_or_default();
     let top = hits.first().map(|h| h.score).unwrap_or(1.0).max(1e-6);
     let known: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();

@@ -273,6 +273,40 @@ async fn http_json_and_auth() {
     assert_eq!(onto.get_entity(req).await.unwrap().into_inner().id, "issue:421");
 }
 
+#[tokio::test]
+async fn action_and_analytics_services() {
+    let srv = start(|_| {}).await;
+    let ch = channel(srv.addr).await;
+    let mut actions = pb::action_service_client::ActionServiceClient::new(ch.clone());
+    let req = |confirm: bool| pb::ActionRequest {
+        action: "assign".into(),
+        params: Some(struct_of(json!({ "item": "issue:433", "assignee": "person:aiko" }))),
+        confirm,
+        ..Default::default()
+    };
+    let plan = actions.plan(req(false)).await.unwrap().into_inner();
+    assert_eq!(plan.fields["valid"].kind, Some(prost_types::value::Kind::BoolValue(true)));
+    let applied = actions.apply(req(false)).await.unwrap().into_inner();
+    let status = |s: &prost_types::Struct| match &s.fields["status"].kind {
+        Some(prost_types::value::Kind::StringValue(v)) => v.clone(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(status(&applied), "applied", "low-risk, reversible: applies without confirm");
+    let id = match &applied.fields["id"].kind {
+        Some(prost_types::value::Kind::StringValue(v)) => v.clone(),
+        _ => panic!("no receipt id"),
+    };
+    let undone = actions.undo(pb::UndoRequest { receipt: id, ..Default::default() }).await.unwrap().into_inner();
+    assert_eq!(status(&undone), "undone");
+
+    let mut analytics = pb::analytics_service_client::AnalyticsServiceClient::new(ch);
+    let m =
+        analytics.metric(struct_of(json!({ "metric": "open_work", "group_by": ["team"] }))).await.unwrap().into_inner();
+    assert!(format!("{:?}", m.fields["rows"]).contains("Payments Team"));
+    let q = analytics.quality(struct_of(json!({}))).await.unwrap().into_inner();
+    assert!(q.fields.contains_key("score"));
+}
+
 #[test]
 fn route_table_rejects_bad_config() {
     let mut cfg = Config::default();

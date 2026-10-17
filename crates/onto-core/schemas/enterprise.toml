@@ -37,6 +37,7 @@ properties.goal = { type = "text", searchable = true }
 properties.due = { type = "timestamp" }
 
 [object_types.milestone]
+implements = ["work_item"]
 category = "container"
 description = "Dated checkpoint inside a project."
 states = ["planned", "active", "at_risk", "done", "missed"]
@@ -66,6 +67,7 @@ properties.purpose = { type = "text", searchable = true }
 # ── Work items ───────────────────────────────────────────────────────────────
 
 [object_types.issue]
+implements = ["work_item"]
 description = "Problem, bug or request that needs work."
 states = ["open", "triaged", "in_progress", "blocked", "resolved", "closed"]
 terminal_states = ["resolved", "closed"]
@@ -74,6 +76,7 @@ properties.priority = { type = "enum", values = ["low", "medium", "high", "criti
 properties.description = { type = "text", searchable = true }
 
 [object_types.task]
+implements = ["work_item"]
 description = "Concrete unit of work. `estimate` (days) feeds critical-path analysis."
 states = ["todo", "in_progress", "blocked", "review", "done", "cancelled"]
 terminal_states = ["done", "cancelled"]
@@ -108,6 +111,7 @@ properties.version = { type = "string" }
 # ── Knowledge and artifacts ──────────────────────────────────────────────────
 
 [object_types.knowledge]
+implements = ["knowledge_item"]
 category = "knowledge"
 description = "Document, runbook, note or wiki page."
 properties.body = { type = "text", searchable = true }
@@ -115,6 +119,7 @@ properties.source_url = { type = "string" }
 properties.tags = { type = "list" }
 
 [object_types.decision]
+implements = ["knowledge_item"]
 category = "knowledge"
 description = "Recorded decision with its rationale (ADR)."
 states = ["proposed", "accepted", "superseded", "rejected"]
@@ -122,6 +127,7 @@ terminal_states = ["superseded", "rejected"]
 properties.rationale = { type = "text", searchable = true }
 
 [object_types.artifact]
+implements = ["knowledge_item"]
 category = "artifact"
 description = "File or generated output. Provenance says where it came from."
 properties.media_type = { type = "string" }
@@ -131,6 +137,7 @@ properties.uri = { type = "string" }
 properties.summary = { type = "text", searchable = true }
 
 [object_types.conversation]
+implements = ["knowledge_item"]
 category = "knowledge"
 description = "Chat thread. Messages live in conversation storage; the thread is linked to what it discussed."
 properties.summary = { type = "text", searchable = true }
@@ -169,7 +176,7 @@ inverse = "has_part"
 weight = 0.9
 
 [link_types.assigned_to]
-from = ["issue", "task", "project"]
+from = ["work_item", "project"]
 to = ["person", "agent", "team"]
 inverse = "works_on"
 weight = 1.0
@@ -182,8 +189,8 @@ weight = 0.5
 
 [link_types.blocked_by]
 description = "The subject cannot progress until the object is resolved."
-from = ["issue", "task", "project", "milestone", "deployment"]
-to = ["issue", "task", "project", "milestone", "deployment", "service", "decision"]
+from = ["work_item", "project", "deployment"]
+to = ["work_item", "project", "deployment", "service", "decision"]
 inverse = "blocks"
 dependency = true
 weight = 1.0
@@ -257,6 +264,303 @@ weight = 0.6
 [link_types.relates_to]
 symmetric = true
 weight = 0.4
+
+# ── Interfaces: shapes shared across types (query `work_item` to get all) ─────
+
+[interfaces.work_item]
+description = "Anything that can be assigned, blocked and completed."
+properties.priority = { type = "enum", values = ["low", "medium", "high", "critical"] }
+properties.due = { type = "timestamp" }
+links = ["assigned_to", "blocked_by", "belongs_to"]
+
+[interfaces.knowledge_item]
+description = "Documents, decisions, files and conversations people learn from."
+links = ["references"]
+
+# ── Derived properties: computed on read from relations ──────────────────────
+
+[object_types.project.derived]
+open_issues = { count = "has_item", kind = "issue", open = true }
+open_tasks = { count = "has_item", kind = "task", open = true }
+blocked_items = { count = "has_item", state = ["blocked"] }
+remaining_days = { sum = "estimate", over = "has_item", open = true }
+
+[object_types.team.derived]
+members = { count = "has_member" }
+owned_services = { count = "owns", kind = "service" }
+
+[object_types.person.derived]
+open_assignments = { count = "works_on", open = true }
+
+[object_types.service.derived]
+open_issues = { count = "affected_by", kind = "issue", open = true }
+dependents = { count = "required_by" }
+dependencies = { count = "depends_on" }
+
+[object_types.task.derived]
+open_blockers = { count = "blocked_by", open = true, transitive = true }
+
+[object_types.issue.derived]
+open_blockers = { count = "blocked_by", open = true, transitive = true }
+
+# ── Data-quality constraints ─────────────────────────────────────────────────
+
+[object_types.issue.constraints]
+required_links = ["belongs_to"]
+stale_after_days = 14
+
+[object_types.task.constraints]
+required_links = ["belongs_to"]
+stale_after_days = 10
+
+[object_types.person.constraints]
+required_links = ["member_of"]
+unique = ["email"]
+
+[object_types.service.constraints]
+required_links = ["owned_by"]
+
+[object_types.project.constraints]
+required_links = ["owned_by"]
+
+# ── Glossary: the words people actually use ──────────────────────────────────
+
+[glossary.kinds]
+ticket = "issue"
+bug = "issue"
+defect = "issue"
+incident = "issue"
+problem = "issue"
+todo = "task"
+chore = "task"
+subtask = "task"
+story = "task"
+epic = "project"
+initiative = "project"
+program = "project"
+squad = "team"
+group = "team"
+department = "team"
+people = "person"
+employee = "person"
+engineer = "person"
+user = "person"
+colleague = "person"
+bot = "agent"
+automation = "agent"
+microservice = "service"
+system = "service"
+app = "service"
+application = "service"
+repo = "repository"
+codebase = "repository"
+env = "environment"
+release = "deployment"
+deploy = "deployment"
+rollout = "deployment"
+doc = "knowledge"
+document = "knowledge"
+runbook = "knowledge"
+wiki = "knowledge"
+note = "knowledge"
+adr = "decision"
+file = "artifact"
+chat = "conversation"
+thread = "conversation"
+work = "work_item"
+workitem = "work_item"
+
+[glossary.relations]
+owner = "owned_by"
+assignee = "assigned_to"
+blocker = "blocked_by"
+dependency = "depends_on"
+dependent = "required_by"
+member = "has_member"
+manager = "managed_by"
+
+[glossary.dimensions]
+team = "assigned_to.member_of"
+project = "belongs_to"
+assignee = "assigned_to"
+owner = "owned_by"
+reporter = "reported_by"
+
+# ── Governed metrics (measure + filter + dimensions) ─────────────────────────
+
+[metrics.open_work]
+description = "Open work items (issues, tasks, milestones)."
+kind = "work_item"
+measure = "count"
+filter = { open = true }
+dimensions = { kind = "kind", state = "state", priority = "priority", assignee = "assigned_to", team = "assigned_to.member_of", project = "belongs_to" }
+certified = true
+
+[metrics.remaining_effort]
+description = "Remaining estimated days of open tasks."
+kind = "task"
+measure = "sum"
+property = "estimate"
+filter = { open = true }
+dimensions = { assignee = "assigned_to", project = "belongs_to" }
+certified = true
+
+[metrics.issue_lead_time]
+description = "Days from an issue being opened to being resolved or closed."
+kind = "issue"
+measure = "lead_time"
+window_days = 90
+certified = true
+
+[metrics.task_throughput]
+description = "Tasks finished in the last 30 days."
+kind = "task"
+measure = "throughput"
+window_days = 30
+dimensions = { assignee = "assigned_to", project = "belongs_to" }
+
+[metrics.deployment_failure_rate]
+description = "Share of deployment events that failed or were denied."
+measure = "failure_rate"
+event_action = "deployment"
+window_days = 90
+dimensions = { actor = "actor", action = "action" }
+certified = true
+
+[metrics.activity]
+description = "Recorded events in the last 30 days."
+measure = "event_count"
+window_days = 30
+dimensions = { actor = "actor", action = "action", day = "day" }
+
+# ── Action types: governed edits (parameters, checks, effects, risk, undo) ───
+
+[action_types.assign]
+description = "Assign a work item to a person, agent or team (replaces the current assignee)."
+phrases = ["assign", "reassign", "hand over", "give"]
+risk = "low"
+parameters.item = { type = "entity", kinds = ["work_item"], required = true, description = "What to assign" }
+parameters.assignee = { type = "entity", kinds = ["person", "agent", "team"], required = true, cue = ["to", "for"] }
+parameters.note = { type = "text" }
+
+[[action_types.assign.preconditions]]
+check = "open"
+param = "item"
+message = "Only open work can be assigned."
+
+[[action_types.assign.preconditions]]
+check = "no_link"
+param = "item"
+rel = "assigned_to"
+to = "{assignee}"
+message = "Already assigned to that assignee."
+
+[[action_types.assign.effects]]
+link = { from = "{item}", rel = "assigned_to", to = "{assignee}" }
+replace = true
+
+[[action_types.assign.effects]]
+patch = { id = "{item}", state = "triaged" }
+when = { check = "state_in", param = "item", values = ["open"] }
+
+[[action_types.assign.effects]]
+event = { action = "work.assigned", target = "{item}", payload = { assignee = "{assignee}", note = "{note}" } }
+
+[action_types.set_state]
+description = "Move an entity to another state (mark done, in progress, blocked...)."
+phrases = ["mark", "set", "move", "transition", "change"]
+risk = "low"
+parameters.item = { type = "entity", required = true }
+parameters.state = { type = "string", required = true, cue = ["as", "to", "into"] }
+
+[[action_types.set_state.preconditions]]
+check = "state_allowed"
+param = "item"
+value = "{state}"
+
+[[action_types.set_state.effects]]
+patch = { id = "{item}", state = "{state}" }
+
+[[action_types.set_state.effects]]
+event = { action = "state.changed", target = "{item}", payload = { to = "{state}" } }
+
+[action_types.block]
+description = "Record that a work item or project is blocked by something."
+phrases = ["block"]
+risk = "low"
+parameters.item = { type = "entity", kinds = ["work_item", "project"], required = true }
+parameters.blocker = { type = "entity", kinds = ["work_item", "project", "deployment", "service", "decision"], required = true, cue = ["on", "by", "behind"] }
+
+[[action_types.block.preconditions]]
+check = "distinct"
+param = "item"
+other = "blocker"
+message = "Something cannot block itself."
+
+[[action_types.block.preconditions]]
+check = "open"
+param = "item"
+
+[[action_types.block.effects]]
+link = { from = "{item}", rel = "blocked_by", to = "{blocker}" }
+
+[[action_types.block.effects]]
+patch = { id = "{item}", state = "blocked" }
+when = { check = "state_allowed", param = "item", value = "blocked" }
+
+[action_types.unblock]
+description = "Remove a blocker (or all blockers) from a work item."
+phrases = ["unblock"]
+risk = "low"
+parameters.item = { type = "entity", kinds = ["work_item", "project"], required = true }
+parameters.blocker = { type = "entity", cue = ["from", "on", "by"] }
+
+[[action_types.unblock.effects]]
+unlink = { from = "{item}", rel = "blocked_by", to = "{blocker}" }
+
+[action_types.create_task]
+description = "Create a task in a project, optionally assigned and estimated."
+phrases = ["create task", "add task", "new task"]
+risk = "low"
+parameters.title = { type = "string", required = true }
+parameters.project = { type = "entity", kinds = ["project"], required = true, cue = ["in", "to", "under", "into", "for"] }
+parameters.assignee = { type = "entity", kinds = ["person", "agent"], cue = ["for", "to"] }
+parameters.estimate = { type = "float" }
+parameters.priority = { type = "enum", values = ["low", "medium", "high", "critical"] }
+
+[[action_types.create_task.effects]]
+create = { kind = "task", title = "{title}", state = "todo", props = { estimate = "{estimate}", priority = "{priority}" }, links = [ { rel = "belongs_to", to = "{project}" }, { rel = "assigned_to", to = "{assignee}" } ] }
+
+[[action_types.create_task.effects]]
+event = { action = "task.created", target = "{created}", payload = { project = "{project}" } }
+
+[action_types.resolve]
+description = "Resolve an issue."
+phrases = ["resolve", "close", "fix"]
+risk = "low"
+parameters.issue = { type = "entity", kinds = ["issue"], required = true }
+parameters.note = { type = "text" }
+
+[[action_types.resolve.preconditions]]
+check = "open"
+param = "issue"
+message = "The issue is already resolved or closed."
+
+[[action_types.resolve.effects]]
+patch = { id = "{issue}", state = "resolved" }
+
+[[action_types.resolve.effects]]
+event = { action = "issue.resolved", target = "{issue}", payload = { note = "{note}" } }
+
+[action_types.delete]
+description = "Delete an entity and its relations (restorable with undo)."
+phrases = ["delete", "remove"]
+roles = ["member", "admin"]
+risk = "high"
+parameters.target = { type = "entity", required = true }
+
+[[action_types.delete.effects]]
+delete = "{target}"
 
 # ── Inference rules: chain of relations => derived relation ──────────────────
 

@@ -7,7 +7,7 @@ use crate::schema::Dir;
 
 pub type LinkKey = (Id, String, Id);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Graph {
     entities: HashMap<Id, Entity>,
     links: HashMap<LinkKey, Link>,

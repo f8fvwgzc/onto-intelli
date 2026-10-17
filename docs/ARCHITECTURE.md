@@ -98,6 +98,31 @@ user protos, HTTP JSON, the CLI and the C ABI are all thin transports over it. T
 proto is itself served dynamically (descriptor + route table), which is why user protos
 behave exactly like first-party ones.
 
+## 8. v0.2: governed change, time, and evaluation
+
+* **Action types** are the only edit path offered to agents: a plan validates
+  parameters and preconditions, renders effects against the current graph and
+  derives an inverse per effect. Risk and reversibility are known before
+  anything runs; high-risk or irreversible plans need `confirm`. Applying commits
+  the edits, an `action.<name>` audit event and the undo receipt in one
+  transaction. Undo refuses when touched entities changed since (revision check)
+  unless forced.
+* **Versions**: every committed entity state (and deletion) is written to
+  `entity_versions` in the same transaction as the change. History, as-of reads,
+  change feeds and lead-time/throughput metrics read it; the hot graph stays a
+  current-state index.
+* **Forks** clone the in-memory indexes onto a `MemoryStore`, so scenarios run
+  every read algorithm unchanged and can never leak writes.
+* **Merges** move links, fill properties and aliases, delete the duplicate and
+  record a redirect in the same transaction; reads and writes follow redirects.
+* **Prompts** use the populated pattern profile (count-free, sorted) instead of
+  the full schema; it changes only when a new pattern appears, keeping provider
+  prompt caches warm.
+* **Evaluation** is part of the product: competency questions with expected
+  substrings, modes, intents and entities, reported with their evidence.
+
+See [RESEARCH.md](RESEARCH.md) for the sources of each decision.
+
 ## Performance notes
 
 * Reads take a single `RwLock` read guard; context building does all graph work under one

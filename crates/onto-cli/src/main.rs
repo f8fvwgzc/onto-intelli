@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use onto_intelli::config::{Config, EXAMPLE_CONFIG, EXAMPLE_PROTO, EXAMPLE_PROTO_PATH};
 use onto_intelli::{AskRequest, Error, Intelli, Principal, Result, seed};
@@ -103,8 +104,90 @@ enum Command {
         #[arg(long)]
         plan: bool,
     },
-    /// Print the ontology schema.
+    /// Print the ontology schema, its populated profile, or suggested additions.
     Schema {
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        sub: Option<SchemaCmd>,
+    },
+    /// Governed actions: list them, or plan/apply one with key=value parameters.
+    Do {
+        action: Option<String>,
+        /// Parameters as key=value (values may be JSON).
+        params: Vec<String>,
+        /// Apply high-risk or irreversible actions.
+        #[arg(long)]
+        confirm: bool,
+        /// Plan only.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Undo an applied action by receipt id.
+    Undo {
+        receipt: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Version history of an entity.
+    History { id: String },
+    /// What changed recently, optionally inside an entity's scope.
+    Changes {
+        #[arg(long, default_value_t = 7.0)]
+        days: f64,
+        #[arg(long)]
+        within: Option<String>,
+    },
+    /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
+    Metric {
+        name: Option<String>,
+        /// Group by dimension (repeatable): team, priority, assignee, state, kind...
+        #[arg(long)]
+        by: Vec<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        measure: Option<String>,
+        #[arg(long)]
+        within: Option<String>,
+        #[arg(long)]
+        days: Option<u32>,
+    },
+    /// Data-quality report.
+    Quality {
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Likely duplicate entities.
+    Dupes {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 0.8)]
+        threshold: f32,
+    },
+    /// Merge a duplicate into the entity to keep (the old id keeps working).
+    Merge { keep: String, duplicate: String },
+    /// What-if: hypothetically move an entity to a state and see what changes.
+    Whatif { id: String, state: String },
+    /// Who knows about a topic.
+    Experts { topic: Vec<String> },
+    /// Export as Turtle (RDF/OWL + PROV-O), Mermaid or JSON.
+    Export {
+        #[arg(long, default_value = "turtle")]
+        format: String,
+        #[arg(long)]
+        start: Vec<String>,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(long)]
+        no_schema: bool,
+    },
+    /// Serve the ontology to AI agents over MCP (stdio).
+    Mcp,
+    /// Run competency questions (default: the built-in demo suite).
+    Eval {
+        #[arg(long)]
+        file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -112,6 +195,55 @@ enum Command {
     Protos,
     /// Graph, memory, cache and token statistics.
     Stats,
+}
+
+#[derive(Subcommand)]
+enum SchemaCmd {
+    /// Populated patterns, kinds, properties and states.
+    Profile,
+    /// TOML layer proposing kinds/relations/properties seen in data but not in the schema.
+    Suggest,
+}
+
+fn parse_params(items: &[String]) -> Result<Value> {
+    let mut m = serde_json::Map::new();
+    for it in items {
+        let (k, v) = it.split_once('=').ok_or_else(|| Error::invalid(format!("parameter '{it}' must be key=value")))?;
+        let value = serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!(v));
+        m.insert(k.to_string(), value);
+    }
+    Ok(Value::Object(m))
+}
+
+fn print_receipt(st: &Style, r: &Value) {
+    let status = r["status"].as_str().unwrap_or("?");
+    let mark = match status {
+        "applied" | "undone" => st.bold(status),
+        "rejected" => st.red(status),
+        _ => st.cyan(status),
+    };
+    println!("{} {} {}", mark, r["action"].as_str().unwrap_or(""), st.dim(r["id"].as_str().unwrap_or("")));
+    let plan = &r["plan"];
+    for line in plan["preview"].as_array().into_iter().flatten() {
+        println!("  • {}", line.as_str().unwrap_or(""));
+    }
+    for c in plan["checks"].as_array().into_iter().flatten().filter(|c| c["ok"] == false) {
+        println!("  {} {}", st.red("✗"), c["message"].as_str().unwrap_or(""));
+    }
+    for w in plan["warnings"].as_array().into_iter().flatten() {
+        println!("  {} {}", st.dim("!"), w.as_str().unwrap_or(""));
+    }
+    println!(
+        "  {}",
+        st.dim(&format!(
+            "risk {} · {}",
+            plan["risk"].as_str().unwrap_or("?"),
+            if plan["reversible"] == true { "reversible" } else { "not reversible" }
+        ))
+    );
+    if let Some(reason) = r["reason"].as_str() {
+        println!("  {}", st.dim(reason));
+    }
 }
 
 // ── backend: local engine or remote server ────────────────────────────
@@ -529,7 +661,279 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
-        Command::Schema { json: as_json } => {
+        Command::Schema { sub: Some(sub), .. } => {
+            let be = backend(&cli).await?;
+            match sub {
+                SchemaCmd::Profile => {
+                    print_json(&be.call("schema.profile", json!({ "workspace": cli.workspace })).await?)
+                }
+                SchemaCmd::Suggest => {
+                    let r = be.call("schema.suggest", json!({ "workspace": cli.workspace })).await?;
+                    print!("{}", r["toml"].as_str().unwrap_or_default());
+                }
+            }
+            Ok(())
+        }
+        Command::Do { action: None, .. } => {
+            let be = backend(&cli).await?;
+            let r = be.call("action.list", json!({})).await?;
+            for a in r["action_types"].as_array().into_iter().flatten() {
+                let params: Vec<String> = a["parameters"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter().map(|(k, v)| if v["required"] == true { k.clone() } else { format!("{k}?") }).collect()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "{:<12} {:<38} {}",
+                    st.cyan(a["name"].as_str().unwrap_or("")),
+                    params.join(" "),
+                    st.dim(a["description"].as_str().unwrap_or(""))
+                );
+            }
+            Ok(())
+        }
+        Command::Do { action: Some(action), params, confirm, dry_run } => {
+            let be = backend(&cli).await?;
+            let input = json!({
+                "action": action, "params": parse_params(params)?, "confirm": confirm,
+                "dry_run": dry_run, "workspace": cli.workspace,
+            });
+            print_receipt(st, &be.call("action.apply", input).await?);
+            Ok(())
+        }
+        Command::Undo { receipt, force } => {
+            let be = backend(&cli).await?;
+            print_receipt(st, &be.call("action.undo", json!({ "receipt": receipt, "force": force })).await?);
+            Ok(())
+        }
+        Command::History { id } => {
+            let be = backend(&cli).await?;
+            let r = be.call("entity.history", json!({ "id": id })).await?;
+            for h in r["history"].as_array().into_iter().flatten() {
+                let changed: Vec<&str> =
+                    h["changed"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                println!(
+                    "{} rev {:<3} {:<10} {}{}",
+                    st.dim(h["at"].as_str().unwrap_or("")),
+                    h["revision"],
+                    h["actor"].as_str().unwrap_or(""),
+                    changed.join(", "),
+                    h["state"].as_str().map(|s| format!("  [{s}]")).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        Command::Changes { days, within } => {
+            let be = backend(&cli).await?;
+            let r = be
+                .call("graph.changes", json!({ "since_days": days, "within": within, "workspace": cli.workspace }))
+                .await?;
+            let list = r["changes"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("No changes in the last {days} day(s).");
+            }
+            for c in list {
+                let changed_fields: Vec<&str> =
+                    c["changed"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let what = if c["created"] == true && !changed_fields.is_empty() {
+                    format!("created, then changed {}", changed_fields.join(", "))
+                } else if c["created"] == true {
+                    "created".to_string()
+                } else if c["deleted"] == true {
+                    "deleted".to_string()
+                } else if c["from_state"] != c["to_state"] && !c["to_state"].is_null() {
+                    format!("{} → {}", c["from_state"].as_str().unwrap_or("∅"), c["to_state"].as_str().unwrap_or("∅"))
+                } else {
+                    let f: Vec<&str> = c["changed"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    format!("updated {}", f.join(", "))
+                };
+                println!("{} {}", entity_line(st, &json!({ "id": c["id"], "title": c["title"] })), st.dim(&what));
+            }
+            Ok(())
+        }
+        Command::Metric { name, by, kind, measure, within, days } => {
+            let be = backend(&cli).await?;
+            if name.is_none() && kind.is_none() && measure.is_none() {
+                let r = be.call("metric.list", json!({})).await?;
+                for m in r["metrics"].as_array().into_iter().flatten() {
+                    let cert = if m["certified"] == true { "✓" } else { " " };
+                    println!(
+                        "{cert} {:<26} {}",
+                        st.cyan(m["name"].as_str().unwrap_or("")),
+                        st.dim(m["description"].as_str().unwrap_or(""))
+                    );
+                }
+                return Ok(());
+            }
+            let q = json!({
+                "metric": name, "group_by": by, "kind": kind, "measure": measure,
+                "within": within, "window_days": days, "workspace": cli.workspace,
+            });
+            let r = be.call("metric.query", q).await?;
+            println!(
+                "{} = {} {}{}",
+                st.bold(r["metric"].as_str().unwrap_or("")),
+                r["value"],
+                r["unit"].as_str().unwrap_or(""),
+                r["window_days"].as_u64().map(|d| format!(" (last {d} days)")).unwrap_or_default()
+            );
+            for row in r["rows"].as_array().into_iter().flatten() {
+                let g: Vec<&str> = row["group"]
+                    .as_object()
+                    .map(|m| m.values().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !g.is_empty() {
+                    println!("  {:<30} {}", g.join(" / "), row["value"]);
+                }
+            }
+            Ok(())
+        }
+        Command::Quality { kind } => {
+            let be = backend(&cli).await?;
+            let r = be.call("quality.report", json!({ "kind": kind, "workspace": cli.workspace })).await?;
+            println!("{} {}/100 across {} entities", st.bold("Data quality"), r["score"], r["entities"]);
+            for (k, q) in r["by_kind"].as_object().into_iter().flatten() {
+                println!("  {:<14} {:>5}  ({} of {} with issues)", k, q["score"], q["with_issues"], q["entities"]);
+            }
+            for v in r["violations"].as_array().into_iter().flatten().take(25) {
+                let sev = v["severity"].as_str().unwrap_or("");
+                let tag = if sev == "error" { st.red(sev) } else { st.dim(sev) };
+                println!("  {tag:<9} {:<18} {}", v["rule"].as_str().unwrap_or(""), v["message"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        Command::Dupes { kind, threshold } => {
+            let be = backend(&cli).await?;
+            let r = be
+                .call("entity.duplicates", json!({ "kind": kind, "threshold": threshold, "workspace": cli.workspace }))
+                .await?;
+            let pairs = r["pairs"].as_array().cloned().unwrap_or_default();
+            if pairs.is_empty() {
+                println!("No likely duplicates.");
+            }
+            for d in pairs {
+                let reasons: Vec<&str> =
+                    d["reasons"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                println!(
+                    "{:.2}  {} ≈ {}  {}",
+                    d["score"].as_f64().unwrap_or(0.0),
+                    d["a"].as_str().unwrap_or(""),
+                    d["b"].as_str().unwrap_or(""),
+                    st.dim(&reasons.join(", "))
+                );
+            }
+            Ok(())
+        }
+        Command::Merge { keep, duplicate } => {
+            let be = backend(&cli).await?;
+            let r = be
+                .call("entity.merge", json!({ "keep": keep, "merge": duplicate, "workspace": cli.workspace }))
+                .await?;
+            println!(
+                "Merged {} into {} ({} links moved); the old id now redirects.",
+                r["merged"].as_str().unwrap_or_default(),
+                r["kept"].as_str().unwrap_or_default(),
+                r["links_moved"]
+            );
+            Ok(())
+        }
+        Command::Whatif { id, state } => {
+            let be = backend(&cli).await?;
+            let q = format!("What if {id} were {state}?");
+            let r =
+                be.call("intelli.ask", json!({ "question": q, "workspace": cli.workspace, "no_cache": true })).await?;
+            print_answer(st, &r, false);
+            Ok(())
+        }
+        Command::Experts { topic } => {
+            let be = backend(&cli).await?;
+            let r = be.call("people.experts", json!({ "topic": topic.join(" "), "workspace": cli.workspace })).await?;
+            let list = r["experts"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("Nobody is connected to that topic yet.");
+            }
+            for e in list {
+                let reasons: Vec<&str> =
+                    e["reasons"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                println!(
+                    "{:>6.2}  {}  {}",
+                    e["score"].as_f64().unwrap_or(0.0),
+                    entity_line(st, &e),
+                    st.dim(&reasons.join("; "))
+                );
+            }
+            Ok(())
+        }
+        Command::Export { format, start, depth, no_schema } => {
+            let be = backend(&cli).await?;
+            let r = be
+                .call(
+                    "export.graph",
+                    json!({ "format": format, "start": start, "depth": depth, "include_schema": !no_schema, "workspace": cli.workspace }),
+                )
+                .await?;
+            print!("{}", r["content"].as_str().unwrap_or_default());
+            Ok(())
+        }
+        Command::Mcp => {
+            let (intelli, cfg) = open_local(&cli).await?;
+            let server =
+                onto_intelli::mcp::McpServer::new(intelli, cfg.auth.default_principal.clone(), cfg.mcp.allow_writes);
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            let mut out = tokio::io::stdout();
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let reply = match serde_json::from_str::<Value>(&line) {
+                    Ok(msg) => server.handle(msg).await,
+                    Err(e) => Some(
+                        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": format!("parse error: {e}") } }),
+                    ),
+                };
+                if let Some(r) = reply {
+                    out.write_all(format!("{r}\n").as_bytes()).await?;
+                    out.flush().await?;
+                }
+            }
+            Ok(())
+        }
+        Command::Eval { file, json: as_json } => {
+            let be = backend(&cli).await?;
+            let input = match file {
+                Some(f) => json!({ "toml": std::fs::read_to_string(f)? }),
+                None => json!({}),
+            };
+            let r = be.call("eval.run", input).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            for c in r["cases"].as_array().into_iter().flatten() {
+                let mark = if c["passed"] == true { st.bold("PASS") } else { st.red("FAIL") };
+                println!(
+                    "{mark} {:<40} {}",
+                    c["question"].as_str().unwrap_or(""),
+                    st.dim(&format!("{} · {} tokens · {} ms", c["mode"].as_str().unwrap_or(""), c["tokens"], c["ms"]))
+                );
+                for f in c["failures"].as_array().into_iter().flatten() {
+                    println!("     {}", st.red(f.as_str().unwrap_or("")));
+                }
+            }
+            println!(
+                "\n{}/{} passed ({}%) · {}% deterministic · avg {} ms · {} prompt tokens",
+                r["passed"], r["total"], r["pass_rate"], r["deterministic_share"], r["avg_ms"], r["prompt_tokens"]
+            );
+            if r["failed"].as_u64().unwrap_or(0) > 0 {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        Command::Schema { json: as_json, sub: None } => {
             let cfg = Config::discover(cli.config.as_deref())?;
             let schema = onto_intelli::intelli::load_schema(&cfg)?;
             if *as_json {

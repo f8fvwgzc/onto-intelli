@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::Value;
 
-use super::{Snapshot, Store, StoreStats, WriteBatch};
+use super::{Snapshot, Store, StoreStats, VersionRecord, WriteBatch};
 use crate::model::{Event, EventFilter};
 use crate::time::now_ms;
 use crate::{Error, Result};
@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS kv (
     expires_at INTEGER,
     PRIMARY KEY (ns, key)
 );
+CREATE TABLE IF NOT EXISTS entity_versions (
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    id        TEXT NOT NULL,
+    revision  INTEGER NOT NULL,
+    ts        INTEGER NOT NULL,
+    doc       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS entity_versions_id ON entity_versions(id, seq);
+CREATE INDEX IF NOT EXISTS entity_versions_ts ON entity_versions(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta(key, value) VALUES ('format', '1');
 "#;
@@ -144,8 +153,35 @@ impl Store for SqliteStore {
                 params![ev.id, ev.ts, ev.workspace, ev.actor, ev.action, ev.target, serde_json::to_string(ev)?],
             )?;
         }
+        for v in &b.versions {
+            tx.execute(
+                "INSERT INTO entity_versions(id, revision, ts, doc) VALUES (?1, ?2, ?3, ?4)",
+                params![v.id, v.revision as i64, v.ts, serde_json::to_string(v)?],
+            )?;
+        }
+        for (ns, key, value) in &b.kv {
+            tx.execute(
+                "INSERT INTO kv(ns, key, value, expires_at) VALUES (?1, ?2, ?3, NULL)
+                 ON CONFLICT(ns, key) DO UPDATE SET value = excluded.value, expires_at = NULL",
+                params![ns, key, serde_json::to_string(value)?],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT doc FROM entity_versions WHERE id = ?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![id, limit.min(100_000) as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|doc| parse(&doc?)).collect()
+    }
+
+    fn versions_since(&self, since: i64, limit: usize) -> Result<Vec<VersionRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT doc FROM entity_versions WHERE ts >= ?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![since, limit.min(100_000) as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|doc| parse(&doc?)).collect()
     }
 
     fn events(&self, f: &EventFilter) -> Result<Vec<Event>> {

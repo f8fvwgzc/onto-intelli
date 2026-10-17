@@ -32,7 +32,7 @@ fn stem(w: &str) -> String {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TextIndex {
     docs: HashMap<String, u32>,
     terms: HashMap<String, Vec<String>>,

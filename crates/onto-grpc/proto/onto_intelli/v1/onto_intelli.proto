@@ -214,6 +214,7 @@ message AskRequest {
   uint32 token_budget = 5;
   bool include_context = 6;
   bool no_cache = 7;
+  bool confirm = 8;               // apply commands instead of proposing them
 }
 
 message ResolvedEntity {
@@ -265,6 +266,8 @@ message AskResponse {
   repeated string memories = 15;
   google.protobuf.Struct context = 16;
   string note = 17;
+  repeated ResolvedEntity options = 18;   // candidates when mode = clarify
+  google.protobuf.Struct action = 19;     // receipt when mode = proposal | action
 }
 
 message AskEvent {
@@ -296,6 +299,55 @@ service IntelliService {
   rpc RootCause(GraphQuery) returns (google.protobuf.Struct);
   rpc CriticalPath(GraphQuery) returns (google.protobuf.Struct);
   rpc Cycles(GraphQuery) returns (google.protobuf.Struct);
+}
+
+// ──────────────────────── Governed actions ────────────────────────
+
+message ActionRequest {
+  string action = 1;              // action type, e.g. assign, set_state, block
+  google.protobuf.Struct params = 2;
+  string workspace = 3;
+  bool confirm = 4;               // required for high-risk or irreversible actions
+  bool dry_run = 5;
+}
+
+message UndoRequest {
+  string receipt = 1;
+  bool force = 2;                 // undo even if touched entities changed since
+  string workspace = 3;
+}
+
+// Action types are declared in the schema: typed parameters, preconditions,
+// effects, risk. Plan previews edits and reversibility; Apply writes them with
+// an audit event and an undo receipt in one transaction.
+service ActionService {
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Plan(ActionRequest) returns (google.protobuf.Struct);
+  rpc Apply(ActionRequest) returns (google.protobuf.Struct);
+  rpc Undo(UndoRequest) returns (google.protobuf.Struct);
+  rpc Receipt(EntityRef) returns (google.protobuf.Struct);
+}
+
+// ─────────────────── Analytics, time and data quality ───────────────────
+// Requests and responses are JSON objects; fields match the engine actions
+// (`onto actions`): metric.query, entity.history, graph.changes, ...
+
+service AnalyticsService {
+  rpc Metric(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Metrics(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Derived(EntityRef) returns (google.protobuf.Struct);
+  rpc History(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc AsOf(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Changes(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Quality(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Duplicates(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Merge(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Scenario(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Experts(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Profile(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc SuggestSchema(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Export(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Eval(google.protobuf.Struct) returns (google.protobuf.Struct);
 }
 
 // ───────────────────────────── Memory ─────────────────────────────

@@ -85,6 +85,41 @@ fully dynamic and extensible from TOML — no recompilation:
 Extend it: [`examples/schema/custom.toml`](examples/schema/custom.toml) adds an `incident`
 type that `extends = "issue"`, a `customer` type, new relations and a rule.
 
+## Capabilities (v0.2)
+
+Grounded in Palantir's Ontology, Databricks Unity Catalog semantics, Glean's
+enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEARCH.md).
+
+| Capability | Try it |
+|---|---|
+| **Governed action types** — typed parameters, preconditions, conditional effects, roles, risk; every plan derives an inverse, so reversibility is known before running; high-risk or irreversible actions need `confirm`; atomic audit event + undo receipt | `onto do` · `onto do assign item=issue:433 assignee=person:aiko` · `onto undo <receipt>` |
+| **Natural-language commands** as gated proposals | `onto ask "Assign issue 433 to Aiko"` → proposal; add `confirm: true` to apply |
+| **Interfaces + glossary** — `work_item` = issue/task/milestone; "tickets", "people", "per team" understood | `onto ask "How many open work items per team?"` |
+| **Derived properties** (functions over relations) | `onto show project:alpha` · `entity.get {derived: true}` |
+| **Governed metrics** with dimensions and certification, plus process KPIs from history and events: lead time (p50/p90), throughput, failure rate, volume | `onto metric` · `onto metric open_work --by team` · `onto ask "What is the deployment failure rate?"` |
+| **Time**: every write versioned; history, as-of reads, change feeds | `onto history issue:421` · `onto changes --days 7` · `onto ask "What changed in Project Alpha this week?"` |
+| **What-if scenarios** on an isolated fork | `onto whatif task:31 done` · `scenario.run` |
+| **Entity alignment** — duplicate detection and merge with permanent id redirects | `onto dupes` · `onto merge person:kenji person:kenji.t` |
+| **Data quality** — required links, uniqueness, staleness, orphans, dangling provenance, duplicates, low-confidence facts, scored per kind | `onto quality` · `onto ask "Show me stale issues"` |
+| **Hybrid personalised search** — BM25 + hashed vectors (typo/morphology tolerant), boosted by your graph neighbourhood and recency | `onto call entity.search '{"query":"paymnt timeout"}'` |
+| **Expert finding** with reasons | `onto experts postgres` · `onto ask "Who knows about PostgreSQL?"` |
+| **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
+| **Graph profile** grounds prompts in patterns that exist; **drift suggestions** for data the schema doesn't cover | `onto schema profile` · `onto schema suggest` |
+| **MCP server** for agents (same permissions, writes only via action types) | `onto mcp` |
+| **Evaluation** with competency questions and evidence | `onto eval` (15/15 on the demo, 80% without the LLM) |
+| **Export** — Turtle (OWL + PROV-O provenance) and Mermaid | `onto export --format mermaid --start project:alpha` |
+
+### Use from an MCP client (Claude Code, IDEs)
+
+```json
+{ "mcpServers": { "onto-intelli": { "command": "onto", "args": ["--config", "/path/to/onto-intelli.toml", "mcp"] } } }
+```
+
+Tools: `ask`, `search`, `get_entity`, `neighbors`, `find_entities`, `explain_blockers`,
+`impact`, `dependencies`, `critical_path`, `metric`, `history`, `changes`, `experts`,
+`data_quality`, `what_if`, `list_actions`, `plan_action` (+ `apply_action`, `undo_action`
+when `[mcp] allow_writes = true`).
+
 ## Install
 
 | Option | Command |
@@ -147,6 +182,8 @@ block and server-side refusal fallback (`fallbacks: "default"`, disable with
 
 * the built-in API [`onto_intelli.v1`](crates/onto-grpc/proto/onto_intelli/v1/onto_intelli.proto):
   `OntologyService`, `IntelliService` (incl. server-streaming `AskStream`),
+  `ActionService` (plan/apply/undo governed actions), `AnalyticsService` (metrics,
+  history, changes, quality, duplicates/merge, scenarios, experts, profile, export, eval),
   `MemoryService`, `EventService` (incl. client-streaming `Ingest`), `AdminService`;
 * gRPC reflection and `grpc.health.v1`;
 * JSON over HTTP/1.1 on the same port.
@@ -266,6 +303,7 @@ crates/onto-ffi       C ABI (cdylib + staticlib) and header
 examples/             FFI demos, JSONL ingest sample, schema extension
 packaging/            install script, Homebrew formula; Dockerfile and CI at the root
 docs/ARCHITECTURE.md  design notes
+docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
 ```
 
 ## Development

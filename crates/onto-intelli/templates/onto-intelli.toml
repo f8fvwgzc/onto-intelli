@@ -53,7 +53,8 @@ consolidate_every = 25
 [reasoning]
 # Intents answered straight from the graph (zero LLM tokens) when entities resolve.
 deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",
-                         "blockers", "dependencies", "impact", "relation", "workload", "history"]
+                         "blockers", "dependencies", "impact", "relation", "workload", "history",
+                         "expert", "metric", "changes", "quality", "what_if"]
 min_confidence = 0.8
 
 [grpc]
@@ -99,6 +100,9 @@ method = "acme.tickets.v1.TicketService/Ask"
 action = "intelli.ask"
 request = { question = "{{question}}" }
 response = { text = "{{answer}}", facts = "{{facts}}", mode = "{{mode}}" }
+
+[mcp]
+allow_writes = false          # `onto mcp`: expose apply_action/undo_action to agents
 
 [auth]
 mode = "none"                 # none | token

@@ -1,0 +1,90 @@
+# Competency questions for the demo workspace (`onto seed demo`).
+# Run: onto eval            (or: onto eval --file my-evals.toml)
+
+[[case]]
+name = "ownership"
+question = "Who owns Project Alpha?"
+expect = ["Payments Team"]
+expect_mode = "deterministic"
+expect_entities = ["project:alpha"]
+
+[[case]]
+name = "assignment"
+question = "Who is assigned to issue #421?"
+expect = ["Kenji Tanaka", "Payments Team"]
+expect_mode = "deterministic"
+
+[[case]]
+name = "scoped count"
+question = "How many open issues does the Payments Team have?"
+expect = ["2 open issues"]
+
+[[case]]
+name = "blockers"
+question = "What is blocking task 31?"
+expect = ["issue:421"]
+
+[[case]]
+name = "impact"
+question = "What breaks if PostgreSQL goes down?"
+expect = ["Payment API", "Project Alpha"]
+expect_intent = "impact"
+
+[[case]]
+name = "root cause"
+question = "Why is Project Alpha blocked?"
+expect = ["Deployment #182"]
+expect_mode = "llm"
+
+[[case]]
+name = "experts"
+question = "Who knows about PostgreSQL?"
+expect = ["Maria Garcia"]
+expect_intent = "expert"
+
+[[case]]
+name = "grouped metric"
+question = "How many open work items per team?"
+expect = ["Payments Team"]
+expect_mode = "deterministic"
+
+[[case]]
+name = "process KPI"
+question = "What is the deployment failure rate?"
+expect = ["%"]
+expect_intent = "metric"
+
+[[case]]
+name = "what if"
+question = "What if task 31 were done?"
+expect = ["critical path"]
+expect_intent = "what_if"
+
+[[case]]
+name = "data quality"
+question = "How is our data quality?"
+expect = ["Data quality score"]
+expect_intent = "quality"
+
+[[case]]
+name = "duplicates"
+question = "Are there duplicate people?"
+expect = ["duplicate"]
+
+[[case]]
+name = "change feed"
+question = "What changed this week?"
+expect = ["change(s)"]
+expect_intent = "changes"
+
+[[case]]
+name = "governed command"
+question = "Mark task 32 as done"
+expect = ["Proposed set_state", "reversible"]
+expect_mode = "proposal"
+
+[[case]]
+name = "clarify"
+question = "What is #182?"
+expect = ["Which one do you mean"]
+expect_mode = "clarify"

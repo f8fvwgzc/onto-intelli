@@ -55,6 +55,12 @@ pub enum AnswerMode {
     LlmCache,
     AnswerCache,
     Fallback,
+    /// The question was ambiguous; `options` lists the candidates.
+    Clarify,
+    /// A command was planned but not applied (needs confirmation or failed checks).
+    Proposal,
+    /// A command was applied; `action` holds the receipt.
+    Action,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,6 +80,9 @@ pub struct AskRequest {
     pub include_context: bool,
     #[serde(default)]
     pub no_cache: bool,
+    /// Apply commands instead of only proposing them.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 impl AskRequest {
@@ -124,6 +133,10 @@ pub struct AskResponse {
     pub context: Option<ContextPack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<Resolved>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Value>,
 }
 
 /// Streaming event: `stage`, `entities`, `delta`, `done` or `error`.
@@ -163,7 +176,7 @@ pub struct Intelli {
     memory: Memory,
     conversations: Conversations,
     llm: Arc<dyn LlmProvider>,
-    system_prompt: String,
+    prompt: parking_lot::Mutex<(u64, Instant, String)>,
     answers: TtlCache<AskResponse>,
     resolutions: TtlCache<Vec<Resolved>>,
     completions: TtlCache<LlmResponse>,
@@ -196,7 +209,7 @@ impl Intelli {
         let memory = Memory::open(store.clone(), config.memory.clone())?;
         let conversations = Conversations::new(store);
         let c = &config.cache;
-        let system_prompt = format!("{SYSTEM_PROMPT}\n\nOntology schema:\n{}", onto.schema().summary());
+        let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
         Ok(Arc::new(Self {
             answers: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             resolutions: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
@@ -205,13 +218,58 @@ impl Intelli {
             ledger: Ledger::default(),
             asks: AtomicUsize::new(0),
             started: Instant::now(),
-            system_prompt,
+            prompt,
             conversations,
             memory,
             onto,
             llm,
             config,
         }))
+    }
+
+    /// Stable system prompt: instructions plus the populated patterns of the
+    /// graph (not the whole schema). Recomputed at most every 30 s after a
+    /// write; the text only changes when a new pattern appears, so provider
+    /// prompt caches stay warm.
+    pub fn system_prompt(&self) -> String {
+        let rev = self.onto.revision();
+        let mut cache = self.prompt.lock();
+        if !cache.2.is_empty() && (cache.0 == rev || cache.1.elapsed() < Duration::from_secs(30)) {
+            return cache.2.clone();
+        }
+        let schema = self.onto.schema();
+        let body = match self.onto.profile(&Principal::system(), None) {
+            Ok(prof) if prof.entities > 0 => onto_core::profile::pattern_summary(schema, &prof, 60),
+            _ => schema.summary(),
+        };
+        let mut extra = String::new();
+        if !schema.interfaces.is_empty() {
+            let ifaces: Vec<String> =
+                schema.interfaces.keys().map(|i| format!("{i}={}", schema.concrete_kinds(i).join("|"))).collect();
+            extra.push_str(&format!("\nInterfaces: {}", ifaces.join(", ")));
+        }
+        let certified: Vec<&str> = schema.metrics.values().filter(|m| m.certified).map(|m| m.name.as_str()).collect();
+        if !certified.is_empty() {
+            extra.push_str(&format!("\nCertified metrics: {}", certified.join(", ")));
+        }
+        let text = format!("{SYSTEM_PROMPT}\n\nOntology:\n{body}{extra}");
+        *cache = (rev, Instant::now(), text.clone());
+        text
+    }
+
+    /// Ambiguous mentions with no confident entity: ask instead of guessing.
+    fn clarification(&self, entities: &[Resolved]) -> Option<(String, Vec<Resolved>)> {
+        let min = self.config.reasoning.min_confidence;
+        if entities.is_empty() || entities.iter().any(|r| r.confidence >= min) {
+            return None;
+        }
+        let first = &entities[0];
+        let group: Vec<Resolved> = entities.iter().filter(|r| r.mention == first.mention).cloned().collect();
+        if group.len() < 2 {
+            return None;
+        }
+        let names: Vec<String> = group.iter().map(|r| format!("{} ({})", r.title, r.id)).collect();
+        Some((format!("Which one do you mean by \"{}\": {}?", first.mention, names.join(" or ")), group))
     }
 
     /// Volatile engine with the offline mock provider.
@@ -405,14 +463,43 @@ impl Intelli {
                     && self.config.reasoning.deterministic_intents.iter().any(|i| i == classified.intent.as_str())
             }
         };
-        let direct = if deterministic_allowed {
-            answer::try_answer(&self.onto, p, &ws, &classified, &entities, self.config.reasoning.min_confidence)
+        // 3a. Commands become governed action proposals (applied only when confirmed);
+        //     ambiguous mentions get a clarifying question.
+        let mut options: Vec<Resolved> = Vec::new();
+        let mut action_out: Option<Value> = None;
+        let pre: Option<(String, Vec<String>, AnswerMode)> = if classified.intent == Intent::Command
+            && let Some(action) = classified.action.clone()
+        {
+            let out = crate::command::run(&self.onto, p, &ws, &action, &question, &entities, req.confirm)?;
+            let mode = if out.receipt.status == "applied" { AnswerMode::Action } else { AnswerMode::Proposal };
+            action_out = serde_json::to_value(&out.receipt).ok();
+            emit(sink, AskEvent::new("delta", out.answer.clone(), Value::Null)).await;
+            Some((out.answer, out.facts, mode))
+        } else if deterministic_allowed && let Some((q, group)) = self.clarification(&entities) {
+            options = group;
+            emit(sink, AskEvent::new("delta", q.clone(), Value::Null)).await;
+            Some((q, Vec::new(), AnswerMode::Clarify))
+        } else {
+            None
+        };
+        let direct = if pre.is_none() && deterministic_allowed {
+            answer::try_answer(
+                &self.onto,
+                &question,
+                p,
+                &ws,
+                &classified,
+                &entities,
+                self.config.reasoning.min_confidence,
+            )
         } else {
             None
         };
 
-        let (answer_text, facts, mode) = if let Some(d) = direct {
-            let avoided = budget.min(600) + estimate(&self.system_prompt);
+        let (answer_text, facts, mode) = if let Some(x) = pre {
+            x
+        } else if let Some(d) = direct {
+            let avoided = budget.min(600) + estimate(&self.system_prompt());
             efficiency.saved_tokens = avoided;
             self.ledger.update(|s| {
                 s.deterministic_answers += 1;
@@ -494,11 +581,8 @@ impl Intelli {
             user.push_str("\n\nQuestion: ");
             user.push_str(&question);
             messages.push(ChatMessage::user(user));
-            let llm_req = LlmRequest {
-                system: self.system_prompt.clone(),
-                messages,
-                max_tokens: self.config.llm.max_output_tokens,
-            };
+            let llm_req =
+                LlmRequest { system: self.system_prompt(), messages, max_tokens: self.config.llm.max_output_tokens };
             if req.include_context {
                 context_out = Some(pack);
             }
@@ -553,7 +637,9 @@ impl Intelli {
                 self.link_conversation(c, &new_topics);
             }
         }
-        if self.config.memory.enabled && mode != AnswerMode::Fallback {
+        if self.config.memory.enabled
+            && matches!(mode, AnswerMode::Deterministic | AnswerMode::Llm | AnswerMode::LlmCache | AnswerMode::Action)
+        {
             let salience = if entity_ids.is_empty() { 0.3 } else { 0.5 };
             let _ = self.memory.record_episode(
                 p,
@@ -608,6 +694,8 @@ impl Intelli {
             revision,
             memories: memories_used,
             context: context_out,
+            options,
+            action: action_out,
             note,
         };
         if use_cache && matches!(mode, AnswerMode::Deterministic | AnswerMode::Llm | AnswerMode::LlmCache) {

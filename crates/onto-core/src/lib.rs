@@ -15,20 +15,30 @@
 //! All reads are synchronous and take microseconds; callers that need async
 //! ingestion wrap [`Ontology::apply`] in a queue (see the `onto-intelli` crate).
 
+pub mod action_types;
 pub mod deps;
 pub mod engine;
 pub mod error;
+pub mod experts;
+pub mod export;
 pub mod graph;
+pub mod metrics;
 pub mod model;
 pub mod policy;
+pub mod profile;
+pub mod quality;
 pub mod query;
 pub mod rules;
 pub mod schema;
+pub mod similarity;
 pub mod store;
 pub mod text;
 pub mod time;
 
-pub use engine::{ActionContext, ChangeSet, OntoStats, Ontology, OntologyOptions, SearchHit};
+pub use engine::{
+    ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
+    SearchHit, SearchMode,
+};
 pub use error::{Error, Result};
 pub use model::*;
 pub use policy::{Access, Principal, Role};

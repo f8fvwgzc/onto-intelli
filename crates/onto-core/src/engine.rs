@@ -13,12 +13,14 @@ use crate::deps::{self, CriticalPath, DepDirection, DepReport, RootCause};
 use crate::graph::{Graph, LinkKey};
 use crate::model::*;
 use crate::policy::{self, Access, Principal};
+use crate::quality::{self, QualityReport};
 use crate::query::{self, FindSpec, Hop, Subgraph, TraverseSpec};
 use crate::rules::{self, Inferred};
 use crate::schema::{Cardinality, Dir, PropType, Schema};
-use crate::store::{MemoryStore, Store, StoreStats, WriteBatch};
+use crate::similarity::{self, DuplicatePair, VectorIndex};
+use crate::store::{MemoryStore, Store, StoreStats, VersionRecord, WriteBatch};
 use crate::text::TextIndex;
-use crate::time::{new_id, now_ms};
+use crate::time::{fmt_ts, new_id, now_ms};
 use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
@@ -86,6 +88,93 @@ pub struct ChangeSet {
 pub struct SearchHit {
     pub entity: Entity,
     pub score: f32,
+    /// Why it ranked: lexical/vector ranks, personal-graph distance, recency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    /// BM25 + hashed-vector similarity fused with reciprocal rank fusion.
+    #[default]
+    Hybrid,
+    Lexical,
+    Vector,
+}
+
+/// One entry of an entity's version history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub revision: u64,
+    pub ts: i64,
+    pub at: String,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub changed: Vec<String>,
+}
+
+/// What happened to one entity inside a time window.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChangeSummary {
+    pub id: Id,
+    pub kind: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_state: Option<String>,
+    pub created: bool,
+    pub deleted: bool,
+    pub changed: Vec<String>,
+    pub versions: usize,
+    pub last_ts: i64,
+    pub actors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MergeResult {
+    pub kept: Id,
+    pub merged: Id,
+    pub links_moved: usize,
+    pub revision: u64,
+}
+
+/// Extra items committed atomically with a mutation batch.
+#[derive(Default)]
+pub(crate) struct Extra {
+    pub kv: Vec<(String, String, Value)>,
+    pub redirects: Vec<(Id, Id)>,
+}
+
+/// Fields that differ between two versions of an entity.
+pub fn diff_fields(old: &Entity, new: &Entity) -> Vec<String> {
+    let mut changed = Vec::new();
+    if old.title != new.title {
+        changed.push("title".to_string());
+    }
+    if old.state != new.state {
+        changed.push("state".to_string());
+    }
+    let keys: std::collections::BTreeSet<&String> = old.props.keys().chain(new.props.keys()).collect();
+    for k in keys {
+        if old.props.get(k) != new.props.get(k) {
+            changed.push(k.clone());
+        }
+    }
+    if old.aliases != new.aliases {
+        changed.push("aliases".to_string());
+    }
+    if old.provenance != new.provenance {
+        changed.push("provenance".to_string());
+    }
+    changed
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,6 +185,8 @@ pub struct OntoStats {
     pub revision: u64,
     pub kinds: BTreeMap<String, usize>,
     pub indexed_docs: usize,
+    pub vectors: usize,
+    pub redirects: usize,
     pub store: StoreStats,
 }
 
@@ -105,6 +196,9 @@ struct Inner {
     schema: Arc<Schema>,
     graph: RwLock<Graph>,
     text: RwLock<TextIndex>,
+    vectors: RwLock<VectorIndex>,
+    /// Merged-away id -> surviving id.
+    redirects: RwLock<HashMap<Id, Id>>,
     store: Arc<dyn Store>,
     revision: AtomicU64,
     opts: OntologyOptions,
@@ -123,10 +217,18 @@ impl Ontology {
         let snap = store.load()?;
         let mut graph = Graph::default();
         let mut text = TextIndex::default();
+        let mut vectors = VectorIndex::default();
         for e in snap.entities {
-            text.upsert(&e.id, &searchable_text(&schema, &e));
+            let doc = searchable_text(&schema, &e);
+            text.upsert(&e.id, &doc);
+            vectors.upsert(&e.id, &doc);
             graph.put_entity(e);
         }
+        let redirects: HashMap<Id, Id> = store
+            .kv_scan("redirect", "")?
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|t| (k, t.to_string())))
+            .collect();
         for l in snap.links {
             if graph.contains(&l.from) && graph.contains(&l.to) {
                 graph.put_link(l);
@@ -137,6 +239,8 @@ impl Ontology {
                 schema: Arc::new(schema),
                 graph: RwLock::new(graph),
                 text: RwLock::new(text),
+                vectors: RwLock::new(vectors),
+                redirects: RwLock::new(redirects),
                 store,
                 revision: AtomicU64::new(1),
                 opts,
@@ -184,6 +288,46 @@ impl Ontology {
         f(&g, &self.inner.schema)
     }
 
+    /// Independent in-memory copy for what-if scenarios: edits to the fork
+    /// never reach this ontology or its store.
+    pub fn fork(&self) -> Ontology {
+        let graph = self.inner.graph.read().clone();
+        Ontology {
+            inner: Arc::new(Inner {
+                schema: self.inner.schema.clone(),
+                graph: RwLock::new(graph),
+                text: RwLock::new(self.inner.text.read().clone()),
+                vectors: RwLock::new(self.inner.vectors.read().clone()),
+                redirects: RwLock::new(self.inner.redirects.read().clone()),
+                store: Arc::new(MemoryStore::default()),
+                revision: AtomicU64::new(self.revision()),
+                opts: self.inner.opts.clone(),
+                listeners: RwLock::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Follow merge redirects to the surviving id.
+    pub fn resolve_id(&self, id: &str) -> String {
+        let g = self.inner.graph.read();
+        self.resolve_in(&g, id)
+    }
+
+    pub(crate) fn resolve_in(&self, g: &Graph, id: &str) -> String {
+        if g.contains(id) {
+            return id.to_string();
+        }
+        let redirects = self.inner.redirects.read();
+        let mut cur = id;
+        for _ in 0..8 {
+            match redirects.get(cur) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        cur.to_string()
+    }
+
     fn reader(&self, p: &Principal) -> Result<RwLockReadGuard<'_, Graph>> {
         if !p.allows(Access::Read) {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
@@ -195,21 +339,29 @@ impl Ontology {
 
     pub fn get(&self, p: &Principal, id: &str) -> Result<Entity> {
         let g = self.reader(p)?;
-        match g.get(id) {
+        let id = self.resolve_in(&g, id);
+        match g.get(&id) {
             Some(e) if policy::visible(p, e, &g) => Ok(e.clone()),
-            _ => Err(Error::not_found(id)),
+            _ => Err(Error::not_found(&id)),
         }
     }
 
     pub fn get_many(&self, p: &Principal, ids: &[Id]) -> Result<Vec<Entity>> {
         let g = self.reader(p)?;
-        Ok(ids.iter().filter_map(|id| g.get(id)).filter(|e| policy::visible(p, e, &g)).cloned().collect())
+        Ok(ids
+            .iter()
+            .filter_map(|id| g.get(&self.resolve_in(&g, id)))
+            .filter(|e| policy::visible(p, e, &g))
+            .cloned()
+            .collect())
     }
 
     /// Direct neighbours as (relation as walked, entity). `rel` filters.
     pub fn neighbors(&self, p: &Principal, id: &str, rel: Option<&str>) -> Result<Vec<(String, Entity)>> {
         let g = self.reader(p)?;
         let schema = self.schema();
+        let id = self.resolve_in(&g, id);
+        let id = id.as_str();
         if !g.get(id).is_some_and(|e| policy::visible(p, e, &g)) {
             return Err(Error::not_found(id));
         }
@@ -242,6 +394,7 @@ impl Ontology {
         Ok(query::find(self.schema(), &g, spec, &can))
     }
 
+    /// Hybrid, permission-aware search personalised to the caller.
     pub fn search(
         &self,
         p: &Principal,
@@ -250,20 +403,249 @@ impl Ontology {
         workspace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        self.search_with(p, text, kinds, workspace, limit, SearchMode::Hybrid, true)
+    }
+
+    /// Search with an explicit mode. Hybrid fuses BM25 and vector ranks
+    /// (reciprocal rank fusion), then boosts things near the caller in the graph
+    /// (their team, their work) and recently active things.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with(
+        &self,
+        p: &Principal,
+        text: &str,
+        kinds: &[String],
+        workspace: Option<&str>,
+        limit: usize,
+        mode: SearchMode,
+        personalize: bool,
+    ) -> Result<Vec<SearchHit>> {
         let g = self.reader(p)?;
-        let idx = self.inner.text.read();
         let schema = self.schema();
-        let hits = idx.search(text, limit, |id| {
+        let keep = |id: &str| {
             g.get(id).is_some_and(|e| {
                 policy::visible(p, e, &g)
                     && workspace.is_none_or(|w| e.workspace == w)
                     && (kinds.is_empty() || kinds.iter().any(|k| schema.kind_is(&e.kind, k)))
             })
-        });
-        Ok(hits
+        };
+        let pool = (limit * 3).max(30);
+        let lexical =
+            if mode == SearchMode::Vector { Vec::new() } else { self.inner.text.read().search(text, pool, keep) };
+        let vector = if mode == SearchMode::Lexical {
+            Vec::new()
+        } else {
+            self.inner.vectors.read().search(text, pool, 0.25, keep)
+        };
+        let mut fused: HashMap<String, (f32, Option<usize>, Option<usize>)> = HashMap::new();
+        for (rank, (id, _)) in lexical.iter().enumerate() {
+            let slot = fused.entry(id.clone()).or_default();
+            slot.0 += 1.0 / (60.0 + rank as f32 + 1.0);
+            slot.1 = Some(rank + 1);
+        }
+        for (rank, (id, _)) in vector.iter().enumerate() {
+            let slot = fused.entry(id.clone()).or_default();
+            slot.0 += 1.0 / (60.0 + rank as f32 + 1.0);
+            slot.2 = Some(rank + 1);
+        }
+        // Personal graph: distance from the caller's own entity.
+        let mut near: HashMap<String, usize> = HashMap::new();
+        if personalize && let Some(me) = p.entity.as_deref().filter(|me| g.contains(me)) {
+            let mut frontier = vec![me.to_string()];
+            for d in 1..=2 {
+                let mut next = Vec::new();
+                for id in &frontier {
+                    for s in g.steps(id) {
+                        if s.other != me && !near.contains_key(s.other) {
+                            near.insert(s.other.to_string(), d);
+                            next.push(s.other.to_string());
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+        let now = now_ms();
+        let mut hits: Vec<SearchHit> = fused
             .into_iter()
-            .filter_map(|(id, score)| g.get(&id).map(|e| SearchHit { entity: e.clone(), score }))
-            .collect())
+            .filter_map(|(id, (base, lr, vr))| {
+                let e = g.get(&id)?;
+                let dist = near.get(&id).copied();
+                let personal = match dist {
+                    Some(1) => 1.3,
+                    Some(2) => 1.15,
+                    _ => 1.0,
+                };
+                let idle_days = ((now - e.updated_at).max(0) as f32) / 86_400_000.0;
+                let recency = 1.0 + 0.2 * (-idle_days / 14.0).exp();
+                let score = base * personal * recency * 100.0;
+                Some(SearchHit {
+                    entity: e.clone(),
+                    score: (score * 1000.0).round() / 1000.0,
+                    signals: Some(json!({
+                        "lexical_rank": lr,
+                        "vector_rank": vr,
+                        "personal_distance": dist,
+                        "recency": (recency * 100.0).round() / 100.0,
+                    })),
+                })
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.entity.id.cmp(&b.entity.id)));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Likely duplicate entities (entity alignment candidates).
+    pub fn duplicates(
+        &self,
+        p: &Principal,
+        workspace: Option<&str>,
+        kind: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<DuplicatePair>> {
+        let g = self.reader(p)?;
+        let can = |e: &Entity| policy::visible(p, e, &g);
+        Ok(similarity::duplicates(self.schema(), &g, workspace, kind, threshold, &can))
+    }
+
+    /// Data-quality report over what the caller can see.
+    pub fn quality(
+        &self,
+        p: &Principal,
+        workspace: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<QualityReport> {
+        let g = self.reader(p)?;
+        let can = |e: &Entity| policy::visible(p, e, &g);
+        Ok(quality::report(self.schema(), &g, workspace, kind, limit, &can))
+    }
+
+    fn version_visible(&self, p: &Principal, doc: &Entity) -> bool {
+        let g = self.inner.graph.read();
+        policy::visible(p, doc, &g)
+    }
+
+    /// Version history of an entity, newest first, with changed fields.
+    pub fn history(&self, p: &Principal, id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
+        let id = self.resolve_id(id);
+        let versions = self.inner.store.versions(&id, limit + 1)?;
+        let last_doc = versions.iter().find_map(|v| v.doc.clone());
+        match &last_doc {
+            Some(doc) if self.version_visible(p, doc) => {}
+            _ => return Err(Error::not_found(&id)),
+        }
+        let mut out = Vec::new();
+        for (i, v) in versions.iter().enumerate().take(limit) {
+            let older = versions.get(i + 1).and_then(|o| o.doc.as_ref());
+            let changed = match (&v.doc, older) {
+                (Some(new), Some(old)) => diff_fields(old, new),
+                (Some(_), None) if i + 1 >= versions.len() => vec!["created".to_string()],
+                (Some(_), None) => vec!["recreated".to_string()],
+                (None, _) => vec!["deleted".to_string()],
+            };
+            out.push(HistoryEntry {
+                revision: v.revision,
+                ts: v.ts,
+                at: fmt_ts(v.ts),
+                actor: v.actor.clone(),
+                request_id: v.request_id.clone(),
+                deleted: v.doc.is_none(),
+                state: v.doc.as_ref().and_then(|d| d.state.clone()),
+                title: v.doc.as_ref().map(|d| d.title.clone()),
+                changed,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The entity as it was at `ts` (None if it did not exist or was deleted).
+    pub fn as_of(&self, p: &Principal, id: &str, ts: i64) -> Result<Option<Entity>> {
+        let id = self.resolve_id(id);
+        let versions = self.inner.store.versions(&id, 100_000)?;
+        let at = versions.iter().find(|v| v.ts <= ts).and_then(|v| v.doc.clone());
+        Ok(at.filter(|doc| self.version_visible(p, doc)))
+    }
+
+    /// Entities that changed since `since`, one summary each, newest first.
+    pub fn changes(
+        &self,
+        p: &Principal,
+        since: i64,
+        workspace: Option<&str>,
+        kinds: &[String],
+        within: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ChangeSummary>> {
+        if !p.allows(Access::Read) {
+            return Err(Error::Denied(format!("{} has no read role", p.id)));
+        }
+        let versions = self.inner.store.versions_since(since, 50_000)?;
+        let mut order: Vec<Id> = Vec::new();
+        let mut by_id: HashMap<Id, Vec<VersionRecord>> = HashMap::new();
+        for v in versions {
+            if !by_id.contains_key(&v.id) {
+                order.push(v.id.clone());
+            }
+            by_id.entry(v.id.clone()).or_default().push(v);
+        }
+        let scope: Option<HashSet<Id>> = within.map(|root| {
+            let root = self.resolve_id(root);
+            let g = self.inner.graph.read();
+            let mut set: HashSet<Id> = query::scope_set(self.schema(), &g, &root, 3).into_iter().collect();
+            set.insert(root);
+            set
+        });
+        let schema = self.schema();
+        let mut out = Vec::new();
+        for id in order {
+            let vs = &by_id[&id];
+            let newest = &vs[0];
+            let Some(doc) = vs.iter().find_map(|v| v.doc.as_ref()) else { continue };
+            if workspace.is_some_and(|w| doc.workspace != w)
+                || (!kinds.is_empty() && !kinds.iter().any(|k| schema.kind_is(&doc.kind, k)))
+                || scope.as_ref().is_some_and(|s| !s.contains(&id))
+                || !self.version_visible(p, doc)
+            {
+                continue;
+            }
+            let oldest = vs.last().expect("non-empty");
+            let before = self.inner.store.versions(&id, 64)?.into_iter().find(|v| v.ts < since).and_then(|v| v.doc);
+            let created = before.is_none() && oldest.revision <= 1;
+            let mut changed: Vec<String> = Vec::new();
+            let mut prev = before.clone();
+            for v in vs.iter().rev() {
+                if let (Some(old), Some(new)) = (&prev, &v.doc) {
+                    for f in diff_fields(old, new) {
+                        if !changed.contains(&f) {
+                            changed.push(f);
+                        }
+                    }
+                }
+                prev = v.doc.clone().or(prev);
+            }
+            let mut actors: Vec<String> = vs.iter().map(|v| v.actor.clone()).collect();
+            actors.sort();
+            actors.dedup();
+            out.push(ChangeSummary {
+                id: id.clone(),
+                kind: doc.kind.clone(),
+                title: doc.label().to_string(),
+                from_state: before.as_ref().and_then(|b| b.state.clone()),
+                to_state: newest.doc.as_ref().and_then(|d| d.state.clone()),
+                created,
+                deleted: newest.doc.is_none(),
+                changed,
+                versions: vs.len(),
+                last_ts: newest.ts,
+                actors,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub fn path(&self, p: &Principal, from: &str, to: &str, max_depth: usize) -> Result<Option<Vec<Hop>>> {
@@ -343,6 +725,8 @@ impl Ontology {
             revision: self.revision(),
             kinds: g.kinds().map(|(k, n)| (k.clone(), n)).collect(),
             indexed_docs: self.inner.text.read().len(),
+            vectors: self.inner.vectors.read().len(),
+            redirects: self.inner.redirects.read().len(),
             store: self.inner.store.stats()?,
         })
     }
@@ -391,8 +775,82 @@ impl Ontology {
             .ok_or_else(|| Error::Storage("event not readable after write".into()))
     }
 
+    /// Merge `dup` into `keep`: links move over, properties and names fill in,
+    /// `dup` is deleted and its id redirects to `keep` from now on.
+    pub fn merge(&self, ctx: &ActionContext, keep: &str, dup: &str) -> Result<MergeResult> {
+        let (keep, dup) = (self.resolve_id(keep), self.resolve_id(dup));
+        if keep == dup {
+            return Err(Error::invalid("cannot merge an entity into itself"));
+        }
+        let (muts, moved) = {
+            let g = self.inner.graph.read();
+            let ke = g.get(&keep).ok_or_else(|| Error::not_found(&keep))?;
+            let de = g.get(&dup).ok_or_else(|| Error::not_found(&dup))?;
+            if ke.kind != de.kind || ke.workspace != de.workspace {
+                return Err(Error::invalid(format!("{keep} and {dup} must share kind and workspace")));
+            }
+            let mut muts = Vec::new();
+            let mut moved = 0;
+            for (rel, other) in g.out_edges(&dup) {
+                if other != &keep {
+                    let props = g.get_link(&dup, rel, other).map(|l| l.props.clone()).unwrap_or_default();
+                    muts.push(Mutation::Link(LinkInput {
+                        from: keep.clone(),
+                        rel: rel.clone(),
+                        to: other.clone(),
+                        props,
+                    }));
+                    moved += 1;
+                }
+            }
+            for (rel, other) in g.in_edges(&dup) {
+                if other != &keep {
+                    let props = g.get_link(other, rel, &dup).map(|l| l.props.clone()).unwrap_or_default();
+                    muts.push(Mutation::Link(LinkInput {
+                        from: other.clone(),
+                        rel: rel.clone(),
+                        to: keep.clone(),
+                        props,
+                    }));
+                    moved += 1;
+                }
+            }
+            let mut aliases: Vec<String> = vec![de.label().to_string(), de.key().to_string()];
+            aliases.extend(de.aliases.iter().cloned());
+            aliases.retain(|a| !a.is_empty() && *a != ke.title && !ke.aliases.contains(a));
+            aliases.dedup();
+            muts.push(Mutation::Upsert(EntityInput {
+                id: Some(keep.clone()),
+                kind: ke.kind.clone(),
+                props: de.props.clone(),
+                aliases,
+                fill_only: true,
+                ..Default::default()
+            }));
+            muts.push(Mutation::Delete(EntityRef { id: dup.clone() }));
+            muts.push(Mutation::Event(EventInput {
+                action: "entity.merge".into(),
+                target: Some(keep.clone()),
+                workspace: Some(ke.workspace.clone()),
+                payload: json!({ "merged": dup, "links_moved": moved }),
+                ..Default::default()
+            }));
+            (muts, moved)
+        };
+        let extra = Extra {
+            kv: vec![("redirect".into(), dup.clone(), json!(keep))],
+            redirects: vec![(dup.clone(), keep.clone())],
+        };
+        let res = self.apply_inner(ctx, muts, extra)?;
+        Ok(MergeResult { kept: keep, merged: dup, links_moved: moved, revision: res.revision })
+    }
+
     /// Apply mutations atomically: all succeed and are persisted, or none are.
     pub fn apply(&self, ctx: &ActionContext, muts: Vec<Mutation>) -> Result<MutationResult> {
+        self.apply_inner(ctx, muts, Extra::default())
+    }
+
+    pub(crate) fn apply_inner(&self, ctx: &ActionContext, muts: Vec<Mutation>, extra: Extra) -> Result<MutationResult> {
         if muts.is_empty() {
             return Ok(MutationResult { revision: self.revision(), ..Default::default() });
         }
@@ -416,22 +874,60 @@ impl Ontology {
             }
             st.finish(events, touched)
         };
+        let mut staged = staged;
+        for e in &staged.batch.put_entities {
+            staged.batch.versions.push(VersionRecord {
+                id: e.id.clone(),
+                revision: e.revision,
+                ts: now,
+                actor: ctx.principal.id.clone(),
+                request_id: Some(ctx.request_id.clone()),
+                doc: Some(e.clone()),
+            });
+        }
+        for id in &staged.batch.del_entities {
+            staged.batch.versions.push(VersionRecord {
+                id: id.clone(),
+                revision: g.get(id).map(|e| e.revision + 1).unwrap_or(0),
+                ts: now,
+                actor: ctx.principal.id.clone(),
+                request_id: Some(ctx.request_id.clone()),
+                doc: None,
+            });
+        }
+        staged.batch.kv.extend(extra.kv);
         self.inner.store.write(&staged.batch)?;
         {
             let mut text = self.inner.text.write();
+            let mut vectors = self.inner.vectors.write();
             for key in &staged.batch.del_links {
                 g.remove_link(key);
             }
             for id in &staged.batch.del_entities {
                 g.remove_entity(id);
                 text.remove(id);
+                vectors.remove(id);
             }
             for e in &staged.batch.put_entities {
-                text.upsert(&e.id, &searchable_text(&self.inner.schema, e));
+                let doc = searchable_text(&self.inner.schema, e);
+                text.upsert(&e.id, &doc);
+                vectors.upsert(&e.id, &doc);
                 g.put_entity(e.clone());
             }
             for l in &staged.batch.put_links {
                 g.put_link(l.clone());
+            }
+            if !extra.redirects.is_empty() {
+                let mut r = self.inner.redirects.write();
+                for (from, to) in extra.redirects {
+                    // Re-point older redirects that targeted the merged id.
+                    for v in r.values_mut() {
+                        if *v == from {
+                            *v = to.clone();
+                        }
+                    }
+                    r.insert(from, to);
+                }
             }
         }
         drop(g);
@@ -507,6 +1003,13 @@ impl Ontology {
         match m {
             Mutation::Upsert(input) => {
                 let (id, kind) = entity_id(&input)?;
+                let id = match st.entity(&id) {
+                    Some(_) => id,
+                    None => {
+                        let target = self.resolve_in(st.g, &id);
+                        if st.entity(&target).is_some_and(|e| e.kind == kind) { target } else { id }
+                    }
+                };
                 let existing = st.entity(&id).cloned();
                 let ws = match (&existing, &input.workspace) {
                     (Some(ex), Some(w)) if &ex.workspace != w => {
@@ -648,7 +1151,9 @@ impl Ontology {
                 Ok(events)
             }
             Mutation::Patch(patch) => {
-                let ex = st.entity(&patch.id).cloned().ok_or_else(|| Error::not_found(&patch.id))?;
+                let pid =
+                    if st.entity(&patch.id).is_some() { patch.id.clone() } else { self.resolve_in(st.g, &patch.id) };
+                let ex = st.entity(&pid).cloned().ok_or_else(|| Error::not_found(&patch.id))?;
                 let mut props = patch.props;
                 for k in patch.unset {
                     props.insert(k, Value::Null);
@@ -663,7 +1168,10 @@ impl Ontology {
                 };
                 self.stage(ctx, st, Mutation::Upsert(input), now, touched)
             }
-            Mutation::Delete(r) => {
+            Mutation::Delete(mut r) => {
+                if st.entity(&r.id).is_none() {
+                    r.id = self.resolve_in(st.g, &r.id);
+                }
                 let ex = st.entity(&r.id).cloned().ok_or_else(|| Error::not_found(&r.id))?;
                 policy::check(&ctx.principal, Access::Delete, &ex.workspace, Some(&ex), st.g)?;
                 st.del_entity(&r.id);
@@ -748,6 +1256,12 @@ impl Ontology {
             return Err(Error::invalid("relation name is required"));
         }
         let (mut from, mut to) = if dir == Dir::In { (input.to, input.from) } else { (input.from, input.to) };
+        if st.entity(&from).is_none() {
+            from = self.resolve_in(st.g, &from);
+        }
+        if st.entity(&to).is_none() {
+            to = self.resolve_in(st.g, &to);
+        }
         if from == to {
             return Err(Error::invalid(format!("{from} cannot link to itself")));
         }

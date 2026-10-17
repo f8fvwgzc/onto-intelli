@@ -27,6 +27,7 @@ pub struct Config {
     pub reasoning: ReasoningConfig,
     pub grpc: GrpcConfig,
     pub auth: AuthConfig,
+    pub mcp: McpConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -201,6 +202,11 @@ impl Default for ReasoningConfig {
                 "relation",
                 "workload",
                 "history",
+                "expert",
+                "metric",
+                "changes",
+                "quality",
+                "what_if",
             ]
             .map(String::from)
             .to_vec(),
@@ -258,6 +264,13 @@ pub struct RouteConfig {
     /// Workspace override for this route.
     #[serde(default)]
     pub workspace: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Expose apply_action / undo_action to MCP clients.
+    pub allow_writes: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
