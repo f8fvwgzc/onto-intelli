@@ -1,0 +1,9 @@
+// One record per line: mutations ({"op": ...}), bare entities, or GitHub "issues" webhook payloads.
+// onto ingest examples/ingest/sample.jsonl --async
+{"op": "upsert", "kind": "team", "key": "growth", "title": "Growth Team", "props": {"mission": "Activation and onboarding"}}
+{"op": "upsert", "kind": "person", "key": "noa", "title": "Noa Levi", "props": {"role": "Product Engineer"}, "links": [{"rel": "member_of", "to": "team:growth"}]}
+{"op": "upsert", "kind": "project", "key": "onboarding-v2", "title": "Onboarding v2", "state": "active", "links": [{"rel": "owned_by", "to": "team:growth"}]}
+{"id": "task:ob-1", "title": "Design the welcome checklist", "state": "in_progress", "props": {"estimate": 2}, "links": [{"rel": "belongs_to", "to": "project:onboarding-v2"}, {"rel": "assigned_to", "to": "person:noa"}]}
+{"id": "task:ob-2", "title": "Instrument activation funnel", "state": "todo", "props": {"estimate": 3}, "links": [{"rel": "belongs_to", "to": "project:onboarding-v2"}, {"rel": "depends_on", "to": "task:ob-1"}]}
+{"op": "event", "action": "experiment.launch", "actor": "person:noa", "target": "project:onboarding-v2", "payload": {"variant": "checklist-a"}}
+{"action": "opened", "issue": {"number": 88, "title": "Signup email lands in spam", "state": "open", "body": "SPF record missing on the new domain.", "html_url": "https://github.com/acme/web/issues/88", "assignees": [{"login": "noa"}]}, "repository": {"full_name": "acme/web", "html_url": "https://github.com/acme/web"}, "sender": {"login": "noa"}}

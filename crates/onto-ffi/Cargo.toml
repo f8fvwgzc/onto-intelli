@@ -1,0 +1,18 @@
+[package]
+name = "onto-intelli-ffi"
+description = "C ABI for embedding onto-intelli in any language (Python, Go, Node, C/C++, Swift...)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "onto_intelli"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+onto-intelli = { workspace = true, features = ["sqlite", "http-llm"] }
+serde_json.workspace = true

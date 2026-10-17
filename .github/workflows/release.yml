@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} -p onto-intelli-cli -p onto-intelli-ffi
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="onto-${{ matrix.target }}"
+          out="target/${{ matrix.target }}/dist"
+          mkdir -p "pkg/$name/lib" "pkg/$name/include"
+          cp README.md LICENSE "pkg/$name/"
+          cp crates/onto-ffi/include/onto_intelli.h "pkg/$name/include/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "$out/onto.exe" "pkg/$name/"
+            cp "$out/onto_intelli.dll" "$out/onto_intelli.lib" "pkg/$name/lib/" 2>/dev/null || true
+            (cd pkg && 7z a "../$name.zip" "$name" >/dev/null)
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            cp "$out/onto" "pkg/$name/"
+            cp "$out"/libonto_intelli.* "pkg/$name/lib/" 2>/dev/null || true
+            rm -f "pkg/$name/lib/"*.d
+            tar -czf "$name.tar.gz" -C pkg "$name"
+            (sha256sum "$name.tar.gz" 2>/dev/null || shasum -a 256 "$name.tar.gz") > "$name.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onto-${{ matrix.target }}
+          path: onto-${{ matrix.target }}.*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -1,0 +1,32 @@
+[package]
+name = "onto-intelli"
+description = "Enterprise Execution Intelligence on an ontology: context graphs, dependency reasoning, episodic and long-term memory, token-budgeted LLM orchestration and caching."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["sqlite", "http-llm"]
+# Durable single-file storage.
+sqlite = ["onto-core/sqlite"]
+# OpenAI-compatible (OpenAI, Ollama, vLLM, LM Studio, OpenRouter) and Anthropic providers.
+http-llm = ["dep:reqwest"]
+
+[dependencies]
+onto-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+toml.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

@@ -1,0 +1,433 @@
+// onto-intelli built-in API.
+//
+// The server does not use generated stubs: every RPC below is mapped onto an
+// engine action at runtime, exactly like user-supplied protos configured in
+// onto-intelli.toml. Field names match the engine's JSON (proto3 JSON mapping
+// with original field names), and free-form results use google.protobuf.Struct.
+syntax = "proto3";
+
+package onto_intelli.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+// ───────────────────────────── Things ─────────────────────────────
+
+message Provenance {
+  string source = 1;              // upload | github | ai_generation | saas | manual | ingest
+  repeated string derived_from = 2;
+  string generated_by = 3;
+  string run = 4;
+  string external_ref = 5;
+  int64 at = 6;
+}
+
+message Entity {
+  string id = 1;                  // kind:key, e.g. issue:421
+  string kind = 2;
+  string workspace = 3;
+  string title = 4;
+  string state = 5;
+  google.protobuf.Struct props = 6;
+  repeated string aliases = 7;
+  Provenance provenance = 8;
+  int64 created_at = 9;
+  int64 updated_at = 10;
+  uint64 revision = 11;
+}
+
+message LinkSpec {
+  string rel = 1;
+  string to = 2;
+  google.protobuf.Struct props = 3;
+}
+
+message EntityInput {
+  string id = 1;
+  string kind = 2;
+  string key = 3;
+  string workspace = 4;
+  string title = 5;
+  string state = 6;
+  google.protobuf.Struct props = 7;
+  repeated string aliases = 8;
+  Provenance provenance = 9;
+  bool replace = 10;
+  repeated LinkSpec links = 11;
+  bool fill_only = 12;            // only fill empty fields of an existing entity
+}
+
+message EntityPatch {
+  string id = 1;
+  string title = 2;
+  string state = 3;
+  google.protobuf.Struct props = 4;
+  repeated string unset = 5;
+}
+
+message EntityRef {
+  string id = 1;
+}
+
+message DeleteResult {
+  string id = 1;
+  bool deleted = 2;
+  uint64 revision = 3;
+}
+
+message Related {
+  string rel = 1;
+  string to = 2;
+}
+
+message FindRequest {
+  string kind = 1;
+  string workspace = 2;
+  repeated string state = 3;
+  optional bool open = 4;
+  google.protobuf.Struct props = 5;
+  Related related = 6;
+  string within = 7;
+  uint32 limit = 8;
+  uint32 offset = 9;
+}
+
+message EntityList {
+  repeated Entity entities = 1;
+  uint64 total = 2;
+}
+
+message SearchRequest {
+  string query = 1;
+  repeated string kinds = 2;
+  string workspace = 3;
+  uint32 limit = 4;
+}
+
+message SearchHit {
+  Entity entity = 1;
+  float score = 2;
+}
+
+message SearchResult {
+  repeated SearchHit hits = 1;
+}
+
+message LinkInput {
+  string from = 1;
+  string rel = 2;                 // canonical or inverse name (owned_by)
+  string to = 3;
+  google.protobuf.Struct props = 4;
+}
+
+message LinkResult {
+  string from = 1;
+  string rel = 2;
+  string to = 3;
+  uint64 revision = 4;
+  bool changed = 5;
+  bool deleted = 6;
+}
+
+message ApplyRequest {
+  repeated google.protobuf.Struct mutations = 1;   // {"op": "upsert" | "patch" | "delete" | "link" | "unlink" | "event", ...}
+  string workspace = 2;
+}
+
+message MutationResult {
+  uint64 applied = 1;
+  repeated string entities = 2;
+  uint64 links = 3;
+  repeated string events = 4;
+  uint64 revision = 5;
+}
+
+message NeighborsRequest {
+  string id = 1;
+  string rel = 2;
+}
+
+message Neighbor {
+  string rel = 1;
+  Entity entity = 2;
+}
+
+message NeighborsResult {
+  repeated Neighbor neighbors = 1;
+}
+
+message TraverseRequest {
+  repeated string start = 1;
+  repeated string rels = 2;
+  string direction = 3;           // out | in | both
+  uint32 depth = 4;
+  uint32 limit = 5;
+  repeated string kinds = 6;
+}
+
+message Edge {
+  string from = 1;
+  string rel = 2;
+  string to = 3;
+}
+
+message Subgraph {
+  repeated Entity nodes = 1;
+  repeated Edge edges = 2;
+  bool truncated = 3;
+}
+
+message PathRequest {
+  string from = 1;
+  string to = 2;
+  uint32 depth = 3;
+}
+
+message PathResult {
+  bool found = 1;
+  string text = 2;
+  repeated Edge hops = 3;
+}
+
+service OntologyService {
+  rpc UpsertEntity(EntityInput) returns (Entity);
+  rpc PatchEntity(EntityPatch) returns (Entity);
+  rpc GetEntity(EntityRef) returns (Entity);
+  rpc DeleteEntity(EntityRef) returns (DeleteResult);
+  rpc FindEntities(FindRequest) returns (EntityList);
+  rpc Search(SearchRequest) returns (SearchResult);
+  rpc CreateLink(LinkInput) returns (LinkResult);
+  rpc DeleteLink(LinkInput) returns (LinkResult);
+  rpc Apply(ApplyRequest) returns (MutationResult);
+  rpc Neighbors(NeighborsRequest) returns (NeighborsResult);
+  rpc Traverse(TraverseRequest) returns (Subgraph);
+  rpc Path(PathRequest) returns (PathResult);
+}
+
+// ─────────────────────────── Intelligence ───────────────────────────
+
+message AskRequest {
+  string question = 1;
+  string workspace = 2;
+  string conversation_id = 3;     // "new" starts a conversation; empty = one-off
+  string mode = 4;                // auto | deterministic | llm
+  uint32 token_budget = 5;
+  bool include_context = 6;
+  bool no_cache = 7;
+}
+
+message ResolvedEntity {
+  string id = 1;
+  string kind = 2;
+  string title = 3;
+  string mention = 4;
+  float confidence = 5;
+}
+
+message TokenUsage {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+  uint64 cached_tokens = 3;
+  double cost_usd = 4;
+  bool estimated = 5;
+}
+
+message Efficiency {
+  uint64 context_tokens = 1;
+  uint64 naive_tokens = 2;
+  uint64 saved_tokens = 3;
+  uint64 facts_used = 4;
+  uint64 facts_dropped = 5;
+}
+
+message Timings {
+  double resolve_ms = 1;
+  double retrieve_ms = 2;
+  double llm_ms = 3;
+  double total_ms = 4;
+}
+
+message AskResponse {
+  string answer = 1;
+  string mode = 2;                // deterministic | llm | llm_cache | answer_cache | fallback
+  string intent = 3;
+  bool why = 4;
+  repeated ResolvedEntity entities = 5;
+  repeated string facts = 6;
+  string conversation_id = 7;
+  TokenUsage usage = 8;
+  Efficiency efficiency = 9;
+  Timings timings = 10;
+  string provider = 11;
+  string model = 12;
+  string request_id = 13;
+  uint64 revision = 14;
+  repeated string memories = 15;
+  google.protobuf.Struct context = 16;
+  string note = 17;
+}
+
+message AskEvent {
+  string type = 1;                // stage | entities | delta | done | error
+  string text = 2;
+  google.protobuf.Value data = 3;
+}
+
+message ContextRequest {
+  string question = 1;
+  string workspace = 2;
+  uint32 token_budget = 3;
+}
+
+message GraphQuery {
+  string id = 1;
+  string direction = 2;           // upstream | downstream (Dependencies)
+  uint32 depth = 3;
+  string workspace = 4;           // Cycles
+}
+
+service IntelliService {
+  rpc Ask(AskRequest) returns (AskResponse);
+  rpc AskStream(AskRequest) returns (stream AskEvent);
+  rpc BuildContext(ContextRequest) returns (google.protobuf.Struct);
+  rpc Infer(GraphQuery) returns (google.protobuf.Struct);
+  rpc Dependencies(GraphQuery) returns (google.protobuf.Struct);
+  rpc Impact(GraphQuery) returns (google.protobuf.Struct);
+  rpc RootCause(GraphQuery) returns (google.protobuf.Struct);
+  rpc CriticalPath(GraphQuery) returns (google.protobuf.Struct);
+  rpc Cycles(GraphQuery) returns (google.protobuf.Struct);
+}
+
+// ───────────────────────────── Memory ─────────────────────────────
+
+message RememberRequest {
+  string text = 1;
+  repeated string entities = 2;
+  string kind = 3;                // fact | preference | summary
+  bool private = 4;
+  string workspace = 5;
+  float salience = 6;
+}
+
+message MemoryItem {
+  string id = 1;
+  string workspace = 2;
+  string scope = 3;               // episodic | long_term
+  string kind = 4;
+  string text = 5;
+  repeated string entities = 6;
+  string subject = 7;
+  string conversation = 8;
+  float salience = 9;
+  uint32 hits = 10;
+  int64 created_at = 11;
+  int64 last_access = 12;
+  int64 expires_at = 13;
+  bool consolidated = 14;
+}
+
+message RecallRequest {
+  string query = 1;
+  repeated string entities = 2;
+  string workspace = 3;
+  uint32 k = 4;
+}
+
+message MemoryHit {
+  MemoryItem item = 1;
+  float score = 2;
+}
+
+message RecallResult {
+  repeated MemoryHit items = 1;
+}
+
+service MemoryService {
+  rpc Remember(RememberRequest) returns (MemoryItem);
+  rpc Recall(RecallRequest) returns (RecallResult);
+  rpc Consolidate(google.protobuf.Empty) returns (google.protobuf.Struct);
+}
+
+// ───────────────────────────── Events ─────────────────────────────
+
+message EventInput {
+  string action = 1;              // e.g. file.upload, deployment.run
+  string actor = 2;
+  string target = 3;
+  string workspace = 4;
+  string outcome = 5;             // success | failure | denied | pending
+  string intent = 6;
+  string source = 7;
+  repeated string derived_from = 8;
+  google.protobuf.Value payload = 9;
+  int64 ts = 10;
+}
+
+message Event {
+  string id = 1;
+  int64 ts = 2;
+  string workspace = 3;
+  string actor = 4;
+  string action = 5;
+  string target = 6;
+  string request_id = 7;
+  string outcome = 8;
+  string intent = 9;
+  string source = 10;
+  repeated string derived_from = 11;
+  google.protobuf.Value payload = 12;
+}
+
+message EventFilter {
+  string workspace = 1;
+  string actor = 2;
+  string target = 3;
+  string action = 4;              // exact or dotted prefix
+  int64 since = 5;
+  int64 until = 6;
+  uint32 limit = 7;
+}
+
+message EventList {
+  repeated Event events = 1;
+}
+
+message IngestSummary {
+  uint64 accepted = 1;
+  bool queued = 2;
+  MutationResult result = 3;
+}
+
+service EventService {
+  rpc Append(EventInput) returns (Event);
+  rpc List(EventFilter) returns (EventList);
+  // Stream mutations, bare entities or GitHub webhook payloads; applied atomically at the end.
+  rpc Ingest(stream google.protobuf.Struct) returns (IngestSummary);
+}
+
+// ───────────────────────────── Admin ─────────────────────────────
+
+message HealthStatus {
+  string status = 1;
+  string version = 2;
+  uint64 revision = 3;
+  string llm = 4;
+  bool llm_available = 5;
+}
+
+message CallRequest {
+  string action = 1;              // any engine action, see Actions
+  google.protobuf.Struct input = 2;
+}
+
+message CallResponse {
+  google.protobuf.Value output = 1;
+}
+
+service AdminService {
+  rpc Health(google.protobuf.Empty) returns (HealthStatus);
+  rpc Stats(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Schema(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Actions(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Call(CallRequest) returns (CallResponse);
+}

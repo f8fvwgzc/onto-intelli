@@ -1,0 +1,108 @@
+# onto-intelli configuration. Relative paths resolve against this file's folder.
+# Every section is optional; omitted values use the defaults shown here.
+
+[engine]
+storage = "sqlite"            # sqlite (durable, single file) | memory
+data_dir = ".onto"            # holds onto.db
+default_workspace = "acme"
+ingest_queue = 1024           # async ingestion backpressure
+
+[ontology]
+schema = "builtin:enterprise" # or a path to your own schema TOML
+extend = []                   # extra schema layers, e.g. ["schema/custom.toml"]
+strict = false                # true: reject unknown kinds/relations/properties
+
+[llm]
+# mock: offline and deterministic (default, no key needed)
+# openai | ollama | openai-compatible (vLLM, LM Studio, OpenRouter) | anthropic | none
+provider = "mock"
+model = ""                    # empty = provider default
+# api_key_env = "OPENAI_API_KEY"      # keys are read from the environment only
+# base_url = "http://localhost:11434/v1"
+max_output_tokens = 4096
+# effort = "medium"           # anthropic: low | medium | high | xhigh | max
+# fallbacks = true            # anthropic: server-side refusal fallback
+timeout_secs = 120
+# [llm.pricing]               # USD per million tokens, for cost tracking
+# input_per_mtok = 4.0
+# output_per_mtok = 20.0
+# cached_input_per_mtok = 0.2
+
+[context]
+token_budget = 1800           # max tokens of facts sent to the LLM per question
+max_depth = 2                 # graph hops expanded around resolved entities
+max_nodes = 80
+history_turns = 6             # verbatim turns; older ones fold into a summary
+recent_events = 5
+knowledge_hits = 4
+
+[cache]
+enabled = true
+max_entries = 10000
+answer_ttl_secs = 300         # keys include the graph revision: writes invalidate
+llm_ttl_secs = 86400
+persist_llm = true
+
+[memory]
+enabled = true
+recall_k = 4
+episodic_ttl_days = 30
+consolidate_after = 3         # repeated episodes about the same things -> long-term memory
+consolidate_every = 25
+
+[reasoning]
+# Intents answered straight from the graph (zero LLM tokens) when entities resolve.
+deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",
+                         "blockers", "dependencies", "impact", "relation", "workload", "history"]
+min_confidence = 0.8
+
+[grpc]
+listen = "127.0.0.1:50051"
+builtin_api = true            # onto_intelli.v1.* services
+reflection = true             # grpcurl / Postman discovery
+health = true                 # grpc.health.v1
+http = true                   # JSON on the same port: POST /v1/call/{action}, /v1/ask
+proto_dirs = ["protos"]
+proto_files = ["acme/tickets/v1/tickets.proto"]
+
+# Map RPCs of your own protos onto engine actions (`onto actions` lists them).
+# Templates read the request with {{field.path}}; a value that is exactly one
+# placeholder keeps its JSON type. Fields whose placeholders are missing are dropped.
+
+[[grpc.routes]]
+method = "acme.tickets.v1.TicketService/CreateTicket"
+action = "entity.upsert"
+[grpc.routes.request]
+kind = "issue"
+key = "{{ticket_id}}"
+title = "{{title}}"
+state = "open"
+props = { priority = "{{priority}}" }
+links = [
+  { rel = "belongs_to", to = "project:{{project}}" },
+  { rel = "assigned_to", to = "person:{{assignee}}" },
+]
+[grpc.routes.response]
+id = "{{id}}"
+title = "{{title}}"
+state = "{{state}}"
+priority = "{{props.priority}}"
+
+[[grpc.routes]]
+method = "acme.tickets.v1.TicketService/GetTicket"
+action = "entity.get"
+request = { id = "issue:{{ticket_id}}" }
+response = { id = "{{id}}", title = "{{title}}", state = "{{state}}", priority = "{{props.priority}}" }
+
+[[grpc.routes]]
+method = "acme.tickets.v1.TicketService/Ask"
+action = "intelli.ask"
+request = { question = "{{question}}" }
+response = { text = "{{answer}}", facts = "{{facts}}", mode = "{{mode}}" }
+
+[auth]
+mode = "none"                 # none | token
+default_principal = { id = "local", roles = ["admin"], workspaces = ["*"] }
+# [[auth.tokens]]
+# token_env = "ONTO_TOKEN_OPS"
+# principal = { id = "ops-bot", roles = ["agent"], workspaces = ["acme"], entity = "agent:ops-bot" }

@@ -1,0 +1,7 @@
+/target
+/dist
+.onto/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

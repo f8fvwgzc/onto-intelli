@@ -1,0 +1,24 @@
+[package]
+name = "onto-intelli-cli"
+description = "`onto`: the onto-intelli command line — serve gRPC/HTTP, ask questions, ingest, inspect the ontology."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "onto"
+path = "src/main.rs"
+
+[dependencies]
+onto-intelli = { workspace = true, features = ["sqlite", "http-llm"] }
+onto-grpc.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

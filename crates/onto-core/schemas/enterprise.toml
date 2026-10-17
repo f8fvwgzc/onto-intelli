@@ -1,0 +1,304 @@
+# Built-in ontology for Enterprise Execution Intelligence.
+#
+# Things live in the graph (workspace, team, project, issue, task, knowledge,
+# artifact, conversation, ...). Events (who did what, when) live in the
+# separate event store and point at things; they never become graph nodes.
+#
+# Extend or override any part of this file from your own schema file:
+#   [ontology] extend = ["./schema/custom.toml"]
+#
+# Relation notation used in [analysis] and rule chains:
+#   "owns"      follow the stored direction (team -owns-> project)
+#   "owned_by"  a declared inverse name, follows the edge backwards
+#   "^owns"     same as the inverse, for relations without an inverse name
+
+name = "enterprise-execution"
+version = 1
+
+# ── Containers ───────────────────────────────────────────────────────────────
+
+[object_types.workspace]
+category = "container"
+description = "Tenant boundary. Every entity belongs to exactly one workspace."
+properties.domain = { type = "string" }
+
+[object_types.team]
+category = "container"
+description = "Group of people that owns projects, services and knowledge."
+properties.mission = { type = "text", searchable = true }
+
+[object_types.project]
+category = "container"
+description = "Body of work with a goal, owned by a team."
+states = ["planned", "active", "blocked", "done", "cancelled"]
+terminal_states = ["done", "cancelled"]
+alert_states = ["blocked"]
+properties.goal = { type = "text", searchable = true }
+properties.due = { type = "timestamp" }
+
+[object_types.milestone]
+category = "container"
+description = "Dated checkpoint inside a project."
+states = ["planned", "active", "at_risk", "done", "missed"]
+terminal_states = ["done", "missed"]
+alert_states = ["at_risk", "missed"]
+properties.due = { type = "timestamp" }
+
+[object_types.folder]
+category = "container"
+description = "Logical grouping of artifacts (not just a filesystem path)."
+
+# ── Actors ───────────────────────────────────────────────────────────────────
+
+[object_types.person]
+category = "actor"
+description = "Human member of the workspace."
+properties.email = { type = "string" }
+properties.role = { type = "string", searchable = true }
+properties.timezone = { type = "string" }
+
+[object_types.agent]
+category = "actor"
+description = "AI agent or automation acting inside the workspace."
+properties.model = { type = "string" }
+properties.purpose = { type = "text", searchable = true }
+
+# ── Work items ───────────────────────────────────────────────────────────────
+
+[object_types.issue]
+description = "Problem, bug or request that needs work."
+states = ["open", "triaged", "in_progress", "blocked", "resolved", "closed"]
+terminal_states = ["resolved", "closed"]
+alert_states = ["open", "triaged", "in_progress", "blocked"]
+properties.priority = { type = "enum", values = ["low", "medium", "high", "critical"] }
+properties.description = { type = "text", searchable = true }
+
+[object_types.task]
+description = "Concrete unit of work. `estimate` (days) feeds critical-path analysis."
+states = ["todo", "in_progress", "blocked", "review", "done", "cancelled"]
+terminal_states = ["done", "cancelled"]
+alert_states = ["blocked"]
+properties.estimate = { type = "float", description = "Remaining effort in days." }
+properties.description = { type = "text", searchable = true }
+
+# ── Systems ──────────────────────────────────────────────────────────────────
+
+[object_types.service]
+description = "Running software component."
+states = ["healthy", "degraded", "down", "retired"]
+terminal_states = ["retired"]
+alert_states = ["degraded", "down"]
+properties.tier = { type = "string" }
+
+[object_types.repository]
+description = "Source code repository."
+properties.url = { type = "string" }
+properties.default_branch = { type = "string" }
+
+[object_types.environment]
+description = "Deployment target such as staging or production."
+
+[object_types.deployment]
+description = "One rollout of a service to an environment."
+states = ["pending", "running", "succeeded", "failed", "rolled_back"]
+terminal_states = ["succeeded", "failed", "rolled_back"]
+alert_states = ["failed", "rolled_back"]
+properties.version = { type = "string" }
+
+# ── Knowledge and artifacts ──────────────────────────────────────────────────
+
+[object_types.knowledge]
+category = "knowledge"
+description = "Document, runbook, note or wiki page."
+properties.body = { type = "text", searchable = true }
+properties.source_url = { type = "string" }
+properties.tags = { type = "list" }
+
+[object_types.decision]
+category = "knowledge"
+description = "Recorded decision with its rationale (ADR)."
+states = ["proposed", "accepted", "superseded", "rejected"]
+terminal_states = ["superseded", "rejected"]
+properties.rationale = { type = "text", searchable = true }
+
+[object_types.artifact]
+category = "artifact"
+description = "File or generated output. Provenance says where it came from."
+properties.media_type = { type = "string" }
+properties.size = { type = "int" }
+properties.hash = { type = "string" }
+properties.uri = { type = "string" }
+properties.summary = { type = "text", searchable = true }
+
+[object_types.conversation]
+category = "knowledge"
+description = "Chat thread. Messages live in conversation storage; the thread is linked to what it discussed."
+properties.summary = { type = "text", searchable = true }
+properties.channel = { type = "string" }
+
+# ── Relations (stored in one direction; inverse names traverse backwards) ────
+
+[link_types.member_of]
+from = ["person", "agent"]
+to = ["team", "workspace"]
+inverse = "has_member"
+weight = 0.9
+
+[link_types.manages]
+from = ["person"]
+to = ["team", "project"]
+inverse = "managed_by"
+weight = 0.8
+
+[link_types.owns]
+from = ["team", "person"]
+to = ["project", "service", "repository", "knowledge", "artifact", "environment", "decision"]
+inverse = "owned_by"
+weight = 1.0
+
+[link_types.belongs_to]
+from = ["issue", "task", "milestone", "knowledge", "artifact", "conversation", "deployment", "decision", "project", "folder"]
+to = ["project", "team", "workspace", "folder", "milestone"]
+inverse = "has_item"
+weight = 0.9
+
+[link_types.part_of]
+from = ["task", "issue", "milestone"]
+to = ["issue", "milestone", "project", "task"]
+inverse = "has_part"
+weight = 0.9
+
+[link_types.assigned_to]
+from = ["issue", "task", "project"]
+to = ["person", "agent", "team"]
+inverse = "works_on"
+weight = 1.0
+
+[link_types.reported_by]
+from = ["issue"]
+to = ["person", "agent"]
+inverse = "reported"
+weight = 0.5
+
+[link_types.blocked_by]
+description = "The subject cannot progress until the object is resolved."
+from = ["issue", "task", "project", "milestone", "deployment"]
+to = ["issue", "task", "project", "milestone", "deployment", "service", "decision"]
+inverse = "blocks"
+dependency = true
+weight = 1.0
+
+[link_types.depends_on]
+description = "The subject needs the object to work or to finish."
+from = ["project", "task", "service", "issue", "milestone"]
+to = ["project", "task", "service", "issue", "milestone", "repository", "environment"]
+inverse = "required_by"
+dependency = true
+weight = 0.9
+
+[link_types.affects]
+from = ["issue", "deployment"]
+to = ["service", "project", "repository", "environment"]
+inverse = "affected_by"
+weight = 1.0
+
+[link_types.implemented_by]
+from = ["service"]
+to = ["repository"]
+inverse = "implements"
+weight = 0.7
+
+[link_types.deploys]
+from = ["deployment"]
+to = ["service"]
+inverse = "deployed_in"
+weight = 0.8
+
+[link_types.deployed_to]
+from = ["deployment", "service"]
+to = ["environment"]
+inverse = "hosts"
+weight = 0.6
+
+[link_types.requested_by]
+from = ["deployment", "issue", "task"]
+to = ["person", "agent"]
+inverse = "requested"
+weight = 0.6
+
+[link_types.contains]
+from = ["folder"]
+to = ["artifact", "folder", "knowledge"]
+inverse = "in_folder"
+weight = 0.6
+
+[link_types.derived_from]
+description = "Provenance: the subject was produced from the object."
+inverse = "source_of"
+provenance = true
+weight = 0.7
+
+[link_types.generated_by]
+description = "Provenance: the actor that produced the subject."
+to = ["agent", "person"]
+inverse = "generated"
+provenance = true
+weight = 0.6
+
+[link_types.references]
+inverse = "referenced_by"
+weight = 0.5
+
+[link_types.about]
+from = ["conversation", "knowledge", "decision"]
+inverse = "discussed_in"
+weight = 0.6
+
+[link_types.relates_to]
+symmetric = true
+weight = 0.4
+
+# ── Inference rules: chain of relations => derived relation ──────────────────
+
+[[rules]]
+name = "responsible_team"
+description = "Work assigned to a person is handled by that person's team."
+chain = ["assigned_to", "member_of"]
+infer = "handled_by_team"
+
+[[rules]]
+name = "accountable_team"
+description = "The team owning a service is accountable for issues affecting it."
+chain = ["affects", "owned_by"]
+infer = "accountable_team"
+
+[[rules]]
+name = "escalation"
+description = "Escalate to the manager of the team owning the affected service."
+chain = ["affects", "owned_by", "managed_by"]
+infer = "escalate_to"
+
+[[rules]]
+name = "owning_team"
+description = "Items inside a project are owned by the project's team."
+chain = ["belongs_to", "owned_by"]
+infer = "owning_team"
+
+[[rules]]
+name = "task_owning_team"
+description = "Tasks inherit the owning team of their parent item's project."
+chain = ["part_of", "belongs_to", "owned_by"]
+infer = "owning_team"
+
+# ── Graph analysis ───────────────────────────────────────────────────────────
+
+[analysis]
+# Followed when explaining why something is blocked or failing.
+root_cause = ["has_item", "has_part", "blocked_by", "depends_on", "affects", "deployed_in"]
+# Followed when asking what breaks if something fails.
+impact = ["blocks", "required_by", "part_of", "belongs_to"]
+# What counts as "inside" a team, project or person for counts and lists.
+scope = ["owns", "has_item", "has_part", "has_member", "works_on", "contains"]
+# Children collected for critical-path planning.
+containment = ["has_item", "has_part"]
+estimate_property = "estimate"

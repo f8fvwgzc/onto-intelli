@@ -1,0 +1,43 @@
+# Extend the built-in ontology without forking it:
+#   [ontology]
+#   extend = ["examples/schema/custom.toml"]
+
+# A new type that inherits issue's properties, states and link rules.
+[object_types.incident]
+extends = "issue"
+category = "thing"
+description = "Production incident with a severity."
+states = ["open", "mitigated", "resolved", "closed"]
+terminal_states = ["resolved", "closed"]
+alert_states = ["open"]
+properties.sev = { type = "int", required = true, description = "1 = highest" }
+properties.postmortem_url = { type = "string" }
+
+[object_types.customer]
+description = "External customer account."
+properties.tier = { type = "enum", values = ["free", "pro", "enterprise"] }
+properties.arr = { type = "float" }
+
+# New relations, with inverse names for traversal.
+[link_types.pages]
+from = ["incident"]
+to = ["person", "team"]
+inverse = "paged_by"
+
+[link_types.impacts_customer]
+from = ["incident", "issue"]
+to = ["customer"]
+inverse = "impacted_by"
+weight = 0.9
+
+[link_types.subscribes_to]
+from = ["customer"]
+to = ["service", "project"]
+inverse = "subscribers"
+
+# A derived relation: which customers are hurt by a degraded service's issues.
+[[rules]]
+name = "customers_at_risk"
+description = "Customers subscribed to a service affected by an issue."
+chain = ["affects", "subscribers"]
+infer = "customer_at_risk"

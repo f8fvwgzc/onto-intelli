@@ -1,0 +1,39 @@
+[package]
+name = "onto-grpc"
+description = "gRPC + JSON server for onto-intelli: built-in API and runtime-configurable proto files mapped to engine actions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+onto-intelli = { workspace = true, features = ["sqlite", "http-llm"] }
+tonic = { workspace = true, features = ["transport", "router", "codegen"] }
+tonic-prost.workspace = true
+tonic-reflection.workspace = true
+tonic-health.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+prost-reflect.workspace = true
+protox.workspace = true
+axum.workspace = true
+tower.workspace = true
+http.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protox.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true }

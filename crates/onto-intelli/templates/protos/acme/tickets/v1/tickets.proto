@@ -1,0 +1,40 @@
+// Example of a user-defined API served by onto-intelli without writing code:
+// every RPC is mapped to an engine action in onto-intelli.toml ([[grpc.routes]]).
+syntax = "proto3";
+
+package acme.tickets.v1;
+
+service TicketService {
+  rpc CreateTicket(CreateTicketRequest) returns (Ticket);
+  rpc GetTicket(GetTicketRequest) returns (Ticket);
+  rpc Ask(AskRequest) returns (Answer);
+}
+
+message CreateTicketRequest {
+  string ticket_id = 1;
+  string title = 2;
+  string priority = 3;
+  string project = 4;
+  string assignee = 5;
+}
+
+message GetTicketRequest {
+  string ticket_id = 1;
+}
+
+message Ticket {
+  string id = 1;
+  string title = 2;
+  string state = 3;
+  string priority = 4;
+}
+
+message AskRequest {
+  string question = 1;
+}
+
+message Answer {
+  string text = 1;
+  repeated string facts = 2;
+  string mode = 3;
+}

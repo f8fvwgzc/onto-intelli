@@ -1,0 +1,24 @@
+[package]
+name = "onto-core"
+description = "Ontology core for onto-intelli: schema, typed graph, provenance, events, policy, inference rules and dependency analysis."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["sqlite"]
+# Durable single-file storage (SQLite compiled in, no system library needed).
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+toml.workspace = true
+fastrand.workspace = true
+rusqlite = { workspace = true, optional = true }

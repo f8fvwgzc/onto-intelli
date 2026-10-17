@@ -1,0 +1,76 @@
+use std::fmt;
+
+/// Errors shared by every onto-intelli crate.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid: {0}")]
+    Invalid(String),
+    #[error("permission denied: {0}")]
+    Denied(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("storage: {0}")]
+    Storage(String),
+    #[error("config: {0}")]
+    Config(String),
+    #[error("llm: {0}")]
+    Llm(String),
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Stable machine-readable code, used by the gRPC/HTTP/FFI layers.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::NotFound(_) => "not_found",
+            Error::Invalid(_) => "invalid_argument",
+            Error::Denied(_) => "permission_denied",
+            Error::Conflict(_) => "conflict",
+            Error::Storage(_) => "storage",
+            Error::Config(_) => "config",
+            Error::Llm(_) => "llm",
+            Error::Unavailable(_) => "unavailable",
+            Error::Other(_) => "internal",
+        }
+    }
+
+    pub fn invalid(msg: impl fmt::Display) -> Self {
+        Error::Invalid(msg.to_string())
+    }
+
+    pub fn not_found(msg: impl fmt::Display) -> Self {
+        Error::NotFound(msg.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Invalid(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
+impl From<toml::de::Error> for Error {
+    fn from(e: toml::de::Error) -> Self {
+        Error::Config(e.to_string())
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
