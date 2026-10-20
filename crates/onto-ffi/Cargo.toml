@@ -14,5 +14,5 @@ name = "onto_intelli"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-onto-intelli = { workspace = true, features = ["sqlite", "http-llm"] }
+onto-intelli = { workspace = true, features = ["sqlite", "postgres", "http-llm"] }
 serde_json.workspace = true

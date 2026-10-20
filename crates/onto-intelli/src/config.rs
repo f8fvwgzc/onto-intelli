@@ -38,12 +38,20 @@ pub struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
-    /// `sqlite` (durable, single file) or `memory` (volatile).
+    /// `sqlite` (durable, single file, one node), `postgres` (shared by
+    /// several processes) or `memory` (volatile).
     pub storage: String,
     pub data_dir: String,
     pub default_workspace: String,
     /// Capacity of the async ingestion queue (backpressure beyond this).
     pub ingest_queue: usize,
+    /// `eventual`: reads see other processes' writes once the follower applies
+    /// them (milliseconds with LISTEN/NOTIFY). `strong`: every read first
+    /// checks the store's commit head (one cheap query) and catches up.
+    pub read_consistency: String,
+    /// How often the follower of a shared store polls when no notice arrives.
+    pub follow_interval_ms: u64,
+    pub postgres: PostgresConfig,
 }
 
 impl Default for EngineConfig {
@@ -53,7 +61,56 @@ impl Default for EngineConfig {
             data_dir: ".onto".into(),
             default_workspace: "default".into(),
             ingest_queue: 1024,
+            read_consistency: "eventual".into(),
+            follow_interval_ms: 1_000,
+            postgres: PostgresConfig::default(),
         }
+    }
+}
+
+/// `[engine.postgres]`: the shared store for several processes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostgresConfig {
+    /// Connection URL (prefer `url_env`; the URL holds credentials).
+    pub url: Option<String>,
+    /// Environment variable holding the URL.
+    pub url_env: Option<String>,
+    /// Tenant: one PostgreSQL schema (`{schema_prefix}{tenant}`) per tenant.
+    pub tenant: String,
+    pub schema_prefix: String,
+    pub max_connections: u32,
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            url_env: Some("ONTO_DATABASE_URL".into()),
+            tenant: "default".into(),
+            schema_prefix: "onto_".into(),
+            max_connections: 10,
+            connect_timeout_secs: 10,
+        }
+    }
+}
+
+impl PostgresConfig {
+    /// The URL from `url_env` or `url`.
+    pub fn resolve_url(&self) -> Result<String> {
+        if let Some(var) = &self.url_env
+            && let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return Ok(v);
+        }
+        self.url.clone().filter(|u| !u.is_empty()).ok_or_else(|| {
+            Error::Config(format!(
+                "engine.storage = \"postgres\" needs a URL: set {} or engine.postgres.url",
+                self.url_env.as_deref().unwrap_or("engine.postgres.url_env")
+            ))
+        })
     }
 }
 

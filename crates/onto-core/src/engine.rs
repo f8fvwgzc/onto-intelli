@@ -24,6 +24,10 @@ use crate::text::TextIndex;
 use crate::time::{fmt_ts, new_id, now_ms};
 use crate::{Error, Result};
 
+#[path = "engine_sync.rs"]
+mod sync;
+pub use sync::SyncReport;
+
 #[derive(Clone, Debug)]
 pub struct OntologyOptions {
     /// Reject unknown kinds, relations and properties.
@@ -33,6 +37,13 @@ pub struct OntologyOptions {
     pub schema_mode: SchemaMode,
     /// Who may change, propose and approve schema changes.
     pub governance: Governance,
+    /// Before every read, check the store's commit head and catch up when
+    /// another process committed (read-your-writes across replicas, one cheap
+    /// query per read). Off: reads see other processes' writes as soon as
+    /// the follower applies them (milliseconds after LISTEN/NOTIFY).
+    pub sync_reads: bool,
+    /// How often the follower of a shared store polls when no notice arrives.
+    pub follow_interval_ms: u64,
 }
 
 impl Default for OntologyOptions {
@@ -42,6 +53,8 @@ impl Default for OntologyOptions {
             default_workspace: "default".into(),
             schema_mode: SchemaMode::default(),
             governance: Governance::default(),
+            sync_reads: false,
+            follow_interval_ms: 1_000,
         }
     }
 }
@@ -157,7 +170,7 @@ pub struct MergeResult {
 }
 
 /// Extra items committed atomically with a mutation batch.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Extra {
     pub kv: Vec<(String, String, Value)>,
     pub redirects: Vec<(Id, Id)>,
@@ -233,6 +246,8 @@ struct Inner {
     redirects: RwLock<HashMap<Id, Id>>,
     store: Arc<dyn Store>,
     revision: AtomicU64,
+    /// Store commit sequence the in-memory state reflects.
+    seq: AtomicU64,
     opts: OntologyOptions,
     listeners: RwLock<Vec<Listener>>,
 }
@@ -252,27 +267,17 @@ impl Ontology {
     /// imported as new versions (see [`SchemaMode`]).
     pub fn open(schema: Schema, store: Arc<dyn Store>, opts: OntologyOptions) -> Result<Self> {
         let config_schema = schema;
-        let (schema, version) = live_schema::load_active(&*store, &config_schema, opts.schema_mode)?;
+        // Snapshot first: a schema read afterwards is at least as new, and
+        // catching up from the snapshot's sequence re-applies anything newer.
         let snap = store.load()?;
-        let mut graph = Graph::default();
-        let mut text = TextIndex::default();
-        let mut vectors = VectorIndex::default();
-        for e in snap.entities {
-            let doc = searchable_text(&schema, &e);
-            text.upsert(&e.id, &doc);
-            vectors.upsert(&e.id, &doc);
-            graph.put_entity(e);
-        }
+        let (schema, version) = live_schema::load_active(&*store, &config_schema, opts.schema_mode)?;
+        let (graph, text, vectors) = sync::build_indexes(&schema, snap.entities, snap.links);
         let redirects: HashMap<Id, Id> = store
             .kv_scan("redirect", "")?
             .into_iter()
             .filter_map(|(k, v)| v.as_str().map(|t| (k, t.to_string())))
             .collect();
-        for l in snap.links {
-            if graph.contains(&l.from) && graph.contains(&l.to) {
-                graph.put_link(l);
-            }
-        }
+        let follow = store.shared().then(|| std::time::Duration::from_millis(opts.follow_interval_ms.max(50)));
         let onto = Self {
             inner: Arc::new(Inner {
                 active: RwLock::new(ActiveSchema { schema: Arc::new(schema), version }),
@@ -283,11 +288,15 @@ impl Ontology {
                 redirects: RwLock::new(redirects),
                 store,
                 revision: AtomicU64::new(1),
+                seq: AtomicU64::new(snap.seq),
                 opts,
                 listeners: RwLock::new(Vec::new()),
             }),
         };
         onto.bootstrap_schema(config_schema)?;
+        if let Some(interval) = follow {
+            sync::spawn_follower(&onto.inner, interval)?;
+        }
         Ok(onto)
     }
 
@@ -365,6 +374,7 @@ impl Ontology {
                 redirects: RwLock::new(self.inner.redirects.read().clone()),
                 store: Arc::new(MemoryStore::default()),
                 revision: AtomicU64::new(self.revision()),
+                seq: AtomicU64::new(0),
                 opts: self.inner.opts.clone(),
                 listeners: RwLock::new(Vec::new()),
             }),
@@ -399,6 +409,9 @@ impl Ontology {
     fn reader(&self, p: &Principal) -> Result<RwLockReadGuard<'_, Graph>> {
         if !p.allows(Access::Read) {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
+        }
+        if self.inner.opts.sync_reads {
+            self.sync_if_behind()?;
         }
         Ok(self.inner.graph.read())
     }
@@ -923,14 +936,8 @@ impl Ontology {
         if muts.is_empty() && extra.is_empty() {
             return Ok(MutationResult { revision: self.revision(), ..Default::default() });
         }
-        let mut g = self.inner.graph.write();
-        self.commit_locked(&mut g, ctx, muts, extra)
-    }
-
-    /// Exclusive access to the graph for an operation that must plan and
-    /// commit against the same state (schema changes).
-    pub(crate) fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Graph> {
-        self.inner.graph.write()
+        let (res, ()) = self.transact(ctx, |_, _| Ok((muts.clone(), extra.clone(), ())))?;
+        Ok(res)
     }
 
     /// Validate `muts` against `schema` on a copy-on-write overlay without
@@ -1003,7 +1010,13 @@ impl Ontology {
             });
         }
         staged.batch.kv.extend(extra.kv);
-        self.inner.store.write(&staged.batch)?;
+        if self.inner.store.tracks_commits() {
+            staged.batch.expect_seq = Some(self.inner.seq.load(Ordering::SeqCst));
+        }
+        let seq = self.inner.store.write(&staged.batch)?;
+        if staged.batch.changes_state() {
+            self.inner.seq.store(seq, Ordering::SeqCst);
+        }
         {
             let mut text = self.inner.text.write();
             let mut vectors = self.inner.vectors.write();

@@ -39,7 +39,7 @@ pub mod time;
 
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
-    SearchHit, SearchMode,
+    SearchHit, SearchMode, SyncReport,
 };
 pub use error::{Error, Result};
 pub use live_schema::{

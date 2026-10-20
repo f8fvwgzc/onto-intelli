@@ -4,12 +4,13 @@
 use std::path::Path;
 
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::Value;
 
-use super::{Snapshot, Store, StoreStats, VersionRecord, WriteBatch};
-use crate::model::{Event, EventFilter};
-use crate::time::now_ms;
+use super::{CommitRecord, Snapshot, Store, StoreStats, VersionRecord, WriteBatch};
+use crate::graph::LinkKey;
+use crate::model::{Entity, Event, EventFilter, Id, Link};
+use crate::time::{new_id, now_ms};
 use crate::{Error, Result};
 
 const SCHEMA_SQL: &str = r#"
@@ -62,11 +63,24 @@ CREATE INDEX IF NOT EXISTS entity_versions_id ON entity_versions(id, seq);
 CREATE INDEX IF NOT EXISTS entity_versions_ts ON entity_versions(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta(key, value) VALUES ('format', '1');
+CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL);
+INSERT OR IGNORE INTO head(id, seq) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS commits (
+    seq      INTEGER PRIMARY KEY,
+    ts       INTEGER NOT NULL,
+    origin   TEXT NOT NULL,
+    doc      TEXT NOT NULL
+);
 "#;
+
+/// Commit records older than this many sequence numbers are pruned; a reader
+/// further behind reloads everything.
+const KEEP_COMMITS: i64 = 100_000;
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     path: String,
+    origin: String,
 }
 
 impl SqliteStore {
@@ -79,13 +93,13 @@ impl SqliteStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA_SQL)?;
-        Ok(Self { conn: Mutex::new(conn), path: path.display().to_string() })
+        Ok(Self { conn: Mutex::new(conn), path: path.display().to_string(), origin: new_id("proc") })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
-        Ok(Self { conn: Mutex::new(conn), path: ":memory:".into() })
+        Ok(Self { conn: Mutex::new(conn), path: ":memory:".into(), origin: new_id("proc") })
     }
 
     /// Delete expired KV rows and events older than `keep_events_ms`.
@@ -106,8 +120,10 @@ fn parse<T: serde::de::DeserializeOwned>(doc: &str) -> Result<T> {
 
 impl Store for SqliteStore {
     fn load(&self) -> Result<Snapshot> {
-        let conn = self.conn.lock();
-        let mut snap = Snapshot::default();
+        let mut conn = self.conn.lock();
+        let conn = conn.transaction()?;
+        let seq = conn.query_row("SELECT seq FROM head WHERE id = 1", [], |r| r.get::<_, i64>(0))? as u64;
+        let mut snap = Snapshot { seq, ..Default::default() };
         let mut stmt = conn.prepare("SELECT doc FROM entities")?;
         for doc in stmt.query_map([], |r| r.get::<_, String>(0))? {
             snap.entities.push(parse(&doc?)?);
@@ -119,12 +135,66 @@ impl Store for SqliteStore {
         Ok(snap)
     }
 
-    fn write(&self, b: &WriteBatch) -> Result<()> {
-        if b.is_empty() {
-            return Ok(());
+    fn tracks_commits(&self) -> bool {
+        true
+    }
+
+    fn origin(&self) -> String {
+        self.origin.clone()
+    }
+
+    fn head(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row("SELECT seq FROM head WHERE id = 1", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    fn commits_since(&self, seq: u64, limit: usize) -> Result<Vec<CommitRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT doc FROM commits WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let rows = stmt.query_map(params![seq as i64, limit.min(100_000) as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|doc| parse(&doc?)).collect()
+    }
+
+    fn get_entities(&self, ids: &[Id]) -> Result<Vec<Entity>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT doc FROM entities WHERE id = ?1")?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(doc) = stmt.query_row(params![id], |r| r.get::<_, String>(0)).optional()? {
+                out.push(parse(&doc)?);
+            }
         }
+        Ok(out)
+    }
+
+    fn get_links(&self, keys: &[LinkKey]) -> Result<Vec<Link>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT doc FROM links WHERE src = ?1 AND rel = ?2 AND dst = ?3")?;
+        let mut out = Vec::new();
+        for (src, rel, dst) in keys {
+            if let Some(doc) = stmt.query_row(params![src, rel, dst], |r| r.get::<_, String>(0)).optional()? {
+                out.push(parse(&doc)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn write(&self, b: &WriteBatch) -> Result<u64> {
         let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        if b.is_empty() {
+            return Ok(conn.query_row("SELECT seq FROM head WHERE id = 1", [], |r| r.get::<_, i64>(0))? as u64);
+        }
+        // IMMEDIATE takes the write lock up front, so the head check and the
+        // write are one critical section across processes sharing the file.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head = tx.query_row("SELECT seq FROM head WHERE id = 1", [], |r| r.get::<_, i64>(0))? as u64;
+        let bumps = b.changes_state();
+        if bumps
+            && let Some(expected) = b.expect_seq
+            && expected != head
+        {
+            return Err(Error::Stale(format!("store is at commit {head}, batch was staged at {expected}")));
+        }
         for (src, rel, dst) in &b.del_links {
             tx.execute("DELETE FROM links WHERE src = ?1 AND rel = ?2 AND dst = ?3", params![src, rel, dst])?;
         }
@@ -166,8 +236,21 @@ impl Store for SqliteStore {
                 params![ns, key, serde_json::to_string(value)?],
             )?;
         }
+        let mut seq = head;
+        if bumps {
+            seq = head + 1;
+            let rec = b.commit_record(seq, &self.origin);
+            tx.execute(
+                "INSERT INTO commits(seq, ts, origin, doc) VALUES (?1, ?2, ?3, ?4)",
+                params![seq as i64, rec.ts, rec.origin, serde_json::to_string(&rec)?],
+            )?;
+            tx.execute("UPDATE head SET seq = ?1 WHERE id = 1", params![seq as i64])?;
+            if seq as i64 % 1000 == 0 {
+                tx.execute("DELETE FROM commits WHERE seq < ?1", params![seq as i64 - KEEP_COMMITS])?;
+            }
+        }
         tx.commit()?;
-        Ok(())
+        Ok(seq)
     }
 
     fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>> {

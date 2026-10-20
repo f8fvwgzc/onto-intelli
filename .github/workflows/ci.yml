@@ -30,3 +30,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: onto
+          POSTGRES_PASSWORD: onto
+          POSTGRES_DB: onto
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U onto -d onto"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ONTO_TEST_POSTGRES_URL: postgres://onto:onto@localhost:5432/onto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked --features onto-core/postgres,onto-intelli/postgres

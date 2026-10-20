@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use onto_core::store::Store;
+use onto_core::store::{Store, StoreNotice};
 use onto_core::text::TextIndex;
 use onto_core::time::{new_id, now_ms};
 use onto_core::{Error, Id, Principal, Result};
@@ -109,7 +109,40 @@ pub struct MemoryStats {
     pub revision: u64,
 }
 
+/// Episodic and long-term memory. Cheap to share; other processes' writes
+/// to a shared store arrive through store notices.
 pub struct Memory {
+    state: Arc<MemoryState>,
+}
+
+impl std::ops::Deref for Memory {
+    type Target = MemoryState;
+    fn deref(&self) -> &MemoryState {
+        &self.state
+    }
+}
+
+impl Memory {
+    pub fn open(store: Arc<dyn Store>, cfg: MemoryConfig) -> Result<Self> {
+        let state = Arc::new(MemoryState::load(store, cfg)?);
+        let weak = Arc::downgrade(&state);
+        state.store.subscribe(Arc::new(move |n: StoreNotice| {
+            let Some(state) = weak.upgrade() else { return };
+            match n {
+                StoreNotice::Kv { ns, key, .. } if ns == NS => {
+                    let _ = state.reload(&key);
+                }
+                StoreNotice::Resync => {
+                    let _ = state.reload_all();
+                }
+                _ => {}
+            }
+        }))?;
+        Ok(Self { state })
+    }
+}
+
+pub struct MemoryState {
     store: Arc<dyn Store>,
     items: RwLock<HashMap<String, MemoryItem>>,
     by_entity: RwLock<HashMap<Id, HashSet<String>>>,
@@ -118,8 +151,8 @@ pub struct Memory {
     revision: AtomicU64,
 }
 
-impl Memory {
-    pub fn open(store: Arc<dyn Store>, cfg: MemoryConfig) -> Result<Self> {
+impl MemoryState {
+    fn load(store: Arc<dyn Store>, cfg: MemoryConfig) -> Result<Self> {
         let mem = Self {
             store,
             items: RwLock::new(HashMap::new()),
@@ -138,6 +171,52 @@ impl Memory {
             }
         }
         Ok(mem)
+    }
+
+    /// Another process wrote or deleted this item.
+    fn reload(&self, id: &str) -> Result<()> {
+        let fresh = self.store.kv_get(NS, id)?.and_then(|v| serde_json::from_value::<MemoryItem>(v).ok());
+        let old = self.items.write().remove(id);
+        if let Some(old) = &old {
+            self.unindex_item(old);
+        }
+        let long_term = old.as_ref().is_some_and(|o| o.scope == MemoryScope::LongTerm)
+            || fresh.as_ref().is_some_and(|f| f.scope == MemoryScope::LongTerm);
+        if let Some(item) = fresh {
+            self.index_item(&item);
+            self.items.write().insert(item.id.clone(), item);
+        }
+        if long_term {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Notices may have been missed: reload everything.
+    fn reload_all(&self) -> Result<()> {
+        let now = now_ms();
+        let fresh: Vec<MemoryItem> = self
+            .store
+            .kv_scan(NS, "")?
+            .into_iter()
+            .filter_map(|(_, v)| serde_json::from_value::<MemoryItem>(v).ok())
+            .filter(|i| i.expires_at.is_none_or(|e| e > now))
+            .collect();
+        let mut items = self.items.write();
+        let mut index = self.index.write();
+        let mut by = self.by_entity.write();
+        items.clear();
+        *index = TextIndex::default();
+        by.clear();
+        for item in fresh {
+            index.upsert(&item.id, &format!("{} {}", item.text, item.entities.join(" ")));
+            for e in &item.entities {
+                by.entry(e.clone()).or_default().insert(item.id.clone());
+            }
+            items.insert(item.id.clone(), item);
+        }
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Changes whenever long-term memory changes (part of answer-cache keys).

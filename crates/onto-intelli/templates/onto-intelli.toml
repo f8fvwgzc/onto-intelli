@@ -2,15 +2,31 @@
 # Every section is optional; omitted values use the defaults shown here.
 
 [engine]
-storage = "sqlite"            # sqlite (durable, single file) | memory
+storage = "sqlite"            # sqlite (one node, single file) | postgres (shared by replicas) | memory
 data_dir = ".onto"            # holds onto.db
 default_workspace = "acme"
 ingest_queue = 1024           # async ingestion backpressure
+# read_consistency = "eventual" # eventual | strong (check the shared store's head before each read)
+# follow_interval_ms = 1000     # poll fallback for followers of a shared store
+
+# [engine.postgres]             # storage = "postgres": several processes share one store
+# url_env = "ONTO_DATABASE_URL" # postgres://user:pass@host/db?sslmode=require
+# tenant = "acme"               # one PostgreSQL schema per tenant: {schema_prefix}{tenant}
+# schema_prefix = "onto_"
+# max_connections = 10
 
 [ontology]
 schema = "builtin:enterprise" # or a path to your own schema TOML
 extend = []                   # extra schema layers, e.g. ["schema/custom.toml"]
 strict = false                # true: reject unknown kinds/relations/properties
+schema_mode = "live"          # live: stored versions win, file edits import as new versions | config: files win
+
+# Who may change the schema through the API (see docs/SCHEMA.md).
+[governance]
+apply_roles = ["admin"]       # apply change sets directly
+approve_roles = ["admin"]     # approve/reject proposals (agents never can)
+required_approvals = 1
+allow_self_approval = false
 
 [llm]
 # mock: offline and deterministic (default, no key needed)

@@ -2047,6 +2047,25 @@ pub(crate) fn load_active(store: &dyn Store, config: &Schema, mode: SchemaMode) 
     }
 }
 
+/// The stored head when it differs from `current` (another process moved it).
+pub(crate) fn reload_active(
+    store: &dyn Store,
+    current: &crate::engine::ActiveSchema,
+    mode: SchemaMode,
+) -> Result<Option<crate::engine::ActiveSchema>> {
+    let Some(head) = read_head(store)? else { return Ok(None) };
+    if head == current.version {
+        return Ok(None);
+    }
+    let schema = match mode {
+        SchemaMode::Live => Arc::new(
+            read_version(store, head)?.ok_or_else(|| Error::Storage(format!("missing schema version {head}")))?.schema,
+        ),
+        SchemaMode::Config => current.schema.clone(),
+    };
+    Ok(Some(crate::engine::ActiveSchema { schema, version: head }))
+}
+
 /// KV writes that store a version and move the head to it.
 fn version_kv(sv: &SchemaVersion) -> Result<Vec<(String, String, Value)>> {
     Ok(vec![
@@ -2070,8 +2089,9 @@ pub(crate) struct VersionOrigin {
     pub config: Option<Schema>,
     /// Extra audit events committed with the version.
     pub events: Vec<crate::model::Event>,
-    /// Proposal recorded as applied (with the new version) in the same transaction.
-    pub proposal_record: Option<Box<crate::proposals::SchemaProposal>>,
+    /// The proposal this version applies and the approval that applies it;
+    /// the proposal is recorded as applied in the same transaction.
+    pub approve: Option<(String, crate::proposals::Review, u32)>,
 }
 
 impl VersionOrigin {
@@ -2080,7 +2100,7 @@ impl VersionOrigin {
     }
 
     pub fn of(source: &'static str) -> Self {
-        Self { source, proposal: None, kv: Vec::new(), config: None, events: Vec::new(), proposal_record: None }
+        Self { source, proposal: None, kv: Vec::new(), config: None, events: Vec::new(), approve: None }
     }
 }
 
@@ -2098,9 +2118,13 @@ impl Ontology {
     pub(crate) fn bootstrap_schema(&self, config: Schema) -> Result<()> {
         let store = self.store().clone();
         let mode = self.options().schema_mode;
-        let active = self.active_schema();
         let ctx = ActionContext::system(self.options().default_workspace.clone()).with_source("schema");
-        if active.version == 0 {
+        // First open: store version 1, unless another process just did.
+        self.transact(&ctx, |o, _| {
+            let active = o.active_schema();
+            if active.version != 0 {
+                return Ok((Vec::new(), Extra::default(), ()));
+            }
             let now = now_ms();
             let sv = SchemaVersion {
                 version: 1,
@@ -2120,15 +2144,8 @@ impl Ontology {
             };
             let mut kv = version_kv(&sv)?;
             kv.push(config_kv(&config)?);
-            let mut g = self.write_lock();
-            self.commit_locked(
-                &mut g,
-                &ctx,
-                Vec::new(),
-                Extra { kv, schema: Some((active.schema.clone(), 1)), ..Default::default() },
-            )?;
-            return Ok(());
-        }
+            Ok((Vec::new(), Extra { kv, schema: Some((active.schema.clone(), 1)), ..Default::default() }, ()))
+        })?;
         let hash = fingerprint(&config);
         let baseline = store.kv_get(NS_SCHEMA, "config")?;
         let base_hash = baseline.as_ref().and_then(|b| b.get("hash")).and_then(Value::as_str).unwrap_or_default();
@@ -2138,9 +2155,7 @@ impl Ontology {
         match mode {
             SchemaMode::Config => {
                 // Files are authoritative: record them as a version, data untouched.
-                let sv_changes = changes_between(&self.schema_at_version(active.version)?.schema, &config);
-                self.record_version(&ctx, config.clone(), sv_changes, "config", "schema files changed")?;
-                Ok(())
+                self.record_version(&ctx, config, "config", "schema files changed")
             }
             SchemaMode::Live => {
                 let old: Option<Schema> =
@@ -2150,13 +2165,8 @@ impl Ontology {
                     None => Vec::new(),
                 };
                 if changes.is_empty() {
-                    let mut g = self.write_lock();
-                    self.commit_locked(
-                        &mut g,
-                        &ctx,
-                        Vec::new(),
-                        Extra { kv: vec![config_kv(&config)?], ..Default::default() },
-                    )?;
+                    let kv = vec![config_kv(&config)?];
+                    self.transact(&ctx, |_, _| Ok((Vec::new(), Extra { kv: kv.clone(), ..Default::default() }, ())))?;
                     return Ok(());
                 }
                 let set = SchemaChangeSet {
@@ -2178,43 +2188,42 @@ impl Ontology {
     }
 
     /// Record `schema` as a new version without data migration (config mode).
-    fn record_version(
-        &self,
-        ctx: &ActionContext,
-        schema: Schema,
-        changes: Vec<SchemaChange>,
-        source: &'static str,
-        message: &str,
-    ) -> Result<()> {
-        let active = self.active_schema();
-        let now = now_ms();
-        let version = active.version + 1;
-        let sv = SchemaVersion {
-            version,
-            parent: Some(active.version),
-            ts: now,
-            at: fmt_ts(now),
-            actor: ctx.principal.id.clone(),
-            request_id: ctx.request_id.clone(),
-            source: source.into(),
-            message: message.into(),
-            proposal: None,
-            diff: diff(&active.schema, &schema),
-            changes,
-            breaking: false,
-            migration: MigrationSummary::default(),
-            schema: schema.clone(),
-        };
-        let mut kv = version_kv(&sv)?;
-        kv.push(config_kv(&schema)?);
-        let reindex: Vec<String> = schema.object_types.keys().cloned().collect();
-        let mut g = self.write_lock();
-        self.commit_locked(
-            &mut g,
-            ctx,
-            Vec::new(),
-            Extra { kv, schema: Some((Arc::new(schema), version)), reindex, ..Default::default() },
-        )?;
+    fn record_version(&self, ctx: &ActionContext, schema: Schema, source: &'static str, message: &str) -> Result<()> {
+        self.transact(ctx, |o, _| {
+            let active = o.active_schema();
+            if fingerprint(&active.schema) == fingerprint(&schema) && active.version > 0 {
+                // Another process recorded the same files already.
+                let kv = vec![config_kv(&schema)?];
+                return Ok((Vec::new(), Extra { kv, ..Default::default() }, ()));
+            }
+            let previous = o.schema_at_version(active.version)?.schema;
+            let now = now_ms();
+            let version = active.version + 1;
+            let sv = SchemaVersion {
+                version,
+                parent: Some(active.version),
+                ts: now,
+                at: fmt_ts(now),
+                actor: ctx.principal.id.clone(),
+                request_id: ctx.request_id.clone(),
+                source: source.into(),
+                message: message.into(),
+                proposal: None,
+                diff: diff(&previous, &schema),
+                changes: changes_between(&previous, &schema),
+                breaking: false,
+                migration: MigrationSummary::default(),
+                schema: schema.clone(),
+            };
+            let mut kv = version_kv(&sv)?;
+            kv.push(config_kv(&schema)?);
+            let reindex: Vec<String> = schema.object_types.keys().cloned().collect();
+            Ok((
+                Vec::new(),
+                Extra { kv, schema: Some((Arc::new(schema.clone()), version)), reindex, ..Default::default() },
+                (),
+            ))
+        })?;
         Ok(())
     }
 
@@ -2297,85 +2306,102 @@ impl Ontology {
         }
     }
 
-    /// Plan and commit under one write lock. No authorization here: callers check it.
+    /// Plan and commit against the same state (retried when another process
+    /// commits first). No authorization here: callers check it.
     pub(crate) fn schema_commit(
         &self,
         ctx: &ActionContext,
         set: SchemaChangeSet,
         origin: VersionOrigin,
     ) -> Result<SchemaApplied> {
-        let mut g = self.write_lock();
-        let active = self.active_schema();
-        let mut planned = plan(&active.schema, active.version, &g, &set, self.options().strict);
-        self.check_migration(&g, &mut planned, &ctx.principal);
-        if !planned.plan.applicable() {
-            return Err(planned.plan.refusal());
-        }
-        if planned.plan.diff.is_empty() && planned.mutations.is_empty() {
-            return Err(Error::invalid("the change set does not change the schema"));
-        }
-        let schema = planned.schema.take().expect("valid plans carry a schema");
-        let now = now_ms();
-        let version = active.version + 1;
-        let sv = SchemaVersion {
-            version,
-            parent: Some(active.version),
-            ts: now,
-            at: fmt_ts(now),
-            actor: ctx.principal.id.clone(),
-            request_id: ctx.request_id.clone(),
-            source: origin.source.into(),
-            message: set.message.clone(),
-            proposal: origin.proposal.clone(),
-            changes: set.changes.clone(),
-            diff: planned.plan.diff.clone(),
-            breaking: planned.plan.breaking,
-            migration: planned.plan.migration.clone(),
-            schema: schema.clone(),
-        };
-        let mut kv = version_kv(&sv)?;
-        kv.extend(origin.kv);
-        if let Some(c) = &origin.config {
-            kv.push(config_kv(c)?);
-        }
-        if let Some(mut prop) = origin.proposal_record {
-            prop.status = crate::proposals::ProposalStatus::Applied;
-            prop.applied_version = Some(version);
-            prop.error = None;
-            prop.updated_at = now;
-            kv.push((crate::proposals::NS_PROPOSALS.into(), prop.id.clone(), serde_json::to_value(&*prop)?));
-        }
-        let event = self.event(
-            ctx,
-            &ctx.workspace,
-            "schema.change",
-            None,
-            now,
-            json!({
-                "version": version,
-                "parent": active.version,
-                "source": origin.source,
-                "proposal": origin.proposal,
-                "message": set.message,
-                "changes": set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
-                "diff": sv.diff.summary(),
-                "breaking": sv.breaking,
-                "migration": sv.migration,
-            }),
-            Vec::new(),
-        );
-        let mut events = origin.events;
-        events.push(event);
-        let extra = Extra {
-            kv,
-            redirects: planned.redirects.clone(),
-            events,
-            schema: Some((Arc::new(schema), version)),
-            reindex: planned.reindex.clone(),
-        };
         let mctx = migration_ctx(ctx);
-        let res = self.commit_locked(&mut g, &mctx, planned.mutations, extra)?;
-        Ok(SchemaApplied { version: SchemaVersionInfo::from(&sv), plan: planned.plan, revision: res.revision })
+        let (res, (info, plan)) = self.transact(&mctx, |o, g| {
+            let active = o.active_schema();
+            let mut planned = plan(&active.schema, active.version, g, &set, o.options().strict);
+            o.check_migration(g, &mut planned, &ctx.principal);
+            if !planned.plan.applicable() {
+                return Err(planned.plan.refusal());
+            }
+            if planned.plan.diff.is_empty() && planned.mutations.is_empty() {
+                return Err(Error::invalid("the change set does not change the schema"));
+            }
+            let schema = planned.schema.take().expect("valid plans carry a schema");
+            let now = now_ms();
+            let version = active.version + 1;
+            let sv = SchemaVersion {
+                version,
+                parent: Some(active.version),
+                ts: now,
+                at: fmt_ts(now),
+                actor: ctx.principal.id.clone(),
+                request_id: ctx.request_id.clone(),
+                source: origin.source.into(),
+                message: set.message.clone(),
+                proposal: origin.proposal.clone(),
+                changes: set.changes.clone(),
+                diff: planned.plan.diff.clone(),
+                breaking: planned.plan.breaking,
+                migration: planned.plan.migration.clone(),
+                schema: schema.clone(),
+            };
+            let mut kv = version_kv(&sv)?;
+            kv.extend(origin.kv.iter().cloned());
+            if let Some(c) = &origin.config {
+                kv.push(config_kv(c)?);
+            }
+            if let Some((pid, review, revision)) = &origin.approve {
+                // Read the proposal inside the transaction: if another
+                // approver applied it first, this attempt must not.
+                let mut rec = o.load_proposal(pid)?;
+                if rec.status != crate::proposals::ProposalStatus::Open {
+                    return Err(Error::Conflict(
+                        format!("proposal {pid} is {:?}, not open", rec.status).to_lowercase(),
+                    ));
+                }
+                if rec.approvals().contains(&review.by.as_str()) {
+                    return Err(Error::Conflict(format!("{} already approved {pid}", review.by)));
+                }
+                if rec.revision != *revision {
+                    return Err(Error::Conflict(format!("proposal {pid} was revised; review it again")));
+                }
+                rec.reviews.push(review.clone());
+                rec.status = crate::proposals::ProposalStatus::Applied;
+                rec.applied_version = Some(version);
+                rec.error = None;
+                rec.updated_at = now;
+                kv.push((crate::proposals::NS_PROPOSALS.into(), rec.id.clone(), serde_json::to_value(&rec)?));
+            }
+            let event = o.event(
+                ctx,
+                &ctx.workspace,
+                "schema.change",
+                None,
+                now,
+                json!({
+                    "version": version,
+                    "parent": active.version,
+                    "source": origin.source,
+                    "proposal": origin.proposal,
+                    "message": set.message,
+                    "changes": set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
+                    "diff": sv.diff.summary(),
+                    "breaking": sv.breaking,
+                    "migration": sv.migration,
+                }),
+                Vec::new(),
+            );
+            let mut events = origin.events.clone();
+            events.push(event);
+            let extra = Extra {
+                kv,
+                redirects: planned.redirects.clone(),
+                events,
+                schema: Some((Arc::new(schema), version)),
+                reindex: planned.reindex.clone(),
+            };
+            Ok((planned.mutations, extra, (SchemaVersionInfo::from(&sv), planned.plan)))
+        })?;
+        Ok(SchemaApplied { version: info, plan, revision: res.revision })
     }
 
     /// Schema versions, newest first.

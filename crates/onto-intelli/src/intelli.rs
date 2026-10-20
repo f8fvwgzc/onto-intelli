@@ -206,6 +206,8 @@ impl Intelli {
                 default_workspace: config.engine.default_workspace.clone(),
                 schema_mode: config.ontology.schema_mode,
                 governance: config.governance.clone(),
+                sync_reads: config.engine.read_consistency == "strong",
+                follow_interval_ms: config.engine.follow_interval_ms,
             },
         )?;
         let memory = Memory::open(store.clone(), config.memory.clone())?;
@@ -832,6 +834,17 @@ fn open_store(cfg: &Config) -> Result<Arc<dyn Store>> {
         "memory" => Ok(Arc::new(MemoryStore::default())),
         #[cfg(feature = "sqlite")]
         "sqlite" => Ok(Arc::new(onto_core::store::SqliteStore::open(cfg.db_path())?)),
-        other => Err(Error::Config(format!("unknown engine.storage '{other}' (sqlite, memory)"))),
+        #[cfg(feature = "postgres")]
+        "postgres" | "postgresql" => {
+            let pg = &cfg.engine.postgres;
+            let opts = onto_core::store::PgOptions {
+                schema_prefix: pg.schema_prefix.clone(),
+                max_connections: pg.max_connections,
+                connect_timeout: Duration::from_secs(pg.connect_timeout_secs),
+                listen: true,
+            };
+            Ok(Arc::new(onto_core::store::PgStore::connect(&pg.resolve_url()?, &pg.tenant, opts)?))
+        }
+        other => Err(Error::Config(format!("unknown engine.storage '{other}' (sqlite, postgres, memory)"))),
     }
 }

@@ -151,7 +151,7 @@ fn proposer_of(p: &Principal) -> Proposer {
 }
 
 impl Ontology {
-    fn load_proposal(&self, id: &str) -> Result<SchemaProposal> {
+    pub(crate) fn load_proposal(&self, id: &str) -> Result<SchemaProposal> {
         let v =
             self.store().kv_get(NS_PROPOSALS, id)?.ok_or_else(|| Error::not_found(format!("schema proposal {id}")))?;
         serde_json::from_value(v).map_err(|e| Error::Storage(format!("proposal {id}: {e}")))
@@ -175,17 +175,30 @@ impl Ontology {
         })
     }
 
-    /// Persist a proposal and its audit event atomically.
-    fn save_proposal(&self, ctx: &ActionContext, prop: &SchemaProposal, action: &str, payload: Value) -> Result<()> {
-        let event = self.event(ctx, &prop.workspace, action, None, now_ms(), payload, Vec::new());
-        let extra = Extra {
-            kv: vec![(NS_PROPOSALS.into(), prop.id.clone(), serde_json::to_value(prop)?)],
-            events: vec![event],
-            ..Default::default()
-        };
-        let mut g = self.write_lock();
-        self.commit_locked(&mut g, ctx, Vec::new(), extra)?;
-        Ok(())
+    /// Read-modify-write a proposal and record `action` in one transaction
+    /// (re-read and re-applied if another process commits first). `f`
+    /// returns the event payload, or `None` to write nothing.
+    fn update_proposal<T>(
+        &self,
+        ctx: &ActionContext,
+        id: &str,
+        action: &str,
+        mut f: impl FnMut(&mut SchemaProposal) -> Result<(Option<Value>, T)>,
+    ) -> Result<(SchemaProposal, T)> {
+        let (_, out) = self.transact(ctx, |o, _| {
+            let mut prop = o.load_proposal(id)?;
+            let (payload, t) = f(&mut prop)?;
+            let extra = match payload {
+                Some(payload) => Extra {
+                    kv: vec![(NS_PROPOSALS.into(), prop.id.clone(), serde_json::to_value(&prop)?)],
+                    events: vec![o.event(ctx, &prop.workspace, action, None, now_ms(), payload, Vec::new())],
+                    ..Default::default()
+                },
+                None => Extra::default(),
+            };
+            Ok((Vec::new(), extra, (prop, t)))
+        })?;
+        Ok(out)
     }
 
     fn deny(&self, ctx: &ActionContext, action: &str, reason: String) -> Error {
@@ -232,19 +245,20 @@ impl Ontology {
             updated_at: now,
             revision: 1,
         };
-        self.save_proposal(
-            ctx,
-            &prop,
-            "schema.proposal.create",
-            json!({
-                "proposal": prop.id,
-                "title": prop.title,
-                "agent": prop.proposer.agent,
-                "breaking": prop.plan.breaking,
-                "needs_migration": prop.plan.needs_migration.len(),
-                "changes": prop.change_set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
-            }),
-        )?;
+        let payload = json!({
+            "proposal": prop.id,
+            "title": prop.title,
+            "agent": prop.proposer.agent,
+            "breaking": prop.plan.breaking,
+            "needs_migration": prop.plan.needs_migration.len(),
+            "changes": prop.change_set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
+        });
+        let extra = Extra {
+            kv: vec![(NS_PROPOSALS.into(), prop.id.clone(), serde_json::to_value(&prop)?)],
+            events: vec![self.event(ctx, &prop.workspace, "schema.proposal.create", None, now, payload, Vec::new())],
+            ..Default::default()
+        };
+        self.apply_inner(ctx, Vec::new(), extra)?;
         self.view(prop, &ctx.principal)
     }
 
@@ -303,13 +317,13 @@ impl Ontology {
         seen_version: Option<u64>,
     ) -> Result<ReviewOutcome> {
         let gov = self.options().governance.clone();
-        let mut prop = self.load_proposal(id)?;
         let p = &ctx.principal;
         let action = match decision {
             Decision::Approve => "schema.proposal.approve",
             Decision::Reject => "schema.proposal.reject",
             Decision::Comment => "schema.proposal.comment",
         };
+        let current = self.load_proposal(id)?;
         if decision == Decision::Comment {
             if !p.allows(crate::policy::Access::Read) {
                 return Err(Error::Denied(format!("{} has no read role", p.id)));
@@ -327,11 +341,8 @@ impl Ontology {
                 };
                 return Err(self.deny(ctx, action, reason));
             }
-            if decision == Decision::Approve && !gov.allow_self_approval && p.id == prop.proposer.id {
+            if decision == Decision::Approve && !gov.allow_self_approval && p.id == current.proposer.id {
                 return Err(self.deny(ctx, action, format!("{} cannot approve their own proposal", p.id)));
-            }
-            if prop.status != ProposalStatus::Open {
-                return Err(Error::Conflict(format!("proposal {id} is {:?}, not open", prop.status).to_lowercase()));
             }
             if let Some(seen) = seen_version {
                 let active = self.schema_version();
@@ -343,49 +354,63 @@ impl Ontology {
             }
         }
         let now = now_ms();
-        if decision == Decision::Approve && prop.approvals().contains(&p.id.as_str()) {
-            return Err(Error::Conflict(format!("{} already approved {id}", p.id)));
-        }
-        prop.reviews.push(Review {
-            by: p.id.clone(),
-            decision,
-            comment: comment.to_string(),
-            seen_version,
-            ts: now,
-            at: fmt_ts(now),
-        });
-        prop.updated_at = now;
-        let payload = json!({ "proposal": prop.id, "title": prop.title, "comment": comment });
+        let review =
+            Review { by: p.id.clone(), decision, comment: comment.to_string(), seen_version, ts: now, at: fmt_ts(now) };
+        let payload = json!({ "proposal": id, "title": current.title, "comment": comment });
+        let open = |prop: &SchemaProposal| -> Result<()> {
+            if prop.status != ProposalStatus::Open {
+                return Err(Error::Conflict(format!("proposal {id} is {:?}, not open", prop.status).to_lowercase()));
+            }
+            Ok(())
+        };
         match decision {
             Decision::Comment => {
-                self.save_proposal(ctx, &prop, action, payload)?;
+                let (prop, ()) = self.update_proposal(ctx, id, action, |prop| {
+                    prop.reviews.push(review.clone());
+                    prop.updated_at = now;
+                    Ok((Some(payload.clone()), ()))
+                })?;
                 Ok(ReviewOutcome { proposal: self.view(prop, p)?, applied: None })
             }
             Decision::Reject => {
-                prop.status = ProposalStatus::Rejected;
-                self.save_proposal(ctx, &prop, action, payload)?;
+                let (prop, ()) = self.update_proposal(ctx, id, action, |prop| {
+                    open(prop)?;
+                    prop.reviews.push(review.clone());
+                    prop.status = ProposalStatus::Rejected;
+                    prop.updated_at = now;
+                    Ok((Some(payload.clone()), ()))
+                })?;
                 Ok(ReviewOutcome { proposal: self.view(prop, p)?, applied: None })
             }
             Decision::Approve => {
                 let required = gov.required_approvals.max(1);
-                if prop.approvals().len() < required {
-                    self.save_proposal(ctx, &prop, action, payload)?;
+                // Record the approval, unless it is the one that completes the set.
+                let (prop, completes) = self.update_proposal(ctx, id, action, |prop| {
+                    open(prop)?;
+                    if prop.approvals().contains(&p.id.as_str()) {
+                        return Err(Error::Conflict(format!("{} already approved {id}", p.id)));
+                    }
+                    if prop.approvals().len() + 1 >= required {
+                        return Ok((None, true));
+                    }
+                    prop.reviews.push(review.clone());
+                    prop.updated_at = now;
+                    Ok((Some(payload.clone()), false))
+                })?;
+                if !completes {
                     return Ok(ReviewOutcome { proposal: self.view(prop, p)?, applied: None });
                 }
-                // Enough approvals: apply, recording the proposal as applied in
-                // the same transaction as the schema version.
-                let approve_event = self.event(ctx, &prop.workspace, action, None, now, payload, Vec::new());
+                // Apply, recording the proposal as applied in the same transaction.
+                let approve_event = self.event(ctx, &prop.workspace, action, None, now, payload.clone(), Vec::new());
                 let mut set = prop.change_set.clone();
                 if set.message.is_empty() {
                     set.message = prop.title.clone();
                 }
                 let origin = VersionOrigin {
-                    source: "proposal",
                     proposal: Some(prop.id.clone()),
-                    kv: Vec::new(),
-                    config: None,
                     events: vec![approve_event],
-                    proposal_record: Some(Box::new(prop.clone())),
+                    approve: Some((prop.id.clone(), review.clone(), prop.revision)),
+                    ..VersionOrigin::of("proposal")
                 };
                 match self.schema_commit(ctx, set, origin) {
                     Ok(applied) => {
@@ -393,14 +418,22 @@ impl Ontology {
                         Ok(ReviewOutcome { proposal: self.view(prop, p)?, applied: Some(applied) })
                     }
                     Err(e) => {
-                        prop.status = ProposalStatus::Failed;
-                        prop.error = Some(e.to_string());
-                        self.save_proposal(
-                            ctx,
-                            &prop,
-                            "schema.proposal.fail",
-                            json!({ "proposal": prop.id, "error": e.to_string() }),
-                        )?;
+                        // Lost a race with another reviewer: report, change nothing.
+                        if matches!(&e, Error::Conflict(m) if m.contains("not open") || m.contains("already approved") || m.contains("was revised"))
+                        {
+                            return Err(e);
+                        }
+                        let reason = e.to_string();
+                        self.update_proposal(ctx, id, "schema.proposal.fail", |prop| {
+                            if prop.status != ProposalStatus::Open {
+                                return Ok((None, ()));
+                            }
+                            prop.reviews.push(review.clone());
+                            prop.status = ProposalStatus::Failed;
+                            prop.error = Some(reason.clone());
+                            prop.updated_at = now_ms();
+                            Ok((Some(json!({ "proposal": id, "error": reason })), ()))
+                        })?;
                         Err(e)
                     }
                 }
@@ -408,57 +441,56 @@ impl Ontology {
         }
     }
 
-    /// The proposer (or an approver) withdraws an open proposal.
+    /// The proposer (or an approver) withdraws an open or failed proposal.
     pub fn withdraw_proposal(&self, ctx: &ActionContext, id: &str) -> Result<ProposalView> {
-        let mut prop = self.load_proposal(id)?;
         let p = &ctx.principal;
-        if p.id != prop.proposer.id && !self.options().governance.can_approve(p) {
+        let current = self.load_proposal(id)?;
+        if p.id != current.proposer.id && !self.options().governance.can_approve(p) {
             return Err(self.deny(ctx, "schema.proposal.withdraw", format!("{} cannot withdraw {id}", p.id)));
         }
-        if !matches!(prop.status, ProposalStatus::Open | ProposalStatus::Failed) {
-            return Err(Error::Conflict(format!("proposal {id} is {:?}", prop.status).to_lowercase()));
-        }
-        prop.status = ProposalStatus::Withdrawn;
-        prop.updated_at = now_ms();
-        self.save_proposal(ctx, &prop, "schema.proposal.withdraw", json!({ "proposal": prop.id }))?;
+        let (prop, ()) = self.update_proposal(ctx, id, "schema.proposal.withdraw", |prop| {
+            if !matches!(prop.status, ProposalStatus::Open | ProposalStatus::Failed) {
+                return Err(Error::Conflict(format!("proposal {id} is {:?}", prop.status).to_lowercase()));
+            }
+            prop.status = ProposalStatus::Withdrawn;
+            prop.updated_at = now_ms();
+            Ok((Some(json!({ "proposal": id })), ()))
+        })?;
         self.view(prop, p)
     }
 
     /// Replace the change set of an open or failed proposal; approvals reset.
     pub fn revise_proposal(&self, ctx: &ActionContext, id: &str, input: ProposalInput) -> Result<ProposalView> {
-        let mut prop = self.load_proposal(id)?;
         let p = &ctx.principal;
-        if p.id != prop.proposer.id && !self.options().governance.can_approve(p) {
+        let current = self.load_proposal(id)?;
+        if p.id != current.proposer.id && !self.options().governance.can_approve(p) {
             return Err(self.deny(ctx, "schema.proposal.revise", format!("{} cannot revise {id}", p.id)));
-        }
-        if !matches!(prop.status, ProposalStatus::Open | ProposalStatus::Failed) {
-            return Err(Error::Conflict(format!("proposal {id} is {:?}", prop.status).to_lowercase()));
         }
         let plan = self.schema_plan(p, &input.change_set)?;
         if !plan.valid {
             return Err(Error::Invalid(format!("the revised change does not validate: {}", plan.errors.join("; "))));
         }
-        if !input.title.trim().is_empty() {
-            prop.title = input.title.trim().to_string();
-        }
-        if !input.rationale.is_empty() {
-            prop.rationale = input.rationale;
-        }
-        prop.change_set = input.change_set;
-        prop.base_version = plan.base_version;
-        prop.plan = plan;
-        prop.status = ProposalStatus::Open;
-        prop.error = None;
-        prop.revision += 1;
-        prop.updated_at = now_ms();
-        // Approvals were for the previous change set.
-        prop.reviews.retain(|r| r.decision != Decision::Approve);
-        self.save_proposal(
-            ctx,
-            &prop,
-            "schema.proposal.revise",
-            json!({ "proposal": prop.id, "revision": prop.revision, "by": p.id }),
-        )?;
+        let (prop, ()) = self.update_proposal(ctx, id, "schema.proposal.revise", |prop| {
+            if !matches!(prop.status, ProposalStatus::Open | ProposalStatus::Failed) {
+                return Err(Error::Conflict(format!("proposal {id} is {:?}", prop.status).to_lowercase()));
+            }
+            if !input.title.trim().is_empty() {
+                prop.title = input.title.trim().to_string();
+            }
+            if !input.rationale.is_empty() {
+                prop.rationale = input.rationale.clone();
+            }
+            prop.change_set = input.change_set.clone();
+            prop.base_version = plan.base_version;
+            prop.plan = plan.clone();
+            prop.status = ProposalStatus::Open;
+            prop.error = None;
+            prop.revision += 1;
+            prop.updated_at = now_ms();
+            // Approvals were for the previous change set.
+            prop.reviews.retain(|r| r.decision != Decision::Approve);
+            Ok((Some(json!({ "proposal": id, "revision": prop.revision, "by": p.id })), ()))
+        })?;
         self.view(prop, p)
     }
 }

@@ -19,6 +19,10 @@ pub enum Error {
     Llm(String),
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// The store moved on since the write was staged (another process
+    /// committed); the engine catches up and retries.
+    #[error("stale: {0}")]
+    Stale(String),
     #[error("{0}")]
     Other(String),
 }
@@ -37,6 +41,7 @@ impl Error {
             Error::Config(_) => "config",
             Error::Llm(_) => "llm",
             Error::Unavailable(_) => "unavailable",
+            Error::Stale(_) => "aborted",
             Error::Other(_) => "internal",
         }
     }
