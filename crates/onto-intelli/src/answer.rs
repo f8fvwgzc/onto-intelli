@@ -256,6 +256,9 @@ pub fn try_answer(
             Some(Direct { answer, facts: picked })
         }
         Intent::WhatIf => what_if(onto, p, ws, c, first()?),
+        Intent::DataLocation => data_location(onto, p, ws, question),
+        Intent::JoinPath => join_answer(onto, p, ws, question, &confident),
+        Intent::TrustedMetric => trusted_metric(onto, p, ws, question, &schema),
         Intent::Count | Intent::List => {
             let kind = c.kind.clone()?;
             let scope = confident
@@ -801,4 +804,322 @@ fn what_if(onto: &Ontology, p: &Principal, ws: &str, c: &Classified, x: Entity) 
         format!("If {} were {state}:\n• {}", label(&x), lines.join("\n• "))
     };
     Some(Direct { answer, facts: lines })
+}
+
+// ── the data catalog ─────────────────────────────────────────────────────
+
+const CATALOG_STOP: &[&str] = &[
+    "which",
+    "what",
+    "where",
+    "is",
+    "are",
+    "the",
+    "a",
+    "an",
+    "our",
+    "we",
+    "do",
+    "does",
+    "did",
+    "table",
+    "tables",
+    "view",
+    "views",
+    "dataset",
+    "datasets",
+    "column",
+    "columns",
+    "database",
+    "holds",
+    "hold",
+    "has",
+    "have",
+    "contains",
+    "contain",
+    "stores",
+    "store",
+    "stored",
+    "keep",
+    "keeps",
+    "kept",
+    "find",
+    "can",
+    "i",
+    "data",
+    "about",
+    "for",
+    "on",
+    "in",
+    "of",
+    "located",
+    "lives",
+    "live",
+    "recorded",
+    "to",
+    "how",
+    "join",
+    "joins",
+    "joined",
+    "joining",
+    "with",
+    "and",
+    "metric",
+    "metrics",
+    "kpi",
+    "trusted",
+    "certified",
+    "official",
+    "canonical",
+    "right",
+    "correct",
+    "one",
+    "source",
+    "truth",
+    "should",
+    "use",
+    "measure",
+    "it",
+    "be",
+    "you",
+    "me",
+    "us",
+    "there",
+    "any",
+    "get",
+    "from",
+];
+
+fn catalog_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .map(|w| w.trim_matches('.').to_string())
+        .filter(|w| !w.is_empty() && !CATALOG_STOP.contains(&w.as_str()))
+        .collect()
+}
+
+/// The two things a join question names: "How do orders join to customers?"
+fn join_sides(question: &str) -> Option<(String, String)> {
+    let q = question.to_lowercase();
+    let at =
+        ["joins", "joined", "joining", "join"].iter().find_map(|v| q.find(&format!(" {v} ")).map(|i| (i, v.len())))?;
+    let (before, after) = (&q[..at.0], &q[at.0 + at.1 + 1..]);
+    let a = catalog_words(before).pop()?;
+    let b = catalog_words(after).into_iter().next()?;
+    Some((a, b))
+}
+
+fn asset_name(e: &Entity) -> String {
+    e.prop_str("name").map(str::to_string).unwrap_or_else(|| e.title.clone())
+}
+
+/// A table or view called `term` ("orders", "order", "sales.orders"), else the best `find_data` hit.
+fn find_table(onto: &Ontology, p: &Principal, ws: &str, term: &str, ents: &[&Resolved]) -> Option<Entity> {
+    let term = term.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.').to_lowercase();
+    let singular = term.strip_suffix('s').unwrap_or(&term).to_string();
+    let matches = |e: &Entity| {
+        let n = asset_name(e).to_lowercase();
+        let full = e.prop_str("schema_name").map(|s| format!("{s}.{n}")).unwrap_or_default();
+        n == term || n == singular || format!("{n}s") == term || full == term
+    };
+    for r in ents {
+        if let Ok(e) = onto.get(p, &r.id)
+            && matches!(e.kind.as_str(), "table" | "view")
+            && matches(&e)
+        {
+            return Some(e);
+        }
+    }
+    let scores = onto.authority_scores();
+    let mut found: Vec<Entity> = ["table", "view"]
+        .iter()
+        .flat_map(|k| {
+            onto.find(
+                p,
+                &FindSpec {
+                    kind: Some(k.to_string()),
+                    workspace: Some(ws.to_string()),
+                    limit: 5_000,
+                    ..Default::default()
+                },
+            )
+            .map(|(v, _)| v)
+            .unwrap_or_default()
+        })
+        .filter(|e| matches(e))
+        .collect();
+    found.sort_by(|a, b| {
+        let (x, y) = (scores.get(&a.id).copied().unwrap_or(0.0), scores.get(&b.id).copied().unwrap_or(0.0));
+        y.total_cmp(&x).then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(e) = found.into_iter().next() {
+        return Some(e);
+    }
+    let best = onto.find_data(p, &term, Some(ws), 1).ok()?.into_iter().next()?;
+    onto.get(p, &best.id).ok()
+}
+
+/// "customers.id = orders.customer_id" read from `from`'s side.
+fn orient(on: &str, from: &str) -> String {
+    on.split(" AND ")
+        .map(|c| match c.split_once(" = ") {
+            Some((l, r)) if !l.starts_with(&format!("{from}.")) && r.starts_with(&format!("{from}.")) => {
+                format!("{r} = {l}")
+            }
+            _ => c.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn data_location(onto: &Ontology, p: &Principal, ws: &str, question: &str) -> Option<Direct> {
+    let term = catalog_words(question).join(" ");
+    if term.is_empty() {
+        return None;
+    }
+    let found = onto.find_data(p, &term, Some(ws), 4).ok()?;
+    let best = found.first()?;
+    let auth = best.authority.map(|a| format!(", authority {a:.2}")).unwrap_or_default();
+    let mut answer =
+        format!("{} ({} {}{auth}) holds {term}: {}.", best.title, best.kind, best.id, best.reasons.join("; "));
+    if found.len() > 1 {
+        let others: Vec<String> = found[1..]
+            .iter()
+            .map(|l| match l.authority {
+                Some(a) => format!("{} ({}, authority {a:.2})", l.title, l.id),
+                None => format!("{} ({})", l.title, l.id),
+            })
+            .collect();
+        answer.push_str(&format!(" Also: {}.", join(&others)));
+    }
+    let facts = found.iter().map(|l| format!("{} holds {term}: {}", l.id, l.reasons.join("; "))).collect();
+    Some(Direct { answer, facts })
+}
+
+fn join_answer(onto: &Ontology, p: &Principal, ws: &str, question: &str, ents: &[&Resolved]) -> Option<Direct> {
+    let (a, b) = join_sides(question)?;
+    let ta = find_table(onto, p, ws, &a, ents)?;
+    let tb = find_table(onto, p, ws, &b, ents)?;
+    let Some(path) = onto.join_path(p, &ta.id, &tb.id).ok()? else {
+        return Some(Direct {
+            answer: format!(
+                "I found no join between {} ({}) and {} ({}): no foreign key or query in the catalog connects them within four steps.",
+                asset_name(&ta),
+                ta.id,
+                asset_name(&tb),
+                tb.id
+            ),
+            facts: vec![],
+        });
+    };
+    let name = |id: &str| onto.get(p, id).map(|e| asset_name(&e)).unwrap_or_else(|_| id.to_string());
+    let hops: Vec<String> = path.hops.iter().map(|(from, _, on)| orient(on, &name(from))).collect();
+    let mut why: Vec<String> = Vec::new();
+    for f in &path.facts {
+        let evidence = onto
+            .get(p, &f.id)
+            .ok()
+            .and_then(|e| e.props.get("evidence").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default();
+        let constraints = evidence.iter().filter_map(|v| v.as_str()).filter(|s| s.starts_with("constraint ")).count();
+        let queries = evidence.iter().filter_map(|v| v.as_str()).filter(|s| s.starts_with("query:")).count();
+        let mut parts = Vec::new();
+        if constraints > 0 {
+            parts.push(if constraints == 1 {
+                "a foreign key".to_string()
+            } else {
+                format!("{constraints} foreign keys")
+            });
+        }
+        if queries > 0 {
+            parts.push(if queries == 1 { "1 query".to_string() } else { format!("{queries} queries") });
+        }
+        let state = if f.state == "certified" {
+            format!("certified{}", f.certified_by.as_ref().map(|b| format!(" by {b}")).unwrap_or_default())
+        } else {
+            format!("confidence {:.2}", f.confidence)
+        };
+        why.push(format!(
+            "{state}{}",
+            if parts.is_empty() { String::new() } else { format!(", from {}", parts.join(" and ")) }
+        ));
+    }
+    let answer = if hops.len() == 1 {
+        format!(
+            "{} joins {} on {} ({}{}).",
+            asset_name(&ta),
+            asset_name(&tb),
+            hops[0],
+            path.via,
+            why.first().map(|w| format!(", {w}")).unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{} joins {} in {} steps: {} ({}).",
+            asset_name(&ta),
+            asset_name(&tb),
+            hops.len(),
+            hops.join(", then "),
+            path.via
+        )
+    };
+    let mut facts: Vec<String> = path.hops.iter().map(|(f, t, on)| format!("{f} joins {t} on {on}")).collect();
+    facts.extend(path.facts.iter().zip(&why).map(|(f, w)| format!("{} ({w})", f.statement)));
+    Some(Direct { answer, facts })
+}
+
+fn trusted_metric(onto: &Ontology, p: &Principal, ws: &str, question: &str, schema: &Schema) -> Option<Direct> {
+    let term = catalog_words(question).join(" ");
+    let found = onto.trusted_metrics(p, &term, Some(ws)).ok()?;
+    let label = if term.is_empty() { String::new() } else { format!("{term} ") };
+    let on = |ids: &[String]| -> String {
+        let names: Vec<String> =
+            ids.iter().filter_map(|id| onto.get(p, id).ok()).map(|e| format!("{} ({})", e.title, e.id)).collect();
+        join(&names)
+    };
+    if let Some(m) = found.iter().find(|m| m.state == "certified") {
+        let by = m.certified_by.as_ref().map(|b| format!(" by {b}")).unwrap_or_default();
+        let mut answer = format!(
+            "The trusted {label}metric is {} = {} ({}), certified{by}. It is defined over {}.",
+            m.name,
+            m.expression,
+            m.id,
+            on(&m.concerns)
+        );
+        let others: Vec<String> = found
+            .iter()
+            .filter(|o| o.id != m.id)
+            .take(3)
+            .map(|o| format!("{} = {} ({}, confidence {:.2})", o.name, o.expression, o.state, o.confidence))
+            .collect();
+        if !others.is_empty() {
+            answer.push_str(&format!(" Not certified: {}.", join(&others)));
+        }
+        let facts = found.iter().map(|f| format!("{} [{}] {}", f.id, f.state, f.statement)).collect();
+        return Some(Direct { answer, facts });
+    }
+    let governed = schema.metrics.values().find(|g| {
+        g.certified && (term.is_empty() || g.name.contains(&term) || g.description.to_lowercase().contains(&term))
+    });
+    if let Some(g) = governed {
+        return Some(Direct {
+            answer: format!("The governed metric {} is certified: {}", g.name, g.description),
+            facts: vec![format!("metric {} certified", g.name)],
+        });
+    }
+    let m = found.first()?;
+    Some(Direct {
+        answer: format!(
+            "No {label}metric is certified yet. The strongest candidate is {} = {} ({}, confidence {:.2}{}), over {}. \
+             A person can certify it: onto learned --certify {}",
+            m.name,
+            m.expression,
+            m.id,
+            m.confidence,
+            m.authority.map(|a| format!(", authority {a:.2}")).unwrap_or_default(),
+            on(&m.concerns),
+            m.id
+        ),
+        facts: found.iter().map(|f| format!("{} [{}] {}", f.id, f.state, f.statement)).collect(),
+    })
 }

@@ -111,8 +111,38 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
 | **Graph profile** grounds prompts in patterns that exist; **drift suggestions** for data the schema doesn't cover | `onto schema profile` · `onto schema suggest` |
 | **MCP server** for agents (same permissions, writes only via action types) | `onto mcp` |
-| **Evaluation** with competency questions and evidence | `onto eval` (15/15 on the demo, 80% without the LLM) |
+| **Evaluation** with competency questions and evidence | `onto eval` (19/19 on the demo, 84% without the LLM) |
 | **Export** — Turtle (OWL + PROV-O provenance) and Mermaid | `onto export --format mermaid --start project:alpha` |
+
+## A data catalog that knows what to trust
+
+Connect a database and onto-intelli maps the data estate, metadata only and
+never rows, the way Databricks Genie's knowledge layer does
+([docs/CATALOG.md](docs/CATALOG.md)):
+
+- **Connectors** crawl schemas, tables, views, columns, comments, foreign
+  keys, grants and query usage (`pg_stat_statements`) in the background,
+  incrementally, through the audited write path with provenance.
+- **OntoRank** scores every asset for authority: PageRank over who reads
+  what, usage, freshness, ownership, documentation and certification. Each
+  component is stored, so `onto rank <id>` explains the score. Search and
+  context packing put authoritative assets first.
+- **A learned layer** infers join paths, metric definitions and synonyms
+  from constraints, the query log and names, each with a confidence and its
+  evidence. People certify or reject them; the learner never overrides them.
+- **Questions answered from the graph:** "Which table holds revenue?", "How
+  do orders join to customers?", "Which revenue metric is the trusted one?"
+  are deterministic: 0 tokens, with evidence.
+
+What Genie does not offer:
+
+| | |
+|---|---|
+| **Runs anywhere** | One binary + PostgreSQL, next to any database, cloud or laptop; no Databricks workspace, Unity Catalog or warehouse to buy into. |
+| **Governed actions with undo** | Changes go through typed, role-checked action types with preconditions, risk levels and an inverse plan; every apply leaves an audit event and an undo receipt. Certifying a fact is one of them. |
+| **Evidence paths and scores** | Every answer returns the facts and graph paths it used; every authority score keeps its components and their inputs. |
+| **Time travel and what-if** | Every write is versioned: history, as-of reads, a history slider on the map, and what-if scenarios on an isolated fork. |
+| **Zero-token graph answers** | Ownership, blockers, impact, counts, joins, data locations and trusted metrics come from the graph without calling a model; the LLM only gets ranked, permission-filtered facts when reasoning is needed. |
 
 ### Use from an MCP client (Claude Code, IDEs)
 
@@ -120,10 +150,11 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 { "mcpServers": { "onto-intelli": { "command": "onto", "args": ["--config", "/path/to/onto-intelli.toml", "mcp"] } } }
 ```
 
-Tools: `ask`, `search`, `get_entity`, `neighbors`, `find_entities`, `explain_blockers`,
-`impact`, `dependencies`, `critical_path`, `metric`, `history`, `changes`, `experts`,
-`data_quality`, `what_if`, `list_actions`, `plan_action` (+ `apply_action`, `undo_action`
-when `[mcp] allow_writes = true`).
+Tools: `ask`, `search`, `get_entity`, `neighbors`, `find_data`, `join_path`, `trusted_metric`,
+`authority`, `learned_facts`, `find_entities`, `explain_blockers`, `impact`, `dependencies`,
+`critical_path`, `metric`, `history`, `changes`, `experts`, `data_quality`, `what_if`,
+`list_actions`, `plan_action` (+ `apply_action`, `undo_action`, `crawl` when
+`[mcp] allow_writes = true`).
 
 ## Install
 
@@ -154,6 +185,8 @@ onto ask "Why is Project Alpha blocked?" --context      # show the facts sent to
 onto show issue:421             # entity card, neighbours, derived relations
 onto deps project:alpha --cause # root-cause chains
 onto deps project:alpha --plan  # execution order + critical path
+onto ask "Which table holds revenue?"  # the demo warehouse catalog; see docs/CATALOG.md
+onto rank table:warehouse.sales.orders # OntoRank and why
 onto chat                       # multi-turn, remembers what "it" refers to
 export ONTO_TOKEN=$(openssl rand -hex 24)
 onto serve                      # gRPC + HTTP on 127.0.0.1:50051 (token auth)
@@ -315,7 +348,8 @@ C: [`examples/ffi/demo.c`](examples/ffi/demo.c).
 ## Configuration
 
 `onto init` writes an annotated [`onto-intelli.toml`](crates/onto-intelli/templates/onto-intelli.toml).
-Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers, `[llm]`, `[context]`
+Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers, `[connectors]`
+background crawls, `[llm]`, `[context]`
 token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic intents,
 `[grpc]` listener and routes, `[auth]`. Lookup order: `--config`, `$ONTO_CONFIG`,
 `./onto-intelli.toml`, `~/.config/onto-intelli/config.toml`.
@@ -341,6 +375,7 @@ crates/onto-ffi       C ABI (cdylib + staticlib) and header
 examples/             FFI demos, JSONL ingest sample, schema extension
 packaging/            install script, Homebrew formula; Dockerfile and CI at the root
 docs/ARCHITECTURE.md  design notes
+docs/CATALOG.md       connectors, OntoRank, learned facts
 docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
 ```
 

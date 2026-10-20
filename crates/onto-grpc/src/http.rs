@@ -34,7 +34,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 
@@ -73,6 +73,18 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/auth/whoami", get(whoami))
         .route("/v1/execution/graphs", get(exec_graphs).post(exec_init))
         .route("/v1/execution/graphs/{graph}/vocabulary", get(exec_vocab).put(exec_set_vocab))
+        .route("/v1/catalog/connectors", get(connectors_list).post(connector_add))
+        .route("/v1/catalog/connectors/{name}", delete(connector_remove))
+        .route("/v1/catalog/connectors/{name}/crawl", post(connector_crawl))
+        .route("/v1/catalog/crawl", post(crawl_all))
+        .route("/v1/catalog/find", get(catalog_find))
+        .route("/v1/catalog/join", get(catalog_join))
+        .route("/v1/catalog/metric", get(catalog_metric))
+        .route("/v1/catalog/rank/{id}", get(catalog_rank))
+        .route("/v1/catalog/top", get(catalog_top))
+        .route("/v1/catalog/rerank", post(catalog_rerank))
+        .route("/v1/catalog/facts", get(facts_list))
+        .route("/v1/catalog/facts/{id}/{verb}", post(fact_verb))
         .with_state(AppState { hub, auth })
 }
 
@@ -393,4 +405,113 @@ async fn ask_stream(State(s): State<AppState>, headers: HeaderMap, Json(body): J
             Ok(SseEvent::default().event(ev.kind.clone()).data(serde_json::to_string(&ev).unwrap_or_default()))
         }));
     Sse::new(events).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ── data catalog ─────────────────────────────────────────────────────────
+
+async fn connectors_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "connector.list", json!({})).await
+}
+
+async fn connector_add(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "connector.add", body_or_empty(body)).await
+}
+
+async fn connector_remove(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let purge = q.get("purge").is_some_and(|v| v == "true" || v == "1");
+    run(&s, &headers, "connector.remove", json!({ "name": name, "purge": purge })).await
+}
+
+async fn connector_crawl(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "connector.crawl", json!({ "name": name })).await
+}
+
+async fn crawl_all(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "connector.crawl", json!({})).await
+}
+
+/// Query strings stay strings here (a term like "2024" is text).
+fn text_query(q: HashMap<String, String>) -> Value {
+    Value::Object(
+        q.into_iter()
+            .map(|(k, v)| match (k.as_str(), v.parse::<i64>()) {
+                ("limit", Ok(n)) => (k, Value::from(n)),
+                ("kinds", _) => (k, Value::from(v.split(',').map(str::to_string).collect::<Vec<_>>())),
+                _ => (k, Value::String(v)),
+            })
+            .collect(),
+    )
+}
+
+async fn catalog_find(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "catalog.find", text_query(q)).await
+}
+
+async fn catalog_join(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "catalog.join", text_query(q)).await
+}
+
+async fn catalog_metric(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "catalog.metric", text_query(q)).await
+}
+
+async fn catalog_rank(State(s): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "catalog.rank", json!({ "id": id })).await
+}
+
+async fn catalog_top(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "catalog.top", text_query(q)).await
+}
+
+async fn catalog_rerank(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "catalog.rerank", body_or_empty(body)).await
+}
+
+async fn facts_list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "learned.list", text_query(q)).await
+}
+
+async fn fact_verb(
+    State(s): State<AppState>,
+    Path((id, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "certify" => "learned.certify",
+        "reject" => "learned.reject",
+        other => {
+            return error_response(&Error::not_found(format!("fact verb '{other}' (certify, reject)")));
+        }
+    };
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("id".into(), Value::String(id));
+    }
+    run(&s, &headers, action, input).await
 }

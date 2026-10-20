@@ -138,6 +138,10 @@ pub struct SchemaSuggestion {
     pub kinds: Vec<String>,
     pub relations: Vec<String>,
     pub properties: Vec<String>,
+    /// Learned facts (join paths, metrics, synonyms) waiting for a person
+    /// to certify or reject them, most confident first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned: Vec<String>,
 }
 
 fn toml_type(types: &BTreeSet<String>) -> &'static str {
@@ -223,6 +227,22 @@ impl crate::Ontology {
     /// Schema additions proposed from data the schema does not describe yet.
     pub fn suggest_schema(&self, p: &crate::Principal, workspace: Option<&str>) -> crate::Result<SchemaSuggestion> {
         let prof = self.profile(p, workspace)?;
-        Ok(suggest(&self.schema(), &prof))
+        let mut s = suggest(&self.schema(), &prof);
+        let mut facts = self.learned_facts(p, None, Some("suggested"), None, 200)?;
+        facts.retain(|f| {
+            workspace.is_none() || self.get(p, &f.id).is_ok_and(|e| Some(e.workspace.as_str()) == workspace)
+        });
+        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
+        s.learned = facts
+            .iter()
+            .take(25)
+            .map(|f| {
+                format!(
+                    "{} {} (confidence {:.2}): onto learned --certify {}",
+                    f.fact_type, f.statement, f.confidence, f.id
+                )
+            })
+            .collect();
+        Ok(s)
     }
 }

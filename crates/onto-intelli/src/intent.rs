@@ -37,6 +37,12 @@ pub enum Intent {
     Quality,
     /// "What if task 31 were done?"
     WhatIf,
+    /// "Which table holds revenue?"
+    DataLocation,
+    /// "How do orders join to customers?"
+    JoinPath,
+    /// "Which revenue metric is the trusted one?"
+    TrustedMetric,
 }
 
 impl Intent {
@@ -63,6 +69,9 @@ impl Intent {
             Intent::Changes => "changes",
             Intent::Quality => "quality",
             Intent::WhatIf => "what_if",
+            Intent::DataLocation => "data_location",
+            Intent::JoinPath => "join_path",
+            Intent::TrustedMetric => "trusted_metric",
         }
     }
 }
@@ -264,6 +273,46 @@ pub fn classify(question: &str, schema: &Schema) -> Classified {
         Intent::Command
     } else if whatif {
         Intent::WhatIf
+    } else if has_any(&q, &[" join ", " joins ", " joined ", " joining "])
+        && has_any(&q, &[" to ", " with ", " and ", " on "])
+        && !has_any(&q, &[" team ", " project ", " meeting ", " channel ", " company ", " call "])
+    {
+        Intent::JoinPath
+    } else if has_any(&q, &[" metric", " kpi", " measure "])
+        && has_any(
+            &q,
+            &[
+                " trusted",
+                " certified",
+                " official",
+                " canonical",
+                " right one",
+                " source of truth",
+                " correct one",
+                " should i use",
+                " should we use",
+            ],
+        )
+    {
+        Intent::TrustedMetric
+    } else if has_any(
+        &q,
+        &[
+            " which table",
+            " what table",
+            " which view",
+            " which dataset",
+            " what dataset",
+            " which column",
+            " where is the data",
+            " where do we store",
+            " where do we keep",
+            " which database",
+        ],
+    ) || (has_any(&q, &[" where is ", " where are ", " where can i find "])
+        && has_any(&q, &[" stored", " kept", " data ", " table", " dataset", " recorded"]))
+    {
+        Intent::DataLocation
     } else if has_any(
         &q,
         &[
@@ -515,5 +564,17 @@ mod tests {
         assert_eq!(wi.intent, Intent::WhatIf);
         assert_eq!(wi.whatif_state.as_deref(), Some("done"));
         assert_eq!(time_window(" last 3 weeks "), Some(21));
+    }
+
+    #[test]
+    fn classifies_catalog_questions() {
+        assert_eq!(c("Which table holds revenue?").intent, Intent::DataLocation);
+        assert_eq!(c("Where is customer churn stored?").intent, Intent::DataLocation);
+        assert_eq!(c("How do orders join to customers?").intent, Intent::JoinPath);
+        assert_eq!(c("How can I join order_items with customers").intent, Intent::JoinPath);
+        assert_eq!(c("Which revenue metric is the trusted one?").intent, Intent::TrustedMetric);
+        assert_ne!(c("When did Aiko join the team?").intent, Intent::JoinPath);
+        assert_ne!(c("Where is Kenji?").intent, Intent::DataLocation);
+        assert_eq!(c("What is the deployment failure rate?").intent, Intent::Metric);
     }
 }

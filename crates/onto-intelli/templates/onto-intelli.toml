@@ -20,7 +20,7 @@ ingest_queue = 1024           # async ingestion backpressure
 
 [ontology]
 schema = "builtin:enterprise" # or a path to your own schema TOML
-extend = []                   # extra schema layers, e.g. ["schema/custom.toml"]
+extend = ["builtin:data-catalog"] # layers: data sources, tables, columns, queries, learned facts; add e.g. "schema/custom.toml"
 strict = false                # true: reject unknown kinds/relations/properties
 schema_mode = "live"          # live: stored versions win, file edits import as new versions | config: files win
 
@@ -30,6 +30,13 @@ apply_roles = ["admin"]       # apply change sets directly
 approve_roles = ["admin"]     # approve/reject proposals (agents never can)
 required_approvals = 1
 allow_self_approval = false
+
+# Connectors crawl data sources' metadata (never rows) into the catalog:
+#   onto connect postgres env:WAREHOUSE_URL --name warehouse --every 15m
+# They are stored in the database; this only controls the background crawler.
+[connectors]
+background = true             # crawl due connectors while onto runs
+tick_secs = 30
 
 [llm]
 # mock: offline and deterministic (default, no key needed)
@@ -73,7 +80,8 @@ consolidate_every = 25
 # Intents answered straight from the graph (zero LLM tokens) when entities resolve.
 deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",
                          "blockers", "dependencies", "impact", "relation", "workload", "history",
-                         "expert", "metric", "changes", "quality", "what_if"]
+                         "expert", "metric", "changes", "quality", "what_if",
+                         "data_location", "join_path", "trusted_metric"]
 min_confidence = 0.8
 
 [grpc]

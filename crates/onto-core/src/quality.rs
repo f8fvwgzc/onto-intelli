@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::graph::Graph;
 use crate::model::{Entity, Id};
-use crate::schema::Schema;
+use crate::schema::{Dir, Schema};
 use crate::similarity::duplicates;
 use crate::time::now_ms;
 
@@ -188,6 +188,27 @@ pub fn report(
                     push(e, "dangling_provenance", Severity::Warning, format!("{} references missing {src}", e.id));
                 }
             }
+        }
+        // The data catalog: what a reader would need to trust an asset.
+        if matches!(e.kind.as_str(), "table" | "view") {
+            if e.prop_str("description").is_none_or(|d| d.trim().is_empty()) {
+                let what = if e.kind == "view" { "VIEW" } else { "TABLE" };
+                push(e, "undocumented", Severity::Info, format!("{} has no description (COMMENT ON {what})", e.id));
+            }
+            if g.neighbors(&e.id, "owns", Dir::In).is_empty() {
+                push(e, "unowned", Severity::Info, format!("{} has no owner (link a team with owns)", e.id));
+            }
+        }
+        if e.kind == "learned_fact"
+            && e.state.as_deref() == Some("suggested")
+            && e.props.get("confidence").and_then(Value::as_f64).unwrap_or(0.0) >= 0.8
+        {
+            push(
+                e,
+                "awaiting_review",
+                Severity::Info,
+                format!("{} awaits review: {}", e.id, e.prop_str("statement").unwrap_or(&e.title)),
+            );
         }
         if let Some(c) = low_confidence(&e.props) {
             push(e, "low_confidence", Severity::Info, format!("{} has unverified confidence {c:.2}", e.id));

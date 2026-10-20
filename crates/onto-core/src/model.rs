@@ -61,8 +61,12 @@ pub struct Provenance {
     pub run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
+    /// When it was produced (for connectors: when the source was crawled).
     #[serde(default)]
     pub at: i64,
+    /// The connector that crawled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
 }
 
 /// Create-or-update request for an entity.

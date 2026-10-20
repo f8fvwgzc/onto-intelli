@@ -16,6 +16,8 @@
 //! ingestion wrap [`Ontology::apply`] in a queue (see the `onto-intelli` crate).
 
 pub mod action_types;
+pub mod authority;
+pub mod catalog;
 pub mod deps;
 pub mod engine;
 pub mod error;
@@ -23,6 +25,7 @@ pub mod execution;
 pub mod experts;
 pub mod export;
 pub mod graph;
+pub mod learn;
 pub mod live_schema;
 pub mod map;
 pub mod metrics;

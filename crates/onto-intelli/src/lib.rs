@@ -27,6 +27,7 @@ pub mod blocking;
 pub mod cache;
 pub mod command;
 pub mod config;
+pub mod connectors;
 pub mod context;
 pub mod conversation;
 pub mod eval;

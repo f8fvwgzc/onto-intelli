@@ -34,6 +34,8 @@ pub struct Config {
     pub ui: UiConfig,
     /// Who may change, propose and approve schema changes.
     pub governance: Governance,
+    /// Background crawls of registered connectors.
+    pub connectors: ConnectorsConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -136,7 +138,12 @@ pub struct OntologyConfig {
 
 impl Default for OntologyConfig {
     fn default() -> Self {
-        Self { schema: "builtin:enterprise".into(), extend: Vec::new(), strict: false, schema_mode: SchemaMode::Live }
+        Self {
+            schema: "builtin:enterprise".into(),
+            extend: vec!["builtin:data-catalog".into()],
+            strict: false,
+            schema_mode: SchemaMode::Live,
+        }
     }
 }
 
@@ -276,6 +283,9 @@ impl Default for ReasoningConfig {
                 "changes",
                 "quality",
                 "what_if",
+                "data_location",
+                "join_path",
+                "trusted_metric",
             ]
             .map(String::from)
             .to_vec(),
@@ -333,6 +343,23 @@ pub struct RouteConfig {
     /// Workspace override for this route.
     #[serde(default)]
     pub workspace: Option<String>,
+}
+
+/// `[connectors]`: connectors themselves are registered at runtime
+/// (`onto connect`, `connector.add`) and stored in the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectorsConfig {
+    /// Crawl due connectors in the background while the ontology is open.
+    pub background: bool,
+    /// How often to look for due connectors.
+    pub tick_secs: u64,
+}
+
+impl Default for ConnectorsConfig {
+    fn default() -> Self {
+        Self { background: true, tick_secs: 30 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

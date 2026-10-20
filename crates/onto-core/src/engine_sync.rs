@@ -178,6 +178,9 @@ impl Ontology {
                 }
             }
         }
+        if kv.iter().any(|(ns, _)| ns == crate::authority::NS_META) {
+            self.reload_authority()?;
+        }
         let redirect_keys: Vec<&String> = kv.iter().filter(|(ns, _)| ns == "redirect").map(|(_, k)| k).collect();
         if !redirect_keys.is_empty() {
             let mut r = self.inner.redirects.write();
@@ -250,6 +253,7 @@ impl Ontology {
             .filter_map(|(k, v)| v.as_str().map(|t| (k, t.to_string())))
             .collect();
         self.inner.seq.store(snap.seq, Ordering::SeqCst);
+        self.reload_authority()?;
         Ok(())
     }
 }

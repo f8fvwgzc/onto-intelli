@@ -201,6 +201,84 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Register a data source and crawl it: metadata only, never rows.
+    Connect {
+        /// Kind of source: postgres.
+        kind: String,
+        /// postgres://user:pass@host/db, or env:VAR to read it at crawl time (keeps the secret out of the store).
+        url: String,
+        /// Connector name, part of entity ids (default: the database name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Schemas to crawl, `*` wildcards (repeatable; default: all).
+        #[arg(long = "schema")]
+        schemas: Vec<String>,
+        /// Schemas to skip (repeatable; default: onto_*).
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Background crawl interval: 15m, 1h, 900s, or 0 for on demand only.
+        #[arg(long, default_value = "15m")]
+        every: String,
+        /// Turn table grants into entity ACLs (see --grant).
+        #[arg(long)]
+        map_grants: bool,
+        /// role=principal: whom a database role's grants map to (repeatable), e.g. analyst=team:analytics.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+        /// role=owner: who owns what a database role owns (repeatable), e.g. finance_owner=team:finance.
+        #[arg(long = "owner")]
+        owners: Vec<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Register only; crawl later (`onto crawl`).
+        #[arg(long)]
+        no_crawl: bool,
+    },
+    /// List connectors, or remove one.
+    Connectors {
+        #[arg(long)]
+        remove: Option<String>,
+        /// With --remove: also delete what it crawled.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Crawl a connector now (every connector without a name).
+    Crawl {
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// OntoRank: an entity's authority and what it is made of, or the top assets.
+    Rank {
+        id: Option<String>,
+        /// How many of the top assets to list.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        /// Kinds to list (repeatable).
+        #[arg(long)]
+        kind: Vec<String>,
+        /// Recompute first.
+        #[arg(long)]
+        recompute: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Learned facts (join paths, metric definitions, synonyms); certify or reject one.
+    Learned {
+        #[arg(long = "type")]
+        fact_type: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        certify: Option<String>,
+        #[arg(long)]
+        reject: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// Infer again from the catalog.
+        #[arg(long)]
+        relearn: bool,
+    },
     /// Compile configured proto files and print the gRPC route table.
     Protos,
     /// Graph, memory, cache and token statistics.
@@ -465,6 +543,57 @@ impl Style {
     }
 }
 
+/// A connector name from a URL's database ("postgres://…/analytics" → analytics).
+fn connector_name(url: &str) -> String {
+    let db = url
+        .rsplit_once('/')
+        .map(|(_, d)| d.split('?').next().unwrap_or_default())
+        .filter(|_| url.contains("://"))
+        .unwrap_or_default();
+    let name: String = db
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .take(40)
+        .collect();
+    if name.is_empty() { "warehouse".into() } else { name }
+}
+
+/// "15m" → 900, "1h" → 3600, "90s"/"90" → 90, "0" → 0.
+fn parse_every(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = n.parse().map_err(|_| Error::invalid(format!("--every '{s}': use 15m, 1h, 900s or 0")))?;
+    Ok(match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return Err(Error::invalid(format!("--every '{s}': use 15m, 1h, 900s or 0"))),
+    })
+}
+
+fn print_crawl(st: &Style, c: &Value) {
+    println!(
+        "Crawled {} in {} ms: {} schemas, {} tables, {} views, {} columns, {} queries · {} written, {} unchanged, {} removed · learned {} · ranked {}",
+        st.bold(c["connector"].as_str().unwrap_or_default()),
+        c["ms"],
+        c["schemas"],
+        c["tables"],
+        c["views"],
+        c["columns"],
+        c["queries"],
+        c["upserted"],
+        c["unchanged"],
+        c["deleted"],
+        c["learned"]["written"],
+        c["ranked"]
+    );
+    for n in c["notes"].as_array().cloned().unwrap_or_default() {
+        println!("  {} {}", st.dim("note:"), n.as_str().unwrap_or_default());
+    }
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
@@ -722,7 +851,17 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 report.events,
                 report.memories
             );
+            if let Some(w) = &report.warehouse {
+                println!(
+                    "Catalogued the demo warehouse · {} tables · {} views · {} columns · {} queries · {} learned facts",
+                    w.tables, w.views, w.columns, w.queries, w.learned.written
+                );
+            }
             println!("{}", st.dim("Try: onto ask \"Why is Project Alpha blocked?\" --context"));
+            println!(
+                "{}",
+                st.dim("     onto ask \"Which table holds revenue?\" · onto rank table:warehouse.sales.orders")
+            );
             Ok(())
         }
         Command::Ingest { file, background, source } => {
@@ -856,6 +995,13 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 SchemaCmd::Suggest => {
                     let r = be.call("schema.suggest", json!({ "workspace": cli.workspace })).await?;
                     print!("{}", r["toml"].as_str().unwrap_or_default());
+                    let learned = r["learned"].as_array().cloned().unwrap_or_default();
+                    if !learned.is_empty() {
+                        println!("\n# Learned from the catalog, waiting for review ({}):", learned.len());
+                        for l in learned {
+                            println!("#   {}", l.as_str().unwrap_or_default());
+                        }
+                    }
                 }
                 SchemaCmd::Status => print_json(&be.call("schema.status", json!({})).await?),
                 SchemaCmd::Plan { file } => {
@@ -1212,6 +1358,204 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             let r =
                 be.call("intelli.ask", json!({ "question": q, "workspace": cli.workspace, "no_cache": true })).await?;
             print_answer(st, &r, false);
+            Ok(())
+        }
+        Command::Connect { kind, url, name, schemas, exclude, every, map_grants, grants, owners, title, no_crawl } => {
+            let be = backend(&cli).await?;
+            let name = name.clone().unwrap_or_else(|| connector_name(url));
+            let pairs = |list: &[String], what: &str| -> Result<serde_json::Map<String, Value>> {
+                list.iter()
+                    .map(|kv| {
+                        kv.split_once('=')
+                            .map(|(k, v)| (k.to_string(), json!(v)))
+                            .ok_or_else(|| Error::invalid(format!("--{what} takes role=entity, got '{kv}'")))
+                    })
+                    .collect()
+            };
+            let mut spec = json!({
+                "name": name,
+                "kind": kind,
+                "url": url,
+                "workspace": cli.workspace,
+                "every_secs": parse_every(every)?,
+                "map_grants": *map_grants,
+                "grant_map": pairs(grants, "grant")?,
+                "owner_map": pairs(owners, "owner")?,
+                "title": title.clone().unwrap_or_default(),
+            });
+            if !schemas.is_empty() {
+                spec["schemas"] = json!(schemas);
+            }
+            if !exclude.is_empty() {
+                spec["exclude_schemas"] = json!(exclude);
+            }
+            let saved = be.call("connector.add", spec).await?;
+            println!(
+                "Connected {} ({} {}), {}",
+                st.bold(saved["name"].as_str().unwrap_or_default()),
+                saved["kind"].as_str().unwrap_or_default(),
+                saved["url"].as_str().unwrap_or_default(),
+                if saved["every_secs"] == 0 {
+                    "crawled on demand only".to_string()
+                } else {
+                    format!("crawled every {every}")
+                }
+            );
+            if !no_crawl {
+                let r = be.call("connector.crawl", json!({ "name": name })).await?;
+                for c in r["crawls"].as_array().cloned().unwrap_or_default() {
+                    print_crawl(st, &c);
+                }
+            }
+            Ok(())
+        }
+        Command::Connectors { remove, purge } => {
+            let be = backend(&cli).await?;
+            if let Some(name) = remove {
+                let r = be.call("connector.remove", json!({ "name": name, "purge": purge })).await?;
+                println!("Removed {name} ({} crawled entities deleted)", r["deleted"]);
+                return Ok(());
+            }
+            let r = be.call("connector.list", json!({})).await?;
+            let list = r["connectors"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("No connectors. Add one: onto connect postgres env:WAREHOUSE_URL --name warehouse");
+            }
+            for c in list {
+                let s = &c["spec"];
+                let last = c["last_crawl_at"].as_i64().filter(|t| *t > 0).map(onto_intelli::core::time::fmt_ts);
+                println!(
+                    "{}  {} {}  every {}s · {} assets · last crawl {}{}",
+                    st.bold(s["name"].as_str().unwrap_or_default()),
+                    s["kind"].as_str().unwrap_or_default(),
+                    s["url"].as_str().unwrap_or_default(),
+                    s["every_secs"],
+                    c["assets"],
+                    last.unwrap_or_else(|| "never".into()),
+                    c["last_error"].as_str().map(|e| format!(" · {}", st.red(e))).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        Command::Crawl { name, json: as_json } => {
+            let be = backend(&cli).await?;
+            let r = be.call("connector.crawl", json!({ "name": name })).await?;
+            if *as_json {
+                print_json(&r);
+            } else {
+                let crawls = r["crawls"].as_array().cloned().unwrap_or_default();
+                if crawls.is_empty() {
+                    println!("No connectors to crawl. Add one: onto connect postgres <url>");
+                }
+                for c in crawls {
+                    print_crawl(st, &c);
+                }
+            }
+            Ok(())
+        }
+        Command::Rank { id, top, kind, recompute, json: as_json } => {
+            let be = backend(&cli).await?;
+            if *recompute {
+                let r = be.call("catalog.rerank", json!({})).await?;
+                println!("{}", st.dim(&format!("ranked {} entities", r["ranked"])));
+            }
+            match id {
+                Some(id) => {
+                    let a = be.call("catalog.rank", json!({ "id": id })).await?;
+                    if *as_json {
+                        print_json(&a);
+                        return Ok(());
+                    }
+                    println!(
+                        "{}  authority {}  rank {}",
+                        st.bold(a["id"].as_str().unwrap_or_default()),
+                        st.bold(&format!("{:.2}", a["score"].as_f64().unwrap_or(0.0))),
+                        a["rank"]
+                    );
+                    let ev = &a["evidence"];
+                    let rows = [
+                        ("centrality", ev.get("pagerank").map(|v| format!("PageRank {v}"))),
+                        ("usage", ev.get("usage").map(|v| format!("{v} scans and calls"))),
+                        ("freshness", ev.get("age_days").map(|v| format!("{v} days since activity"))),
+                        ("owner", ev.get("owner").and_then(Value::as_str).map(str::to_string)),
+                        (
+                            "documentation",
+                            ev.get("documented_columns")
+                                .and_then(Value::as_f64)
+                                .map(|v| format!("{:.0}% of columns documented", v * 100.0)),
+                        ),
+                        (
+                            "certification",
+                            ev.get("certified_by").and_then(Value::as_str).map(|b| format!("by {b}")).or_else(|| {
+                                ev.get("certified_fact").and_then(Value::as_str).map(|f| format!("subject of {f}"))
+                            }),
+                        ),
+                    ];
+                    for (name, why) in rows {
+                        let v = a["components"][name].as_f64().unwrap_or(0.0);
+                        println!("  {name:<14} {v:.2}  {}", st.dim(&why.unwrap_or_default()));
+                    }
+                }
+                None => {
+                    let r = be
+                        .call("catalog.top", json!({ "kinds": kind, "limit": top, "workspace": cli.workspace }))
+                        .await?;
+                    if *as_json {
+                        print_json(&r);
+                        return Ok(());
+                    }
+                    let list = r["top"].as_array().cloned().unwrap_or_default();
+                    if list.is_empty() {
+                        println!("Nothing ranked yet: crawl a connector, or onto rank --recompute");
+                    }
+                    for a in list {
+                        println!(
+                            "{:>5.2}  {}",
+                            a["score"].as_f64().unwrap_or(0.0),
+                            a["id"].as_str().unwrap_or_default()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Learned { fact_type, state, certify, reject, note, relearn } => {
+            let be = backend(&cli).await?;
+            if *relearn {
+                let r = be.call("learned.run", json!({ "workspace": cli.workspace })).await?;
+                println!(
+                    "{}",
+                    st.dim(&format!(
+                        "{} join paths, {} metrics, {} synonyms · {} written",
+                        r["join_paths"], r["metrics"], r["synonyms"], r["written"]
+                    ))
+                );
+            }
+            for (id, action, verb) in
+                [(certify, "learned.certify", "Certified"), (reject, "learned.reject", "Rejected")]
+            {
+                if let Some(id) = id {
+                    let r = be.call(action, json!({ "id": id, "note": note })).await?;
+                    println!("{verb} {}", r["fact"]["statement"].as_str().unwrap_or(id));
+                    return Ok(());
+                }
+            }
+            let r = be.call("learned.list", json!({ "fact_type": fact_type, "state": state })).await?;
+            let list = r["facts"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("No learned facts yet: crawl a connector first.");
+            }
+            for f in list {
+                let state = f["state"].as_str().unwrap_or_default();
+                let tag = if state == "certified" { st.bold("certified") } else { st.dim(state) };
+                println!(
+                    "{tag:<10} {:.2}  {:<9} {}  {}",
+                    f["confidence"].as_f64().unwrap_or(0.0),
+                    f["fact_type"].as_str().unwrap_or_default(),
+                    f["statement"].as_str().unwrap_or_default(),
+                    st.dim(f["id"].as_str().unwrap_or_default())
+                );
+            }
             Ok(())
         }
         Command::Experts { topic } => {

@@ -19,8 +19,16 @@ pub const ENTERPRISE_SCHEMA: &str = include_str!("../schemas/enterprise.toml");
 /// nexc-engine's execution vocabulary: graphs, node types, relation types.
 pub const NEXC_EXECUTION_SCHEMA: &str = include_str!("../schemas/nexc-execution.toml");
 
+/// A data estate: data sources, schemas, tables, views, columns, queries and
+/// learned facts, written by connectors (layered on enterprise by default).
+pub const DATA_CATALOG_SCHEMA: &str = include_str!("../schemas/data-catalog.toml");
+
 /// Built-in schema packages, layered with `extend = ["builtin:<name>"]`.
-pub const PACKAGES: &[(&str, &str)] = &[("enterprise", ENTERPRISE_SCHEMA), ("nexc-execution", NEXC_EXECUTION_SCHEMA)];
+pub const PACKAGES: &[(&str, &str)] = &[
+    ("enterprise", ENTERPRISE_SCHEMA),
+    ("nexc-execution", NEXC_EXECUTION_SCHEMA),
+    ("data-catalog", DATA_CATALOG_SCHEMA),
+];
 
 /// The TOML of a built-in package.
 pub fn builtin_package(name: &str) -> Result<&'static str> {

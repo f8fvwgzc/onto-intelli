@@ -224,7 +224,8 @@ impl Intelli {
         let conversations = Conversations::new(store);
         let c = &config.cache;
         let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
-        Ok(Arc::new(Self {
+        let crawl = config.connectors.clone();
+        let me = Arc::new(Self {
             answers: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             resolutions: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             completions: TtlCache::new(c.max_entries, Duration::from_secs(c.llm_ttl_secs)),
@@ -238,7 +239,11 @@ impl Intelli {
             onto,
             llm,
             config,
-        }))
+        });
+        if crawl.background {
+            crate::connectors::spawn_scheduler(&me, Duration::from_secs(crawl.tick_secs.max(1)));
+        }
+        Ok(me)
     }
 
     /// Stable system prompt: instructions plus the populated patterns of the

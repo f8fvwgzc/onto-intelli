@@ -614,6 +614,78 @@ service ExecutionService {
   rpc InitGraph(InitGraphRequest) returns (google.protobuf.Struct);
 }
 
+// ── Data catalog: connectors, OntoRank, learned facts ───────────────────────
+
+message ConnectRequest {
+  string name = 1;                // [a-z0-9_-], part of entity ids
+  string kind = 2;                // postgres (default)
+  string url = 3;                 // postgres://… or env:VAR (preferred)
+  string workspace = 4;
+  repeated string schemas = 5;    // * wildcards; empty: all
+  repeated string exclude_schemas = 6;
+  uint64 every_secs = 7;          // background crawl interval (default 900)
+  bool map_grants = 8;            // table grants become entity ACLs
+  map<string, string> grant_map = 9;   // database role -> onto principal or team
+  map<string, string> owner_map = 10;  // database role -> owning team or person
+  uint32 max_queries = 11;
+  string title = 12;
+}
+
+message ConnectorRef {
+  string name = 1;                // crawl: empty crawls every connector
+  bool purge = 2;                 // disconnect: also delete what it crawled
+}
+
+message TermRequest {
+  string term = 1;
+  string workspace = 2;
+  uint32 limit = 3;
+}
+
+message JoinRequest {
+  string from = 1;
+  string to = 2;
+}
+
+message RankRequest {
+  string id = 1;
+}
+
+message TopRequest {
+  repeated string kinds = 1;
+  string workspace = 2;
+  uint32 limit = 3;
+}
+
+message LearnedRequest {
+  string fact_type = 1;           // join_path | metric | synonym
+  string state = 2;               // suggested | certified | rejected
+  string about = 3;               // entity id
+  uint32 limit = 4;
+}
+
+message DecideFactRequest {
+  string id = 1;
+  string note = 2;
+}
+
+service CatalogService {
+  rpc AddConnector(ConnectRequest) returns (google.protobuf.Struct);
+  rpc ListConnectors(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc RemoveConnector(ConnectorRef) returns (google.protobuf.Struct);
+  rpc Crawl(ConnectorRef) returns (google.protobuf.Struct);
+  rpc FindData(TermRequest) returns (google.protobuf.Struct);
+  rpc JoinPath(JoinRequest) returns (google.protobuf.Struct);
+  rpc TrustedMetric(TermRequest) returns (google.protobuf.Struct);
+  rpc Rank(RankRequest) returns (google.protobuf.Struct);
+  rpc Top(TopRequest) returns (google.protobuf.Struct);
+  rpc Rerank(TopRequest) returns (google.protobuf.Struct);
+  rpc LearnedFacts(LearnedRequest) returns (google.protobuf.Struct);
+  rpc Learn(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Certify(DecideFactRequest) returns (google.protobuf.Struct);
+  rpc Reject(DecideFactRequest) returns (google.protobuf.Struct);
+}
+
 message CallRequest {
   string action = 1;              // any engine action, see Actions
   google.protobuf.Struct input = 2;

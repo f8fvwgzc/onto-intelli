@@ -171,6 +171,36 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "Create an execution graph, with the starter vocabulary unless starter=false or a vocabulary is given. Input: {graph, title?, starter?, node_types?, relation_types?}.",
     ),
+    a(
+        "connector.add",
+        true,
+        "Register a data source to crawl (metadata only, never rows); admins only. Input: {name, kind?=postgres, url (or env:VAR), workspace?, schemas?, exclude_schemas?, every_secs?, map_grants?, grant_map?, owner_map?, max_queries?}.",
+    ),
+    a("connector.list", false, "Registered connectors with their last crawl (URLs redacted)."),
+    a("connector.remove", true, "Remove a connector; purge=true also deletes what it crawled. Input: {name, purge?}."),
+    a(
+        "connector.crawl",
+        true,
+        "Crawl a connector (or all) now: incremental, through the audited write path, then learn and rank. Input: {name?}.",
+    ),
+    a(
+        "catalog.find",
+        false,
+        "Which tables or views hold something, ranked by OntoRank. Input: {term, workspace?, limit?}.",
+    ),
+    a("catalog.join", false, "How two tables join: certified or learned paths, else foreign keys. Input: {from, to}."),
+    a("catalog.metric", false, "Metric definitions for a term, certified first. Input: {term, workspace?}."),
+    a("catalog.rank", false, "OntoRank of one entity with every component and its evidence. Input: {id}."),
+    a("catalog.top", false, "The highest-authority entities. Input: {kinds?, workspace?, limit?}."),
+    a("catalog.rerank", true, "Recompute OntoRank. Input: {kinds?, weights?}."),
+    a(
+        "learned.list",
+        false,
+        "Learned facts (join paths, metrics, synonyms), certified first. Input: {fact_type?, state?, about?, limit?}.",
+    ),
+    a("learned.run", true, "Infer facts from the catalog again. Input: {workspace?}."),
+    a("learned.certify", true, "Certify a learned fact (approvers and admins, never agents). Input: {id, note?}."),
+    a("learned.reject", true, "Reject a learned fact (approvers and admins, never agents). Input: {id, note?}."),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -219,6 +249,72 @@ struct DepsIn {
     direction: Option<DepDirection>,
     #[serde(default)]
     depth: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RemoveConnectorIn {
+    name: String,
+    #[serde(default)]
+    purge: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct CrawlIn {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TermIn {
+    #[serde(alias = "query", alias = "q")]
+    term: String,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct JoinIn {
+    from: String,
+    to: String,
+}
+
+#[derive(Deserialize, Default)]
+struct TopIn {
+    #[serde(default, deserialize_with = "one_or_many")]
+    kinds: Vec<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct RerankIn {
+    #[serde(default, deserialize_with = "one_or_many")]
+    kinds: Vec<String>,
+    #[serde(default)]
+    weights: Option<onto_core::authority::Weights>,
+}
+
+#[derive(Deserialize, Default)]
+struct LearnedIn {
+    #[serde(default, alias = "type")]
+    fact_type: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct DecideFactIn {
+    id: String,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -663,6 +759,92 @@ impl Intelli {
                     onto.schema_undo(&ctx, i.version, i.migrations, i.dry_run)?
                 };
                 to_json(&r)
+            }
+            "connector.add" => {
+                let spec: crate::connectors::ConnectorSpec = parse(action, input)?;
+                to_json(&self.add_connector(p, spec)?)
+            }
+            "connector.list" => Ok(json!({ "connectors": self.connectors(p)? })),
+            "connector.remove" => {
+                let i: RemoveConnectorIn = parse(action, input)?;
+                self.remove_connector(p, &i.name, i.purge)
+            }
+            "connector.crawl" => {
+                let i: CrawlIn = parse(action, input)?;
+                Ok(json!({ "crawls": self.crawl(p, i.name.as_deref()).await? }))
+            }
+            "catalog.find" => {
+                let i: TermIn = parse(action, input)?;
+                let ws = self.ws_or_default(i.workspace);
+                Ok(json!({ "term": i.term, "locations": onto.find_data(p, &i.term, Some(&ws), i.limit.unwrap_or(5))? }))
+            }
+            "catalog.join" => {
+                let i: JoinIn = parse(action, input)?;
+                Ok(json!({ "join": onto.join_path(p, &i.from, &i.to)? }))
+            }
+            "catalog.metric" => {
+                let i: TermIn = parse(action, input)?;
+                let ws = self.ws_or_default(i.workspace);
+                Ok(json!({ "term": i.term, "metrics": onto.trusted_metrics(p, &i.term, Some(&ws))? }))
+            }
+            "catalog.rank" => {
+                let i: IdIn = parse(action, input)?;
+                match onto.authority(p, &i.id)? {
+                    Some(a) => to_json(&a),
+                    None => Err(Error::not_found(format!(
+                        "no authority computed for {} (run catalog.rerank or crawl a connector)",
+                        i.id
+                    ))),
+                }
+            }
+            "catalog.top" => {
+                let i: TopIn = parse(action, input)?;
+                Ok(json!({ "top": onto.authority_top(p, &i.kinds, i.workspace.as_deref(), i.limit.unwrap_or(20))? }))
+            }
+            "catalog.rerank" => {
+                let i: RerankIn = parse(action, input)?;
+                let ctx = self.ctx(p, None).with_intent(action);
+                to_json(&onto.compute_authority(&ctx, &i.kinds, &i.weights.unwrap_or_default())?)
+            }
+            "learned.list" => {
+                let i: LearnedIn = parse(action, input)?;
+                Ok(json!({ "facts": onto.learned_facts(
+                    p,
+                    i.fact_type.as_deref(),
+                    i.state.as_deref(),
+                    i.about.as_deref(),
+                    i.limit.unwrap_or(100),
+                )? }))
+            }
+            "learned.run" => {
+                let w: WsIn = parse(action, input)?;
+                if !p.allows(onto_core::Access::Write) {
+                    return Err(Error::Denied(format!("{} may not run the learner", p.id)));
+                }
+                to_json(&onto.learn(w.workspace.as_deref())?)
+            }
+            "learned.certify" | "learned.reject" => {
+                let i: DecideFactIn = parse(action, input)?;
+                if !onto.options().governance.can_approve(p) && !p.is_privileged() {
+                    return Err(Error::Denied(format!(
+                        "{} may not {} facts: approvers and admins decide, never agents",
+                        p.id,
+                        if action == "learned.certify" { "certify" } else { "reject" }
+                    )));
+                }
+                let id = onto.resolve_id(&i.id);
+                let ws = onto.get(p, &id)?.workspace;
+                let mut params = Map::new();
+                params.insert("fact".into(), json!(id));
+                if let Some(n) = i.note {
+                    params.insert("note".into(), json!(n));
+                }
+                let name = if action == "learned.certify" { "certify_fact" } else { "reject_fact" };
+                let ctx = self.ctx(p, Some(ws)).with_intent(action);
+                let out = onto.apply_action(&ctx, name, &params, ApplyOptions { dry_run: false, confirm: true })?;
+                Ok(
+                    json!({ "receipt": out, "fact": onto.learned_facts(p, None, None, None, 1_000)?.into_iter().find(|f| f.id == id) }),
+                )
             }
             "system.stats" => self.stats(),
             "system.whoami" => {

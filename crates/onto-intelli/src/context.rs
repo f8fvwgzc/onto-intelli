@@ -198,6 +198,8 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
 
         let mut nodes = Vec::new();
         let mut naive = 0usize;
+        // OntoRank lifts authoritative entities when the budget is tight.
+        let authority = onto.authority_scores();
         for (id, s, hop) in &ranked {
             let e = g.get(id).expect("ranked ids exist");
             naive += estimate(&serde_json::to_string(e).unwrap_or_default());
@@ -212,7 +214,8 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
                     fact.push_str(&format!("; computed: {}", derived.join(", ")));
                 }
             }
-            add(&mut facts, fact, *s, "entity", *hop == 0);
+            let auth = authority.get(id).copied().unwrap_or(0.0);
+            add(&mut facts, fact, *s * (1.0 + 0.4 * auth), "entity", *hop == 0);
             nodes.push(CtxNode {
                 id: id.clone(),
                 kind: e.kind.clone(),
@@ -367,6 +370,38 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
             "knowledge",
             false,
         );
+    }
+
+    // Data assets (tables, views, certified definitions) that match the
+    // question, highest authority first.
+    if onto.schema().object_type("table").is_some() {
+        let kinds: Vec<String> = ["table", "view", "learned_fact"].map(String::from).to_vec();
+        let assets = onto.search(p, input.question, &kinds, Some(ws), cfg.knowledge_hits).unwrap_or_default();
+        let scores = onto.authority_scores();
+        let top = assets.first().map(|h| h.score).unwrap_or(1.0).max(1e-6);
+        for h in &assets {
+            let e = &h.entity;
+            if known.contains(e.id.as_str()) || e.state.as_deref() == Some("rejected") {
+                continue;
+            }
+            let auth = scores.get(&e.id).copied().unwrap_or(0.0);
+            let what = match e.kind.as_str() {
+                "learned_fact" if e.state.as_deref() == Some("certified") => "certified fact".to_string(),
+                "learned_fact" => format!(
+                    "learned fact (confidence {})",
+                    e.props.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)
+                ),
+                k => k.to_string(),
+            };
+            let body = ["description", "statement"].iter().find_map(|k| e.prop_str(k)).unwrap_or_default();
+            add(
+                &mut facts,
+                format!("{what} [{}] \"{}\" (authority {auth:.2}): {}", e.id, e.label(), clip(body, 240)),
+                0.45 + 0.35 * auth + 0.2 * h.score / top,
+                "catalog",
+                false,
+            );
+        }
     }
 
     // Memories recalled by the orchestrator. Durable facts rank with graph

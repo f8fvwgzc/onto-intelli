@@ -251,6 +251,8 @@ struct Inner {
     vector_store: Option<Arc<dyn Store>>,
     /// Wakes the background vectorizer after a write (stores that index vectors).
     vector_wake: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
+    /// OntoRank scores (id → 0..1) that boost search and context packing.
+    authority: RwLock<crate::authority::Scores>,
     /// Merged-away id -> surviving id.
     redirects: RwLock<HashMap<Id, Id>>,
     store: Arc<dyn Store>,
@@ -297,6 +299,7 @@ impl Ontology {
                 vectors: RwLock::new(vectors),
                 vector_store,
                 vector_wake: std::sync::OnceLock::new(),
+                authority: RwLock::new(Default::default()),
                 redirects: RwLock::new(redirects),
                 store,
                 revision: AtomicU64::new(1),
@@ -310,6 +313,7 @@ impl Ontology {
         if onto.inner.store.indexes_vectors() {
             sync::spawn_vectorizer(&onto.inner)?;
         }
+        onto.reload_authority()?;
         if let Some(interval) = follow {
             sync::spawn_follower(&onto.inner, interval)?;
         }
@@ -362,6 +366,50 @@ impl Ontology {
     /// Called synchronously after each committed write.
     pub fn on_change(&self, f: impl Fn(&ChangeSet) + Send + Sync + 'static) {
         self.inner.listeners.write().push(Arc::new(f));
+    }
+
+    pub(crate) fn set_authority(&self, scores: crate::authority::Scores) {
+        *self.inner.authority.write() = scores;
+    }
+
+    /// OntoRank scores in memory (empty until computed).
+    pub fn authority_scores(&self) -> crate::authority::Scores {
+        self.inner.authority.read().clone()
+    }
+
+    /// Take the lease `name` for `ttl_ms` unless another holder has it.
+    /// Atomic across processes: it commits through the commit log.
+    pub fn try_lease(&self, name: &str, holder: &str, ttl_ms: i64) -> Result<bool> {
+        let ctx = ActionContext::new(Principal::system(), self.inner.opts.default_workspace.clone());
+        let (_, got) = self.transact(&ctx, |onto, _| {
+            let now = now_ms();
+            let free = match onto.store().kv_get("lease", name)? {
+                None => true,
+                Some(v) => v["holder"] == holder || v["until"].as_i64().unwrap_or(0) < now,
+            };
+            let kv = if free {
+                vec![("lease".to_string(), name.to_string(), json!({ "holder": holder, "until": now + ttl_ms }))]
+            } else {
+                Vec::new()
+            };
+            Ok((Vec::new(), Extra { kv, ..Default::default() }, free))
+        })?;
+        Ok(got)
+    }
+
+    /// Give a lease back (only its holder can).
+    pub fn release_lease(&self, name: &str, holder: &str) -> Result<()> {
+        let ctx = ActionContext::new(Principal::system(), self.inner.opts.default_workspace.clone());
+        self.transact(&ctx, |onto, _| {
+            let mine = onto.store().kv_get("lease", name)?.is_some_and(|v| v["holder"] == holder);
+            let kv = if mine {
+                vec![("lease".to_string(), name.to_string(), json!({ "holder": holder, "until": 0 }))]
+            } else {
+                Vec::new()
+            };
+            Ok((Vec::new(), Extra { kv, ..Default::default() }, ()))
+        })?;
+        Ok(())
     }
 
     /// Give entities the store holds without a vector one (after a bulk
@@ -447,6 +495,7 @@ impl Ontology {
                 // in the fork are found lexically.
                 vector_store: self.inner.vector_store.clone(),
                 vector_wake: std::sync::OnceLock::new(),
+                authority: RwLock::new(self.authority_scores()),
                 redirects: RwLock::new(self.inner.redirects.read().clone()),
                 store: Arc::new(MemoryStore::default()),
                 revision: AtomicU64::new(self.revision()),
@@ -647,10 +696,12 @@ impl Ontology {
             }
         }
         let now = now_ms();
+        let authority = self.authority_scores();
         let mut hits: Vec<SearchHit> = fused
             .into_iter()
             .filter_map(|(id, (base, lr, vr))| {
                 let e = g.get(&id)?;
+                let auth = authority.get(&id).copied();
                 let dist = near.get(&id).copied();
                 let personal = match dist {
                     Some(1) => 1.3,
@@ -659,7 +710,10 @@ impl Ontology {
                 };
                 let idle_days = ((now - e.updated_at).max(0) as f32) / 86_400_000.0;
                 let recency = 1.0 + 0.2 * (-idle_days / 14.0).exp();
-                let score = base * personal * recency * 100.0;
+                // OntoRank: authoritative assets (used, documented, owned,
+                // certified) outrank stale copies with the same words.
+                let boost = 1.0 + 0.5 * auth.unwrap_or(0.0);
+                let score = base * personal * recency * boost * 100.0;
                 Some(SearchHit {
                     entity: e.clone(),
                     score: (score * 1000.0).round() / 1000.0,
@@ -668,6 +722,7 @@ impl Ontology {
                         "vector_rank": vr,
                         "personal_distance": dist,
                         "recency": (recency * 100.0).round() / 100.0,
+                        "authority": auth,
                     })),
                 })
             })

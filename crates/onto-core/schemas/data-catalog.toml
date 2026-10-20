@@ -1,0 +1,195 @@
+# data-catalog: a data estate as ontology data. Connectors write it
+# (`onto connect postgres …`, then `onto crawl`): data sources, schemas,
+# tables, views, columns and the queries that read them. They read metadata
+# only, never row data. A learner adds what it can infer (join paths, metric
+# definitions, synonyms) as learned facts, kept apart from this curated
+# layer, each with a confidence and the evidence for it. People certify the
+# facts they trust.
+#
+# Layered on builtin:enterprise by default (extend = ["builtin:data-catalog"]).
+# Ids: data_source:{source}, db_schema:{source}.{schema},
+# table:{source}.{schema}.{table} (views too), column:{source}.{schema}.{table}.{column},
+# query:{source}.{queryid}, learned_fact:{type}.{hash}.
+
+[object_types.data_source]
+label = "Data source"
+category = "container"
+icon = "database"
+color = "#0f766e"
+description = "A database a connector crawls. Only metadata is read: schemas, tables, columns, comments, constraints and usage statistics."
+properties.engine = { type = "enum", values = ["postgres"], description = "Database engine." }
+properties.host = { type = "string" }
+properties.database = { type = "string" }
+properties.server_version = { type = "string" }
+properties.description = { type = "text", searchable = true }
+
+[object_types.db_schema]
+label = "Schema"
+category = "container"
+icon = "folder"
+color = "#0d9488"
+description = "A namespace of tables and views in a data source."
+properties.name = { type = "string", searchable = true }
+properties.description = { type = "text", searchable = true, description = "COMMENT ON SCHEMA." }
+properties.owner_role = { type = "string", description = "Database role that owns it." }
+
+[object_types.table]
+label = "Table"
+icon = "table"
+color = "#14b8a6"
+description = "A table, partitioned table, foreign table or materialized view: where data lives."
+properties.name = { type = "string", searchable = true }
+properties.schema_name = { type = "string" }
+properties.table_type = { type = "enum", values = ["table", "partitioned", "foreign", "materialized_view"] }
+properties.description = { type = "text", searchable = true, description = "COMMENT ON TABLE." }
+properties.owner_role = { type = "string" }
+properties.row_estimate = { type = "int", description = "Planner estimate, not a count of rows." }
+properties.reads = { type = "int", description = "Sequential plus index scans since statistics were reset." }
+properties.writes = { type = "int", description = "Rows inserted, updated and deleted since statistics were reset." }
+properties.query_calls = { type = "int", description = "Calls of crawled queries that read it." }
+properties.last_activity = { type = "timestamp", description = "Last analyze, vacuum or crawl that saw activity." }
+properties.documented_columns = { type = "float", description = "Share of columns with a comment (0..1)." }
+properties.column_names = { type = "list", searchable = true }
+
+[object_types.view]
+label = "View"
+icon = "eye"
+color = "#2dd4bf"
+description = "A view: a stored query over tables and other views."
+properties.name = { type = "string", searchable = true }
+properties.schema_name = { type = "string" }
+properties.description = { type = "text", searchable = true, description = "COMMENT ON VIEW." }
+properties.definition = { type = "text", searchable = true, max_length = 8000, description = "The view's SQL." }
+properties.owner_role = { type = "string" }
+properties.query_calls = { type = "int" }
+properties.documented_columns = { type = "float" }
+properties.column_names = { type = "list", searchable = true }
+
+[object_types.column]
+label = "Column"
+icon = "columns"
+color = "#5eead4"
+description = "A column of a table or view."
+properties.name = { type = "string", searchable = true }
+properties.data_type = { type = "string" }
+properties.nullable = { type = "bool" }
+properties.position = { type = "int" }
+properties.primary_key = { type = "bool" }
+properties.description = { type = "text", searchable = true, description = "COMMENT ON COLUMN." }
+
+[object_types.query]
+label = "Query"
+icon = "terminal"
+color = "#64748b"
+description = "A normalized query from pg_stat_statements (literals replaced by $n): how the data is used."
+properties.text = { type = "text", searchable = true, max_length = 4000 }
+properties.queryid = { type = "string" }
+properties.calls = { type = "int" }
+properties.mean_ms = { type = "float" }
+properties.rows = { type = "int", description = "Rows returned or affected in total (a statistic, not row data)." }
+
+[object_types.learned_fact]
+label = "Learned fact"
+category = "knowledge"
+icon = "sparkles"
+color = "#a855f7"
+description = "Something inferred from the catalog and its query log: a join path, a likely metric definition or a synonym. Separate from curated definitions, with a confidence and evidence; a person can certify it."
+states = ["suggested", "certified", "rejected"]
+terminal_states = ["rejected"]
+properties.fact_type = { type = "enum", values = ["join_path", "metric", "synonym"], required = true }
+properties.statement = { type = "text", searchable = true, description = "The fact in words." }
+properties.confidence = { type = "float", description = "0..1: how sure the learner is." }
+properties.support = { type = "int", description = "How many observations back it (queries, constraints, names)." }
+properties.evidence = { type = "list", description = "What it was learned from: constraint names, query ids, comments." }
+properties.expression = { type = "string", searchable = true, description = "Join condition or metric expression." }
+properties.term = { type = "string", searchable = true, description = "Synonym: the word people use." }
+properties.means = { type = "string", searchable = true, description = "Synonym: what it names." }
+properties.name = { type = "string", searchable = true, description = "Metric: its name." }
+properties.learner = { type = "string" }
+properties.certified_by = { type = "string" }
+properties.certified_at = { type = "timestamp" }
+
+# Relations. `contains` and `owns` extend the enterprise ones (the lists
+# repeat theirs), `references` (any → any) carries foreign keys as is.
+
+[link_types.contains]
+label = "Contains"
+from = ["folder", "data_source", "db_schema", "table", "view"]
+to = ["artifact", "folder", "knowledge", "db_schema", "table", "view", "column"]
+inverse = "contained_in"
+weight = 0.6
+description = "A folder holds files; a data source holds schemas, a schema tables and views, a table its columns."
+
+[link_types.owns]
+from = ["team", "person"]
+to = ["project", "service", "repository", "knowledge", "artifact", "environment", "decision", "data_source", "db_schema", "table", "view"]
+inverse = "owned_by"
+weight = 0.8
+
+[link_types.reads_from]
+label = "Reads from"
+from = ["query", "view"]
+to = ["table", "view", "column"]
+inverse = "read_by"
+weight = 0.7
+description = "A query or view reads a table, view or column."
+
+[link_types.concerns]
+label = "Concerns"
+from = ["learned_fact"]
+inverse = "learned_facts"
+weight = 0.6
+description = "A learned fact and the assets it is about."
+
+[glossary.kinds]
+tables = "table"
+dataset = "table"
+datasets = "table"
+views = "view"
+columns = "column"
+field = "column"
+fields = "column"
+database = "data_source"
+databases = "data_source"
+warehouse = "data_source"
+queries = "query"
+
+[glossary.relations]
+in_folder = "contained_in"
+foreign_key = "references"
+reads = "reads_from"
+
+# Governed edits: certifying is a decision people make, never agents.
+
+[action_types.certify_fact]
+description = "Certify a learned fact (a join path, metric definition or synonym): answers then treat it as trusted."
+phrases = ["certify", "trust", "approve fact"]
+risk = "medium"
+roles = ["admin", "approver"]
+parameters.fact = { type = "entity", kinds = ["learned_fact"], required = true }
+parameters.note = { type = "text" }
+
+[[action_types.certify_fact.preconditions]]
+check = "state_allowed"
+param = "fact"
+value = "certified"
+
+[[action_types.certify_fact.effects]]
+patch = { id = "{fact}", state = "certified", props = { certified_by = "{actor}", certified_at = "{now}" } }
+
+[[action_types.certify_fact.effects]]
+event = { action = "learned.certified", target = "{fact}", payload = { note = "{note}" } }
+
+[action_types.reject_fact]
+description = "Reject a learned fact: answers stop using it and the learner does not suggest it again."
+phrases = ["reject fact", "distrust"]
+risk = "low"
+roles = ["admin", "approver"]
+parameters.fact = { type = "entity", kinds = ["learned_fact"], required = true }
+parameters.note = { type = "text" }
+
+[[action_types.reject_fact.effects]]
+patch = { id = "{fact}", state = "rejected" }
+
+[[action_types.reject_fact.effects]]
+event = { action = "learned.rejected", target = "{fact}", payload = { note = "{note}" } }

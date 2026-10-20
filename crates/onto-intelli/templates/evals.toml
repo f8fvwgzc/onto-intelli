@@ -88,3 +88,32 @@ name = "clarify"
 question = "What is #182?"
 expect = ["Which one do you mean"]
 expect_mode = "clarify"
+
+# The data catalog (the demo warehouse, as a PostgreSQL connector crawls it).
+
+[[case]]
+name = "data location"
+question = "Which table holds revenue?"
+expect = ["finance.revenue_recognized"]
+expect_mode = "deterministic"
+expect_intent = "data_location"
+
+[[case]]
+name = "join path"
+question = "How do orders join to customers?"
+expect = ["orders.customer_id = customers.id"]
+expect_mode = "deterministic"
+expect_intent = "join_path"
+
+[[case]]
+name = "trusted metric"
+question = "Which revenue metric is the trusted one?"
+expect = ["revenue_recognized", "certified by finance-lead"]
+expect_mode = "deterministic"
+expect_intent = "trusted_metric"
+
+[[case]]
+name = "asset owner"
+question = "Who owns the revenue_recognized view?"
+expect = ["Finance Team"]
+expect_mode = "deterministic"
