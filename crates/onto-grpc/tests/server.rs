@@ -595,3 +595,50 @@ async fn development_mode_stays_on_loopback() {
     let err = onto_grpc::serve_on(intelli, listener, async {}).await.unwrap_err();
     assert!(err.to_string().contains("--dev"), "{err}");
 }
+
+#[tokio::test]
+async fn execution_vocabulary_over_http_and_grpc() {
+    let srv = start(|c| c.ontology.extend.push("builtin:nexc-execution".into())).await;
+    let base = format!("http://{}", srv.addr);
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!("{base}/v1/execution/graphs"))
+        .json(&json!({ "graph": "g1", "title": "Launch" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["vocabulary"]["node_types"].as_array().unwrap().len(), 6, "{created}");
+    let mut vocab: Value =
+        http.get(format!("{base}/v1/execution/graphs/g1/vocabulary")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(vocab["node_types"][0]["key"], "topic");
+    vocab["relation_types"] = json!([{ "key": "depends_on", "label": "Depends on", "blocking": true }]);
+    let changed: Value = http
+        .put(format!("{base}/v1/execution/graphs/g1/vocabulary"))
+        .json(&vocab)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(changed["removed"], json!(["relates_to"]));
+    let graphs: Value = http.get(format!("{base}/v1/execution/graphs")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(graphs["graphs"][0]["id"], "execution_graph:g1");
+    // gRPC: whole-number stages arrive as integers.
+    let ch = channel(srv.addr).await;
+    let mut exec = pb::execution_service_client::ExecutionServiceClient::new(ch);
+    let v = exec.vocabulary(pb::GraphRef { graph: "g1".into() }).await.unwrap().into_inner();
+    assert!(format!("{:?}", v.fields["node_types"]).contains("\"stage\""));
+    let mut node = struct_of(json!({ "key": "qa", "label": "QA", "default_role": "tester", "stage": 5 }));
+    node.fields
+        .insert("allow_code_exec".into(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) });
+    let r = exec
+        .init_graph(pb::InitGraphRequest { graph: "g2".into(), node_types: vec![node], ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(format!("{:?}", r.fields["vocabulary"]).contains("\"qa\""), "{r:?}");
+}

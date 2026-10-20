@@ -18,6 +18,8 @@
 //! * `GET  /v1/schema/proposals`  proposals (`?status=&limit=`); `POST` files one
 //! * `GET  /v1/schema/proposals/{id}`  one proposal with a fresh preview
 //! * `POST /v1/schema/proposals/{id}/{approve|reject|comment|withdraw|revise}`
+//! * `GET  /v1/execution/graphs`  nexc graphs; `POST` creates one (starter vocabulary)
+//! * `GET|PUT /v1/execution/graphs/{graph}/vocabulary`  node and relation types
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -64,6 +66,8 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/schema/proposals", get(proposals_list).post(proposals_create))
         .route("/v1/schema/proposals/{id}", get(proposal_get))
         .route("/v1/schema/proposals/{id}/{verb}", post(proposal_verb))
+        .route("/v1/execution/graphs", get(exec_graphs).post(exec_init))
+        .route("/v1/execution/graphs/{graph}/vocabulary", get(exec_vocab).put(exec_set_vocab))
         .with_state(AppState { hub, auth })
 }
 
@@ -246,6 +250,35 @@ async fn proposal_verb(
         m.insert("id".into(), Value::String(id));
     }
     run(&s, &headers, action, input).await
+}
+
+async fn exec_graphs(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "execution.graphs", query_json(q)).await
+}
+
+async fn exec_init(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "execution.init_graph", body_or_empty(body)).await
+}
+
+async fn exec_vocab(State(s): State<AppState>, Path(graph): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "execution.vocabulary", json!({ "graph": graph })).await
+}
+
+async fn exec_set_vocab(
+    State(s): State<AppState>,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("graph".into(), Value::String(graph));
+    }
+    run(&s, &headers, "execution.set_vocabulary", input).await
 }
 
 async fn ask(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {

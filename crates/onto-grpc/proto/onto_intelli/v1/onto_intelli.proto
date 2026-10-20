@@ -576,6 +576,44 @@ service SchemaService {
   rpc Revise(ReviseRequest) returns (google.protobuf.Struct);
 }
 
+// ──────────────────────── nexc execution vocabulary ────────────────────────
+// Needs ontology.extend = ["builtin:nexc-execution"]. Shapes match nexc-engine's
+// NodeType / RelationType: {key, label, description, color, icon, default_role,
+// default_executor, stage, produces_artifact, allow_code_exec} and
+// {key, label, description, blocking}.
+
+message GraphRef {
+  string graph = 1;               // key (g1) or id (execution_graph:g1)
+}
+
+message GraphsRequest {
+  string workspace = 1;
+  uint32 limit = 2;
+}
+
+message VocabularyRequest {
+  string graph = 1;
+  repeated google.protobuf.Struct node_types = 2;
+  repeated google.protobuf.Struct relation_types = 3;
+  string workspace = 4;
+}
+
+message InitGraphRequest {
+  string graph = 1;
+  string title = 2;
+  bool empty = 3;                 // true: no starter vocabulary
+  repeated google.protobuf.Struct node_types = 4;
+  repeated google.protobuf.Struct relation_types = 5;
+  string workspace = 6;
+}
+
+service ExecutionService {
+  rpc Graphs(GraphsRequest) returns (google.protobuf.Struct);
+  rpc Vocabulary(GraphRef) returns (google.protobuf.Struct);
+  rpc SetVocabulary(VocabularyRequest) returns (google.protobuf.Struct);
+  rpc InitGraph(InitGraphRequest) returns (google.protobuf.Struct);
+}
+
 message CallRequest {
   string action = 1;              // any engine action, see Actions
   google.protobuf.Struct input = 2;

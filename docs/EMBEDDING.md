@@ -136,6 +136,19 @@ approve_roles = ["approver"]
 Change sets, migrations and the impact report are described in
 [SCHEMA.md](SCHEMA.md).
 
+### The execution vocabulary
+
+With `extend = ["builtin:nexc-execution"]`, a graph's node types and relation
+types live in onto-intelli, in nexc's shape
+([NEXC_EXECUTION.md](NEXC_EXECUTION.md)):
+
+| | Library | gRPC `ExecutionService` | HTTP | Action |
+|---|---|---|---|---|
+| graphs | `find` | `Graphs` | `GET /v1/execution/graphs` | `execution.graphs` |
+| new graph | `init_execution_graph` | `InitGraph` | `POST /v1/execution/graphs` | `execution.init_graph` |
+| read vocabulary | `execution_vocabulary` | `Vocabulary` | `GET /v1/execution/graphs/{g}/vocabulary` | `execution.vocabulary` |
+| replace vocabulary | `set_execution_vocabulary` | `SetVocabulary` | `PUT /v1/execution/graphs/{g}/vocabulary` | `execution.set_vocabulary` |
+
 ## 4. Configuration keys
 
 ```toml

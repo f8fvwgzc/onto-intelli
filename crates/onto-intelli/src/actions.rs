@@ -149,6 +149,18 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "Replace an open or failed proposal's change set; approvals reset. Input: {id, title?, rationale?, changes, migrations?}.",
     ),
+    a("execution.graphs", false, "nexc execution graphs (needs builtin:nexc-execution). Input: {workspace?, limit?}."),
+    a("execution.vocabulary", false, "A graph's node types and relation types in nexc's shape. Input: {graph}."),
+    a(
+        "execution.set_vocabulary",
+        true,
+        "Replace a graph's node types and relation types (created, updated, removed atomically). Input: {graph, node_types, relation_types}.",
+    ),
+    a(
+        "execution.init_graph",
+        true,
+        "Create an execution graph, with the starter vocabulary unless starter=false or a vocabulary is given. Input: {graph, title?, starter?, node_types?, relation_types?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.actions", false, "This list."),
@@ -595,6 +607,42 @@ impl Intelli {
                 let i: ReviseIn = parse(action, input)?;
                 to_json(&onto.revise_proposal(&self.ctx(p, i.workspace).with_intent(action), &i.id, i.input)?)
             }
+            "execution.graphs" => {
+                let i: GraphsIn = parse(action, input)?;
+                let spec = FindSpec {
+                    kind: Some(onto_core::execution::GRAPH_KIND.into()),
+                    workspace: i.workspace,
+                    limit: i.limit.unwrap_or(200),
+                    ..Default::default()
+                };
+                let (graphs, total) = onto.find(p, &spec)?;
+                Ok(json!({ "graphs": graphs, "total": total }))
+            }
+            "execution.vocabulary" => {
+                let i: GraphIn = parse(action, input)?;
+                let v = onto.execution_vocabulary(p, &i.graph)?;
+                Ok(
+                    json!({ "graph": onto_core::execution::graph_id(&i.graph), "node_types": v.node_types, "relation_types": v.relation_types }),
+                )
+            }
+            "execution.set_vocabulary" => {
+                let i: SetVocabIn = parse(action, input)?;
+                let ctx = self.ctx(p, i.workspace).with_intent(action);
+                to_json(&onto.set_execution_vocabulary(&ctx, &i.graph, i.vocabulary)?)
+            }
+            "execution.init_graph" => {
+                let i: InitGraphIn = parse(action, input)?;
+                let ctx = self.ctx(p, i.workspace).with_intent(action);
+                let given = !i.vocabulary.node_types.is_empty() || !i.vocabulary.relation_types.is_empty();
+                let vocab = if given {
+                    Some(i.vocabulary)
+                } else if i.starter.unwrap_or(!i.empty) {
+                    Some(onto_core::execution::Vocabulary::starter())
+                } else {
+                    None
+                };
+                to_json(&onto.init_execution_graph(&ctx, &i.graph, i.title.as_deref().unwrap_or(""), vocab)?)
+            }
             "schema.revert" | "schema.undo" => {
                 let i: RevertIn = parse(action, input)?;
                 let ctx = self.ctx(p, i.workspace).with_intent(action);
@@ -668,6 +716,44 @@ struct DiffIn {
     from: u64,
     #[serde(default)]
     to: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct GraphsIn {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GraphIn {
+    graph: String,
+}
+
+#[derive(Deserialize)]
+struct SetVocabIn {
+    graph: String,
+    #[serde(flatten)]
+    vocabulary: onto_core::execution::Vocabulary,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InitGraphIn {
+    graph: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    starter: Option<bool>,
+    /// gRPC spelling of `starter: false`.
+    #[serde(default)]
+    empty: bool,
+    #[serde(flatten)]
+    vocabulary: onto_core::execution::Vocabulary,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Deserialize)]

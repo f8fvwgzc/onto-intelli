@@ -16,8 +16,11 @@ use crate::{Error, Result};
 /// The built-in Enterprise Execution ontology.
 pub const ENTERPRISE_SCHEMA: &str = include_str!("../schemas/enterprise.toml");
 
+/// nexc-engine's execution vocabulary: graphs, node types, relation types.
+pub const NEXC_EXECUTION_SCHEMA: &str = include_str!("../schemas/nexc-execution.toml");
+
 /// Built-in schema packages, layered with `extend = ["builtin:<name>"]`.
-pub const PACKAGES: &[(&str, &str)] = &[("enterprise", ENTERPRISE_SCHEMA)];
+pub const PACKAGES: &[(&str, &str)] = &[("enterprise", ENTERPRISE_SCHEMA), ("nexc-execution", NEXC_EXECUTION_SCHEMA)];
 
 /// The TOML of a built-in package.
 pub fn builtin_package(name: &str) -> Result<&'static str> {
@@ -54,6 +57,28 @@ pub struct PropertyDef {
     pub searchable: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Strings must match this regular expression (anchor it with `^…$`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Strings may hold at most this many characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+}
+
+/// Compiled `pattern`s, shared by every schema.
+fn pattern_regex(p: &str) -> std::result::Result<std::sync::Arc<regex_lite::Regex>, String> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<String, Arc<regex_lite::Regex>>>> = LazyLock::new(Default::default);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = cache.get(p) {
+        return Ok(r.clone());
+    }
+    let r = Arc::new(regex_lite::Regex::new(p).map_err(|e| format!("invalid pattern {p:?}: {e}"))?);
+    if cache.len() < 1024 {
+        cache.insert(p.to_string(), r.clone());
+    }
+    Ok(r)
 }
 
 impl PropertyDef {
@@ -61,6 +86,16 @@ impl PropertyDef {
     pub fn accepts(&self, value: &Value) -> bool {
         if value.is_null() {
             return true;
+        }
+        if let Some(s) = value.as_str() {
+            if self.max_length.is_some_and(|m| s.chars().count() > m) {
+                return false;
+            }
+            if let Some(p) = &self.pattern
+                && !pattern_regex(p).is_ok_and(|r| r.is_match(s))
+            {
+                return false;
+            }
         }
         match self.ty {
             PropType::String | PropType::Text => value.is_string(),
@@ -76,11 +111,18 @@ impl PropertyDef {
 
     /// What [`accepts`](Self::accepts) expects, for error messages.
     pub fn expected(&self) -> String {
-        if self.ty == PropType::Enum {
+        let mut out = if self.ty == PropType::Enum {
             format!("one of {}", self.values.join("|"))
         } else {
             format!("{:?}", self.ty).to_lowercase()
+        };
+        if let Some(p) = &self.pattern {
+            out.push_str(&format!(" matching {p}"));
         }
+        if let Some(m) = self.max_length {
+            out.push_str(&format!(" of at most {m} characters"));
+        }
+        out
     }
 }
 
@@ -516,6 +558,11 @@ impl Schema {
             }
         }
         for ty in self.object_types.values() {
+            for (prop, def) in &ty.properties {
+                if let Some(p) = &def.pattern {
+                    pattern_regex(p).map_err(|e| Error::Config(format!("{}.{prop}: {e}", ty.name)))?;
+                }
+            }
             for (prop, d) in &ty.derived {
                 d.validate(self).map_err(|e| Error::Config(format!("{}.derived.{prop}: {e}", ty.name)))?;
             }

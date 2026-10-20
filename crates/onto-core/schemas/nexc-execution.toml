@@ -1,0 +1,117 @@
+# nexc-execution: the execution vocabulary of nexc-engine graphs as ontology
+# data. Every graph owns node types and relation types; their properties drive
+# the executor: who runs a node (default_executor, default_role), when
+# (stage), what it delivers (produces_artifact), whether its agents may run
+# code (allow_code_exec), and which relations order execution (blocking).
+#
+# Layer it on any schema: extend = ["builtin:nexc-execution"].
+# Ids keep keys unique per graph: node_type:{graph}.{key}, relation_type:{graph}.{key}.
+# Read and write a graph's vocabulary in nexc's shape with the
+# execution.vocabulary / execution.set_vocabulary actions.
+
+name = "nexc-execution"
+version = 1
+
+[object_types.execution_graph]
+label = "Graph"
+category = "container"
+icon = "puzzle"
+color = "#6366f1"
+description = "A nexc-engine graph: the plan agents execute. Its node types and relation types are its execution vocabulary."
+properties.description = { type = "text", searchable = true, max_length = 2000 }
+
+[object_types.node_type]
+label = "Node type"
+icon = "hash"
+color = "#0ea5e9"
+description = "A type of node in a nexc graph. Its properties drive execution: who runs its nodes, in which stage, what they deliver and whether their agents may run code."
+properties.key = { type = "string", required = true, pattern = "^[a-z][a-z0-9_]*$", max_length = 40, description = "Stable identifier stored on nodes." }
+properties.label = { type = "string", required = true, max_length = 60 }
+properties.description = { type = "text", searchable = true, max_length = 500, description = "What a node of this type means; shown to the planner and to agents." }
+properties.color = { type = "string", pattern = "^#[0-9a-fA-F]{6}$", description = "Colour of the type on the canvas." }
+properties.icon = { type = "string", pattern = "^[a-z0-9-]*$", max_length = 40 }
+properties.default_role = { type = "string", required = true, max_length = 60, description = "Agent role used when a node of this type sets none." }
+properties.default_executor = { type = "enum", values = ["llm", "agent", "symphony"], required = true, description = "Executor used when a node of this type sets none." }
+properties.stage = { type = "int", description = "Position in the usual flow of work: suggested dependencies point from lower to higher stages." }
+properties.produces_artifact = { type = "bool", description = "Nodes of this type are expected to deliver a file." }
+properties.allow_code_exec = { type = "bool", description = "Agents running nodes of this type may execute code." }
+constraints.required_links = ["defined_in"]
+
+[object_types.relation_type]
+label = "Relation type"
+icon = "share"
+color = "#10b981"
+description = "A type of relation between nodes of a nexc graph. Blocking relations form the execution DAG: the source must finish before the target runs, and they may not close a cycle."
+properties.key = { type = "string", required = true, pattern = "^[a-z][a-z0-9_]*$", max_length = 40, description = "Stable identifier stored on edges." }
+properties.label = { type = "string", required = true, max_length = 60 }
+properties.description = { type = "text", searchable = true, max_length = 500, description = "What the relation asserts about source and target." }
+properties.blocking = { type = "bool", required = true, description = "The source must finish before the target runs." }
+constraints.required_links = ["defined_in"]
+
+[object_types.node]
+description = "A node of a nexc graph (its kind is a node type of that graph)."
+
+[link_types.defined_in]
+label = "Defined in"
+from = ["node_type", "relation_type"]
+to = ["execution_graph"]
+inverse = "defines"
+cardinality = "one"
+weight = 0.9
+description = "The graph whose execution vocabulary the type belongs to."
+
+[link_types.instance_of]
+label = "Instance of"
+from = ["node"]
+to = ["node_type"]
+inverse = "instances"
+cardinality = "one"
+weight = 0.7
+description = "A graph node and its node type."
+
+[glossary.kinds]
+graph = "execution_graph"
+pipeline = "execution_graph"
+
+# Governed edits for people and agents (UI, MCP, nexc's assistant).
+
+[action_types.define_node_type]
+description = "Add or change a node type of a graph: who runs its nodes, when, and what they may do (it can allow code execution, so it needs confirmation)."
+phrases = ["define node type", "add node type", "change node type"]
+risk = "medium"
+parameters.graph = { type = "entity", kinds = ["execution_graph"], required = true, cue = ["in", "for", "to"] }
+parameters.key = { type = "string", required = true }
+parameters.label = { type = "string", required = true }
+parameters.description = { type = "text", required = false }
+parameters.color = { type = "string", required = false }
+parameters.icon = { type = "string", required = false }
+parameters.default_role = { type = "string", required = true }
+parameters.default_executor = { type = "enum", values = ["llm", "agent", "symphony"], required = false, default = "llm" }
+parameters.stage = { type = "int", required = false, default = 0 }
+parameters.produces_artifact = { type = "bool", required = false, default = false }
+parameters.allow_code_exec = { type = "bool", required = false, default = false }
+
+[[action_types.define_node_type.effects]]
+create = { kind = "node_type", key = "{graph.key}.{key}", title = "{label}", links = [{ rel = "defined_in", to = "{graph}" }], props = { key = "{key}", label = "{label}", description = "{description}", color = "{color}", icon = "{icon}", default_role = "{default_role}", default_executor = "{default_executor}", stage = "{stage}", produces_artifact = "{produces_artifact}", allow_code_exec = "{allow_code_exec}" } }
+
+[action_types.define_relation_type]
+description = "Add or change a relation type of a graph; blocking relations order execution."
+phrases = ["define relation type", "add relation type"]
+risk = "low"
+parameters.graph = { type = "entity", kinds = ["execution_graph"], required = true, cue = ["in", "for", "to"] }
+parameters.key = { type = "string", required = true }
+parameters.label = { type = "string", required = true }
+parameters.description = { type = "text", required = false }
+parameters.blocking = { type = "bool", required = false, default = false }
+
+[[action_types.define_relation_type.effects]]
+create = { kind = "relation_type", key = "{graph.key}.{key}", title = "{label}", links = [{ rel = "defined_in", to = "{graph}" }], props = { key = "{key}", label = "{label}", description = "{description}", blocking = "{blocking}" } }
+
+[action_types.retire_execution_type]
+description = "Remove a node type or relation type from its graph."
+phrases = ["retire node type", "remove relation type", "remove node type"]
+risk = "high"
+parameters.item = { type = "entity", kinds = ["node_type", "relation_type"], required = true }
+
+[[action_types.retire_execution_type.effects]]
+delete = "{item}"
