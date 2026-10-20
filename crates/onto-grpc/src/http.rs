@@ -15,6 +15,9 @@
 //! * `GET  /v1/schema/diff`       `?from=&to=`
 //! * `GET  /v1/schema/as_of`      `?ts=` or `?days_ago=`
 //! * `POST /v1/schema/revert`     `{version}`; `/v1/schema/undo` likewise
+//! * `GET  /v1/schema/proposals`  proposals (`?status=&limit=`); `POST` files one
+//! * `GET  /v1/schema/proposals/{id}`  one proposal with a fresh preview
+//! * `POST /v1/schema/proposals/{id}/{approve|reject|comment|withdraw|revise}`
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -58,6 +61,9 @@ pub fn router(intelli: Arc<Intelli>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/schema/as_of", get(schema_as_of))
         .route("/v1/schema/revert", post(schema_revert))
         .route("/v1/schema/undo", post(schema_undo))
+        .route("/v1/schema/proposals", get(proposals_list).post(proposals_create))
+        .route("/v1/schema/proposals/{id}", get(proposal_get))
+        .route("/v1/schema/proposals/{id}/{verb}", post(proposal_verb))
         .with_state(AppState { intelli, auth })
 }
 
@@ -199,6 +205,43 @@ async fn schema_revert(State(s): State<AppState>, headers: HeaderMap, body: Opti
 
 async fn schema_undo(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     run(&s, &headers, "schema.undo", body_or_empty(body)).await
+}
+
+async fn proposals_list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "schema.proposals", query_json(q)).await
+}
+
+async fn proposals_create(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "schema.propose", body_or_empty(body)).await
+}
+
+async fn proposal_get(State(s): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "schema.proposal", json!({ "id": id })).await
+}
+
+async fn proposal_verb(
+    State(s): State<AppState>,
+    Path((id, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "approve" => "schema.approve",
+        "reject" => "schema.reject",
+        "comment" => "schema.comment",
+        "withdraw" => "schema.withdraw",
+        "revise" => "schema.revise",
+        other => return error_response(&Error::not_found(format!("proposal action '{other}'"))),
+    };
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("id".into(), Value::String(id));
+    }
+    run(&s, &headers, action, input).await
 }
 
 async fn ask(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {

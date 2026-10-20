@@ -238,6 +238,36 @@ enum SchemaCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// File a change set as a proposal for review.
+    Propose {
+        file: PathBuf,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        rationale: String,
+    },
+    /// Schema change proposals.
+    Proposals {
+        /// open, applied, rejected, failed or withdrawn.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// One proposal: rationale, impact, reviews (fresh preview when stale).
+    Proposal { id: String },
+    /// Approve a proposal; the last needed approval applies it.
+    Approve {
+        id: String,
+        #[arg(long, default_value = "")]
+        comment: String,
+    },
+    /// Reject a proposal.
+    Reject {
+        id: String,
+        #[arg(long, default_value = "")]
+        comment: String,
+    },
+    /// Withdraw an open or failed proposal.
+    Withdraw { id: String },
 }
 
 /// A change set from a JSON or TOML file (`-`: JSON on stdin).
@@ -855,6 +885,103 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                             );
                         }
                     }
+                }
+                SchemaCmd::Propose { file, title, rationale } => {
+                    let mut input = read_change_set(file)?;
+                    input["title"] = json!(title);
+                    input["rationale"] = json!(rationale);
+                    input["source"] = json!("cli");
+                    let r = be.call("schema.propose", input).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else {
+                        println!(
+                            "{} {} {}",
+                            st.bold("proposed"),
+                            r["id"].as_str().unwrap_or(""),
+                            r["title"].as_str().unwrap_or("")
+                        );
+                        print_plan(st, &r["plan"]);
+                    }
+                }
+                SchemaCmd::Proposals { status } => {
+                    let r = be.call("schema.proposals", json!({ "status": status })).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else {
+                        for p in r["proposals"].as_array().into_iter().flatten() {
+                            let mark = match p["status"].as_str().unwrap_or("") {
+                                "open" => st.cyan("open"),
+                                "applied" => st.bold("applied"),
+                                other => st.dim(other),
+                            };
+                            println!(
+                                "{} {:<9} {} {} {}",
+                                p["id"].as_str().unwrap_or(""),
+                                mark,
+                                p["title"].as_str().unwrap_or(""),
+                                st.dim(&format!(
+                                    "by {}{} · {}/{} approvals",
+                                    p["proposer"]["id"].as_str().unwrap_or(""),
+                                    if p["proposer"]["agent"].as_bool().unwrap_or(false) { " (agent)" } else { "" },
+                                    p["approvals"],
+                                    p["required_approvals"]
+                                )),
+                                if p["plan"]["breaking"].as_bool().unwrap_or(false) {
+                                    st.red("breaking")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                        }
+                    }
+                }
+                SchemaCmd::Proposal { id } => {
+                    let r = be.call("schema.proposal", json!({ "id": id })).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else {
+                        println!(
+                            "{} {} [{}]",
+                            r["id"].as_str().unwrap_or(""),
+                            st.bold(r["title"].as_str().unwrap_or("")),
+                            r["status"].as_str().unwrap_or("")
+                        );
+                        println!("{}", r["rationale"].as_str().unwrap_or(""));
+                        let plan = if r["preview"].is_object() { &r["preview"] } else { &r["plan"] };
+                        if r["stale"].as_bool().unwrap_or(false) {
+                            println!(
+                                "{}",
+                                st.cyan(&format!("schema moved on (v{}); preview against it:", r["active_version"]))
+                            );
+                        }
+                        print_plan(st, plan);
+                        for rv in r["reviews"].as_array().into_iter().flatten() {
+                            println!(
+                                "  {} {} {}",
+                                rv["decision"].as_str().unwrap_or(""),
+                                rv["by"].as_str().unwrap_or(""),
+                                st.dim(rv["comment"].as_str().unwrap_or(""))
+                            );
+                        }
+                    }
+                }
+                SchemaCmd::Approve { id, comment } | SchemaCmd::Reject { id, comment } => {
+                    let action =
+                        if matches!(sub, SchemaCmd::Approve { .. }) { "schema.approve" } else { "schema.reject" };
+                    let r = be.call(action, json!({ "id": id, "comment": comment })).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else {
+                        println!("{} {}", st.bold(r["proposal"]["status"].as_str().unwrap_or("")), id);
+                        if let Some(v) = r["applied"]["version"]["version"].as_u64() {
+                            println!("applied as schema v{v}");
+                        }
+                    }
+                }
+                SchemaCmd::Withdraw { id } => {
+                    let r = be.call("schema.withdraw", json!({ "id": id })).await?;
+                    if *as_json { print_json(&r) } else { println!("{} {}", st.bold("withdrawn"), id) }
                 }
                 SchemaCmd::Revert { version, dry_run } | SchemaCmd::Undo { version, dry_run } => {
                     let action = if matches!(sub, SchemaCmd::Revert { .. }) { "schema.revert" } else { "schema.undo" };

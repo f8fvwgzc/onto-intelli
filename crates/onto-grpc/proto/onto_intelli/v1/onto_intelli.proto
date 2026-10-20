@@ -513,9 +513,48 @@ message SchemaRevertRequest {
   string workspace = 4;
 }
 
+// A schema change proposal: anyone allowed to propose (agents included)
+// files it; approvers (never agents, never the proposer) approve or reject.
+message ProposeRequest {
+  string title = 1;
+  string rationale = 2;
+  repeated google.protobuf.Struct changes = 3;
+  repeated google.protobuf.Struct migrations = 4;
+  string message = 5;
+  string source = 6;              // e.g. "nexc-assistant"
+  string workspace = 7;
+}
+
+message ListProposalsRequest {
+  string status = 1;              // open | applied | rejected | failed | withdrawn; empty = all
+  uint32 limit = 2;
+}
+
+message ProposalRef {
+  string id = 1;
+  string workspace = 2;
+}
+
+message ReviewRequest {
+  string id = 1;
+  string comment = 2;
+  uint64 seen_version = 3;        // schema version previewed; 0 = do not check
+  string workspace = 4;
+}
+
+message ReviseRequest {
+  string id = 1;
+  string title = 2;
+  string rationale = 3;
+  repeated google.protobuf.Struct changes = 4;
+  repeated google.protobuf.Struct migrations = 5;
+  string message = 6;
+  string workspace = 7;
+}
+
 // Object types, properties, link types, interfaces, action types, rules,
 // metrics and glossary terms as data: validated, previewed (impact and
-// migration), versioned, audited and reversible.
+// migration), versioned, audited and reversible; or proposed and reviewed.
 service SchemaService {
   rpc Get(SchemaVersionRequest) returns (google.protobuf.Struct);
   rpc Status(google.protobuf.Empty) returns (google.protobuf.Struct);
@@ -527,6 +566,14 @@ service SchemaService {
   rpc Diff(SchemaDiffRequest) returns (google.protobuf.Struct);
   rpc Revert(SchemaRevertRequest) returns (google.protobuf.Struct);
   rpc Undo(SchemaRevertRequest) returns (google.protobuf.Struct);
+  rpc Propose(ProposeRequest) returns (google.protobuf.Struct);
+  rpc ListProposals(ListProposalsRequest) returns (google.protobuf.Struct);
+  rpc GetProposal(ProposalRef) returns (google.protobuf.Struct);
+  rpc Approve(ReviewRequest) returns (google.protobuf.Struct);
+  rpc Reject(ReviewRequest) returns (google.protobuf.Struct);
+  rpc Comment(ReviewRequest) returns (google.protobuf.Struct);
+  rpc Withdraw(ProposalRef) returns (google.protobuf.Struct);
+  rpc Revise(ReviseRequest) returns (google.protobuf.Struct);
 }
 
 message CallRequest {

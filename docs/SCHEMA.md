@@ -174,6 +174,78 @@ any custom name (`schema_admin`, `approver`). Principals with the `agent`
 role never apply or approve schema changes, whatever other roles they hold;
 they file proposals. Denied attempts are audited as `authorization.denied`.
 
+## Proposals
+
+The flow is: **propose → review → approve or reject → apply atomically**.
+
+1. **Propose.** Anyone allowed to propose (agents included) files a change
+   set with a title and rationale. Invalid change sets are refused with their
+   errors. Breaking ones are accepted, and their stored impact report lists
+   what they need.
+2. **Review.** Reviewers see the diff and impact. If the schema has moved on
+   since filing, reading the proposal returns `stale: true` and a `preview`
+   planned against the active version. Anyone who can read may comment.
+3. **Approve or reject.** Only principals with an `approve_roles` role may
+   approve or reject. Agents never can, and neither can the proposer, unless
+   `allow_self_approval` is set. With `seen_version`, the approval is refused
+   when the schema changed since the reviewer looked.
+4. **Apply.** The approval that reaches `required_approvals` applies the
+   change set. The schema version (source `proposal`), the migration, the
+   proposal marked `applied` with its version, and the audit events all
+   commit in one transaction. If the change no longer applies, the proposal
+   becomes `failed` with the reason. The proposer can then revise it, which
+   reopens it and resets approvals.
+
+Statuses: `open`, `applied`, `rejected`, `failed`, `withdrawn`.
+
+Audit events:
+
+- `schema.proposal.create`, `.comment`, `.approve`, `.reject`, `.withdraw`,
+  `.revise`, `.fail`;
+- `schema.change`, which carries the proposal id.
+
+Each event records the principal who acted.
+
+```json
+{ "title": "Track PR reviews",
+  "rationale": "Reviews are mentioned in 12 conversations and 4 decisions",
+  "source": "nexc-assistant",
+  "changes": [ { "op": "put_link_type", "name": "reviews",
+                 "def": { "from": ["person"], "to": ["artifact"], "inverse": "reviewed_by" } } ] }
+```
+
+| | Library | gRPC `SchemaService` | HTTP | Action | MCP tool |
+|---|---|---|---|---|---|
+| propose | `propose_schema(ctx, input)` | `Propose` | `POST /v1/schema/proposals` | `schema.propose` | `propose_schema_change` |
+| list | `list_proposals(p, status, limit)` | `ListProposals` | `GET /v1/schema/proposals?status=` | `schema.proposals` | `list_proposals` |
+| get | `get_proposal(p, id)` | `GetProposal` | `GET /v1/schema/proposals/{id}` | `schema.proposal` | `get_proposal` |
+| approve / reject / comment | `review_proposal(ctx, id, decision, comment, seen_version)` | `Approve` / `Reject` / `Comment` | `POST /v1/schema/proposals/{id}/approve` (`reject`, `comment`) | `schema.approve` / `.reject` / `.comment` | |
+| withdraw | `withdraw_proposal(ctx, id)` | `Withdraw` | `POST …/{id}/withdraw` | `schema.withdraw` | |
+| revise | `revise_proposal(ctx, id, input)` | `Revise` | `POST …/{id}/revise` | `schema.revise` | |
+
+MCP also offers `get_schema` and `plan_schema_change`, so an assistant can
+inspect the schema and dry-run a change before proposing it. Proposing is
+offered even when `[mcp] allow_writes = false`, because a proposal changes
+nothing until a person approves it.
+
+From the CLI:
+
+```bash
+onto schema propose change.json --title "Runbooks" --rationale "on-call asks for them"
+```
+
+```bash
+onto schema proposals --status open
+```
+
+```bash
+onto schema proposal prop_0199f…
+```
+
+```bash
+onto schema approve prop_0199f… --comment "ok"
+```
+
 ## Surfaces
 
 | | Library (`Ontology`) | gRPC `onto_intelli.v1.SchemaService` | HTTP | Action |

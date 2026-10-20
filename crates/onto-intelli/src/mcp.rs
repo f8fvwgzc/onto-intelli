@@ -24,6 +24,22 @@ fn obj(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
+fn schema_change_props() -> Value {
+    json!({
+        "changes": {
+            "type": "array",
+            "description": "Schema changes, each {op, ...}: put_object_type {name, def}, delete_object_type {name}, rename_object_type {from, to}, put_property {object_type, name, def: {type, required?, values?}}, delete_property {object_type, name}, put_link_type {name, def: {from, to, inverse?, cardinality?}}, delete_link_type {name}, rename_link_type {from, to}, put_action_type {name, def}, put_rule {def: {name, chain, infer}}, put_metric {name, def}, put_interface {name, def}, delete_* {name}. Changes that break data in use need migrations.",
+            "items": { "type": "object", "properties": { "op": { "type": "string" } }, "required": ["op"] }
+        },
+        "migrations": {
+            "type": "array",
+            "description": "Migrations for breaking changes: {action: delete_entities|retype {to}|map_states {map, default}|set_default {property, value}|convert|drop_values|delete_links|move_links {to}|keep_latest|acknowledge}.",
+            "items": { "type": "object" }
+        },
+        "message": { "type": "string" }
+    })
+}
+
 /// (tool name, engine action, description, input schema, writes)
 fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
     let s = |d: &str| json!({ "type": "string", "description": d });
@@ -183,6 +199,52 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             obj(json!({ "receipt": s("Receipt id") }), &["receipt"]),
             true,
         ),
+        (
+            "get_schema",
+            "schema.get",
+            "The active ontology schema: object types (properties, states), link types (from/to, cardinality, inverse), interfaces, action types, rules, metrics, and its version.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        (
+            "plan_schema_change",
+            "schema.plan",
+            "Dry-run a schema change set: validation errors, diff, impact (entities/links affected, breaking or not) and the migrations it still needs. Nothing is written.",
+            obj(schema_change_props(), &["changes"]),
+            false,
+        ),
+        (
+            "propose_schema_change",
+            "schema.propose",
+            "File a schema change proposal for human review (new or changed object types, properties, link types, action types, rules...). It is applied only when an approver accepts it. Plan it first with plan_schema_change.",
+            obj(
+                {
+                    let mut p = schema_change_props();
+                    p["title"] = s("Short title");
+                    p["rationale"] = s("Why the change is needed, with the evidence that motivates it");
+                    p
+                },
+                &["title", "rationale", "changes"],
+            ),
+            false,
+        ),
+        (
+            "list_proposals",
+            "schema.proposals",
+            "Schema change proposals with status (open, applied, rejected, failed, withdrawn), approvals and impact.",
+            obj(
+                json!({ "status": { "type": "string", "enum": ["open", "applied", "rejected", "failed", "withdrawn"] }, "limit": { "type": "integer" } }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "get_proposal",
+            "schema.proposal",
+            "One schema change proposal with its diff, impact, reviews and a fresh preview if the schema moved on.",
+            obj(json!({ "id": s("Proposal id") }), &["id"]),
+            false,
+        ),
     ]
 }
 
@@ -246,6 +308,9 @@ impl McpServer {
                 }
                 if name == "get_entity" && args.get("derived").is_none() {
                     args["derived"] = json!(true);
+                }
+                if name == "propose_schema_change" && args.get("source").is_none() {
+                    args["source"] = json!("mcp");
                 }
                 match self.intelli.call(&self.principal, action, args).await {
                     Ok(v) => {

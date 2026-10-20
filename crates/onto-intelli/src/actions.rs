@@ -14,7 +14,7 @@ use onto_core::{
     ActionContext, EntityInput, EntityPatch, EntityRef, Error, EventFilter, EventInput, Id, LinkInput, Mutation,
     Principal, Result, one_or_many,
 };
-use onto_core::{Migration, Ontology, SchemaChangeSet, SearchMode};
+use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, SchemaChangeSet, SearchMode};
 
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
@@ -128,6 +128,26 @@ pub const ACTIONS: &[ActionInfo] = &[
         "schema.undo",
         true,
         "Undo one version's changes on top of the active schema. Input: {version, migrations?, dry_run?}.",
+    ),
+    a(
+        "schema.propose",
+        true,
+        "File a schema change proposal (agents too). Input: {title, rationale, changes, migrations?, message?, source?}.",
+    ),
+    a("schema.proposals", false, "Schema change proposals, newest first. Input: {status?, limit?}."),
+    a("schema.proposal", false, "One proposal with its diff, impact and a fresh preview when stale. Input: {id}."),
+    a(
+        "schema.approve",
+        true,
+        "Approve a proposal (approve roles, not agents, not the proposer); the last needed approval applies it atomically. Input: {id, comment?, seen_version?}.",
+    ),
+    a("schema.reject", true, "Reject a proposal (approve roles). Input: {id, comment?}."),
+    a("schema.comment", true, "Comment on a proposal. Input: {id, comment}."),
+    a("schema.withdraw", true, "Withdraw an open or failed proposal (its proposer or an approver). Input: {id}."),
+    a(
+        "schema.revise",
+        true,
+        "Replace an open or failed proposal's change set; approvals reset. Input: {id, title?, rationale?, changes, migrations?}.",
     ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
@@ -541,6 +561,36 @@ impl Intelli {
                 let i: DiffIn = parse(action, input)?;
                 to_json(&onto.schema_diff(p, i.from, i.to)?)
             }
+            "schema.propose" => {
+                let i: ProposeIn = parse(action, input)?;
+                to_json(&onto.propose_schema(&self.ctx(p, i.workspace).with_intent(action), i.input)?)
+            }
+            "schema.proposals" => {
+                let i: ProposalsIn = parse(action, input)?;
+                Ok(json!({ "proposals": onto.list_proposals(p, i.status, i.limit.unwrap_or(100))? }))
+            }
+            "schema.proposal" => {
+                let i: IdIn = parse(action, input)?;
+                to_json(&onto.get_proposal(p, &i.id)?)
+            }
+            "schema.approve" | "schema.reject" | "schema.comment" => {
+                let i: ReviewIn = parse(action, input)?;
+                let decision = match action {
+                    "schema.approve" => Decision::Approve,
+                    "schema.reject" => Decision::Reject,
+                    _ => Decision::Comment,
+                };
+                let ctx = self.ctx(p, i.workspace).with_intent(action);
+                to_json(&onto.review_proposal(&ctx, &i.id, decision, &i.comment, i.seen_version)?)
+            }
+            "schema.withdraw" => {
+                let i: IdWsIn = parse(action, input)?;
+                to_json(&onto.withdraw_proposal(&self.ctx(p, i.workspace).with_intent(action), &i.id)?)
+            }
+            "schema.revise" => {
+                let i: ReviseIn = parse(action, input)?;
+                to_json(&onto.revise_proposal(&self.ctx(p, i.workspace).with_intent(action), &i.id, i.input)?)
+            }
             "schema.revert" | "schema.undo" => {
                 let i: RevertIn = parse(action, input)?;
                 let ctx = self.ctx(p, i.workspace).with_intent(action);
@@ -614,6 +664,49 @@ struct DiffIn {
     from: u64,
     #[serde(default)]
     to: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ProposeIn {
+    #[serde(flatten)]
+    input: ProposalInput,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ProposalsIn {
+    #[serde(default)]
+    status: Option<ProposalStatus>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ReviewIn {
+    id: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    seen_version: Option<u64>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IdWsIn {
+    id: String,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReviseIn {
+    id: String,
+    #[serde(flatten)]
+    input: ProposalInput,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -394,3 +394,49 @@ async fn schema_service_plans_applies_and_versions() {
     let diff: Value = http.get(format!("{base}/v1/schema/diff?from=1")).send().await.unwrap().json().await.unwrap();
     assert_eq!(diff["entries"][0]["name"], "incident");
 }
+
+#[tokio::test]
+async fn proposals_over_grpc_and_http() {
+    let srv = start(|_| {}).await;
+    let ch = channel(srv.addr).await;
+    let mut schema = pb::schema_service_client::SchemaServiceClient::new(ch);
+    let filed = schema
+        .propose(pb::ProposeRequest {
+            title: "Runbooks".into(),
+            rationale: "on-call needs them".into(),
+            changes: vec![struct_of(json!({ "op": "put_object_type", "name": "runbook", "def": {} }))],
+            source: "test".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let id = match &filed.fields["id"].kind {
+        Some(prost_types::value::Kind::StringValue(s)) => s.clone(),
+        other => panic!("no id: {other:?}"),
+    };
+    let listed =
+        schema.list_proposals(pb::ListProposalsRequest { status: "open".into(), limit: 0 }).await.unwrap().into_inner();
+    assert!(format!("{listed:?}").contains(&id));
+
+    let base = format!("http://{}", srv.addr);
+    let http = reqwest::Client::new();
+    let one: Value = http.get(format!("{base}/v1/schema/proposals/{id}")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["status"], "open");
+    assert_eq!(one["plan"]["changes"][0]["summary"], "add object type runbook");
+    // The default test principal proposed it, so it cannot approve its own proposal.
+    let own = http.post(format!("{base}/v1/schema/proposals/{id}/approve")).json(&json!({})).send().await.unwrap();
+    assert_eq!(own.status(), 403);
+    let rejected: Value = http
+        .post(format!("{base}/v1/schema/proposals/{id}/withdraw"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rejected["status"], "withdrawn");
+    let bad = http.post(format!("{base}/v1/schema/proposals/{id}/explode")).send().await.unwrap();
+    assert_eq!(bad.status(), 404);
+}

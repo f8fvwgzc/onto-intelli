@@ -2064,15 +2064,23 @@ fn config_kv(config: &Schema) -> Result<(String, String, Value)> {
 pub(crate) struct VersionOrigin {
     pub source: &'static str,
     pub proposal: Option<String>,
-    /// Extra KV committed with the version (the proposal record).
+    /// Extra KV committed with the version.
     pub kv: Vec<(String, String, Value)>,
     /// Config baseline to record (imports).
     pub config: Option<Schema>,
+    /// Extra audit events committed with the version.
+    pub events: Vec<crate::model::Event>,
+    /// Proposal recorded as applied (with the new version) in the same transaction.
+    pub proposal_record: Option<Box<crate::proposals::SchemaProposal>>,
 }
 
 impl VersionOrigin {
     pub fn api() -> Self {
-        Self { source: "api", proposal: None, kv: Vec::new(), config: None }
+        Self::of("api")
+    }
+
+    pub fn of(source: &'static str) -> Self {
+        Self { source, proposal: None, kv: Vec::new(), config: None, events: Vec::new(), proposal_record: None }
     }
 }
 
@@ -2156,7 +2164,7 @@ impl Ontology {
                     message: "schema files changed since the last import".into(),
                     ..Default::default()
                 };
-                let origin = VersionOrigin { source: "import", proposal: None, kv: Vec::new(), config: Some(config) };
+                let origin = VersionOrigin { config: Some(config), ..VersionOrigin::of("import") };
                 match self.schema_commit(&ctx, set, origin) {
                     Ok(_) => self.set_import_error(None),
                     Err(e) => self.set_import_error(Some(format!(
@@ -2330,6 +2338,13 @@ impl Ontology {
         if let Some(c) = &origin.config {
             kv.push(config_kv(c)?);
         }
+        if let Some(mut prop) = origin.proposal_record {
+            prop.status = crate::proposals::ProposalStatus::Applied;
+            prop.applied_version = Some(version);
+            prop.error = None;
+            prop.updated_at = now;
+            kv.push((crate::proposals::NS_PROPOSALS.into(), prop.id.clone(), serde_json::to_value(&*prop)?));
+        }
         let event = self.event(
             ctx,
             &ctx.workspace,
@@ -2349,10 +2364,12 @@ impl Ontology {
             }),
             Vec::new(),
         );
+        let mut events = origin.events;
+        events.push(event);
         let extra = Extra {
             kv,
             redirects: planned.redirects.clone(),
-            events: vec![event],
+            events,
             schema: Some((Arc::new(schema), version)),
             reindex: planned.reindex.clone(),
         };
@@ -2493,7 +2510,7 @@ impl Ontology {
         }
         self.authorize_schema_write(ctx, &format!("schema.{source}"))?;
         let changes = set.changes.clone();
-        let origin = VersionOrigin { source, proposal: None, kv: Vec::new(), config: None };
+        let origin = VersionOrigin::of(source);
         let applied = self.schema_commit(ctx, set, origin)?;
         Ok(SchemaRevert { changes, plan: None, applied: Some(applied) })
     }

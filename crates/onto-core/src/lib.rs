@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod model;
 pub mod policy;
 pub mod profile;
+pub mod proposals;
 pub mod quality;
 pub mod query;
 pub mod rules;
@@ -47,4 +48,5 @@ pub use live_schema::{
 };
 pub use model::*;
 pub use policy::{Access, Principal, Role};
+pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use schema::{Dir, Schema};

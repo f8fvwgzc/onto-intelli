@@ -141,3 +141,49 @@ async fn system_prompt_uses_populated_patterns_and_stays_stable() {
         .unwrap();
     assert_eq!(p1, i.system_prompt(), "unrelated writes keep the prompt (and provider caches) stable");
 }
+
+#[tokio::test]
+async fn agents_propose_schema_changes_over_mcp_and_humans_approve() {
+    let i = demo().await;
+    let agent = Principal::new("assistant", vec![onto_intelli::Role::Agent], vec!["*".into()]);
+    let mcp = McpServer::new(i.clone(), agent, false);
+    let list = mcp.handle(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await.unwrap();
+    let names: Vec<&str> =
+        list["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    for t in ["get_schema", "plan_schema_change", "propose_schema_change", "list_proposals", "get_proposal"] {
+        assert!(names.contains(&t), "{t} missing from {names:?}");
+    }
+    let change = json!([{ "op": "put_link_type", "name": "reviews",
+        "def": { "from": ["person"], "to": ["artifact"], "inverse": "reviewed_by" } }]);
+    let plan = mcp
+        .handle(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "plan_schema_change", "arguments": { "changes": change } } }))
+        .await
+        .unwrap();
+    assert_eq!(plan["result"]["structuredContent"]["valid"], true, "{plan}");
+    let filed = mcp
+        .handle(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "propose_schema_change", "arguments": {
+                "title": "Track reviews", "rationale": "PR reviews are mentioned in 12 conversations", "changes": change } } }))
+        .await
+        .unwrap();
+    assert_eq!(filed["result"]["isError"], false, "{filed}");
+    let p = &filed["result"]["structuredContent"];
+    assert_eq!(p["status"], "open");
+    assert_eq!(p["source"], "mcp");
+    assert_eq!(p["proposer"]["agent"], true);
+    let id = p["id"].as_str().unwrap().to_string();
+    let open = mcp
+        .handle(json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "list_proposals", "arguments": { "status": "open" } } }))
+        .await
+        .unwrap();
+    assert_eq!(open["result"]["structuredContent"]["proposals"][0]["id"], json!(id));
+    // A human approver applies it through the action API.
+    let out = i.call(&admin(), "schema.approve", json!({ "id": id, "comment": "ok" })).await.unwrap();
+    assert_eq!(out["proposal"]["status"], "applied");
+    assert_eq!(out["applied"]["version"]["version"], 2);
+    let schema = i.call(&admin(), "schema.get", json!({})).await.unwrap();
+    assert_eq!(schema["schema_version"], 2);
+    assert!(schema["link_types"]["reviews"].is_object());
+}
