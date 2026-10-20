@@ -55,3 +55,4 @@ case ":$PATH:" in
   *) echo "Add $DIR to your PATH, e.g.: export PATH=\"$DIR:\$PATH\"" ;;
 esac
 "$DIR/onto" --version
+echo "onto keeps its data in PostgreSQL 16+ with pgvector: set ONTO_DATABASE_URL (see https://github.com/f8fvwgzc/onto-intelli#install)."

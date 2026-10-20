@@ -14,7 +14,7 @@ name = "onto"
 path = "src/main.rs"
 
 [dependencies]
-onto-intelli = { workspace = true, features = ["sqlite", "postgres", "http-llm"] }
+onto-intelli = { workspace = true, features = ["postgres", "http-llm"] }
 onto-grpc.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

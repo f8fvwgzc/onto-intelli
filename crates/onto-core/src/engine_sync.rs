@@ -148,12 +148,15 @@ impl Ontology {
         {
             let mut text = self.inner.text.write();
             let mut vectors = self.inner.vectors.write();
+            let in_memory = self.inner.vector_store.is_none();
             for id in &ids {
                 match rows.get(id) {
                     Some(e) => {
                         let doc = searchable_text(&schema, e);
                         text.upsert(&e.id, &doc);
-                        vectors.upsert(&e.id, &doc);
+                        if in_memory {
+                            vectors.upsert(&e.id, &doc);
+                        }
                         g.put_entity(e.clone());
                     }
                     None => {
@@ -211,11 +214,16 @@ impl Ontology {
         if !changed.is_empty() {
             let mut text = self.inner.text.write();
             let mut vectors = self.inner.vectors.write();
+            // A store-kept vector index was updated by the writer, in the
+            // same commit as the schema.
+            let in_memory = self.inner.vector_store.is_none();
             for kind in &changed {
                 for e in g.of_kind(kind) {
                     let doc = searchable_text(&next.schema, e);
                     text.upsert(&e.id, &doc);
-                    vectors.upsert(&e.id, &doc);
+                    if in_memory {
+                        vectors.upsert(&e.id, &doc);
+                    }
                 }
             }
         }
@@ -231,7 +239,8 @@ impl Ontology {
             *self.inner.active.write() = next;
         }
         let schema = self.schema();
-        let (graph, text, vectors) = build_indexes(&schema, snap.entities, snap.links);
+        let (graph, text, vectors) =
+            build_indexes(&schema, snap.entities, snap.links, self.inner.vector_store.is_none());
         *g = graph;
         *self.inner.text.write() = text;
         *self.inner.vectors.write() = vectors;
@@ -245,11 +254,12 @@ impl Ontology {
     }
 }
 
-/// Graph, text and vector indexes for a snapshot.
+/// Graph, text and (unless the store indexes them) vector indexes for a snapshot.
 pub(crate) fn build_indexes(
     schema: &crate::schema::Schema,
     entities: Vec<crate::model::Entity>,
     links: Vec<crate::model::Link>,
+    with_vectors: bool,
 ) -> (Graph, TextIndex, VectorIndex) {
     let mut graph = Graph::default();
     let mut text = TextIndex::default();
@@ -257,7 +267,9 @@ pub(crate) fn build_indexes(
     for e in entities {
         let doc = searchable_text(schema, &e);
         text.upsert(&e.id, &doc);
-        vectors.upsert(&e.id, &doc);
+        if with_vectors {
+            vectors.upsert(&e.id, &doc);
+        }
         graph.put_entity(e);
     }
     for l in links {

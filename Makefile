@@ -1,13 +1,32 @@
 TARGET ?= $(shell rustc -vV | sed -n 's/host: //p')
 DIST   := dist/onto-$(TARGET)
+# The local database from docker-compose.yml (`make db-up`).
+DEV_DATABASE_URL := postgres://onto:onto@127.0.0.1:5441/onto
 
-.PHONY: build test lint fmt release install ffi dist docker demo clean
+.PHONY: build test test-db lint fmt release install ffi dist docker demo clean db-up db-down db-reset
 
 build:
 	cargo build --workspace
 
+# Tests that need PostgreSQL run when DATABASE_URL is set; `make test-db` sets it.
 test:
 	cargo test --workspace
+
+test-db: db-up
+	DATABASE_URL=$(DEV_DATABASE_URL) cargo test --workspace
+
+# PostgreSQL 16 + pgvector on 127.0.0.1:5441 (docker compose).
+db-up:
+	docker compose up -d --wait db
+	@echo "export ONTO_DATABASE_URL=$(DEV_DATABASE_URL)"
+
+db-down:
+	docker compose down
+
+# Stop the database and delete its data.
+db-reset:
+	docker compose down --volumes
+	docker compose up -d --wait db
 
 lint:
 	cargo fmt --all --check
@@ -38,10 +57,10 @@ dist:
 docker:
 	docker build -t onto-intelli .
 
-demo:
+demo: db-up
 	cargo run -q -p onto-intelli-cli -- --config /tmp/onto-demo/onto-intelli.toml init /tmp/onto-demo --force
-	cargo run -q -p onto-intelli-cli -- --config /tmp/onto-demo/onto-intelli.toml seed demo
-	cargo run -q -p onto-intelli-cli -- --config /tmp/onto-demo/onto-intelli.toml ask "Why is Project Alpha blocked?" --context
+	cargo run -q -p onto-intelli-cli -- --config /tmp/onto-demo/onto-intelli.toml --database-url $(DEV_DATABASE_URL) seed demo
+	cargo run -q -p onto-intelli-cli -- --config /tmp/onto-demo/onto-intelli.toml --database-url $(DEV_DATABASE_URL) ask "Why is Project Alpha blocked?" --context
 
 clean:
 	cargo clean

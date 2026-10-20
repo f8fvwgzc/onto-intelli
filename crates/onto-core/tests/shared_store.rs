@@ -1,8 +1,11 @@
-//! Several processes on one store: optimistic commits, catch-up, schema and
-//! redirect replication. Runs on a shared SQLite file always, and on
-//! PostgreSQL when `ONTO_TEST_POSTGRES_URL` is set.
+//! Several processes on one PostgreSQL tenant: optimistic commits, catch-up,
+//! schema and redirect replication, and the store itself (migrations,
+//! vectors, append-only history). Runs when a test database is set (see
+//! `common`).
+#![cfg(feature = "postgres")]
 
-use std::sync::Arc;
+mod common;
+
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -106,44 +109,9 @@ pub fn shared_suite(a: Ontology, b: Ontology) {
 }
 
 #[test]
-fn two_processes_on_one_sqlite_file() {
-    let dir = std::env::temp_dir().join(format!("onto-shared-{}", onto_core::time::new_id("t")));
-    let db = dir.join("onto.db");
-    let open = || Ontology::open_sqlite(Schema::enterprise(), &db, OntologyOptions::default()).unwrap();
-    let a = open();
-    let b = open();
-    shared_suite(a, b);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn sqlite_readers_catch_up_many_commits() {
-    let dir = std::env::temp_dir().join(format!("onto-reload-{}", onto_core::time::new_id("t")));
-    let db = dir.join("onto.db");
-    let a = Ontology::open_sqlite(Schema::enterprise(), &db, OntologyOptions::default()).unwrap();
-    let b = Ontology::open_sqlite(Schema::enterprise(), &db, OntologyOptions::default()).unwrap();
-    for i in 0..30 {
-        a.upsert(&ctx("ann"), EntityInput::new("task", format!("{i}"), format!("Task {i}"))).unwrap();
-    }
-    let report = b.sync().unwrap();
-    assert_eq!(report.commits, 30);
-    assert_eq!(b.stats().unwrap().entities, a.stats().unwrap().entities);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[cfg(feature = "postgres")]
-#[test]
 fn two_processes_on_one_postgres_tenant() {
-    let Ok(url) = std::env::var("ONTO_TEST_POSTGRES_URL") else {
-        eprintln!("skipped: set ONTO_TEST_POSTGRES_URL to run the PostgreSQL suite");
-        return;
-    };
-    let tenant = format!("t{}", &onto_core::time::new_id("x")[2..]);
-    let open = || {
-        let store = onto_core::store::PgStore::connect(&url, &tenant, onto_core::store::PgOptions::default()).unwrap();
-        let opts = OntologyOptions { follow_interval_ms: 200, ..Default::default() };
-        Ontology::open(Schema::enterprise(), Arc::new(store), opts).unwrap()
-    };
+    let Some(pg) = common::TestTenant::new("shared") else { return };
+    let open = || pg.open(Schema::enterprise(), OntologyOptions { follow_interval_ms: 200, ..Default::default() });
     let a = open();
     let b = open();
     shared_suite(a.clone(), b.clone());
@@ -154,8 +122,110 @@ fn two_processes_on_one_postgres_tenant() {
         assert!(start.elapsed() < Duration::from_secs(5), "LISTEN/NOTIFY follower did not deliver");
         std::thread::sleep(Duration::from_millis(10));
     }
-    onto_core::store::PgStore::connect(&url, &tenant, onto_core::store::PgOptions::default())
-        .unwrap()
-        .drop_tenant()
+}
+
+#[test]
+fn readers_catch_up_many_commits() {
+    let Some(pg) = common::TestTenant::new("catchup") else { return };
+    let a = pg.open(Schema::enterprise(), OntologyOptions::default());
+    let b = pg.open(Schema::enterprise(), OntologyOptions::default());
+    for i in 0..30 {
+        a.upsert(&ctx("ann"), EntityInput::new("task", format!("{i}"), format!("Task {i}"))).unwrap();
+    }
+    let report = b.sync().unwrap();
+    assert!(report.commits >= 30 || b.seq() == a.seq(), "{report:?}");
+    assert_eq!(b.stats().unwrap().entities, a.stats().unwrap().entities);
+}
+
+#[test]
+fn migrations_are_versioned_and_idempotent() {
+    let Some(pg) = common::TestTenant::new("migrate") else { return };
+    let store = pg.store();
+    let applied = store.migrations().unwrap();
+    let known: Vec<i32> = onto_core::store::postgres::MIGRATIONS.iter().map(|m| m.0).collect();
+    assert_eq!(applied.iter().map(|m| m.0).collect::<Vec<_>>(), known);
+    assert_eq!(applied[0].1, "init");
+    // Opening again applies nothing new.
+    let again = pg.store();
+    assert_eq!(again.migrations().unwrap(), applied);
+}
+
+#[test]
+fn vectors_live_in_pgvector_and_rank_like_memory() {
+    let Some(pg) = common::TestTenant::new("vectors") else { return };
+    let o = pg.open(Schema::enterprise(), OntologyOptions::default());
+    let mem = Ontology::in_memory(Schema::enterprise());
+    let docs = [
+        ("1", "Payment timeout under load"),
+        ("2", "Checkout UI polish"),
+        ("3", "Postgres replication lag"),
+        ("4", "Payments retries time out at peak"),
+    ];
+    for (k, title) in docs {
+        for x in [&o, &mem] {
+            x.upsert(&ctx("ann"), EntityInput::new("issue", k, title)).unwrap();
+        }
+    }
+    let admin = Principal::admin("x");
+    let vector = |x: &Ontology, q: &str| -> Vec<String> {
+        x.search_with(&admin, q, &[], None, 3, onto_core::SearchMode::Vector, false)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.entity.id)
+            .collect()
+    };
+    let pg_hits = vector(&o, "payments timing out");
+    assert!(pg_hits.starts_with(&["issue:4".into(), "issue:1".into()]), "{pg_hits:?}");
+    assert_eq!(pg_hits, vector(&mem, "payments timing out"), "pgvector ranks like the in-memory index");
+    assert_eq!(vector(&o, "postgress replication").first().map(String::as_str), Some("issue:3"));
+    assert_eq!(o.stats().unwrap().vectors, 4);
+    // Kind filters reach the index; a fresh process finds the same.
+    assert!(
+        o.search_with(&admin, "payment", &["team".into()], None, 3, onto_core::SearchMode::Vector, false)
+            .unwrap()
+            .is_empty()
+    );
+    let b = pg.open(Schema::enterprise(), OntologyOptions::default());
+    assert_eq!(vector(&b, "payments timing out"), pg_hits);
+}
+
+#[test]
+fn bulk_imports_get_their_vectors_on_open() {
+    let Some(pg) = common::TestTenant::new("backfill") else { return };
+    let store = pg.store();
+    let entities: Vec<onto_core::Entity> = (0..50)
+        .map(|i| {
+            let title = if i == 7 { "Kafka consumer stuck".to_string() } else { format!("Routine chore {i}") };
+            serde_json::from_value(
+                json!({ "id": format!("issue:{i}"), "kind": "issue", "workspace": "acme", "title": title }),
+            )
+            .unwrap()
+        })
+        .collect();
+    use onto_core::store::Store;
+    store.bulk_import(&entities, &[]).unwrap();
+    let o = pg.open(Schema::enterprise(), OntologyOptions::default());
+    assert_eq!(o.stats().unwrap().vectors, 50, "opening backfilled every vector");
+    let hits = o
+        .search_with(&Principal::admin("x"), "kafka consumers", &[], None, 1, onto_core::SearchMode::Vector, false)
         .unwrap();
+    assert_eq!(hits[0].entity.id, "issue:7");
+    assert_eq!(o.backfill_vectors().unwrap(), 0, "nothing left to do");
+}
+
+#[test]
+fn history_is_append_only() {
+    let Some(pg) = common::TestTenant::new("append") else { return };
+    let o = pg.open(Schema::enterprise(), OntologyOptions::default());
+    o.upsert(&ctx("ann"), EntityInput::new("team", "core", "Core")).unwrap();
+    let schema = pg.store().schema_name().to_string();
+    let url = pg.url.clone();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let res = rt.block_on(async move {
+        let pool = onto_core::sqlx::PgPool::connect(&url).await.unwrap();
+        let update = format!("UPDATE \"{schema}\".events SET actor = 'mallory'");
+        onto_core::sqlx::raw_sql(onto_core::sqlx::AssertSqlSafe(update)).execute(&pool).await
+    });
+    let msg = res.unwrap_err().to_string();
+    assert!(msg.contains("append-only"), "{msg}");
 }

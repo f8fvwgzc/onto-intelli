@@ -37,6 +37,10 @@ struct Args {
     /// Keep the tenant afterwards.
     #[arg(long)]
     keep: bool,
+    /// Import and open once (computing vectors, building the HNSW index),
+    /// then stop and keep the tenant; measure later with --skip-load.
+    #[arg(long)]
+    load_only: bool,
 }
 
 const WORDS: &[&str] = &[
@@ -313,7 +317,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    // Open the way a replica does: load the tenant, build indexes.
+    // The first open after an import also computes every vector and builds
+    // the HNSW index; a replica opening later only loads the graph.
     let rss0 = rss_mb();
     let mut cfg = Config::in_memory();
     cfg.engine.storage = "postgres".into();
@@ -327,15 +332,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let onto = intelli.ontology().clone();
     let stats = onto.stats()?;
     let rss1 = rss_mb();
-    eprintln!("opened in {open_s:.1}s: {} entities, {} links, rss {:.0} MB", stats.entities, stats.links, rss1);
+    eprintln!(
+        "opened in {open_s:.1}s: {} entities, {} links, {} vectors, rss {:.0} MB",
+        stats.entities, stats.links, stats.vectors, rss1
+    );
     report.push(format!(
-        "- Open (load the tenant and build graph, BM25 and vector indexes): **{:.1} s**, {} entities, {} links, resident memory {:.0} MB (+{:.0} MB)",
+        "- First open{}: **{:.1} s** ({} entities, {} links, {} vectors in pgvector), resident memory {:.0} MB (+{:.0} MB)",
+        if args.skip_load { "" } else { " after the import, computing every vector and building the HNSW index" },
         open_s,
         stats.entities,
         stats.links,
+        stats.vectors,
         rss1,
         rss1 - rss0
     ));
+
+    if args.load_only {
+        println!("## Load\n");
+        for r in &report {
+            println!("{r}");
+        }
+        return Ok(());
+    }
 
     let p = Principal::admin("bench");
     let mut rng = fastrand::Rng::with_seed(7);
@@ -353,6 +371,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..iters {
         let q = words(&mut rng, 2);
         let _ = time(&mut s.samples, || onto.search(&p, &q, &[], None, 10));
+    }
+    stats.push(s);
+
+    let mut s =
+        Stat { name: "search (vector)", detail: "pgvector HNSW only, 2 words, top 10".into(), samples: Vec::new() };
+    for _ in 0..iters {
+        let q = words(&mut rng, 2);
+        let _ = time(&mut s.samples, || {
+            onto.search_with(&p, &q, &[], None, 10, onto_intelli::core::SearchMode::Vector, false)
+        });
     }
     stats.push(s);
 
@@ -454,7 +482,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rcfg.engine.storage = "postgres".into();
     rcfg.engine.follow_interval_ms = 1_000;
     rcfg.memory.enabled = false;
+    let (rss2, t) = (rss_mb(), Instant::now());
     let replica = Intelli::open_with_store(rcfg, replica_store, onto_intelli::llm::build(&Default::default())?).await?;
+    let replica_s = t.elapsed().as_secs_f64();
+    report.push(format!(
+        "- Open as another replica (graph and BM25 into memory; vectors stay in PostgreSQL): **{:.1} s**, +{:.0} MB resident",
+        replica_s,
+        rss_mb() - rss2
+    ));
     let mut s =
         Stat { name: "replication", detail: "write on one replica → visible on another".into(), samples: Vec::new() };
     for i in 0..50 {

@@ -1,5 +1,5 @@
 //! Many tenants in one process. Each tenant is its own ontology (its own
-//! PostgreSQL schema, SQLite file or in-memory store) with its own schema
+//! PostgreSQL schema, or an in-memory store) with its own schema
 //! versions, proposals, memory and caches; the LLM provider is shared.
 //! Tenants open on first use and stay open.
 //!
@@ -17,7 +17,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -32,8 +31,6 @@ use crate::llm::{self, LlmProvider};
 
 enum Backend {
     Memory,
-    #[cfg(feature = "sqlite")]
-    Sqlite(PathBuf),
     #[cfg(feature = "postgres")]
     Postgres(onto_core::store::PgShared),
     /// One ontology opened elsewhere (`Hub::single`).
@@ -54,21 +51,18 @@ pub fn valid_tenant(id: &str) -> bool {
 }
 
 impl Hub {
-    /// Backend from `engine.storage`: one PostgreSQL schema per tenant,
-    /// one SQLite file per tenant (`{data_dir}/tenants/{id}/onto.db`, the
-    /// default tenant keeps `{data_dir}/onto.db`), or memory.
+    /// Backend from `engine.storage`: one PostgreSQL schema per tenant
+    /// (`{schema_prefix}{tenant}`), or memory.
     pub async fn open(config: Config) -> Result<Arc<Hub>> {
         let llm = llm::build(&config.llm)?;
         let backend = match config.engine.storage.as_str() {
             "memory" => Backend::Memory,
-            #[cfg(feature = "sqlite")]
-            "sqlite" => Backend::Sqlite(config.resolve_path(&config.engine.data_dir)),
             #[cfg(feature = "postgres")]
-            "postgres" | "postgresql" => {
-                let pg = &config.engine.postgres;
-                Backend::Postgres(onto_core::store::PgShared::connect(&pg.resolve_url()?, &pg_options(&config))?)
-            }
-            other => return Err(Error::Config(format!("unknown engine.storage '{other}' (sqlite, postgres, memory)"))),
+            "postgres" | "postgresql" => Backend::Postgres(onto_core::store::PgShared::connect(
+                &config.engine.resolve_database_url()?,
+                &pg_options(&config),
+            )?),
+            other => return Err(Error::Config(format!("unknown engine.storage '{other}' (postgres, memory)"))),
         };
         Ok(Self::with_backend(config, llm, backend))
     }
@@ -152,22 +146,6 @@ impl Hub {
         match &self.backend {
             #[cfg(feature = "postgres")]
             Backend::Postgres(shared) => shared.list_tenants(&self.config.engine.postgres.schema_prefix),
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(dir) => {
-                let mut out = vec![self.default_tenant.clone()];
-                if let Ok(rd) = std::fs::read_dir(dir.join("tenants")) {
-                    for e in rd.flatten() {
-                        if e.path().join("onto.db").is_file()
-                            && let Some(n) = e.file_name().to_str()
-                        {
-                            out.push(n.to_string());
-                        }
-                    }
-                }
-                out.sort();
-                out.dedup();
-                Ok(out)
-            }
             _ => Ok(self.open_tenants()),
         }
     }
@@ -177,15 +155,6 @@ impl Hub {
         cfg.engine.postgres.tenant = id.to_string();
         let store: Arc<dyn Store> = match &self.backend {
             Backend::Memory => Arc::new(MemoryStore::default()),
-            #[cfg(feature = "sqlite")]
-            Backend::Sqlite(dir) => {
-                let path = if id == self.default_tenant {
-                    dir.join("onto.db")
-                } else {
-                    dir.join("tenants").join(id).join("onto.db")
-                };
-                Arc::new(onto_core::store::SqliteStore::open(path)?)
-            }
             #[cfg(feature = "postgres")]
             Backend::Postgres(shared) => Arc::new(shared.tenant(id, pg_options(&cfg))?),
             Backend::Fixed => {

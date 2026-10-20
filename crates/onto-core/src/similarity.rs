@@ -54,6 +54,13 @@ fn quantize(v: &[f32]) -> Vec<i8> {
     v.iter().map(|x| (x * 127.0).round().clamp(-127.0, 127.0) as i8).collect()
 }
 
+/// The quantized vector of `text` as stores keep it (`None`: no features).
+/// Every component is an integer in -127..=127, exact in half precision.
+pub fn embed_quantized(text: &str) -> Option<Vec<i8>> {
+    let v = embed(text);
+    (!v.iter().all(|x| *x == 0.0)).then(|| quantize(&v))
+}
+
 fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     a.iter().zip(b).map(|(x, y)| i32::from(*x) * i32::from(*y)).sum()
 }

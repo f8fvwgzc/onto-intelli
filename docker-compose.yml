@@ -1,0 +1,47 @@
+# Local PostgreSQL 16 with pgvector for development and tests.
+#   make db-up      start it (waits until it accepts connections)
+#   make db-down    stop it (data is kept in the onto-pg volume)
+#   make db-reset   stop it and delete its data
+# URL: postgres://onto:onto@127.0.0.1:5441/onto
+# Host port 5441 keeps clear of other local PostgreSQL servers on 5432/5440.
+#
+# `docker compose --profile server up` also builds and runs onto itself.
+name: onto-intelli
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    # Parallel HNSW index builds keep maintenance_work_mem in /dev/shm.
+    shm_size: 1g
+    environment:
+      POSTGRES_USER: onto
+      POSTGRES_PASSWORD: onto
+      POSTGRES_DB: onto
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all"]
+    ports:
+      - "127.0.0.1:5441:5432"
+    volumes:
+      - onto-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U onto -d onto"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  onto:
+    profiles: ["server"]
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ONTO_DATABASE_URL: postgres://onto:onto@db:5432/onto
+      ONTO_TOKEN: ${ONTO_TOKEN:-}   # bearer token clients must send; the server refuses to start without one
+    ports:
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - onto-config:/data
+
+volumes:
+  onto-pg:
+  onto-config:

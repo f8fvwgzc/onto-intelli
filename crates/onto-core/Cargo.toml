@@ -10,11 +10,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["sqlite"]
-# Durable single-file storage (SQLite compiled in, no system library needed).
-sqlite = ["dep:rusqlite"]
-# Shared storage for several processes: PostgreSQL with LISTEN/NOTIFY.
-postgres = ["dep:sqlx", "dep:tokio", "dep:futures"]
+default = ["postgres"]
+# Durable storage: PostgreSQL 16+ with pgvector, shared by any number of
+# processes (LISTEN/NOTIFY). Without it only the in-memory store is built.
+postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio", "dep:futures"]
 
 [dependencies]
 serde.workspace = true
@@ -24,7 +23,7 @@ parking_lot.workspace = true
 toml.workspace = true
 fastrand.workspace = true
 regex-lite.workspace = true
-rusqlite = { workspace = true, optional = true }
-sqlx = { workspace = true, optional = true }
+sqlx-core = { workspace = true, optional = true }
+sqlx-postgres = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

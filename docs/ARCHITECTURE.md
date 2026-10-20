@@ -25,7 +25,7 @@ ActionContext (actor, workspace, request_id, intent, source)
    → authorization (workspace isolation, role, entity ACL)    — denials are audited too
    → validation against the schema (kinds, states, property types, relation endpoints)
    → staged copy-on-write overlay (batch is all-or-nothing)
-   → durable write (entities, links, events in one SQLite transaction)
+   → durable write (entities, vectors, links, events, history in one PostgreSQL transaction)
    → graph + index update, revision bump, change listeners
 ```
 
@@ -87,9 +87,10 @@ The split of responsibilities:
 
 The schema (types, relations with inverses and weights, rules, analysis settings) is data,
 loaded from TOML and layered: built-in → organization extensions. The graph is an in-memory
-index over a pluggable `Store`; SQLite (WAL, bundled) is the default, `MemoryStore` for tests
-and embedding. Specialized stores (Postgres, a graph DB, a vector index) can implement the
-same trait when a workload needs them — not before.
+index over a `Store`. PostgreSQL 16+ with pgvector is the durable store, shared by any number
+of processes: JSONB documents, an append-only event log, history, a commit log and the vector
+index. `MemoryStore` is for tests and demos. Specialized stores (a graph DB, another vector
+index) can implement the same trait when a workload needs them — not before.
 
 ## 7. One action surface
 

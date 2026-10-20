@@ -29,6 +29,9 @@ struct Cli {
     /// Tenant (default: engine.postgres.tenant); each tenant is its own ontology.
     #[arg(long, global = true, env = "ONTO_TENANT")]
     tenant: Option<String>,
+    /// PostgreSQL URL (default: engine.database_url, then $ONTO_DATABASE_URL, then $DATABASE_URL).
+    #[arg(long, global = true, value_name = "URL")]
+    database_url: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -554,6 +557,9 @@ fn local_config(cli: &Cli) -> Result<Config> {
     let mut cfg = Config::discover(cli.config.as_deref())?;
     if let Some(ws) = &cli.workspace {
         cfg.engine.default_workspace = ws.clone();
+    }
+    if let Some(url) = &cli.database_url {
+        cfg.engine.database_url = Some(url.clone());
     }
     Ok(cfg)
 }
@@ -1342,10 +1348,10 @@ fn init(dir: &Path, force: bool, st: &Style) -> Result<()> {
     if !proto.exists() || force {
         std::fs::write(&proto, EXAMPLE_PROTO)?;
     }
-    std::fs::create_dir_all(dir.join(".onto"))?;
     println!("Created {} and {}", st.bold(&cfg_path.display().to_string()), proto.display());
     println!(
-        "\nNext:\n  onto seed demo\n  onto ask \"Who owns Project Alpha?\"\n  export ONTO_TOKEN=$(openssl rand -hex 24) && onto serve\n  (or `onto serve --dev` locally: no auth, loopback only)"
+        "\nNext:\n  make db-up   # or any PostgreSQL 16+ with pgvector\n  export ONTO_DATABASE_URL={}\n  onto seed demo\n  onto ask \"Who owns Project Alpha?\"\n  export ONTO_TOKEN=$(openssl rand -hex 24) && onto serve\n  (or `onto serve --dev` locally: no auth, loopback only)",
+        onto_intelli::config::DEV_DATABASE_URL
     );
     Ok(())
 }

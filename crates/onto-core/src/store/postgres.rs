@@ -1,6 +1,13 @@
 //! PostgreSQL store: one PostgreSQL schema per tenant, shared by any number
 //! of processes (replicas embedding the library, several onto servers).
 //!
+//! * Needs PostgreSQL 16 or newer with pgvector 0.7 or newer. Connecting
+//!   checks the server version and runs `CREATE EXTENSION IF NOT EXISTS
+//!   vector`; opening a tenant applies the versioned SQL migrations embedded
+//!   in the binary (`migrations/*.sql`), recorded in `schema_migrations`.
+//! * Entity vectors live in a pgvector `halfvec(512)` column with an HNSW
+//!   index (cosine distance); BM25 stays in memory, where it ranks better
+//!   than `ts_rank`.
 //! * Writes commit optimistically against the commit head (`head` row
 //!   locked `FOR UPDATE`); a writer that is behind gets `Error::Stale`, the
 //!   engine catches up from `commits` and retries.
@@ -15,6 +22,7 @@ use std::future::Future;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use crate::sqlx;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
@@ -22,7 +30,8 @@ use sqlx::{AssertSqlSafe, Row};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 use super::{
-    CommitRecord, NoticeFn, REPLICATED_KV, Snapshot, Store, StoreNotice, StoreStats, VersionRecord, WriteBatch,
+    CommitRecord, EmbedFn, NoticeFn, REPLICATED_KV, Snapshot, Store, StoreNotice, StoreStats, VectorFilter,
+    VersionRecord, WriteBatch,
 };
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
@@ -34,6 +43,98 @@ use crate::{Error, Result};
 const KEEP_COMMITS: i64 = 100_000;
 /// Rows per multi-row statement.
 const CHUNK: usize = 2_000;
+/// Oldest PostgreSQL release the store runs on (`server_version_num`).
+pub const MIN_SERVER_VERSION: i32 = 160_000;
+/// Versioned migrations embedded in the binary, applied in order to every
+/// tenant schema. `{schema}` is the tenant schema, `{vector}` the schema of
+/// the vector extension. Never edit a released migration; add the next one.
+pub const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (1, "init", include_str!("../../migrations/0001_init.sql")),
+    (2, "vectors", include_str!("../../migrations/0002_vectors.sql")),
+    (3, "append_only", include_str!("../../migrations/0003_append_only.sql")),
+];
+/// Above this many entities without vectors, a backfill drops the HNSW
+/// index and builds it once at the end (much faster than row by row).
+const REBUILD_INDEX_ABOVE: i64 = 20_000;
+
+/// Where pgvector lives and what it supports.
+#[derive(Clone, Debug)]
+struct VectorExt {
+    /// Quoted schema of the extension (types and operators are qualified with it).
+    schema: String,
+    /// pgvector 0.8+: filtered HNSW scans continue until enough rows match.
+    iterative_scan: bool,
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn parse_version(v: &str) -> (u32, u32, u32) {
+    let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Check the server and make sure pgvector is installed (once per pool).
+async fn prepare(pool: &PgPool) -> Result<VectorExt> {
+    let (num, version): (String, String) =
+        sqlx::query_as("SELECT current_setting('server_version_num'), current_setting('server_version')")
+            .fetch_one(pool)
+            .await?;
+    check_server(&num, &version)?;
+    let mut tx = pool.begin().await?;
+    // Two processes creating the extension at the same time would collide.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('onto-intelli:extensions'))").execute(&mut *tx).await?;
+    if let Err(e) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector").execute(&mut *tx).await {
+        return Err(Error::Config(format!(
+            "onto-intelli needs the pgvector extension, and CREATE EXTENSION vector failed ({e}). Use a server \
+             with pgvector installed (the pgvector/pgvector images have it), or have a superuser run \
+             CREATE EXTENSION vector in this database"
+        )));
+    }
+    let (schema, ext_version): (String, String) = sqlx::query_as(
+        "SELECT n.nspname::text, e.extversion FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
+         WHERE e.extname = 'vector'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(VectorExt { schema: quote_ident(&schema), iterative_scan: check_pgvector(&ext_version)? })
+}
+
+/// Refuse servers older than PostgreSQL 16.
+fn check_server(version_num: &str, version: &str) -> Result<()> {
+    if version_num.trim().parse::<i32>().unwrap_or(0) < MIN_SERVER_VERSION {
+        return Err(Error::Config(format!("onto-intelli needs PostgreSQL 16 or newer; this server runs {version}")));
+    }
+    Ok(())
+}
+
+/// Refuse pgvector before 0.7 (no halfvec); tell whether it has iterative scans (0.8).
+fn check_pgvector(version: &str) -> Result<bool> {
+    let v = parse_version(version);
+    if v < (0, 7, 0) {
+        return Err(Error::Config(format!(
+            "onto-intelli needs pgvector 0.7 or newer (halfvec); this database has {version}: \
+             run ALTER EXTENSION vector UPDATE"
+        )));
+    }
+    Ok(v >= (0, 8, 0))
+}
+
+/// pgvector's text form of a quantized vector: `[1,-2,3]`.
+fn halfvec_text(v: &[i8]) -> String {
+    let mut s = String::with_capacity(v.len() * 4 + 2);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
 
 #[derive(Clone, Debug)]
 pub struct PgOptions {
@@ -91,6 +192,7 @@ impl Exec {
 pub struct PgShared {
     pool: PgPool,
     exec: Exec,
+    vector: Arc<VectorExt>,
 }
 
 impl PgShared {
@@ -103,10 +205,20 @@ impl PgShared {
             .build()
             .map_err(|e| Error::Unavailable(format!("starting the postgres runtime: {e}")))?;
         let (url_s, max, timeout) = (url.to_string(), opts.max_connections, opts.connect_timeout);
-        let pool = run_on(rt.handle(), false, async move {
-            Ok(PgPoolOptions::new().max_connections(max).acquire_timeout(timeout).connect(&url_s).await?)
-        })?;
-        Ok(Self { pool, exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))) })
+        let connected = run_on(rt.handle(), false, async move {
+            let pool = PgPoolOptions::new().max_connections(max).acquire_timeout(timeout).connect(&url_s).await?;
+            let vector = prepare(&pool).await?;
+            Ok((pool, vector))
+        });
+        let (pool, vector) = match connected {
+            Ok(c) => c,
+            Err(e) => {
+                // Dropping a runtime blocks, which panics inside async callers.
+                rt.shutdown_background();
+                return Err(e);
+            }
+        };
+        Ok(Self { pool, exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))), vector: Arc::new(vector) })
     }
 
     /// Use the application's pool (e.g. its `sqlx::PgPool`). Must be called
@@ -115,7 +227,9 @@ impl PgShared {
         let handle = Handle::try_current().map_err(|_| {
             Error::Config("PgShared::from_pool must be called inside the Tokio runtime that owns the pool".into())
         })?;
-        Ok(Self { pool, exec: Exec::Shared(handle) })
+        let p = pool.clone();
+        let vector = run_on(&handle, true, async move { prepare(&p).await })?;
+        Ok(Self { pool, exec: Exec::Shared(handle), vector: Arc::new(vector) })
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -124,7 +238,7 @@ impl PgShared {
 
     /// The store of one tenant (its own PostgreSQL schema), created if missing.
     pub fn tenant(&self, tenant: &str, opts: PgOptions) -> Result<PgStore> {
-        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone())
+        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone(), self.vector.clone())
     }
 
     /// Tenants with a schema under `prefix`.
@@ -151,6 +265,7 @@ pub struct PgStore {
     tenant: String,
     origin: String,
     exec: Exec,
+    vector: Arc<VectorExt>,
     opts: PgOptions,
     subscribers: Arc<Mutex<Vec<NoticeFn>>>,
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -235,13 +350,14 @@ impl PgStore {
         PgShared::from_pool(pool)?.tenant(tenant, opts)
     }
 
-    fn finish(pool: PgPool, tenant: &str, opts: PgOptions, exec: Exec) -> Result<Self> {
+    fn finish(pool: PgPool, tenant: &str, opts: PgOptions, exec: Exec, vector: Arc<VectorExt>) -> Result<Self> {
         let store = Self {
             schema: tenant_schema(&opts.schema_prefix, tenant)?,
             tenant: tenant.to_string(),
             origin: new_id("proc"),
             pool,
             exec,
+            vector,
             opts,
             subscribers: Arc::new(Mutex::new(Vec::new())),
             listener: Mutex::new(None),
@@ -280,65 +396,63 @@ impl PgStore {
         format!("\"{}\".{table}", self.schema)
     }
 
+    /// Apply the embedded migrations this tenant schema has not had yet.
     fn migrate(&self) -> Result<()> {
         let pool = self.pool.clone();
-        let s = format!("\"{}\"", self.schema);
+        let s = quote_ident(&self.schema);
+        let v = self.vector.schema.clone();
         let lock_key = self.schema.clone();
         self.block(async move {
             let mut tx = pool.begin().await?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(&lock_key).execute(&mut *tx).await?;
-            let ddl = [
-                format!("CREATE SCHEMA IF NOT EXISTS {s}"),
-                format!("CREATE TABLE IF NOT EXISTS {s}.meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.head (id INT PRIMARY KEY CHECK (id = 1), seq BIGINT NOT NULL)"
-                ),
-                format!("INSERT INTO {s}.head (id, seq) VALUES (1, 0) ON CONFLICT DO NOTHING"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
-                     workspace TEXT NOT NULL, doc JSONB NOT NULL, updated_at BIGINT NOT NULL)"
-                ),
-                format!("CREATE INDEX IF NOT EXISTS entities_ws_kind ON {s}.entities (workspace, kind)"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.links (src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL, \
-                     doc JSONB NOT NULL, PRIMARY KEY (src, rel, dst))"
-                ),
-                format!("CREATE INDEX IF NOT EXISTS links_dst ON {s}.links (dst, rel)"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.events (id TEXT PRIMARY KEY, ts BIGINT NOT NULL, \
-                     workspace TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, doc JSONB NOT NULL)"
-                ),
-                format!("CREATE INDEX IF NOT EXISTS events_ws_ts ON {s}.events (workspace, ts)"),
-                format!("CREATE INDEX IF NOT EXISTS events_target ON {s}.events (target, ts)"),
-                format!("CREATE INDEX IF NOT EXISTS events_actor ON {s}.events (actor, ts)"),
-                format!("CREATE INDEX IF NOT EXISTS events_action ON {s}.events (action, ts)"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.kv (ns TEXT NOT NULL, key TEXT NOT NULL, value JSONB NOT NULL, \
-                     expires_at BIGINT, PRIMARY KEY (ns, key))"
-                ),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.entity_versions (seq BIGSERIAL PRIMARY KEY, id TEXT NOT NULL, \
-                     revision BIGINT NOT NULL, ts BIGINT NOT NULL, doc JSONB NOT NULL)"
-                ),
-                format!("CREATE INDEX IF NOT EXISTS entity_versions_id ON {s}.entity_versions (id, seq)"),
-                format!("CREATE INDEX IF NOT EXISTS entity_versions_ts ON {s}.entity_versions (ts)"),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.commits (seq BIGINT PRIMARY KEY, ts BIGINT NOT NULL, \
-                     origin TEXT NOT NULL, doc JSONB NOT NULL)"
-                ),
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {s}.link_versions (seq BIGSERIAL PRIMARY KEY, src TEXT NOT NULL, \
-                     rel TEXT NOT NULL, dst TEXT NOT NULL, ts BIGINT NOT NULL, doc JSONB NOT NULL)"
-                ),
-                format!("CREATE INDEX IF NOT EXISTS link_versions_src ON {s}.link_versions (src, ts)"),
-                format!("CREATE INDEX IF NOT EXISTS link_versions_dst ON {s}.link_versions (dst, ts)"),
-                format!("INSERT INTO {s}.meta (key, value) VALUES ('format', '1') ON CONFLICT DO NOTHING"),
-            ];
-            for stmt in ddl {
-                sqlx::query(sql(stmt)).execute(&mut *tx).await?;
+            sqlx::raw_sql(sql(format!(
+                "CREATE SCHEMA IF NOT EXISTS {s}; CREATE TABLE IF NOT EXISTS {s}.schema_migrations \
+                 (version INT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            let applied: Vec<i32> = sqlx::query_scalar(sql(format!("SELECT version FROM {s}.schema_migrations")))
+                .fetch_all(&mut *tx)
+                .await?;
+            let known = MIGRATIONS.last().map(|m| m.0).unwrap_or(0);
+            if let Some(&newest) = applied.iter().max()
+                && newest > known
+            {
+                return Err(Error::Config(format!(
+                    "tenant schema {s} is at migration {newest}, newer than this build (up to {known}): upgrade onto-intelli"
+                )));
+            }
+            for (version, name, body) in MIGRATIONS {
+                if applied.contains(version) {
+                    continue;
+                }
+                let body = body.replace("{schema}", &s).replace("{vector}", &v);
+                sqlx::raw_sql(sql(body))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Storage(format!("migration {version:04}_{name} on {s}: {e}")))?;
+                sqlx::query(sql(format!(
+                    "INSERT INTO {s}.schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)"
+                )))
+                .bind(version)
+                .bind(name)
+                .bind(now_ms())
+                .execute(&mut *tx)
+                .await?;
             }
             tx.commit().await?;
             Ok(())
+        })
+    }
+
+    /// Migrations applied to this tenant, oldest first: (version, name, applied_at ms).
+    pub fn migrations(&self) -> Result<Vec<(i32, String, i64)>> {
+        let pool = self.pool.clone();
+        let t = self.t("schema_migrations");
+        self.block(async move {
+            Ok(sqlx::query_as(sql(format!("SELECT version, name, applied_at FROM {t} ORDER BY version")))
+                .fetch_all(&pool)
+                .await?)
         })
     }
 
@@ -451,7 +565,8 @@ impl PgStore {
     }
 
     /// Bulk-load through COPY (fast imports and benchmarks): no events and no
-    /// versions; one commit tells other processes to reload.
+    /// versions; one commit tells other processes to reload. Vectors are
+    /// computed when the tenant is next opened ([`Store::backfill_vectors`]).
     fn copy_import(&self, entities: Vec<Entity>, links: Vec<Link>) -> Result<u64> {
         fn csv(field: &str) -> String {
             format!("\"{}\"", field.replace('"', "\"\""))
@@ -514,7 +629,7 @@ impl PgStore {
             sqlx::query(sql(format!(
                 "INSERT INTO {te} (id, kind, workspace, doc, updated_at) SELECT DISTINCT ON (id) id, kind, workspace, doc, updated_at \
                  FROM onto_import_e ORDER BY id ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
-                 doc = excluded.doc, updated_at = excluded.updated_at"
+                 doc = excluded.doc, updated_at = excluded.updated_at, embedding = NULL, embedded = false"
             )))
             .execute(&mut *tx)
             .await?;
@@ -685,11 +800,28 @@ impl Store for PgStore {
         let rec = b.commit_record(0, &origin);
         let expect = b.expect_seq;
         // Serialize documents on the caller's thread.
-        let put_e: Vec<(String, String, String, String, i64)> = b
+        let mut vectors: std::collections::HashMap<&str, Option<String>> =
+            b.vectors.iter().map(|(id, v)| (id.as_str(), v.as_deref().map(halfvec_text))).collect();
+        let put_e: Vec<EntityRow> = b
             .put_entities
             .iter()
-            .map(|e| Ok((e.id.clone(), e.kind.clone(), e.workspace.clone(), serde_json::to_string(e)?, e.updated_at)))
+            .map(|e| {
+                let vector = vectors.remove(e.id.as_str());
+                Ok(EntityRow {
+                    id: e.id.clone(),
+                    kind: e.kind.clone(),
+                    workspace: e.workspace.clone(),
+                    doc: serde_json::to_string(e)?,
+                    updated_at: e.updated_at,
+                    embedded: vector.is_some(),
+                    embedding: vector.flatten(),
+                })
+            })
             .collect::<Result<_>>()?;
+        // Vectors of entities not written here (re-embedded after a schema change).
+        let mut revector: Vec<(String, Option<String>)> =
+            vectors.into_iter().map(|(id, v)| (id.to_string(), v)).collect();
+        revector.sort();
         let put_l: Vec<(String, String, String, String)> = b
             .put_links
             .iter()
@@ -764,27 +896,46 @@ impl Store for PgStore {
                     .await?;
             }
             for chunk in put_e.chunks(CHUNK) {
-                let (mut ids, mut kinds, mut wss, mut docs, mut ats) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for (id, kind, ws, doc, at) in chunk.iter().cloned() {
-                    ids.push(id);
-                    kinds.push(kind);
-                    wss.push(ws);
-                    docs.push(doc);
-                    ats.push(at);
+                let mut c: EntityColumns = Default::default();
+                for r in chunk.iter().cloned() {
+                    c.0.push(r.id);
+                    c.1.push(r.kind);
+                    c.2.push(r.workspace);
+                    c.3.push(r.doc);
+                    c.4.push(r.updated_at);
+                    c.5.push(r.embedding);
+                    c.6.push(r.embedded);
                 }
                 sqlx::query(sql(format!(
-                    "INSERT INTO {} (id, kind, workspace, doc, updated_at) \
-                     SELECT id, kind, ws, doc::jsonb, at FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[]) \
-                     AS r(id, kind, ws, doc, at) \
+                    "INSERT INTO {} (id, kind, workspace, doc, updated_at, embedding, embedded) \
+                     SELECT id, kind, ws, doc::jsonb, at, emb::{v}.halfvec, done FROM \
+                     UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::text[], $7::bool[]) \
+                     AS r(id, kind, ws, doc, at, emb, done) \
                      ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
-                     doc = excluded.doc, updated_at = excluded.updated_at",
-                    tables.entities
+                     doc = excluded.doc, updated_at = excluded.updated_at, embedding = excluded.embedding, \
+                     embedded = excluded.embedded",
+                    tables.entities,
+                    v = tables.vector
+                )))
+                .bind(c.0)
+                .bind(c.1)
+                .bind(c.2)
+                .bind(c.3)
+                .bind(c.4)
+                .bind(c.5)
+                .bind(c.6)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for chunk in revector.chunks(CHUNK) {
+                let (ids, embs): (Vec<String>, Vec<Option<String>>) = chunk.iter().cloned().unzip();
+                sqlx::query(sql(format!(
+                    "UPDATE {} e SET embedding = v.emb::{}.halfvec, embedded = true \
+                     FROM UNNEST($1::text[], $2::text[]) AS v(id, emb) WHERE e.id = v.id",
+                    tables.entities, tables.vector
                 )))
                 .bind(ids)
-                .bind(kinds)
-                .bind(wss)
-                .bind(docs)
-                .bind(ats)
+                .bind(embs)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1091,7 +1242,7 @@ impl Store for PgStore {
 
     fn stats(&self) -> Result<StoreStats> {
         let pool = self.pool.clone();
-        let (te, tk) = (self.t("events"), self.t("kv"));
+        let (te, tk, te_ent) = (self.t("events"), self.t("kv"), self.t("entities"));
         let schema = self.schema.clone();
         self.block(async move {
             // Event counts are estimates: exact counts of a large audit log are slow.
@@ -1110,7 +1261,33 @@ impl Store for PgStore {
                 }
             };
             let kv: i64 = sqlx::query_scalar(sql(format!("SELECT count(*) FROM {tk}"))).fetch_one(&pool).await?;
-            Ok(StoreStats { backend: "postgres".into(), events, kv_entries: kv as u64, path: Some(schema) })
+            // The HNSW index holds exactly the rows with a vector; its
+            // estimate is only kept fresh by (auto)vacuum, so small tables
+            // are counted.
+            let indexed: Option<f32> = sqlx::query_scalar(
+                "SELECT c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = 'entities_embedding'",
+            )
+            .bind(&schema)
+            .fetch_optional(&pool)
+            .await?;
+            let vectors = match indexed {
+                Some(n) if n >= 100_000.0 => n as u64,
+                _ => {
+                    sqlx::query_scalar::<_, i64>(sql(format!(
+                        "SELECT count(*) FROM {te_ent} WHERE embedding IS NOT NULL"
+                    )))
+                    .fetch_one(&pool)
+                    .await? as u64
+                }
+            };
+            Ok(StoreStats {
+                backend: "postgres".into(),
+                events,
+                kv_entries: kv as u64,
+                path: Some(schema),
+                vectors: Some(vectors),
+            })
         })
     }
 
@@ -1164,10 +1341,222 @@ impl Store for PgStore {
     fn bulk_import(&self, entities: &[Entity], links: &[Link]) -> Result<u64> {
         self.copy_import(entities.to_vec(), links.to_vec())
     }
+
+    fn indexes_vectors(&self) -> bool {
+        true
+    }
+
+    fn vector_search(&self, query: &[i8], limit: usize, filter: &VectorFilter) -> Result<Vec<(Id, f32)>> {
+        if limit == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        let te = self.t("entities");
+        let v = self.vector.schema.clone();
+        let iterative = self.vector.iterative_scan;
+        let q = halfvec_text(query);
+        let filter = filter.clone();
+        // ef_search bounds what one HNSW scan returns (pgvector caps it at 1000).
+        let limit = limit.min(1_000);
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+                .bind(limit.max(40).to_string())
+                .execute(&mut *tx)
+                .await?;
+            if iterative {
+                // Keep scanning when the workspace/kind filter rejects candidates.
+                sqlx::query("SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let mut where_ = String::from("embedding IS NOT NULL");
+            let mut n = 2;
+            if filter.workspace.is_some() {
+                n += 1;
+                where_.push_str(&format!(" AND workspace = ${n}"));
+            }
+            if !filter.kinds.is_empty() {
+                n += 1;
+                where_.push_str(&format!(" AND kind = ANY(${n})"));
+            }
+            let stmt = format!(
+                "SELECT id, (embedding OPERATOR({v}.<=>) $1::{v}.halfvec)::float8 FROM {te} WHERE {where_} \
+                 ORDER BY embedding OPERATOR({v}.<=>) $1::{v}.halfvec LIMIT $2"
+            );
+            let mut query = sqlx::query_as::<_, (String, f64)>(sql(stmt)).bind(q).bind(limit as i64);
+            if let Some(w) = filter.workspace {
+                query = query.bind(w);
+            }
+            if !filter.kinds.is_empty() {
+                query = query.bind(filter.kinds);
+            }
+            let rows = query.fetch_all(&mut *tx).await?;
+            tx.commit().await?;
+            let mut out: Vec<(Id, f32)> = rows.into_iter().map(|(id, d)| (id, (1.0 - d) as f32)).collect();
+            // Relaxed iterative scans may return near ties slightly out of order.
+            out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            Ok(out)
+        })
+    }
+
+    fn backfill_vectors(&self, embed: EmbedFn<'_>) -> Result<usize> {
+        type Conn = sqlx::pool::PoolConnection<sqlx::Postgres>;
+        /// Run one step on the session that holds the advisory lock. A failed
+        /// step closes the session, which releases the lock.
+        fn step<T, F>(store: &PgStore, conn: Conn, f: impl FnOnce(Conn) -> F + Send + 'static) -> Result<(Conn, T)>
+        where
+            T: Send + 'static,
+            F: Future<Output = (Conn, Result<T>)> + Send + 'static,
+        {
+            store.block(async move {
+                let (conn, r) = f(conn).await;
+                match r {
+                    Ok(v) => Ok((conn, v)),
+                    Err(e) => {
+                        drop(conn.detach());
+                        Err(e)
+                    }
+                }
+            })
+        }
+        let pool = self.pool.clone();
+        let key = format!("{}:vectors", self.schema);
+        let te = self.t("entities");
+        let v = self.vector.schema.clone();
+        let index = format!("{}.entities_embedding", quote_ident(&self.schema));
+        // Connections go back to the pool from inside the runtime only.
+        let k = key.clone();
+        let Some(conn) = self.block(async move {
+            let mut c: Conn = pool.acquire().await?;
+            let locked: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))").bind(&k).fetch_one(&mut *c).await?;
+            // Not locked: another process is backfilling this tenant.
+            Ok(locked.then_some(c))
+        })?
+        else {
+            return Ok(0);
+        };
+        let t = te.clone();
+        let (mut conn, pending) = step(self, conn, move |mut c| async move {
+            let r = sqlx::query_scalar::<_, i64>(sql(format!("SELECT count(*) FROM {t} WHERE NOT embedded")))
+                .fetch_one(&mut *c)
+                .await
+                .map_err(Error::from);
+            (c, r)
+        })?;
+        let rebuild = pending > REBUILD_INDEX_ABOVE;
+        if rebuild {
+            let i = index.clone();
+            conn = step(self, conn, move |mut c| async move {
+                let r =
+                    sqlx::query(sql(format!("DROP INDEX IF EXISTS {i}"))).execute(&mut *c).await.map_err(Error::from);
+                (c, r.map(|_| ()))
+            })?
+            .0;
+        }
+        let mut done = 0usize;
+        if pending > 0 {
+            loop {
+                let t = te.clone();
+                let (c, docs) = step(self, conn, move |mut c| async move {
+                    let r = sqlx::query_scalar::<_, String>(sql(format!(
+                        "SELECT doc::text FROM {t} WHERE NOT embedded ORDER BY id LIMIT {CHUNK}"
+                    )))
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(Error::from);
+                    (c, r)
+                })?;
+                conn = c;
+                if docs.is_empty() {
+                    break;
+                }
+                let entities: Vec<Entity> = match docs.iter().map(|d| parse(d)).collect::<Result<_>>() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Closing the session releases the lock.
+                        self.block(async move {
+                            drop(conn.detach());
+                            Ok(())
+                        })?;
+                        return Err(e);
+                    }
+                };
+                let vectors = embed(&entities);
+                let ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
+                let embs: Vec<Option<String>> =
+                    (0..ids.len()).map(|i| vectors.get(i).and_then(|v| v.as_deref().map(halfvec_text))).collect();
+                done += ids.len();
+                let (t, v) = (te.clone(), v.clone());
+                conn = step(self, conn, move |mut c| async move {
+                    let r = sqlx::query(sql(format!(
+                        "UPDATE {t} e SET embedding = x.emb::{v}.halfvec, embedded = true \
+                         FROM UNNEST($1::text[], $2::text[]) AS x(id, emb) WHERE e.id = x.id"
+                    )))
+                    .bind(ids)
+                    .bind(embs)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(Error::from);
+                    (c, r.map(|_| ()))
+                })?
+                .0;
+            }
+        }
+        // Builds the index after a large backfill, and repairs one a crashed
+        // backfill left dropped; a no-op otherwise.
+        let (t, v2) = (te.clone(), v.clone());
+        let (conn, ()) = step(self, conn, move |mut c| async move {
+            // At least 512 MB for the build (a server configured higher keeps
+            // its value). A parallel build keeps that much in shared memory,
+            // which containers often cap (/dev/shm); then build serially.
+            let build = |parallel: bool| {
+                format!(
+                    "BEGIN; \
+                     DO $$ BEGIN IF pg_size_bytes(current_setting('maintenance_work_mem')) < pg_size_bytes('512MB') \
+                     THEN PERFORM set_config('maintenance_work_mem', '512MB', true); END IF; END $$; {} \
+                     CREATE INDEX IF NOT EXISTS entities_embedding ON {t} USING hnsw (embedding {v2}.halfvec_cosine_ops); \
+                     COMMIT",
+                    if parallel { "" } else { "SET LOCAL max_parallel_maintenance_workers = 0;" }
+                )
+            };
+            let mut r = sqlx::raw_sql(sql(build(true))).execute(&mut *c).await.map(|_| ());
+            if r.is_err() {
+                let _ = sqlx::raw_sql(sql("ROLLBACK".to_string())).execute(&mut *c).await;
+                r = sqlx::raw_sql(sql(build(false))).execute(&mut *c).await.map(|_| ());
+            }
+            (c, r.map_err(Error::from))
+        })?;
+        self.block(async move {
+            let mut c = conn;
+            let unlocked = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))").bind(&key).execute(&mut *c).await;
+            if unlocked.is_err() {
+                drop(c.detach());
+            }
+            Ok(())
+        })?;
+        Ok(done)
+    }
 }
 
 /// id, ts, workspace, actor, action, target, document.
 type EventRow = (String, i64, String, String, String, Option<String>, String);
+
+#[derive(Clone)]
+struct EntityRow {
+    id: String,
+    kind: String,
+    workspace: String,
+    doc: String,
+    updated_at: i64,
+    /// pgvector text, `None` when the entity has no searchable text.
+    embedding: Option<String>,
+    /// The batch carried a vector for it (otherwise it is backfilled later).
+    embedded: bool,
+}
+
+type EntityColumns = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<i64>, Vec<Option<String>>, Vec<bool>);
 
 #[derive(Clone)]
 struct Tables {
@@ -1179,6 +1568,8 @@ struct Tables {
     link_versions: String,
     kv: String,
     commits: String,
+    /// Quoted schema of the vector extension.
+    vector: String,
 }
 
 impl Tables {
@@ -1192,6 +1583,7 @@ impl Tables {
             link_versions: s.t("link_versions"),
             kv: s.t("kv"),
             commits: s.t("commits"),
+            vector: s.vector.schema.clone(),
         }
     }
 }
@@ -1208,7 +1600,20 @@ fn split3(keys: &[LinkKey]) -> (Vec<String>, Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::tenant_schema;
+    use super::{check_pgvector, check_server, halfvec_text, tenant_schema};
+
+    #[test]
+    fn old_servers_and_old_pgvector_are_refused() {
+        let err = check_server("150004", "15.4").unwrap_err().to_string();
+        assert!(err.contains("PostgreSQL 16 or newer") && err.contains("15.4"), "{err}");
+        assert!(check_server("160015", "16.15").is_ok());
+        assert!(check_server("170002", "17.2").is_ok());
+        assert!(check_pgvector("0.6.2").unwrap_err().to_string().contains("pgvector 0.7"));
+        assert!(!check_pgvector("0.7.4").unwrap(), "0.7 has no iterative scans");
+        assert!(check_pgvector("0.8.7").unwrap());
+        assert!(check_pgvector("1.0.0").unwrap());
+        assert_eq!(halfvec_text(&[1, -127, 0]), "[1,-127,0]");
+    }
 
     #[test]
     fn tenant_schema_names_are_safe() {

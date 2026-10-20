@@ -235,13 +235,20 @@ pub struct OntoStats {
 
 type Listener = Arc<dyn Fn(&ChangeSet) + Send + Sync>;
 
+/// Vector candidates below this cosine similarity are noise.
+const MIN_VECTOR_SIMILARITY: f32 = 0.25;
+
 struct Inner {
     active: RwLock<ActiveSchema>,
     /// Why the last import of changed schema files was not applied.
     import_error: RwLock<Option<String>>,
     graph: RwLock<Graph>,
     text: RwLock<TextIndex>,
+    /// In-memory vectors, used when no store indexes them.
     vectors: RwLock<VectorIndex>,
+    /// The store that indexes entity vectors (pgvector); `vectors` stays
+    /// empty then. A fork keeps its parent's.
+    vector_store: Option<Arc<dyn Store>>,
     /// Merged-away id -> surviving id.
     redirects: RwLock<HashMap<Id, Id>>,
     store: Arc<dyn Store>,
@@ -271,7 +278,8 @@ impl Ontology {
         // catching up from the snapshot's sequence re-applies anything newer.
         let snap = store.load()?;
         let (schema, version) = live_schema::load_active(&*store, &config_schema, opts.schema_mode)?;
-        let (graph, text, vectors) = sync::build_indexes(&schema, snap.entities, snap.links);
+        let vector_store = store.indexes_vectors().then(|| store.clone());
+        let (graph, text, vectors) = sync::build_indexes(&schema, snap.entities, snap.links, vector_store.is_none());
         let redirects: HashMap<Id, Id> = store
             .kv_scan("redirect", "")?
             .into_iter()
@@ -285,6 +293,7 @@ impl Ontology {
                 graph: RwLock::new(graph),
                 text: RwLock::new(text),
                 vectors: RwLock::new(vectors),
+                vector_store,
                 redirects: RwLock::new(redirects),
                 store,
                 revision: AtomicU64::new(1),
@@ -294,6 +303,7 @@ impl Ontology {
             }),
         };
         onto.bootstrap_schema(config_schema)?;
+        onto.backfill_vectors()?;
         if let Some(interval) = follow {
             sync::spawn_follower(&onto.inner, interval)?;
         }
@@ -304,11 +314,6 @@ impl Ontology {
     pub fn in_memory(schema: Schema) -> Self {
         Self::open(schema, Arc::new(MemoryStore::default()), OntologyOptions::default())
             .expect("memory store cannot fail")
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub fn open_sqlite(schema: Schema, path: impl AsRef<std::path::Path>, opts: OntologyOptions) -> Result<Self> {
-        Self::open(schema, Arc::new(crate::store::SqliteStore::open(path)?), opts)
     }
 
     /// The schema in force. Cheap (an `Arc` clone); hold it for the duration
@@ -353,6 +358,41 @@ impl Ontology {
         self.inner.listeners.write().push(Arc::new(f));
     }
 
+    /// Give entities the store holds without a vector one (after a bulk
+    /// import or a migration that added vectors). Returns how many.
+    pub fn backfill_vectors(&self) -> Result<usize> {
+        let Some(store) = &self.inner.vector_store else { return Ok(0) };
+        let schema = self.schema();
+        let embed = |entities: &[Entity]| -> Vec<Option<Vec<i8>>> {
+            entities.iter().map(|e| similarity::embed_quantized(&searchable_text(&schema, e))).collect()
+        };
+        store.backfill_vectors(&embed)
+    }
+
+    /// Vector candidates from the store's index: (id, similarity) at or
+    /// above `min`, best first, at most `want` (before permission filtering).
+    fn store_vectors(
+        &self,
+        store: &Arc<dyn Store>,
+        schema: &Schema,
+        text: &str,
+        kinds: &[String],
+        workspace: Option<&str>,
+        want: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let Some(q) = similarity::embed_quantized(text) else { return Ok(Vec::new()) };
+        let mut concrete: Vec<String> = kinds.iter().flat_map(|k| schema.concrete_kinds(k)).collect();
+        concrete.sort();
+        concrete.dedup();
+        if !kinds.is_empty() && concrete.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = crate::store::VectorFilter { workspace: workspace.map(str::to_string), kinds: concrete };
+        let mut hits = store.vector_search(&q, want, &filter)?;
+        hits.retain(|(_, s)| *s >= MIN_VECTOR_SIMILARITY);
+        Ok(hits)
+    }
+
     /// Escape hatch for custom read-only algorithms (no permission filtering).
     pub fn read<R>(&self, f: impl FnOnce(&Graph, &Schema) -> R) -> R {
         let schema = self.schema();
@@ -371,6 +411,9 @@ impl Ontology {
                 graph: RwLock::new(graph),
                 text: RwLock::new(self.inner.text.read().clone()),
                 vectors: RwLock::new(self.inner.vectors.read().clone()),
+                // Vector search keeps using the parent's index; entities edited
+                // in the fork are found lexically.
+                vector_store: self.inner.vector_store.clone(),
                 redirects: RwLock::new(self.inner.redirects.read().clone()),
                 store: Arc::new(MemoryStore::default()),
                 revision: AtomicU64::new(self.revision()),
@@ -501,8 +544,19 @@ impl Ontology {
         mode: SearchMode,
         personalize: bool,
     ) -> Result<Vec<SearchHit>> {
-        let g = self.reader(p)?;
+        if !p.allows(Access::Read) {
+            return Err(Error::Denied(format!("{} has no read role", p.id)));
+        }
         let schema = self.schema();
+        let pool = (limit * 3).max(30);
+        // Ask the store's vector index before taking the graph lock.
+        let remote = match (&self.inner.vector_store, mode) {
+            (Some(store), SearchMode::Hybrid | SearchMode::Vector) => {
+                Some(self.store_vectors(store, &schema, text, kinds, workspace, (pool * 4).max(64))?)
+            }
+            _ => None,
+        };
+        let g = self.reader(p)?;
         let keep = |id: &str| {
             g.get(id).is_some_and(|e| {
                 policy::visible(p, e, &g)
@@ -510,13 +564,16 @@ impl Ontology {
                     && (kinds.is_empty() || kinds.iter().any(|k| schema.kind_is(&e.kind, k)))
             })
         };
-        let pool = (limit * 3).max(30);
         let lexical =
             if mode == SearchMode::Vector { Vec::new() } else { self.inner.text.read().search(text, pool, keep) };
-        let vector = if mode == SearchMode::Lexical {
-            Vec::new()
-        } else {
-            self.inner.vectors.read().search(text, pool, 0.25, keep)
+        let vector = match remote {
+            Some(mut hits) => {
+                hits.retain(|(id, _)| keep(id));
+                hits.truncate(pool);
+                hits
+            }
+            None if mode == SearchMode::Lexical => Vec::new(),
+            None => self.inner.vectors.read().search(text, pool, MIN_VECTOR_SIMILARITY, keep),
         };
         let mut fused: HashMap<String, (f32, Option<usize>, Option<usize>)> = HashMap::new();
         for (rank, (id, _)) in lexical.iter().enumerate() {
@@ -806,7 +863,10 @@ impl Ontology {
             revision: self.revision(),
             kinds: g.kinds().map(|(k, n)| (k.clone(), n)).collect(),
             indexed_docs: self.inner.text.read().len(),
-            vectors: self.inner.vectors.read().len(),
+            vectors: match &self.inner.vector_store {
+                Some(store) => store.stats()?.vectors.unwrap_or_default() as usize,
+                None => self.inner.vectors.read().len(),
+            },
             redirects: self.inner.redirects.read().len(),
             store: self.inner.store.stats()?,
         })
@@ -1030,6 +1090,24 @@ impl Ontology {
             });
         }
         staged.batch.kv.extend(extra.kv);
+        let in_memory_vectors = self.inner.vector_store.is_none();
+        if self.inner.store.indexes_vectors() {
+            let mut vectors: Vec<(Id, Option<Vec<i8>>)> = staged
+                .batch
+                .put_entities
+                .iter()
+                .map(|e| (e.id.clone(), similarity::embed_quantized(&searchable_text(&schema, e))))
+                .collect();
+            if extra.schema.is_some() {
+                let put: HashSet<&str> = staged.batch.put_entities.iter().map(|e| e.id.as_str()).collect();
+                for kind in &extra.reindex {
+                    for e in g.of_kind(kind).filter(|e| !put.contains(e.id.as_str())) {
+                        vectors.push((e.id.clone(), similarity::embed_quantized(&searchable_text(&schema, e))));
+                    }
+                }
+            }
+            staged.batch.vectors = vectors;
+        }
         if self.inner.store.tracks_commits() {
             staged.batch.expect_seq = Some(self.inner.seq.load(Ordering::SeqCst));
         }
@@ -1051,7 +1129,9 @@ impl Ontology {
             for e in &staged.batch.put_entities {
                 let doc = searchable_text(&schema, e);
                 text.upsert(&e.id, &doc);
-                vectors.upsert(&e.id, &doc);
+                if in_memory_vectors {
+                    vectors.upsert(&e.id, &doc);
+                }
                 g.put_entity(e.clone());
             }
             for l in &staged.batch.put_links {
@@ -1062,7 +1142,9 @@ impl Ontology {
                     for e in g.of_kind(kind) {
                         let doc = searchable_text(&schema, e);
                         text.upsert(&e.id, &doc);
-                        vectors.upsert(&e.id, &doc);
+                        if in_memory_vectors {
+                            vectors.upsert(&e.id, &doc);
+                        }
                     }
                 }
             }

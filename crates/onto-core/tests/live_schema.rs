@@ -1,5 +1,7 @@
 //! Live schema: change sets, impact reports, migrations, versions, reverts.
 
+mod common;
+
 use serde_json::{Value, json};
 
 use onto_core::live_schema::{DiffKind, SchemaMode};
@@ -297,13 +299,13 @@ fn invalid_and_stale_change_sets_are_rejected() {
     assert!(o.schema_plan(&admin(), &s).unwrap().errors[0].contains("must match"));
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn stored_schema_survives_restarts_and_imports_file_changes() {
-    let dir = std::env::temp_dir().join(format!("onto-live-{}", onto_core::time::new_id("t")));
-    let db = dir.join("onto.db");
+    let Some(pg) = common::TestTenant::new("restarts") else { return };
     let ctx = ActionContext::new(admin(), "acme");
     {
-        let o = Ontology::open_sqlite(Schema::enterprise(), &db, OntologyOptions::default()).unwrap();
+        let o = pg.open(Schema::enterprise(), OntologyOptions::default());
         o.upsert(&ctx, EntityInput::new("team", "core", "Core")).unwrap();
         o.schema_apply(
             &ctx,
@@ -313,7 +315,7 @@ fn stored_schema_survives_restarts_and_imports_file_changes() {
         .unwrap();
     }
     {
-        let o = Ontology::open_sqlite(Schema::enterprise(), &db, OntologyOptions::default()).unwrap();
+        let o = pg.open(Schema::enterprise(), OntologyOptions::default());
         assert_eq!(o.schema_version(), 2, "the live edit is still in force");
         assert!(o.schema().object_types["team"].properties.contains_key("slack"));
     }
@@ -321,7 +323,7 @@ fn stored_schema_survives_restarts_and_imports_file_changes() {
         // The schema files gain a type: imported as version 3 on top of the live edit.
         let mut files = Schema::enterprise();
         files.extend_toml("[object_types.runbook]\ncategory = 'knowledge'\n").unwrap();
-        let o = Ontology::open_sqlite(files, &db, OntologyOptions::default()).unwrap();
+        let o = pg.open(files, OntologyOptions::default());
         assert_eq!(o.schema_version(), 3);
         assert!(o.schema_import_error().is_none());
         assert!(o.schema().object_types.contains_key("runbook"));
@@ -331,12 +333,11 @@ fn stored_schema_survives_restarts_and_imports_file_changes() {
     {
         // Config mode: files win and API edits are refused.
         let opts = OntologyOptions { schema_mode: SchemaMode::Config, ..Default::default() };
-        let o = Ontology::open_sqlite(Schema::enterprise(), &db, opts).unwrap();
+        let o = pg.open(Schema::enterprise(), opts);
         assert!(!o.schema().object_types.contains_key("runbook"));
         let err = o
             .schema_apply(&ctx, set(json!({ "changes": [ { "op": "put_object_type", "name": "x", "def": {} } ] })))
             .unwrap_err();
         assert!(matches!(err, Error::Denied(_)));
     }
-    let _ = std::fs::remove_dir_all(dir);
 }

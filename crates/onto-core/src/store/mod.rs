@@ -4,8 +4,10 @@
 //! keeps the append-only event log, and offers a small namespaced KV used by
 //! memory, conversations and caches.
 //!
-//! Stores that several processes share (PostgreSQL, a SQLite file opened by
-//! more than one process) keep a **commit log**: every write that changes
+//! `PgStore` (PostgreSQL 16+ with pgvector) is the durable store, shared by
+//! any number of processes; [`MemoryStore`] is for tests and demos.
+//!
+//! A shared store keeps a **commit log**: every write that changes
 //! entities, links or KV gets the next sequence number and records what it
 //! touched. Writers commit optimistically against the sequence they last
 //! saw ([`WriteBatch::expect_seq`]); a writer that is behind gets
@@ -24,11 +26,6 @@ use crate::Result;
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::now_ms;
-
-#[cfg(feature = "sqlite")]
-mod sqlite;
-#[cfg(feature = "sqlite")]
-pub use sqlite::SqliteStore;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -120,6 +117,10 @@ pub struct WriteBatch {
     pub link_versions: Vec<LinkVersion>,
     /// KV writes that must commit together with the graph change (ns, key, value).
     pub kv: Vec<(String, String, Value)>,
+    /// Entity vectors for stores that index them ([`Store::indexes_vectors`]):
+    /// the quantized embedding of each put entity's searchable text (`None`:
+    /// no text), plus re-embedded entities after a schema change.
+    pub vectors: Vec<(Id, Option<Vec<i8>>)>,
     /// Optimistic concurrency: the commit sequence this batch was staged
     /// against. When the store's head differs, the write is refused with
     /// `Error::Stale` and nothing is written.
@@ -166,8 +167,20 @@ impl WriteBatch {
             && self.versions.is_empty()
             && self.link_versions.is_empty()
             && self.kv.is_empty()
+            && self.vectors.is_empty()
     }
 }
+
+/// Narrows a [`Store::vector_search`].
+#[derive(Clone, Debug, Default)]
+pub struct VectorFilter {
+    pub workspace: Option<String>,
+    /// Concrete kinds (empty: all).
+    pub kinds: Vec<String>,
+}
+
+/// Computes the vectors of entities a store has none for yet.
+pub type EmbedFn<'a> = &'a dyn Fn(&[Entity]) -> Vec<Option<Vec<i8>>>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StoreStats {
@@ -176,6 +189,9 @@ pub struct StoreStats {
     pub kv_entries: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Entity vectors the store indexes (an estimate on large tables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<u64>,
 }
 
 pub trait Store: Send + Sync {
@@ -247,6 +263,25 @@ pub trait Store: Send + Sync {
     /// `until`, newest first.
     fn link_history(&self, _id: &str, _until: i64, _limit: usize) -> Result<Vec<LinkVersion>> {
         Ok(Vec::new())
+    }
+    /// Does the store index entity vectors itself (pgvector)? The engine then
+    /// sends [`WriteBatch::vectors`] with every write and asks
+    /// [`vector_search`](Self::vector_search) instead of keeping a vector
+    /// index in memory.
+    fn indexes_vectors(&self) -> bool {
+        false
+    }
+    /// Entities nearest to `query` (a quantized embedding) by cosine
+    /// similarity, best first: at most `limit` of (id, similarity).
+    fn vector_search(&self, _query: &[i8], _limit: usize, _filter: &VectorFilter) -> Result<Vec<(Id, f32)>> {
+        Ok(Vec::new())
+    }
+    /// Store vectors for entities that have none yet (rows from a bulk
+    /// import or written before vectors were indexed), computing them with
+    /// `embed`. Returns how many entities it embedded. One process at a time
+    /// does this; the others return 0 at once.
+    fn backfill_vectors(&self, _embed: EmbedFn<'_>) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -404,6 +439,7 @@ impl Store for MemoryStore {
             events: inner.events.len() as u64,
             kv_entries: inner.kv.values().map(|m| m.len() as u64).sum(),
             path: None,
+            vectors: None,
         })
     }
 }

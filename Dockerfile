@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
-# docker build -t onto-intelli .
-# docker run -p 50051:50051 -v onto-data:/data -e ANTHROPIC_API_KEY onto-intelli
+# One binary + PostgreSQL. Build and run it with the database:
+#   ONTO_TOKEN=$(openssl rand -hex 24) docker compose --profile server up --build
+# or on its own, against any PostgreSQL 16+ with pgvector:
+#   docker build -t onto-intelli .
+#   docker run -p 50051:50051 -e ONTO_DATABASE_URL=postgres://… -e ONTO_TOKEN -v onto-config:/data onto-intelli
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
@@ -18,6 +21,8 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/onto /usr/local/bin/onto
 USER onto
 WORKDIR /data
+# The volume holds only configuration (and your protos and schema files);
+# all data lives in PostgreSQL.
 ENV ONTO_CONFIG=/data/onto-intelli.toml
 EXPOSE 50051
 # First start writes a starter config into the volume; edit it and restart.

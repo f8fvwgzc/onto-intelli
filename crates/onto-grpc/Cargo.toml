@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-onto-intelli = { workspace = true, features = ["sqlite", "postgres", "http-llm"] }
+onto-intelli = { workspace = true, features = ["postgres", "http-llm"] }
 tonic = { workspace = true, features = ["transport", "router", "codegen"] }
 tonic-prost.workspace = true
 tonic-reflection.workspace = true

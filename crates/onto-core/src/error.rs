@@ -72,10 +72,3 @@ impl From<toml::de::Error> for Error {
         Error::Config(e.to_string())
     }
 }
-
-#[cfg(feature = "sqlite")]
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Storage(e.to_string())
-    }
-}

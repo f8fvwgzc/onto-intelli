@@ -49,22 +49,6 @@ async fn per_call_principals_apply_roles_and_acls() {
     assert!(ws.call(&viewer, "entity.upsert", json!({ "id": "task:z", "title": "z" })).await.is_err());
 }
 
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_tenants_get_their_own_files() {
-    let dir = std::env::temp_dir().join(format!("onto-hub-{}", onto_intelli::core::time::new_id("t")));
-    let mut cfg = Config { base_dir: dir.clone(), ..Default::default() };
-    cfg.engine.tenancy = "multi".into();
-    let hub = Hub::open(cfg).await.unwrap();
-    hub.tenant("default").await.unwrap();
-    hub.tenant("ws_9").await.unwrap();
-    assert!(dir.join(".onto/onto.db").is_file());
-    assert!(dir.join(".onto/tenants/ws_9/onto.db").is_file());
-    assert_eq!(hub.known_tenants().unwrap(), vec!["default", "ws_9"]);
-    assert!(hub.resolve(Some("ws_10")).await.is_ok(), "multi-tenant hubs open new tenants");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 #[tokio::test]
 async fn every_listed_action_is_dispatched() {
     let hub = Hub::open(Config::in_memory()).await.unwrap();

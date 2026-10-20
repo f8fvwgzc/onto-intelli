@@ -1,6 +1,6 @@
 # onto-intelli
 
-**Ontology-based Enterprise Execution Intelligence in one small Rust binary.**
+**Ontology-based Enterprise Execution Intelligence: one Rust binary + PostgreSQL.**
 
 `workspace → team → project → issue → task` + knowledge & artifacts + chat conversations,
 modelled as an ontology, with a context graph, dependency reasoning, episodic and long-term
@@ -93,7 +93,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | Capability | Try it |
 |---|---|
 | **Live schema as data** — create, change and delete object types, properties, link types, interfaces, action types, rules and metrics at runtime; every change set is validated, previewed (entities/links affected, breaking or not), migrated explicitly when it breaks data in use, versioned with diffs and point-in-time reads, audited and reversible ([docs/SCHEMA.md](docs/SCHEMA.md)) | `onto schema plan change.toml` · `onto schema apply change.toml` · `onto schema history` · `onto schema revert 2` |
-| **Shared PostgreSQL store** — several processes (replicas embedding the library, several servers) share one consistent store per tenant: optimistic commits on a commit log, in-memory indexes as caches refreshed through LISTEN/NOTIFY, optional read-your-writes ([docs/STORAGE.md](docs/STORAGE.md)) | `[engine] storage = "postgres"` |
+| **PostgreSQL store** (16+, with pgvector) — the durable store: versioned migrations embedded in the binary, one schema per tenant, JSONB documents, an append-only event log and history, vectors in an HNSW index. Any number of processes (replicas embedding the library, several servers) share it consistently: optimistic commits on a commit log, in-memory graph indexes refreshed through LISTEN/NOTIFY, optional read-your-writes ([docs/STORAGE.md](docs/STORAGE.md)) | `make db-up` · `onto --database-url postgres://… status` |
 | **nexc-execution vocabulary** — `extend = ["builtin:nexc-execution"]`: graphs, node types (executor, default role, stage, produces_artifact, allow_code_exec) and relation types (blocking) as validated, versioned data, read and written in nexc's shape ([docs/NEXC_EXECUTION.md](docs/NEXC_EXECUTION.md)) | `onto call execution.init_graph '{"graph":"g1"}'` |
 | **Web UI** at `/ui` — workspace map (filter, search, expand, path, impact, history slider), schema editor with impact preview and apply/propose, proposals inbox, entity browser with history; iframe-embeddable with browser sessions, works on phones ([docs/UI.md](docs/UI.md)) | `onto serve --dev` then open http://127.0.0.1:50051/ui/ |
 | **Benchmarked at a million entities** on PostgreSQL: graph reads in microseconds to ~2 ms, hybrid search ~14 ms, writes ~1 ms, replication ~1 ms ([docs/BENCHMARK.md](docs/BENCHMARK.md)) | `cargo run --release -p onto-bench -- --url … --entities 1000000` |
@@ -106,7 +106,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **What-if scenarios** on an isolated fork | `onto whatif task:31 done` · `scenario.run` |
 | **Entity alignment** — duplicate detection and merge with permanent id redirects | `onto dupes` · `onto merge person:kenji person:kenji.t` |
 | **Data quality** — required links, uniqueness, staleness, orphans, dangling provenance, duplicates, low-confidence facts, scored per kind | `onto quality` · `onto ask "Show me stale issues"` |
-| **Hybrid personalised search** — BM25 + hashed vectors (typo/morphology tolerant), boosted by your graph neighbourhood and recency | `onto call entity.search '{"query":"paymnt timeout"}'` |
+| **Hybrid personalised search** — BM25 in memory + hashed vectors (typo/morphology tolerant) in pgvector, fused and boosted by your graph neighbourhood and recency | `onto call entity.search '{"query":"paymnt timeout"}'` |
 | **Expert finding** with reasons | `onto experts postgres` · `onto ask "Who knows about PostgreSQL?"` |
 | **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
 | **Graph profile** grounds prompts in patterns that exist; **drift suggestions** for data the schema doesn't cover | `onto schema profile` · `onto schema suggest` |
@@ -131,16 +131,21 @@ when `[mcp] allow_writes = true`).
 |---|---|
 | Release binary | `curl -fsSL https://raw.githubusercontent.com/f8fvwgzc/onto-intelli/main/packaging/install.sh \| sh` |
 | From source | `cargo install --path crates/onto-cli` (or `make install`) |
-| Docker | `docker build -t onto-intelli . && docker run -p 50051:50051 -e ONTO_TOKEN=$(openssl rand -hex 24) -v onto:/data onto-intelli` |
+| Docker | `ONTO_TOKEN=$(openssl rand -hex 24) docker compose --profile server up --build` (onto + PostgreSQL) |
 | Homebrew | formula template in [`packaging/homebrew/onto-intelli.rb`](packaging/homebrew/onto-intelli.rb) |
 
-One static-ish binary (`onto`, ~13 MB release). SQLite is compiled in and protos are compiled
-with [protox](https://github.com/andrewhickman/protox) — no `protoc`, no database server, no
-system libraries.
+One binary (`onto`, ~13 MB release) plus PostgreSQL 16 or newer with the
+[pgvector](https://github.com/pgvector/pgvector) extension: the `pgvector/pgvector` images,
+or any managed PostgreSQL that offers it. The binary checks the server version, creates the
+extension and applies its migrations on first connect. Protos are compiled with
+[protox](https://github.com/andrewhickman/protox), so there is no `protoc` and no other system
+library to install.
 
 ## Quick start
 
 ```bash
+make db-up                      # PostgreSQL 16 + pgvector on 127.0.0.1:5441 (docker compose)
+export ONTO_DATABASE_URL=postgres://onto:onto@127.0.0.1:5441/onto
 mkdir my-org && cd my-org
 onto init                       # onto-intelli.toml + protos/acme/tickets/v1/tickets.proto
 onto seed demo                  # demo workspace "acme"
@@ -285,15 +290,16 @@ intelli.ontology().upsert(&ctx, EntityInput::new("issue", "9", "Login fails").st
 let answer = intelli.ask(&Principal::admin("app"), AskRequest::new("Who owns issue #9?")).await?;
 ```
 
-**Many tenants in one process** (`Hub`): one ontology per tenant (a PostgreSQL schema, a
-SQLite file or memory), opened on first use; `Hub::with_postgres(cfg, PgShared::from_pool(app_pool)?)`
+**Many tenants in one process** (`Hub`): one ontology per tenant (a PostgreSQL schema, or
+memory), opened on first use; `Hub::with_postgres(cfg, PgShared::from_pool(app_pool)?)`
 shares the application's sqlx pool. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 **Rust, sync** ([example](crates/onto-intelli/examples/embed_sync.rs)): `BlockingIntelli`
 owns a small runtime; the graph API (`Ontology`) is synchronous anyway.
 
-Feature flags: `onto-intelli = { default-features = false }` drops SQLite and HTTP providers
-for the smallest footprint; `onto-core` alone is the ontology engine with no async runtime.
+Feature flags: `onto-intelli = { default-features = false }` drops PostgreSQL (in-memory
+only: tests and demos) and the HTTP providers; `onto-core` with `default-features = false` is
+the ontology engine with no async runtime.
 
 **Any language** via the C ABI ([header](crates/onto-ffi/include/onto_intelli.h)) —
 `cargo build --release -p onto-intelli-ffi` produces `libonto_intelli.{so,dylib,dll,a}`:
@@ -309,7 +315,7 @@ C: [`examples/ffi/demo.c`](examples/ffi/demo.c).
 ## Configuration
 
 `onto init` writes an annotated [`onto-intelli.toml`](crates/onto-intelli/templates/onto-intelli.toml).
-Sections: `[engine]` storage and workspace, `[ontology]` schema layers, `[llm]`, `[context]`
+Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers, `[llm]`, `[context]`
 token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic intents,
 `[grpc]` listener and routes, `[auth]`. Lookup order: `--config`, `$ONTO_CONFIG`,
 `./onto-intelli.toml`, `~/.config/onto-intelli/config.toml`.
@@ -327,7 +333,7 @@ token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic i
 ## Project layout
 
 ```text
-crates/onto-core      ontology: schema, graph, store (SQLite/memory), events, policy, rules, deps, BM25
+crates/onto-core      ontology: schema, graph, store (PostgreSQL/memory), events, policy, rules, deps, BM25
 crates/onto-intelli   orchestrator: intent, resolution, context graph, memory, LLM providers, caches, actions
 crates/onto-grpc      gRPC/HTTP server: built-in proto, dynamic proto routes, reflection, health, SSE
 crates/onto-cli       the `onto` binary
@@ -341,7 +347,9 @@ docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
 ## Development
 
 ```bash
-make test        # cargo test --workspace (unit + end-to-end server tests)
+make db-up       # PostgreSQL 16 + pgvector on 127.0.0.1:5441; db-down stops it, db-reset wipes it
+make test        # cargo test --workspace (PostgreSQL tests skip without DATABASE_URL)
+make test-db     # the same with DATABASE_URL pointing at the db-up database
 make lint        # fmt check + clippy
 make release     # optimized binaries in target/release
 make dist        # tarball for this platform in dist/

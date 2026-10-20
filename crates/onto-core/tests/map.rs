@@ -1,5 +1,7 @@
 //! Workspace map queries: overview and point-in-time snapshots.
 
+mod common;
+
 use onto_core::map::{OverviewSpec, SnapshotSpec};
 use onto_core::{ActionContext, EntityInput, Ontology, Principal, Schema};
 
@@ -9,8 +11,17 @@ fn pause() {
 
 #[test]
 fn snapshots_show_the_graph_as_it_was() {
-    let dir = std::env::temp_dir().join(format!("onto-map-{}", onto_core::time::new_id("t")));
-    let o = Ontology::open_sqlite(Schema::enterprise(), dir.join("onto.db"), Default::default()).unwrap();
+    snapshot_suite(Ontology::in_memory(Schema::enterprise()));
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn snapshots_on_postgres() {
+    let Some(pg) = common::TestTenant::new("snapshot") else { return };
+    snapshot_suite(pg.open(Schema::enterprise(), Default::default()));
+}
+
+fn snapshot_suite(o: Ontology) {
     let ctx = ActionContext::new(Principal::admin("ada"), "acme");
     let admin = Principal::admin("x");
     o.upsert(&ctx, EntityInput::new("team", "core", "Core")).unwrap();
@@ -50,7 +61,6 @@ fn snapshots_show_the_graph_as_it_was() {
     let before =
         o.snapshot(&admin, &SnapshotSpec { start: vec!["project:p".into()], ts: 0, depth: 2, limit: 50 }).unwrap();
     assert!(before.nodes.is_empty(), "nothing existed at the epoch");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

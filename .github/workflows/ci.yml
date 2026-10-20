@@ -20,10 +20,40 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # Everything, including the PostgreSQL integration tests and the
+  # competency questions, against PostgreSQL 16 with pgvector.
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: onto
+          POSTGRES_PASSWORD: onto
+          POSTGRES_DB: onto
+        ports: ["5432:5432"]
+        options: >-
+          --shm-size 1g
+          --health-cmd "pg_isready -U onto -d onto"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://onto:onto@localhost:5432/onto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - name: Competency questions on PostgreSQL
+        run: |
+          cargo run -q --locked -p onto-intelli-cli -- init "$RUNNER_TEMP/eval"
+          cargo run -q --locked -p onto-intelli-cli -- -c "$RUNNER_TEMP/eval/onto-intelli.toml" --tenant ci_eval seed demo
+          cargo run -q --locked -p onto-intelli-cli -- -c "$RUNNER_TEMP/eval/onto-intelli.toml" --tenant ci_eval eval
+
+  # The tests that need no database (PostgreSQL tests skip without DATABASE_URL).
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -46,24 +76,3 @@ jobs:
         working-directory: ui
       - name: The committed build matches the sources
         run: git diff --exit-code -- crates/onto-grpc/ui-dist
-
-  postgres:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: onto
-          POSTGRES_PASSWORD: onto
-          POSTGRES_DB: onto
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U onto -d onto"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      ONTO_TEST_POSTGRES_URL: postgres://onto:onto@localhost:5432/onto
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --features onto-core/postgres,onto-intelli/postgres

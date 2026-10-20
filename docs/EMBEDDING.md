@@ -41,7 +41,7 @@ let out = ws.call(&me, "graph.traverse", serde_json::json!({ "start": ["project:
 Other ways to build a hub:
 
 - `Hub::open(cfg)` takes the backend from configuration: one PostgreSQL
-  schema, one SQLite file or one in-memory store per tenant.
+  schema, or one in-memory store, per tenant.
 - `PgShared::connect(url, &opts)` creates a pool of its own, on its own small
   runtime.
 - `Hub::single(intelli)` wraps one ontology you already opened.
@@ -165,14 +165,14 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
 
 ```toml
 [engine]
-storage = "postgres"            # sqlite | postgres | memory
+storage = "postgres"            # postgres | memory (tests and demos)
+# database_url = "postgres://…"  # or ONTO_DATABASE_URL / DATABASE_URL in the environment
 tenancy = "multi"               # single | multi (x-onto-tenant chooses)
 read_consistency = "eventual"   # eventual | strong (read-your-writes across replicas)
 follow_interval_ms = 1000
 default_workspace = "main"
 
 [engine.postgres]
-url_env = "ONTO_DATABASE_URL"   # or url = "postgres://…?sslmode=require"
 tenant = "default"              # the default tenant
 schema_prefix = "onto_"
 max_connections = 10

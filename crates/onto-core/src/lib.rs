@@ -52,6 +52,16 @@ pub use model::*;
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use schema::{Dir, Schema};
-/// The sqlx version the PostgreSQL store is built on (hand its `PgPool` to `PgShared::from_pool`).
+/// The sqlx 0.9 API the PostgreSQL store is built on, as `sqlx::…` paths.
+/// An application's `sqlx::PgPool` is the same type as `sqlx::PgPool` here:
+/// hand it to `store::PgShared::from_pool`.
 #[cfg(feature = "postgres")]
-pub use sqlx;
+pub mod sqlx {
+    pub use sqlx_core::*;
+    pub use sqlx_core::{
+        query::query, query_as::query_as, query_scalar::query_scalar, raw_sql::raw_sql, row::Row,
+        sql_str::AssertSqlSafe,
+    };
+    pub use sqlx_postgres as postgres;
+    pub use sqlx_postgres::{PgPool, Postgres};
+}

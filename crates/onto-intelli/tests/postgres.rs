@@ -1,6 +1,8 @@
-//! Two orchestrators on one PostgreSQL tenant (two replicas of an app).
-//! Runs when `ONTO_TEST_POSTGRES_URL` is set.
+//! Two orchestrators on one PostgreSQL tenant (two replicas of an app), and
+//! hubs of tenants. Runs when a test database is set (see `common`).
 #![cfg(feature = "postgres")]
+
+mod common;
 
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,7 @@ use onto_intelli::{Config, Intelli, Principal, Role, seed};
 async fn replica(url: &str, tenant: &str) -> std::sync::Arc<Intelli> {
     let mut cfg = Config::in_memory();
     cfg.engine.storage = "postgres".into();
-    cfg.engine.postgres.url = Some(url.into());
-    cfg.engine.postgres.url_env = None;
+    cfg.engine.database_url = Some(url.into());
     cfg.engine.postgres.tenant = tenant.into();
     cfg.engine.default_workspace = "acme".into();
     cfg.engine.follow_interval_ms = 200;
@@ -32,11 +33,8 @@ async fn eventually(what: &str, mut f: impl AsyncFnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replicas_share_graph_schema_proposals_and_memory() {
-    let Ok(url) = std::env::var("ONTO_TEST_POSTGRES_URL") else {
-        eprintln!("skipped: set ONTO_TEST_POSTGRES_URL to run the PostgreSQL suite");
-        return;
-    };
-    let tenant = format!("it{}", &onto_intelli::core::time::new_id("x")[2..]);
+    let Some(url) = common::database_url("replicas") else { return };
+    let tenant = common::unique("it");
     let a = replica(&url, &tenant).await;
     seed::load_demo(&a, "acme").await.unwrap();
     let b = replica(&url, &tenant).await;
@@ -95,22 +93,18 @@ async fn replicas_share_graph_schema_proposals_and_memory() {
     })
     .await;
 
-    let store = onto_intelli::core::store::PgStore::connect(&url, &tenant, Default::default()).unwrap();
-    store.drop_tenant().unwrap();
+    common::drop_tenant(&url, "onto_", &tenant);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_on_an_application_pool() {
-    let Ok(url) = std::env::var("ONTO_TEST_POSTGRES_URL") else {
-        eprintln!("skipped: set ONTO_TEST_POSTGRES_URL to run the PostgreSQL suite");
-        return;
-    };
+    let Some(url) = common::database_url("hub_pool") else { return };
     // The application's own pool, as nexc would hand it over.
     let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await.unwrap();
     let shared = onto_intelli::core::store::PgShared::from_pool(pool).unwrap();
     let mut cfg = Config::in_memory();
     cfg.engine.storage = "postgres".into();
-    cfg.engine.postgres.schema_prefix = format!("onto_hub{}_", &onto_intelli::core::time::new_id("x")[2..10]);
+    cfg.engine.postgres.schema_prefix = common::unique("onto_hub") + "_";
     cfg.engine.tenancy = "multi".into();
     let prefix = cfg.engine.postgres.schema_prefix.clone();
     let hub = onto_intelli::Hub::with_postgres(cfg, shared.clone()).unwrap();
@@ -129,4 +123,36 @@ async fn hub_on_an_application_pool() {
             .drop_tenant()
             .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_hub_gives_each_tenant_its_own_schema() {
+    let Some(url) = common::database_url("hub_config") else { return };
+    let mut cfg = Config::in_memory();
+    cfg.engine.storage = "postgres".into();
+    cfg.engine.database_url = Some(url.clone());
+    cfg.engine.tenancy = "multi".into();
+    cfg.engine.postgres.schema_prefix = common::unique("onto_cfg") + "_";
+    let prefix = cfg.engine.postgres.schema_prefix.clone();
+    let hub = onto_intelli::Hub::open(cfg).await.unwrap();
+    hub.tenant("default").await.unwrap();
+    hub.tenant("ws_9").await.unwrap();
+    let mut known = hub.known_tenants().unwrap();
+    known.sort();
+    assert_eq!(known, vec!["default", "ws_9"]);
+    assert!(hub.resolve(Some("ws_10")).await.is_ok(), "multi-tenant hubs open new tenants");
+    for t in ["default", "ws_9", "ws_10"] {
+        common::drop_tenant(&url, &prefix, t);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_database_url_is_a_clear_error() {
+    let mut cfg = Config::default();
+    cfg.engine.database_url = None;
+    if std::env::var_os("ONTO_DATABASE_URL").is_some() || std::env::var_os("DATABASE_URL").is_some() {
+        return; // the environment provides one
+    }
+    let err = Intelli::open(cfg).await.err().unwrap().to_string();
+    assert!(err.contains("--database-url") && err.contains("ONTO_DATABASE_URL"), "{err}");
 }

@@ -42,10 +42,13 @@ pub struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
-    /// `sqlite` (durable, single file, one node), `postgres` (shared by
-    /// several processes) or `memory` (volatile).
+    /// `postgres` (durable: PostgreSQL 16+ with pgvector, shared by any
+    /// number of processes) or `memory` (volatile: tests and demos).
     pub storage: String,
-    pub data_dir: String,
+    /// PostgreSQL URL. Resolution order: `onto --database-url`, this value,
+    /// `ONTO_DATABASE_URL`, `DATABASE_URL`. The URL holds credentials, so
+    /// prefer an environment variable to writing it here.
+    pub database_url: Option<String>,
     pub default_workspace: String,
     /// Capacity of the async ingestion queue (backpressure beyond this).
     pub ingest_queue: usize,
@@ -55,9 +58,9 @@ pub struct EngineConfig {
     pub read_consistency: String,
     /// How often the follower of a shared store polls when no notice arrives.
     pub follow_interval_ms: u64,
-    /// `single`: one tenant (`engine.postgres.tenant`, or the SQLite file).
+    /// `single`: one tenant (`engine.postgres.tenant`).
     /// `multi`: requests choose a tenant (`x-onto-tenant`); each tenant is
-    /// its own PostgreSQL schema or SQLite file, opened on first use.
+    /// its own PostgreSQL schema, opened on first use.
     pub tenancy: String,
     pub postgres: PostgresConfig,
 }
@@ -65,8 +68,8 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            storage: "sqlite".into(),
-            data_dir: ".onto".into(),
+            storage: "postgres".into(),
+            database_url: None,
             default_workspace: "default".into(),
             ingest_queue: 1024,
             read_consistency: "eventual".into(),
@@ -77,14 +80,10 @@ impl Default for EngineConfig {
     }
 }
 
-/// `[engine.postgres]`: the shared store for several processes.
+/// `[engine.postgres]`: tenants and the connection pool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PostgresConfig {
-    /// Connection URL (prefer `url_env`; the URL holds credentials).
-    pub url: Option<String>,
-    /// Environment variable holding the URL.
-    pub url_env: Option<String>,
     /// Tenant: one PostgreSQL schema (`{schema_prefix}{tenant}`) per tenant.
     pub tenant: String,
     pub schema_prefix: String,
@@ -94,32 +93,31 @@ pub struct PostgresConfig {
 
 impl Default for PostgresConfig {
     fn default() -> Self {
-        Self {
-            url: None,
-            url_env: Some("ONTO_DATABASE_URL".into()),
-            tenant: "default".into(),
-            schema_prefix: "onto_".into(),
-            max_connections: 10,
-            connect_timeout_secs: 10,
-        }
+        Self { tenant: "default".into(), schema_prefix: "onto_".into(), max_connections: 10, connect_timeout_secs: 10 }
     }
 }
 
-impl PostgresConfig {
-    /// The URL from `url_env` or `url`.
-    pub fn resolve_url(&self) -> Result<String> {
-        if let Some(var) = &self.url_env
-            && let Ok(v) = std::env::var(var)
-            && !v.trim().is_empty()
-        {
-            return Ok(v);
+/// Local development database (`make db-up`).
+pub const DEV_DATABASE_URL: &str = "postgres://onto:onto@127.0.0.1:5441/onto";
+
+impl EngineConfig {
+    /// The PostgreSQL URL: `database_url` (set by `--database-url` or the
+    /// file), else `ONTO_DATABASE_URL`, else `DATABASE_URL`.
+    pub fn resolve_database_url(&self) -> Result<String> {
+        if let Some(url) = self.database_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            return Ok(url.to_string());
         }
-        self.url.clone().filter(|u| !u.is_empty()).ok_or_else(|| {
-            Error::Config(format!(
-                "engine.storage = \"postgres\" needs a URL: set {} or engine.postgres.url",
-                self.url_env.as_deref().unwrap_or("engine.postgres.url_env")
-            ))
-        })
+        for var in ["ONTO_DATABASE_URL", "DATABASE_URL"] {
+            if let Ok(v) = std::env::var(var)
+                && !v.trim().is_empty()
+            {
+                return Ok(v.trim().to_string());
+            }
+        }
+        Err(Error::Config(format!(
+            "engine.storage = \"postgres\" needs a database: pass --database-url, set engine.database_url, or set \
+             ONTO_DATABASE_URL (or DATABASE_URL). For a local one, run `make db-up` and use {DEV_DATABASE_URL}"
+        )))
     }
 }
 
@@ -490,10 +488,6 @@ impl Config {
     pub fn resolve_path(&self, p: &str) -> PathBuf {
         let path = PathBuf::from(p);
         if path.is_absolute() || self.base_dir.as_os_str().is_empty() { path } else { self.base_dir.join(path) }
-    }
-
-    pub fn db_path(&self) -> PathBuf {
-        self.resolve_path(&self.engine.data_dir).join("onto.db")
     }
 }
 

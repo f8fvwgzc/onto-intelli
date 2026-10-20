@@ -2,18 +2,21 @@
 # Every section is optional; omitted values use the defaults shown here.
 
 [engine]
-storage = "sqlite"            # sqlite (one node, single file) | postgres (shared by replicas) | memory
-data_dir = ".onto"            # holds onto.db
+storage = "postgres"          # postgres (PostgreSQL 16+ with pgvector) | memory (volatile: tests, demos)
+# The database URL holds credentials: keep it in the environment.
+# Order: --database-url, database_url here, ONTO_DATABASE_URL, DATABASE_URL.
+# `make db-up` starts a local one: postgres://onto:onto@127.0.0.1:5441/onto
+# database_url = "postgres://user:pass@host/db?sslmode=require"
 default_workspace = "acme"
 ingest_queue = 1024           # async ingestion backpressure
-# read_consistency = "eventual" # eventual | strong (check the shared store's head before each read)
-# follow_interval_ms = 1000     # poll fallback for followers of a shared store
+# read_consistency = "eventual" # eventual | strong (check the database's commit head before each read)
+# follow_interval_ms = 1000     # poll fallback when a LISTEN/NOTIFY notice is missed
 
-# [engine.postgres]             # storage = "postgres": several processes share one store
-# url_env = "ONTO_DATABASE_URL" # postgres://user:pass@host/db?sslmode=require
+# [engine.postgres]
 # tenant = "acme"               # one PostgreSQL schema per tenant: {schema_prefix}{tenant}
 # schema_prefix = "onto_"
 # max_connections = 10
+# connect_timeout_secs = 10
 
 [ontology]
 schema = "builtin:enterprise" # or a path to your own schema TOML

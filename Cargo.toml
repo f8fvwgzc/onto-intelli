@@ -32,8 +32,11 @@ parking_lot = "0.12"
 toml = "0.9"
 fastrand = "2"
 regex-lite = "0.1"
-rusqlite = { version = "0.39", features = ["bundled"] }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "json", "tls-rustls-aws-lc-rs"] }
+# PostgreSQL through sqlx's core and driver crates: the types of `sqlx` 0.9
+# (an application's `sqlx::PgPool` is a `sqlx_postgres::PgPool`), without
+# the facade's other drivers.
+sqlx-core = { version = "=0.9.0", default-features = false, features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json"] }
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["json"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-std", "io-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }

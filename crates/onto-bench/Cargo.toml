@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-onto-intelli = { workspace = true, features = ["sqlite", "postgres"] }
+onto-intelli = { workspace = true, features = ["postgres"] }
 tokio.workspace = true
 serde_json.workspace = true
 clap.workspace = true

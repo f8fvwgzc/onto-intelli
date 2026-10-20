@@ -842,8 +842,6 @@ pub fn load_schema(cfg: &Config) -> Result<Schema> {
 fn open_store(cfg: &Config) -> Result<Arc<dyn Store>> {
     match cfg.engine.storage.as_str() {
         "memory" => Ok(Arc::new(MemoryStore::default())),
-        #[cfg(feature = "sqlite")]
-        "sqlite" => Ok(Arc::new(onto_core::store::SqliteStore::open(cfg.db_path())?)),
         #[cfg(feature = "postgres")]
         "postgres" | "postgresql" => {
             let pg = &cfg.engine.postgres;
@@ -853,8 +851,8 @@ fn open_store(cfg: &Config) -> Result<Arc<dyn Store>> {
                 connect_timeout: Duration::from_secs(pg.connect_timeout_secs),
                 listen: true,
             };
-            Ok(Arc::new(onto_core::store::PgStore::connect(&pg.resolve_url()?, &pg.tenant, opts)?))
+            Ok(Arc::new(onto_core::store::PgStore::connect(&cfg.engine.resolve_database_url()?, &pg.tenant, opts)?))
         }
-        other => Err(Error::Config(format!("unknown engine.storage '{other}' (sqlite, postgres, memory)"))),
+        other => Err(Error::Config(format!("unknown engine.storage '{other}' (postgres, memory)"))),
     }
 }
