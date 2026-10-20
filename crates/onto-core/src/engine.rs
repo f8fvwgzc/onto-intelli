@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::deps::{self, CriticalPath, DepDirection, DepReport, RootCause};
 use crate::graph::{Graph, LinkKey};
+use crate::live_schema::{self, Governance, SchemaMode};
 use crate::model::*;
 use crate::policy::{self, Access, Principal};
 use crate::quality::{self, QualityReport};
@@ -28,11 +29,20 @@ pub struct OntologyOptions {
     /// Reject unknown kinds, relations and properties.
     pub strict: bool,
     pub default_workspace: String,
+    /// Where the active schema comes from (stored versions or config files).
+    pub schema_mode: SchemaMode,
+    /// Who may change, propose and approve schema changes.
+    pub governance: Governance,
 }
 
 impl Default for OntologyOptions {
     fn default() -> Self {
-        Self { strict: false, default_workspace: "default".into() }
+        Self {
+            strict: false,
+            default_workspace: "default".into(),
+            schema_mode: SchemaMode::default(),
+            governance: Governance::default(),
+        }
     }
 }
 
@@ -151,6 +161,26 @@ pub struct MergeResult {
 pub(crate) struct Extra {
     pub kv: Vec<(String, String, Value)>,
     pub redirects: Vec<(Id, Id)>,
+    /// Audit events written with the batch.
+    pub events: Vec<Event>,
+    /// Schema (and its version) the mutations are validated against; it
+    /// becomes active when the batch commits.
+    pub schema: Option<(Arc<Schema>, u64)>,
+    /// Kinds whose search documents are rebuilt after the commit.
+    pub reindex: Vec<String>,
+}
+
+impl Extra {
+    fn is_empty(&self) -> bool {
+        self.kv.is_empty() && self.redirects.is_empty() && self.events.is_empty() && self.schema.is_none()
+    }
+}
+
+/// The schema in force and its stored version.
+#[derive(Clone)]
+pub(crate) struct ActiveSchema {
+    pub schema: Arc<Schema>,
+    pub version: u64,
 }
 
 /// Fields that differ between two versions of an entity.
@@ -193,7 +223,9 @@ pub struct OntoStats {
 type Listener = Arc<dyn Fn(&ChangeSet) + Send + Sync>;
 
 struct Inner {
-    schema: Arc<Schema>,
+    active: RwLock<ActiveSchema>,
+    /// Why the last import of changed schema files was not applied.
+    import_error: RwLock<Option<String>>,
     graph: RwLock<Graph>,
     text: RwLock<TextIndex>,
     vectors: RwLock<VectorIndex>,
@@ -213,7 +245,14 @@ pub struct Ontology {
 
 impl Ontology {
     /// Load the graph from `store` and build the indexes.
+    ///
+    /// `schema` is the schema of the configuration (built-in packages plus
+    /// files). The first open stores it as schema version 1; afterwards the
+    /// stored live schema is authoritative and changes to the files are
+    /// imported as new versions (see [`SchemaMode`]).
     pub fn open(schema: Schema, store: Arc<dyn Store>, opts: OntologyOptions) -> Result<Self> {
+        let config_schema = schema;
+        let (schema, version) = live_schema::load_active(&*store, &config_schema, opts.schema_mode)?;
         let snap = store.load()?;
         let mut graph = Graph::default();
         let mut text = TextIndex::default();
@@ -234,9 +273,10 @@ impl Ontology {
                 graph.put_link(l);
             }
         }
-        Ok(Self {
+        let onto = Self {
             inner: Arc::new(Inner {
-                schema: Arc::new(schema),
+                active: RwLock::new(ActiveSchema { schema: Arc::new(schema), version }),
+                import_error: RwLock::new(None),
                 graph: RwLock::new(graph),
                 text: RwLock::new(text),
                 vectors: RwLock::new(vectors),
@@ -246,7 +286,9 @@ impl Ontology {
                 opts,
                 listeners: RwLock::new(Vec::new()),
             }),
-        })
+        };
+        onto.bootstrap_schema(config_schema)?;
+        Ok(onto)
     }
 
     /// Volatile ontology, handy for tests and embedding.
@@ -260,8 +302,28 @@ impl Ontology {
         Self::open(schema, Arc::new(crate::store::SqliteStore::open(path)?), opts)
     }
 
-    pub fn schema(&self) -> &Schema {
-        &self.inner.schema
+    /// The schema in force. Cheap (an `Arc` clone); hold it for the duration
+    /// of one operation so a concurrent schema change cannot split it.
+    pub fn schema(&self) -> Arc<Schema> {
+        self.inner.active.read().schema.clone()
+    }
+
+    /// Version of the schema in force (see [`schema_history`](Self::schema_history)).
+    pub fn schema_version(&self) -> u64 {
+        self.inner.active.read().version
+    }
+
+    pub(crate) fn active_schema(&self) -> ActiveSchema {
+        self.inner.active.read().clone()
+    }
+
+    pub(crate) fn set_import_error(&self, err: Option<String>) {
+        *self.inner.import_error.write() = err;
+    }
+
+    /// Why changed schema files could not be imported, if they could not.
+    pub fn schema_import_error(&self) -> Option<String> {
+        self.inner.import_error.read().clone()
     }
 
     pub fn store(&self) -> &Arc<dyn Store> {
@@ -284,8 +346,9 @@ impl Ontology {
 
     /// Escape hatch for custom read-only algorithms (no permission filtering).
     pub fn read<R>(&self, f: impl FnOnce(&Graph, &Schema) -> R) -> R {
+        let schema = self.schema();
         let g = self.inner.graph.read();
-        f(&g, &self.inner.schema)
+        f(&g, &schema)
     }
 
     /// Independent in-memory copy for what-if scenarios: edits to the fork
@@ -294,7 +357,8 @@ impl Ontology {
         let graph = self.inner.graph.read().clone();
         Ontology {
             inner: Arc::new(Inner {
-                schema: self.inner.schema.clone(),
+                active: RwLock::new(self.active_schema()),
+                import_error: RwLock::new(None),
                 graph: RwLock::new(graph),
                 text: RwLock::new(self.inner.text.read().clone()),
                 vectors: RwLock::new(self.inner.vectors.read().clone()),
@@ -326,6 +390,10 @@ impl Ontology {
             }
         }
         cur.to_string()
+    }
+
+    pub(crate) fn inner_graph_read(&self) -> RwLockReadGuard<'_, Graph> {
+        self.inner.graph.read()
     }
 
     fn reader(&self, p: &Principal) -> Result<RwLockReadGuard<'_, Graph>> {
@@ -384,14 +452,14 @@ impl Ontology {
     pub fn traverse(&self, p: &Principal, spec: &TraverseSpec) -> Result<Subgraph> {
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(query::traverse(self.schema(), &g, spec, &can))
+        Ok(query::traverse(&self.schema(), &g, spec, &can))
     }
 
     /// Returns (page, total).
     pub fn find(&self, p: &Principal, spec: &FindSpec) -> Result<(Vec<Entity>, usize)> {
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(query::find(self.schema(), &g, spec, &can))
+        Ok(query::find(&self.schema(), &g, spec, &can))
     }
 
     /// Hybrid, permission-aware search personalised to the caller.
@@ -506,7 +574,7 @@ impl Ontology {
     ) -> Result<Vec<DuplicatePair>> {
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(similarity::duplicates(self.schema(), &g, workspace, kind, threshold, &can))
+        Ok(similarity::duplicates(&self.schema(), &g, workspace, kind, threshold, &can))
     }
 
     /// Data-quality report over what the caller can see.
@@ -519,7 +587,7 @@ impl Ontology {
     ) -> Result<QualityReport> {
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(quality::report(self.schema(), &g, workspace, kind, limit, &can))
+        Ok(quality::report(&self.schema(), &g, workspace, kind, limit, &can))
     }
 
     fn version_visible(&self, p: &Principal, doc: &Entity) -> bool {
@@ -593,7 +661,7 @@ impl Ontology {
         let scope: Option<HashSet<Id>> = within.map(|root| {
             let root = self.resolve_id(root);
             let g = self.inner.graph.read();
-            let mut set: HashSet<Id> = query::scope_set(self.schema(), &g, &root, 3).into_iter().collect();
+            let mut set: HashSet<Id> = query::scope_set(&self.schema(), &g, &root, 3).into_iter().collect();
             set.insert(root);
             set
         });
@@ -656,7 +724,7 @@ impl Ontology {
             }
         }
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(query::shortest_path(self.schema(), &g, from, to, max_depth, &can))
+        Ok(query::shortest_path(&self.schema(), &g, from, to, max_depth, &can))
     }
 
     pub fn path_text(&self, hops: &[Hop]) -> String {
@@ -667,41 +735,41 @@ impl Ontology {
         let g = self.reader(p)?;
         self.visible_or_404(p, &g, id)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(rules::infer(self.schema(), &g, id, &can))
+        Ok(rules::infer(&self.schema(), &g, id, &can))
     }
 
     pub fn dependencies(&self, p: &Principal, id: &str, direction: DepDirection, depth: usize) -> Result<DepReport> {
         let g = self.reader(p)?;
         self.visible_or_404(p, &g, id)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(deps::dependencies(self.schema(), &g, id, direction, depth, &can))
+        Ok(deps::dependencies(&self.schema(), &g, id, direction, depth, &can))
     }
 
     pub fn impact(&self, p: &Principal, id: &str, depth: usize) -> Result<DepReport> {
         let g = self.reader(p)?;
         self.visible_or_404(p, &g, id)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(deps::impact(self.schema(), &g, id, depth, &can))
+        Ok(deps::impact(&self.schema(), &g, id, depth, &can))
     }
 
     pub fn root_cause(&self, p: &Principal, id: &str, depth: usize) -> Result<RootCause> {
         let g = self.reader(p)?;
         self.visible_or_404(p, &g, id)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(deps::root_cause(self.schema(), &g, id, depth, &can))
+        Ok(deps::root_cause(&self.schema(), &g, id, depth, &can))
     }
 
     pub fn cycles(&self, p: &Principal, workspace: Option<&str>) -> Result<Vec<Vec<Id>>> {
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(deps::cycles(self.schema(), &g, workspace, &can))
+        Ok(deps::cycles(&self.schema(), &g, workspace, &can))
     }
 
     pub fn critical_path(&self, p: &Principal, id: &str) -> Result<CriticalPath> {
         let g = self.reader(p)?;
         self.visible_or_404(p, &g, id)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        Ok(deps::critical_path(self.schema(), &g, id, &can))
+        Ok(deps::critical_path(&self.schema(), &g, id, &can))
     }
 
     pub fn events(&self, p: &Principal, filter: &EventFilter) -> Result<Vec<Event>> {
@@ -840,6 +908,7 @@ impl Ontology {
         let extra = Extra {
             kv: vec![("redirect".into(), dup.clone(), json!(keep))],
             redirects: vec![(dup.clone(), keep.clone())],
+            ..Default::default()
         };
         let res = self.apply_inner(ctx, muts, extra)?;
         Ok(MergeResult { kept: keep, merged: dup, links_moved: moved, revision: res.revision })
@@ -851,18 +920,55 @@ impl Ontology {
     }
 
     pub(crate) fn apply_inner(&self, ctx: &ActionContext, muts: Vec<Mutation>, extra: Extra) -> Result<MutationResult> {
-        if muts.is_empty() {
+        if muts.is_empty() && extra.is_empty() {
             return Ok(MutationResult { revision: self.revision(), ..Default::default() });
         }
+        let mut g = self.inner.graph.write();
+        self.commit_locked(&mut g, ctx, muts, extra)
+    }
+
+    /// Exclusive access to the graph for an operation that must plan and
+    /// commit against the same state (schema changes).
+    pub(crate) fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Graph> {
+        self.inner.graph.write()
+    }
+
+    /// Validate `muts` against `schema` on a copy-on-write overlay without
+    /// writing anything (dry runs).
+    pub(crate) fn stage_only(
+        &self,
+        g: &Graph,
+        schema: &Schema,
+        ctx: &ActionContext,
+        muts: Vec<Mutation>,
+    ) -> Result<(WriteBatch, Vec<Id>)> {
+        let now = now_ms();
+        let mut st = Stage::new(g);
+        let mut events = Vec::new();
+        let mut touched = Vec::new();
+        for m in muts {
+            events.append(&mut self.stage(schema, ctx, &mut st, m, now, &mut touched)?);
+        }
+        let staged = st.finish(events, touched);
+        Ok((staged.batch, staged.touched))
+    }
+
+    pub(crate) fn commit_locked(
+        &self,
+        g: &mut Graph,
+        ctx: &ActionContext,
+        muts: Vec<Mutation>,
+        extra: Extra,
+    ) -> Result<MutationResult> {
         let now = now_ms();
         let applied = muts.len();
-        let mut g = self.inner.graph.write();
+        let schema = extra.schema.as_ref().map(|(s, _)| s.clone()).unwrap_or_else(|| self.schema());
         let staged = {
-            let mut st = Stage::new(&g);
+            let mut st = Stage::new(g);
             let mut events = Vec::new();
             let mut touched = Vec::new();
             for m in muts {
-                match self.stage(ctx, &mut st, m, now, &mut touched) {
+                match self.stage(&schema, ctx, &mut st, m, now, &mut touched) {
                     Ok(mut evs) => events.append(&mut evs),
                     Err(err) => {
                         if let Error::Denied(reason) = &err {
@@ -875,6 +981,7 @@ impl Ontology {
             st.finish(events, touched)
         };
         let mut staged = staged;
+        staged.batch.events.extend(extra.events);
         for e in &staged.batch.put_entities {
             staged.batch.versions.push(VersionRecord {
                 id: e.id.clone(),
@@ -909,13 +1016,22 @@ impl Ontology {
                 vectors.remove(id);
             }
             for e in &staged.batch.put_entities {
-                let doc = searchable_text(&self.inner.schema, e);
+                let doc = searchable_text(&schema, e);
                 text.upsert(&e.id, &doc);
                 vectors.upsert(&e.id, &doc);
                 g.put_entity(e.clone());
             }
             for l in &staged.batch.put_links {
                 g.put_link(l.clone());
+            }
+            if extra.schema.is_some() {
+                for kind in &extra.reindex {
+                    for e in g.of_kind(kind) {
+                        let doc = searchable_text(&schema, e);
+                        text.upsert(&e.id, &doc);
+                        vectors.upsert(&e.id, &doc);
+                    }
+                }
             }
             if !extra.redirects.is_empty() {
                 let mut r = self.inner.redirects.write();
@@ -930,9 +1046,13 @@ impl Ontology {
                 }
             }
         }
-        drop(g);
+        let schema_changed = extra.schema.is_some();
+        if let Some((schema, version)) = extra.schema {
+            *self.inner.active.write() = ActiveSchema { schema, version };
+        }
         let links = staged.batch.put_links.len() + staged.batch.del_links.len();
-        let wrote = !(staged.batch.put_entities.is_empty() && staged.batch.del_entities.is_empty() && links == 0);
+        let wrote = schema_changed
+            || !(staged.batch.put_entities.is_empty() && staged.batch.del_entities.is_empty() && links == 0);
         let revision = if wrote { self.inner.revision.fetch_add(1, Ordering::SeqCst) + 1 } else { self.revision() };
         if wrote {
             let change = ChangeSet {
@@ -956,7 +1076,7 @@ impl Ontology {
         })
     }
 
-    fn audit_denied(&self, ctx: &ActionContext, reason: &str, now: i64) {
+    pub(crate) fn audit_denied(&self, ctx: &ActionContext, reason: &str, now: i64) {
         let mut ev =
             self.event(ctx, &ctx.workspace, "authorization.denied", None, now, json!({ "reason": reason }), Vec::new());
         ev.outcome = Outcome::Denied;
@@ -964,7 +1084,7 @@ impl Ontology {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn event(
+    pub(crate) fn event(
         &self,
         ctx: &ActionContext,
         ws: &str,
@@ -992,13 +1112,13 @@ impl Ontology {
 
     fn stage(
         &self,
+        schema: &Schema,
         ctx: &ActionContext,
         st: &mut Stage<'_>,
         m: Mutation,
         now: i64,
         touched: &mut Vec<Id>,
     ) -> Result<Vec<Event>> {
-        let schema = self.schema();
         let strict = self.inner.opts.strict;
         match m {
             Mutation::Upsert(input) => {
@@ -1128,7 +1248,7 @@ impl Ontology {
                 touched.push(id.clone());
                 for spec in input.links {
                     let link = LinkInput { from: id.clone(), rel: spec.rel, to: spec.to, props: spec.props };
-                    events.extend(self.stage_link(ctx, st, link, now)?);
+                    events.extend(self.stage_link(schema, ctx, st, link, now)?);
                 }
                 // Provenance becomes graph edges when the referenced things exist.
                 if let Some(p) = provenance {
@@ -1144,7 +1264,13 @@ impl Ontology {
                                     .is_some_and(|me| schema.validate_link(&me.kind, rel, &t.kind, strict).is_ok())
                             });
                         if ok {
-                            events.extend(self.stage_link(ctx, st, LinkInput::new(id.clone(), rel, target), now)?);
+                            events.extend(self.stage_link(
+                                schema,
+                                ctx,
+                                st,
+                                LinkInput::new(id.clone(), rel, target),
+                                now,
+                            )?);
                         }
                     }
                 }
@@ -1166,7 +1292,7 @@ impl Ontology {
                     props,
                     ..Default::default()
                 };
-                self.stage(ctx, st, Mutation::Upsert(input), now, touched)
+                self.stage(schema, ctx, st, Mutation::Upsert(input), now, touched)
             }
             Mutation::Delete(mut r) => {
                 if st.entity(&r.id).is_none() {
@@ -1186,7 +1312,7 @@ impl Ontology {
                     Vec::new(),
                 )])
             }
-            Mutation::Link(input) => self.stage_link(ctx, st, input, now),
+            Mutation::Link(input) => self.stage_link(schema, ctx, st, input, now),
             Mutation::Unlink(input) => {
                 let (base, dir) = schema.resolve_rel_lenient(&input.rel);
                 let (mut from, mut to) = if dir == Dir::In { (input.to, input.from) } else { (input.from, input.to) };
@@ -1249,8 +1375,14 @@ impl Ontology {
         }
     }
 
-    fn stage_link(&self, ctx: &ActionContext, st: &mut Stage<'_>, input: LinkInput, now: i64) -> Result<Vec<Event>> {
-        let schema = self.schema();
+    fn stage_link(
+        &self,
+        schema: &Schema,
+        ctx: &ActionContext,
+        st: &mut Stage<'_>,
+        input: LinkInput,
+        now: i64,
+    ) -> Result<Vec<Event>> {
         let (base, dir) = schema.resolve_rel_lenient(&input.rel);
         if base.is_empty() {
             return Err(Error::invalid("relation name is required"));

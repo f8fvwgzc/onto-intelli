@@ -93,7 +93,22 @@ pub fn to_json(msg: &DynamicMessage) -> Result<Value, Status> {
     let opts =
         SerializeOptions::new().use_proto_field_name(true).stringify_64_bit_integers(false).skip_default_fields(true);
     msg.serialize_with_options(serde_json::value::Serializer, &opts)
+        .map(integral_numbers)
         .map_err(|e| Status::internal(format!("transcode: {e}")))
+}
+
+/// `google.protobuf.Struct` carries every number as a double; whole numbers
+/// become integers again so `"stage": 2` reaches the engine as 2, not 2.0.
+fn integral_numbers(v: Value) -> Value {
+    match v {
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if !n.is_i64() && !n.is_u64() && f.fract() == 0.0 && f.abs() < 9.0e15 => Value::from(f as i64),
+            _ => Value::Number(n),
+        },
+        Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, integral_numbers(v))).collect()),
+        Value::Array(a) => Value::Array(a.into_iter().map(integral_numbers).collect()),
+        other => other,
+    }
 }
 
 pub fn from_json(desc: &MessageDescriptor, v: Value) -> Result<DynamicMessage, Status> {

@@ -8,19 +8,77 @@ use crate::model::{Entity, Id};
 use crate::schema::Dir;
 use crate::{Error, Result};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// A role held by a principal. The built-in roles carry fixed meaning; any
+/// other name (`schema_admin`, `approver`, ...) is a custom role that only
+/// grants what configuration ties to it (read access, approving proposals).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Role {
     /// Read only.
     Viewer,
     /// Read and write.
     Member,
-    /// Automation: read and write.
+    /// Automation: read and write. Agents may propose schema changes but never
+    /// apply or approve them.
     Agent,
     /// Everything inside its workspaces, including restricted entities.
     Admin,
     /// Internal engine operations.
     System,
+    /// A role named in configuration.
+    Custom(String),
+}
+
+impl Role {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Member => "member",
+            Role::Agent => "agent",
+            Role::Admin => "admin",
+            Role::System => "system",
+            Role::Custom(name) => name,
+        }
+    }
+
+    /// Parse a role name; unknown names become custom roles.
+    pub fn parse(name: &str) -> Result<Role> {
+        let n = name.trim().to_ascii_lowercase();
+        Ok(match n.as_str() {
+            "viewer" => Role::Viewer,
+            "member" => Role::Member,
+            "agent" => Role::Agent,
+            "admin" => Role::Admin,
+            "system" => Role::System,
+            "" => return Err(Error::invalid("empty role name")),
+            other => {
+                if !other.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+                    || other.len() > 64
+                {
+                    return Err(Error::invalid(format!("invalid role name '{name}'")));
+                }
+                Role::Custom(other.to_string())
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Role::parse(&name).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +138,21 @@ impl Principal {
         self.roles.contains(&role)
     }
 
+    pub fn has_role(&self, role: &Role) -> bool {
+        self.roles.contains(role)
+    }
+
+    /// Holds any of `roles` (by name).
+    pub fn has_any(&self, roles: &[Role]) -> bool {
+        roles.iter().any(|r| self.roles.contains(r))
+    }
+
+    /// Automation principals (agents) may propose but never approve or apply
+    /// schema changes, whatever other roles they hold.
+    pub fn is_agent(&self) -> bool {
+        self.has(Role::Agent)
+    }
+
     pub fn is_privileged(&self) -> bool {
         self.has(Role::Admin) || self.has(Role::System)
     }
@@ -101,7 +174,7 @@ impl Principal {
 
     /// A stable fingerprint of what this principal can see (cache keys).
     pub fn scope_key(&self) -> String {
-        let mut roles: Vec<String> = self.roles.iter().map(|r| format!("{r:?}")).collect();
+        let mut roles: Vec<String> = self.roles.iter().map(|r| r.to_string()).collect();
         roles.sort();
         format!("{}|{}|{}", self.id, roles.join(","), self.workspaces.join(","))
     }

@@ -141,7 +141,7 @@ pub fn run(
 ) -> Result<CommandOutcome> {
     let schema = onto.schema();
     let at = schema.action_types.get(action).cloned().ok_or_else(|| onto_core::Error::not_found(action))?;
-    let params = fill_params(schema, &at, question, entities);
+    let params = fill_params(&schema, &at, question, entities);
     let ctx = ActionContext::new(p.clone(), ws).with_source("command").with_intent(format!("command:{action}"));
     let receipt = onto.apply_action(&ctx, action, &params, ApplyOptions { dry_run: !confirm, confirm })?;
     let plan = &receipt.plan;

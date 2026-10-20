@@ -201,7 +201,7 @@ impl crate::Ontology {
     /// Mermaid diagram of a traversal (permission-filtered).
     pub fn export_mermaid(&self, p: &crate::Principal, spec: &crate::query::TraverseSpec) -> crate::Result<String> {
         let sub = self.traverse(p, spec)?;
-        Ok(mermaid(self.schema(), &sub.nodes, &sub.edges))
+        Ok(mermaid(&self.schema(), &sub.nodes, &sub.edges))
     }
 
     /// Turtle of the schema and/or the visible data (optionally a traversal only).

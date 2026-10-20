@@ -422,7 +422,7 @@ impl Ontology {
         if q.window_days.is_some() {
             def.window_days = q.window_days;
         }
-        def.validate(schema).map_err(Error::invalid)?;
+        def.validate(&schema).map_err(Error::invalid)?;
         let dims: Vec<(String, String)> = q.group_by.iter().map(|n| (n.clone(), self.dim_expr(&def, n))).collect();
         let limit = q.limit.unwrap_or(50);
         let window = def.window_days.map(|d| d as i64 * 86_400_000);

@@ -321,3 +321,76 @@ fn route_table_rejects_bad_config() {
     assert!(table.routes.contains_key("/onto_intelli.v1.IntelliService/Ask"));
     let _ = Arc::new(table);
 }
+
+#[tokio::test]
+async fn schema_service_plans_applies_and_versions() {
+    let srv = start(|_| {}).await;
+    let ch = channel(srv.addr).await;
+    let mut schema = pb::schema_service_client::SchemaServiceClient::new(ch);
+    let change = struct_of(json!({
+        "op": "put_object_type", "name": "incident",
+        "def": { "label": "Incident", "extends": "issue", "properties": { "sev": { "type": "int" } } }
+    }));
+    let plan = schema
+        .plan(pb::SchemaChangeRequest { changes: vec![change.clone()], ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plan.fields["valid"].kind, Some(prost_types::value::Kind::BoolValue(true)));
+    let applied = schema
+        .apply(pb::SchemaChangeRequest {
+            changes: vec![change],
+            message: "incidents".into(),
+            expected_version: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(format!("{:?}", applied.fields["version"]).contains("NumberValue(2.0)"));
+    let status = schema.status(()).await.unwrap().into_inner();
+    assert!(format!("{:?}", status.fields["version"]).contains("2.0"));
+    let v1 = schema.get(pb::SchemaVersionRequest { version: 1 }).await.unwrap().into_inner();
+    assert!(!format!("{:?}", v1.fields["object_types"]).contains("\"incident\""));
+    // Stale expected_version is refused.
+    let err = schema
+        .apply(pb::SchemaChangeRequest {
+            changes: vec![struct_of(json!({ "op": "put_object_type", "name": "x", "def": {} }))],
+            expected_version: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    // HTTP: a breaking change reports what it needs; history lists versions.
+    let base = format!("http://{}", srv.addr);
+    let http = reqwest::Client::new();
+    let issue: Value = http.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(issue["schema_version"], 2);
+    let mut def = issue["object_types"]["issue"].clone();
+    def["states"] = json!(["open", "resolved", "closed"]);
+    let plan: Value = http
+        .post(format!("{base}/v1/schema/plan"))
+        .json(&json!({ "changes": [ { "op": "put_object_type", "name": "issue", "def": def } ] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plan["breaking"], true);
+    assert!(!plan["needs_migration"].as_array().unwrap().is_empty());
+    let refused = http
+        .post(format!("{base}/v1/schema/apply"))
+        .json(&json!({ "changes": [ { "op": "put_object_type", "name": "issue", "def": def } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 409);
+    let history: Value =
+        http.get(format!("{base}/v1/schema/history?limit=5")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(history["versions"][0]["version"], 2);
+    let diff: Value = http.get(format!("{base}/v1/schema/diff?from=1")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(diff["entries"][0]["name"], "incident");
+}

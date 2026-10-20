@@ -22,6 +22,7 @@ pub mod error;
 pub mod experts;
 pub mod export;
 pub mod graph;
+pub mod live_schema;
 pub mod metrics;
 pub mod model;
 pub mod policy;
@@ -40,6 +41,10 @@ pub use engine::{
     SearchHit, SearchMode,
 };
 pub use error::{Error, Result};
+pub use live_schema::{
+    Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
+    SchemaVersion, SchemaVersionInfo,
+};
 pub use model::*;
 pub use policy::{Access, Principal, Role};
 pub use schema::{Dir, Schema};

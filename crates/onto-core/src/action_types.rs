@@ -520,7 +520,9 @@ fn eval_check(schema: &Schema, g: &Graph, c: &Check, env: &Env<'_>, p: &Principa
         }
         CheckKind::Role => {
             let ok = p.is_privileged()
-                || c.values.iter().any(|r| serde_json::from_value::<Role>(json!(r)).is_ok_and(|role| p.has(role)));
+                || c.values
+                    .iter()
+                    .any(|r| serde_json::from_value::<Role>(json!(r)).is_ok_and(|role| p.has_role(&role)));
             (ok, format!("requires role {}", c.values.join("|")))
         }
         CheckKind::Distinct => {
@@ -564,7 +566,7 @@ impl Ontology {
         let mut warnings = Vec::new();
         let mut norm: Map<String, Value> = Map::new();
 
-        if !at.roles.is_empty() && !p.is_privileged() && !at.roles.iter().any(|r| p.has(*r)) {
+        if !at.roles.is_empty() && !p.is_privileged() && !at.roles.iter().any(|r| p.has_role(r)) {
             let roles: Vec<String> = at.roles.iter().map(|r| format!("{r:?}").to_lowercase()).collect();
             checks.push(CheckResult {
                 ok: false,
@@ -999,7 +1001,11 @@ impl Ontology {
         receipt.status = "applied".into();
         let ctx = ctx.clone().with_intent(format!("action:{name}"));
         let stored = serde_json::to_value(&receipt)?;
-        let extra = Extra { kv: vec![(RECEIPTS.into(), receipt.id.clone(), stored)], redirects: Vec::new() };
+        let extra = Extra {
+            kv: vec![(RECEIPTS.into(), receipt.id.clone(), stored)],
+            redirects: Vec::new(),
+            ..Default::default()
+        };
         let result = self.apply_inner(&ctx, muts, extra)?;
         receipt.touched =
             self.read(|g, _| result.entities.iter().map(|id| (id.clone(), g.get(id).map(|e| e.revision))).collect());
@@ -1053,8 +1059,11 @@ impl Ontology {
         }));
         r.status = "undone".into();
         r.reason = Some(format!("undone by {}", ctx.principal.id));
-        let extra =
-            Extra { kv: vec![(RECEIPTS.into(), r.id.clone(), serde_json::to_value(&r)?)], redirects: Vec::new() };
+        let extra = Extra {
+            kv: vec![(RECEIPTS.into(), r.id.clone(), serde_json::to_value(&r)?)],
+            redirects: Vec::new(),
+            ..Default::default()
+        };
         self.apply_inner(ctx, muts, extra)?;
         Ok(r)
     }

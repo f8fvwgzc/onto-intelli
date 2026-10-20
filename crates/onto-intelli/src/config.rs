@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use onto_core::{Error, Principal, Result, Role};
+use onto_core::{Error, Governance, Principal, Result, Role, SchemaMode};
 
 /// Annotated starter config written by `onto init`.
 pub const EXAMPLE_CONFIG: &str = include_str!("../templates/onto-intelli.toml");
@@ -28,6 +28,8 @@ pub struct Config {
     pub grpc: GrpcConfig,
     pub auth: AuthConfig,
     pub mcp: McpConfig,
+    /// Who may change, propose and approve schema changes.
+    pub governance: Governance,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -60,14 +62,17 @@ impl Default for EngineConfig {
 pub struct OntologyConfig {
     /// `builtin:enterprise`, `builtin:empty`, or a TOML schema path.
     pub schema: String,
-    /// Extra schema layers applied in order.
+    /// Extra schema layers applied in order (`builtin:<package>` or a TOML path).
     pub extend: Vec<String>,
     pub strict: bool,
+    /// `live`: the stored schema is authoritative and file edits are imported
+    /// as new versions; `config`: the files are authoritative, API edits refused.
+    pub schema_mode: SchemaMode,
 }
 
 impl Default for OntologyConfig {
     fn default() -> Self {
-        Self { schema: "builtin:enterprise".into(), extend: Vec::new(), strict: false }
+        Self { schema: "builtin:enterprise".into(), extend: Vec::new(), strict: false, schema_mode: SchemaMode::Live }
     }
 }
 

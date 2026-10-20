@@ -92,6 +92,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 
 | Capability | Try it |
 |---|---|
+| **Live schema as data** — create, change and delete object types, properties, link types, interfaces, action types, rules and metrics at runtime; every change set is validated, previewed (entities/links affected, breaking or not), migrated explicitly when it breaks data in use, versioned with diffs and point-in-time reads, audited and reversible ([docs/SCHEMA.md](docs/SCHEMA.md)) | `onto schema plan change.toml` · `onto schema apply change.toml` · `onto schema history` · `onto schema revert 2` |
 | **Governed action types** — typed parameters, preconditions, conditional effects, roles, risk; every plan derives an inverse, so reversibility is known before running; high-risk or irreversible actions need `confirm`; atomic audit event + undo receipt | `onto do` · `onto do assign item=issue:433 assignee=person:aiko` · `onto undo <receipt>` |
 | **Natural-language commands** as gated proposals | `onto ask "Assign issue 433 to Aiko"` → proposal; add `confirm: true` to apply |
 | **Interfaces + glossary** — `work_item` = issue/task/milestone; "tickets", "people", "per team" understood | `onto ask "How many open work items per team?"` |

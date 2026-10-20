@@ -14,7 +14,7 @@ use onto_core::{
     ActionContext, EntityInput, EntityPatch, EntityRef, Error, EventFilter, EventInput, Id, LinkInput, Mutation,
     Principal, Result, one_or_many,
 };
-use onto_core::{Ontology, SearchMode};
+use onto_core::{Migration, Ontology, SchemaChangeSet, SearchMode};
 
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
@@ -107,7 +107,28 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("schema.suggest", false, "Schema additions proposed from data the schema does not describe."),
     a("export.graph", false, "Export as Mermaid, Turtle (RDF/OWL + PROV-O) or JSON. Input: {format, start?, depth?}."),
     a("eval.run", false, "Run competency questions and report pass rate, tokens, latency. Input: {cases? | toml?}."),
-    a("schema.get", false, "The active ontology schema."),
+    a("schema.get", false, "The active ontology schema document (or one version's: {version?})."),
+    a("schema.status", false, "Live schema status: version, mode, counts, governance, import problems."),
+    a(
+        "schema.plan",
+        false,
+        "Dry run of a schema change set: validation, diff, impact (entities/links, breaking), migration. Input: SchemaChangeSet.",
+    ),
+    a(
+        "schema.apply",
+        true,
+        "Apply a schema change set as a new version (apply roles only; agents must propose). Input: SchemaChangeSet + dry_run?.",
+    ),
+    a("schema.history", false, "Schema versions, newest first. Input: {limit?}."),
+    a("schema.version", false, "One schema version with its document, changes and diff. Input: {version}."),
+    a("schema.as_of", false, "The schema version in force at a time. Input: {ts? | days_ago?}."),
+    a("schema.diff", false, "Differences between two schema versions. Input: {from, to?}."),
+    a("schema.revert", true, "Make an earlier version's schema active again. Input: {version, migrations?, dry_run?}."),
+    a(
+        "schema.undo",
+        true,
+        "Undo one version's changes on top of the active schema. Input: {version, migrations?, dry_run?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.actions", false, "This list."),
@@ -243,8 +264,8 @@ impl Intelli {
             "action.list" => Ok(json!({ "action_types": onto.schema().action_types.values().collect::<Vec<_>>() })),
             "action.describe" => {
                 let i: NameIn = parse(action, input)?;
-                let at = onto
-                    .schema()
+                let schema = onto.schema();
+                let at = schema
                     .action_types
                     .get(&i.name)
                     .ok_or_else(|| Error::not_found(format!("action type {}", i.name)))?;
@@ -476,7 +497,60 @@ impl Intelli {
                 let i: IdIn = parse(action, input)?;
                 to_json(&self.conversations().get(p, &i.id)?)
             }
-            "schema.get" => to_json(onto.schema()),
+            "schema.get" => {
+                let i: VersionOptIn = parse(action, input)?;
+                match i.version {
+                    Some(v) => to_json(&onto.schema_version_get(p, v)?.schema),
+                    None => {
+                        let mut doc = to_json(&*onto.schema())?;
+                        doc["schema_version"] = json!(onto.schema_version());
+                        Ok(doc)
+                    }
+                }
+            }
+            "schema.status" => to_json(&onto.schema_status(p)?),
+            "schema.plan" => {
+                let set: SchemaChangeSet = parse(action, input)?;
+                to_json(&onto.schema_plan(p, &set)?)
+            }
+            "schema.apply" => {
+                let i: SchemaApplyIn = parse(action, input)?;
+                if i.dry_run {
+                    return to_json(&onto.schema_plan(p, &i.set)?);
+                }
+                to_json(&onto.schema_apply(&self.ctx(p, i.workspace).with_intent("schema.apply"), i.set)?)
+            }
+            "schema.history" => {
+                let i: LimitIn = parse(action, input)?;
+                Ok(
+                    json!({ "active": onto.schema_version(), "versions": onto.schema_history(p, i.limit.unwrap_or(50))? }),
+                )
+            }
+            "schema.version" => {
+                let i: VersionIn = parse(action, input)?;
+                to_json(&onto.schema_version_get(p, i.version)?)
+            }
+            "schema.as_of" => {
+                let i: AsOfTimeIn = parse(action, input)?;
+                let ts = i
+                    .ts
+                    .unwrap_or_else(|| onto_core::time::now_ms() - (i.days_ago.unwrap_or(0.0) * 86_400_000.0) as i64);
+                to_json(&onto.schema_as_of(p, ts)?)
+            }
+            "schema.diff" => {
+                let i: DiffIn = parse(action, input)?;
+                to_json(&onto.schema_diff(p, i.from, i.to)?)
+            }
+            "schema.revert" | "schema.undo" => {
+                let i: RevertIn = parse(action, input)?;
+                let ctx = self.ctx(p, i.workspace).with_intent(action);
+                let r = if action == "schema.revert" {
+                    onto.schema_revert(&ctx, i.version, i.migrations, i.dry_run)?
+                } else {
+                    onto.schema_undo(&ctx, i.version, i.migrations, i.dry_run)?
+                };
+                to_json(&r)
+            }
             "system.stats" => self.stats(),
             "system.health" => Ok(json!({
                 "status": "ok",
@@ -498,6 +572,59 @@ pub fn find(name: &str) -> Option<&'static ActionInfo> {
 #[derive(Deserialize)]
 struct NameIn {
     name: String,
+}
+
+#[derive(Deserialize, Default)]
+struct VersionOptIn {
+    #[serde(default)]
+    version: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct VersionIn {
+    version: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct LimitIn {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SchemaApplyIn {
+    #[serde(flatten)]
+    set: SchemaChangeSet,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct AsOfTimeIn {
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    days_ago: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct DiffIn {
+    from: u64,
+    #[serde(default)]
+    to: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RevertIn {
+    version: u64,
+    #[serde(default)]
+    migrations: Vec<Migration>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Deserialize)]

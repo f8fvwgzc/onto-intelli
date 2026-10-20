@@ -203,6 +203,121 @@ enum SchemaCmd {
     Profile,
     /// TOML layer proposing kinds/relations/properties seen in data but not in the schema.
     Suggest,
+    /// Live schema version, mode and governance.
+    Status,
+    /// Dry run of a change set file (JSON or TOML): diff, impact, migration.
+    Plan {
+        /// Change set file (`-` reads stdin).
+        file: PathBuf,
+    },
+    /// Apply a change set file as a new schema version.
+    Apply {
+        file: PathBuf,
+        /// Only print the plan.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Schema versions, newest first.
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// One version: who, when, why, what changed.
+    Show { version: u64 },
+    /// Differences between two versions (TO defaults to the active one).
+    Diff { from: u64, to: Option<u64> },
+    /// Make an earlier version's schema active again.
+    Revert {
+        version: u64,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Undo one version's changes on top of the active schema.
+    Undo {
+        version: u64,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// A change set from a JSON or TOML file (`-`: JSON on stdin).
+fn read_change_set(path: &std::path::Path) -> Result<Value> {
+    let text = if path.as_os_str() == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(path).map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?
+    };
+    if path.extension().is_some_and(|e| e == "toml") {
+        let v: toml::Value = toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        Ok(serde_json::to_value(v)?)
+    } else {
+        Ok(serde_json::from_str(&text)?)
+    }
+}
+
+fn print_plan(st: &Style, plan: &Value) {
+    let valid = plan["valid"].as_bool().unwrap_or(false);
+    let needs = plan["needs_migration"].as_array().cloned().unwrap_or_default();
+    let verdict = if !valid {
+        st.red("invalid")
+    } else if !needs.is_empty() {
+        st.red("needs migration")
+    } else if plan["breaking"].as_bool().unwrap_or(false) {
+        st.cyan("breaking, migrated")
+    } else {
+        st.bold("non-breaking")
+    };
+    println!(
+        "{} {}",
+        verdict,
+        st.dim(&format!(
+            "on schema v{} · {} entities · {} links in scope",
+            plan["base_version"], plan["entities_affected"], plan["links_affected"]
+        ))
+    );
+    for c in plan["changes"].as_array().into_iter().flatten() {
+        let mark = if c["breaking"].as_bool().unwrap_or(false) { st.red("!") } else { st.dim("·") };
+        println!(
+            "  {mark} {} {}",
+            c["summary"].as_str().unwrap_or(""),
+            st.dim(&format!("({} entities, {} links)", c["entities"], c["links"]))
+        );
+        for r in c["reasons"].as_array().into_iter().flatten() {
+            println!("      {}", st.dim(r.as_str().unwrap_or("")));
+        }
+    }
+    for e in plan["errors"].as_array().into_iter().flatten() {
+        println!("  {} {}", st.red("error"), e.as_str().unwrap_or(""));
+    }
+    for n in &needs {
+        println!("  {} {}", st.red("needs"), n.as_str().unwrap_or(""));
+    }
+    for w in plan["warnings"].as_array().into_iter().flatten() {
+        println!("  {} {}", st.cyan("warning"), w.as_str().unwrap_or(""));
+    }
+    let m = &plan["migration"];
+    if m["mutations"].as_u64().unwrap_or(0) > 0 {
+        println!(
+            "  migration: {} updated, {} retyped, {} deleted entities; {} links deleted, {} moved",
+            m["entities_updated"], m["entities_retyped"], m["entities_deleted"], m["links_deleted"], m["links_moved"]
+        );
+    }
+}
+
+fn print_version_line(st: &Style, v: &Value, active: Option<u64>) {
+    let n = v["version"].as_u64().unwrap_or(0);
+    let mark = if Some(n) == active { st.bold("*") } else { " ".into() };
+    println!(
+        "{mark} v{:<4} {} {:<9} {:<12} {}{}",
+        n,
+        st.dim(v["at"].as_str().unwrap_or("")),
+        v["source"].as_str().unwrap_or(""),
+        v["actor"].as_str().unwrap_or(""),
+        v["message"].as_str().unwrap_or(""),
+        if v["breaking"].as_bool().unwrap_or(false) { st.red(" [breaking]") } else { String::new() }
+    );
 }
 
 fn parse_params(items: &[String]) -> Result<Value> {
@@ -661,7 +776,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
-        Command::Schema { sub: Some(sub), .. } => {
+        Command::Schema { sub: Some(sub), json: as_json } => {
             let be = backend(&cli).await?;
             match sub {
                 SchemaCmd::Profile => {
@@ -670,6 +785,88 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 SchemaCmd::Suggest => {
                     let r = be.call("schema.suggest", json!({ "workspace": cli.workspace })).await?;
                     print!("{}", r["toml"].as_str().unwrap_or_default());
+                }
+                SchemaCmd::Status => print_json(&be.call("schema.status", json!({})).await?),
+                SchemaCmd::Plan { file } => {
+                    let plan = be.call("schema.plan", read_change_set(file)?).await?;
+                    if *as_json { print_json(&plan) } else { print_plan(st, &plan) }
+                }
+                SchemaCmd::Apply { file, dry_run } => {
+                    let mut set = read_change_set(file)?;
+                    if *dry_run {
+                        set["dry_run"] = json!(true);
+                        let plan = be.call("schema.apply", set).await?;
+                        if *as_json { print_json(&plan) } else { print_plan(st, &plan) }
+                    } else {
+                        let r = be.call("schema.apply", set).await?;
+                        if *as_json {
+                            print_json(&r)
+                        } else {
+                            print_plan(st, &r["plan"]);
+                            println!("{} schema v{}", st.bold("applied"), r["version"]["version"]);
+                        }
+                    }
+                }
+                SchemaCmd::History { limit } => {
+                    let r = be.call("schema.history", json!({ "limit": limit })).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else {
+                        let active = r["active"].as_u64();
+                        for v in r["versions"].as_array().into_iter().flatten() {
+                            print_version_line(st, v, active);
+                        }
+                    }
+                }
+                SchemaCmd::Show { version } => {
+                    let v = be.call("schema.version", json!({ "version": version })).await?;
+                    if *as_json {
+                        print_json(&v)
+                    } else {
+                        print_version_line(st, &v, None);
+                        for c in v["changes"].as_array().into_iter().flatten() {
+                            println!("    {} {}", c["op"].as_str().unwrap_or(""), st.dim(&c.to_string()));
+                        }
+                        for e in v["diff"]["entries"].as_array().into_iter().flatten() {
+                            let fields = e["fields"]
+                                .as_array()
+                                .map(|f| f.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+                            println!(
+                                "    {} {}.{} {}",
+                                e["change"].as_str().unwrap_or(""),
+                                e["section"].as_str().unwrap_or(""),
+                                e["name"].as_str().unwrap_or(""),
+                                st.dim(&fields.unwrap_or_default())
+                            );
+                        }
+                    }
+                }
+                SchemaCmd::Diff { from, to } => {
+                    let d = be.call("schema.diff", json!({ "from": from, "to": to })).await?;
+                    if *as_json {
+                        print_json(&d)
+                    } else {
+                        for e in d["entries"].as_array().into_iter().flatten() {
+                            println!(
+                                "{:<9} {}.{}",
+                                e["change"].as_str().unwrap_or(""),
+                                e["section"].as_str().unwrap_or(""),
+                                e["name"].as_str().unwrap_or("")
+                            );
+                        }
+                    }
+                }
+                SchemaCmd::Revert { version, dry_run } | SchemaCmd::Undo { version, dry_run } => {
+                    let action = if matches!(sub, SchemaCmd::Revert { .. }) { "schema.revert" } else { "schema.undo" };
+                    let r = be.call(action, json!({ "version": version, "dry_run": dry_run })).await?;
+                    if *as_json {
+                        print_json(&r)
+                    } else if let Some(plan) = r.get("plan") {
+                        print_plan(st, plan)
+                    } else {
+                        print_plan(st, &r["applied"]["plan"]);
+                        println!("{} schema v{}", st.bold("applied"), r["applied"]["version"]["version"]);
+                    }
                 }
             }
             Ok(())
@@ -934,11 +1131,17 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
         Command::Schema { json: as_json, sub: None } => {
-            let cfg = Config::discover(cli.config.as_deref())?;
-            let schema = onto_intelli::intelli::load_schema(&cfg)?;
+            // The live schema of the store (or server), not just the config files.
+            let be = backend(&cli).await?;
+            let mut doc = be.call("schema.get", json!({})).await?;
+            let version = doc.as_object_mut().and_then(|m| m.remove("schema_version"));
             if *as_json {
-                print_json(&serde_json::to_value(&schema)?)
+                print_json(&doc)
             } else {
+                let schema = onto_intelli::Schema::from_json(doc)?;
+                if let Some(v) = version {
+                    println!("{}", st.dim(&format!("live schema version {v}")));
+                }
                 print!("{}", schema.describe())
             }
             Ok(())

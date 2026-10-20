@@ -756,7 +756,7 @@ pub fn hypothetical_state(schema: &Schema, kind: &str, word: &str) -> Option<Str
 
 fn what_if(onto: &Ontology, p: &Principal, ws: &str, c: &Classified, x: Entity) -> Option<Direct> {
     let schema = onto.schema();
-    let state = hypothetical_state(schema, &x.kind, c.whatif_state.as_deref().unwrap_or("done"))?;
+    let state = hypothetical_state(&schema, &x.kind, c.whatif_state.as_deref().unwrap_or("done"))?;
     let fork = onto.fork();
     fork.apply(
         &ActionContext::system(ws).with_source("scenario"),

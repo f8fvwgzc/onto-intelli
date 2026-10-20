@@ -204,6 +204,8 @@ impl Intelli {
             OntologyOptions {
                 strict: config.ontology.strict,
                 default_workspace: config.engine.default_workspace.clone(),
+                schema_mode: config.ontology.schema_mode,
+                governance: config.governance.clone(),
             },
         )?;
         let memory = Memory::open(store.clone(), config.memory.clone())?;
@@ -239,7 +241,7 @@ impl Intelli {
         }
         let schema = self.onto.schema();
         let body = match self.onto.profile(&Principal::system(), None) {
-            Ok(prof) if prof.entities > 0 => onto_core::profile::pattern_summary(schema, &prof, 60),
+            Ok(prof) if prof.entities > 0 => onto_core::profile::pattern_summary(&schema, &prof, 60),
             _ => schema.summary(),
         };
         let mut extra = String::new();
@@ -332,7 +334,7 @@ impl Intelli {
         if !p.in_workspace(ws) {
             return Err(Error::Denied(format!("{} has no access to workspace {ws}", p.id)));
         }
-        let classified = intent::classify(question, self.onto.schema());
+        let classified = intent::classify(question, &self.onto.schema());
         let entities = resolve::resolve(&self.onto, p, ws, question);
         let ids: Vec<Id> = entities.iter().map(|r| r.id.clone()).collect();
         let memories = if self.config.memory.enabled {
@@ -413,7 +415,7 @@ impl Intelli {
         }
 
         // 2. Intent + entity resolution (deterministic, cached per revision).
-        let classified = intent::classify(&question, schema);
+        let classified = intent::classify(&question, &schema);
         emit(sink, AskEvent::new("stage", "intent", json!({ "intent": classified.intent, "why": classified.why })))
             .await;
         let t_res = Instant::now();
@@ -820,7 +822,7 @@ pub fn load_schema(cfg: &Config) -> Result<Schema> {
         Schema::from_file(cfg.resolve_path(src))?
     };
     for ext in &cfg.ontology.extend {
-        schema.extend_file(cfg.resolve_path(ext))?;
+        schema.extend_source(ext, |p| cfg.resolve_path(p))?;
     }
     Ok(schema)
 }

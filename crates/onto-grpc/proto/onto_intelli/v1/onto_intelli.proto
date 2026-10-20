@@ -467,6 +467,68 @@ message HealthStatus {
   bool llm_available = 5;
 }
 
+// ──────────────────────── Live schema ────────────────────────
+
+// A schema change set. Each change is an object with an `op` and its fields:
+// put_object_type {name, def, migrations?} · delete_object_type {name, migrations?} ·
+// rename_object_type {from, to} · put_property {object_type, name, def, migrations?} ·
+// delete_property {object_type, name, migrations?} · rename_property {object_type, from, to} ·
+// put_link_type {name, def, migrations?} · delete_link_type {name, migrations?} ·
+// rename_link_type {from, to} · put_interface/put_action_type/put_metric {name, def} ·
+// put_rule {def} · delete_* {name} · put_glossary_term {section, word, target} ·
+// delete_glossary_term {section, word} · set_analysis {def}.
+// Migrations: {action: delete_entities|retype|map_states|set_default|convert|drop_values|
+// delete_links|move_links|keep_latest|acknowledge, ...}.
+message SchemaChangeRequest {
+  repeated google.protobuf.Struct changes = 1;
+  string message = 2;
+  uint64 expected_version = 3;    // 0: whatever version is active
+  repeated google.protobuf.Struct migrations = 4;
+  bool dry_run = 5;               // Apply only: return the plan
+  string workspace = 6;           // where the schema.change audit event is recorded
+}
+
+message SchemaVersionRequest {
+  uint64 version = 1;             // Get: 0 = active
+}
+
+message SchemaHistoryRequest {
+  uint32 limit = 1;
+}
+
+message SchemaAsOfRequest {
+  int64 ts = 1;                   // unix ms
+  double days_ago = 2;
+}
+
+message SchemaDiffRequest {
+  uint64 from = 1;
+  uint64 to = 2;                  // 0 = active
+}
+
+message SchemaRevertRequest {
+  uint64 version = 1;
+  repeated google.protobuf.Struct migrations = 2;
+  bool dry_run = 3;
+  string workspace = 4;
+}
+
+// Object types, properties, link types, interfaces, action types, rules,
+// metrics and glossary terms as data: validated, previewed (impact and
+// migration), versioned, audited and reversible.
+service SchemaService {
+  rpc Get(SchemaVersionRequest) returns (google.protobuf.Struct);
+  rpc Status(google.protobuf.Empty) returns (google.protobuf.Struct);
+  rpc Plan(SchemaChangeRequest) returns (google.protobuf.Struct);
+  rpc Apply(SchemaChangeRequest) returns (google.protobuf.Struct);
+  rpc History(SchemaHistoryRequest) returns (google.protobuf.Struct);
+  rpc Version(SchemaVersionRequest) returns (google.protobuf.Struct);
+  rpc AsOf(SchemaAsOfRequest) returns (google.protobuf.Struct);
+  rpc Diff(SchemaDiffRequest) returns (google.protobuf.Struct);
+  rpc Revert(SchemaRevertRequest) returns (google.protobuf.Struct);
+  rpc Undo(SchemaRevertRequest) returns (google.protobuf.Struct);
+}
+
 message CallRequest {
   string action = 1;              // any engine action, see Actions
   google.protobuf.Struct input = 2;

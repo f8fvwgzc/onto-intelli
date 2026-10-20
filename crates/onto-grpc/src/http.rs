@@ -6,12 +6,23 @@
 //! * `POST /v1/call/{action}`     run any action with a JSON body
 //! * `POST /v1/ask`               ask a question
 //! * `POST /v1/ask/stream`        ask with Server-Sent Events
+//! * `GET  /v1/schema`            active schema (`?version=` for an older one)
+//! * `GET  /v1/schema/status`     version, mode, governance
+//! * `POST /v1/schema/plan`       dry run of a change set (impact, migration)
+//! * `POST /v1/schema/apply`      apply a change set as a new version
+//! * `GET  /v1/schema/history`    versions (`?limit=`)
+//! * `GET  /v1/schema/versions/{v}`  one version with its document and diff
+//! * `GET  /v1/schema/diff`       `?from=&to=`
+//! * `GET  /v1/schema/as_of`      `?ts=` or `?days_ago=`
+//! * `POST /v1/schema/revert`     `{version}`; `/v1/schema/undo` likewise
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -37,6 +48,16 @@ pub fn router(intelli: Arc<Intelli>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/call/{action}", post(call))
         .route("/v1/ask", post(ask))
         .route("/v1/ask/stream", post(ask_stream))
+        .route("/v1/schema", get(schema_get))
+        .route("/v1/schema/status", get(schema_status))
+        .route("/v1/schema/plan", post(schema_plan))
+        .route("/v1/schema/apply", post(schema_apply))
+        .route("/v1/schema/history", get(schema_history))
+        .route("/v1/schema/versions/{version}", get(schema_version))
+        .route("/v1/schema/diff", get(schema_diff))
+        .route("/v1/schema/as_of", get(schema_as_of))
+        .route("/v1/schema/revert", post(schema_revert))
+        .route("/v1/schema/undo", post(schema_undo))
         .with_state(AppState { intelli, auth })
 }
 
@@ -100,6 +121,84 @@ async fn call(
     body: Option<Json<Value>>,
 ) -> Response {
     run(&s, &headers, &action, body.map(|Json(v)| v).unwrap_or(Value::Null)).await
+}
+
+/// Query string as a JSON object; numeric values become numbers.
+fn query_json(q: HashMap<String, String>) -> Value {
+    fn scalar(v: String) -> Value {
+        if let Ok(n) = v.parse::<i64>() {
+            return Value::from(n);
+        }
+        if let Ok(f) = v.parse::<f64>() {
+            return Value::from(f);
+        }
+        match v.as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(v),
+        }
+    }
+    Value::Object(q.into_iter().map(|(k, v)| (k, scalar(v))).collect())
+}
+
+fn body_or_empty(body: Option<Json<Value>>) -> Value {
+    body.map(|Json(v)| v).unwrap_or_else(|| json!({}))
+}
+
+async fn schema_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "schema.get", query_json(q)).await
+}
+
+async fn schema_status(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "schema.status", json!({})).await
+}
+
+async fn schema_plan(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "schema.plan", body_or_empty(body)).await
+}
+
+async fn schema_apply(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "schema.apply", body_or_empty(body)).await
+}
+
+async fn schema_history(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "schema.history", query_json(q)).await
+}
+
+async fn schema_version(State(s): State<AppState>, Path(version): Path<u64>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "schema.version", json!({ "version": version })).await
+}
+
+async fn schema_diff(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "schema.diff", query_json(q)).await
+}
+
+async fn schema_as_of(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "schema.as_of", query_json(q)).await
+}
+
+async fn schema_revert(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "schema.revert", body_or_empty(body)).await
+}
+
+async fn schema_undo(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "schema.undo", body_or_empty(body)).await
 }
 
 async fn ask(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {

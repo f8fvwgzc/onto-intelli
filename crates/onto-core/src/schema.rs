@@ -16,6 +16,17 @@ use crate::{Error, Result};
 /// The built-in Enterprise Execution ontology.
 pub const ENTERPRISE_SCHEMA: &str = include_str!("../schemas/enterprise.toml");
 
+/// Built-in schema packages, layered with `extend = ["builtin:<name>"]`.
+pub const PACKAGES: &[(&str, &str)] = &[("enterprise", ENTERPRISE_SCHEMA)];
+
+/// The TOML of a built-in package.
+pub fn builtin_package(name: &str) -> Result<&'static str> {
+    PACKAGES.iter().find(|(n, _)| *n == name).map(|(_, t)| *t).ok_or_else(|| {
+        let names: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+        Error::Config(format!("unknown built-in schema package '{name}' (available: {})", names.join(", ")))
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PropType {
@@ -31,7 +42,7 @@ pub enum PropType {
     Json,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PropertyDef {
     #[serde(rename = "type", default)]
     pub ty: PropType,
@@ -43,6 +54,34 @@ pub struct PropertyDef {
     pub searchable: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+}
+
+impl PropertyDef {
+    /// Does `value` fit this definition? `null` always fits (it means unset).
+    pub fn accepts(&self, value: &Value) -> bool {
+        if value.is_null() {
+            return true;
+        }
+        match self.ty {
+            PropType::String | PropType::Text => value.is_string(),
+            PropType::Enum => value.as_str().is_some_and(|v| self.values.iter().any(|x| x == v)),
+            PropType::Int => value.is_i64() || value.is_u64(),
+            PropType::Float => value.is_number(),
+            PropType::Bool => value.is_boolean(),
+            PropType::Timestamp => value.is_i64() || value.is_string(),
+            PropType::List => value.is_array(),
+            PropType::Json => true,
+        }
+    }
+
+    /// What [`accepts`](Self::accepts) expects, for error messages.
+    pub fn expected(&self) -> String {
+        if self.ty == PropType::Enum {
+            format!("one of {}", self.values.join("|"))
+        } else {
+            format!("{:?}", self.ty).to_lowercase()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +99,17 @@ pub enum Category {
 pub struct ObjectType {
     #[serde(default)]
     pub name: String,
+    /// Display name (the name when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// `#rrggbb` used by maps and editors.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
+    /// Icon name for UIs (free-form; unknown names render as a dot).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
     #[serde(default)]
     pub category: Category,
     /// Parent type (is-a). Properties and link constraints are inherited.
@@ -94,6 +142,15 @@ impl ObjectType {
     pub fn merge(&mut self, other: ObjectType) {
         if !other.description.is_empty() {
             self.description = other.description;
+        }
+        if !other.label.is_empty() {
+            self.label = other.label;
+        }
+        if !other.color.is_empty() {
+            self.color = other.color;
+        }
+        if !other.icon.is_empty() {
+            self.icon = other.icon;
         }
         if other.category != Category::Thing {
             self.category = other.category;
@@ -162,6 +219,9 @@ pub enum Cardinality {
 pub struct LinkType {
     #[serde(default)]
     pub name: String,
+    /// Display name (the name when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// Allowed source kinds; empty means any.
@@ -185,6 +245,24 @@ pub struct LinkType {
     /// Relevance weight used when expanding a context graph (0..1].
     #[serde(default = "default_weight")]
     pub weight: f32,
+}
+
+impl Default for LinkType {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            label: String::new(),
+            description: String::new(),
+            from: Vec::new(),
+            to: Vec::new(),
+            inverse: None,
+            cardinality: Cardinality::Many,
+            dependency: false,
+            symmetric: false,
+            provenance: false,
+            weight: default_weight(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -280,12 +358,24 @@ impl Schema {
         Self::from_toml(ENTERPRISE_SCHEMA).expect("built-in schema is valid")
     }
 
-    /// `builtin:enterprise`, `builtin:empty`, or a path to a TOML schema file.
+    /// `builtin:enterprise`, `builtin:empty`, `builtin:<package>`, or a path
+    /// to a TOML schema file.
     pub fn load(source: &str) -> Result<Self> {
         match source {
             "builtin:enterprise" | "enterprise" => Ok(Self::enterprise()),
             "builtin:empty" | "empty" => Ok(Self::empty()),
-            path => Self::from_file(path),
+            other => match other.strip_prefix("builtin:") {
+                Some(name) => Self::from_toml(builtin_package(name)?),
+                None => Self::from_file(other),
+            },
+        }
+    }
+
+    /// Layer a built-in package (`nexc-execution`, ...) or a TOML file.
+    pub fn extend_source(&mut self, source: &str, resolve: impl Fn(&str) -> std::path::PathBuf) -> Result<()> {
+        match source.strip_prefix("builtin:") {
+            Some(name) => self.extend_toml(builtin_package(name)?),
+            None => self.extend_file(resolve(source)),
         }
     }
 
@@ -336,7 +426,16 @@ impl Schema {
         }
         self.metrics.extend(file.metrics);
         self.action_types.extend(file.action_types);
-        self.finish()
+        self.compile()
+    }
+
+    /// A schema document as JSON (the shape `schema.get` returns and the
+    /// live schema API stores), validated.
+    pub fn from_json(value: Value) -> Result<Self> {
+        let mut schema: Schema =
+            serde_json::from_value(value).map_err(|e| Error::Config(format!("schema document: {e}")))?;
+        schema.compile()?;
+        Ok(schema)
     }
 
     pub fn extend_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
@@ -346,7 +445,9 @@ impl Schema {
         self.extend_toml(&text)
     }
 
-    fn finish(&mut self) -> Result<()> {
+    /// Normalize names and validate every cross-reference. Called after any
+    /// edit; the first problem found is returned.
+    pub fn compile(&mut self) -> Result<()> {
         for (name, ty) in self.object_types.iter_mut() {
             ty.name = name.clone();
         }
@@ -689,23 +790,8 @@ impl Schema {
                 }
                 continue;
             };
-            let ok = match def.ty {
-                PropType::String | PropType::Text => value.is_string(),
-                PropType::Enum => value.as_str().is_some_and(|v| def.values.iter().any(|x| x == v)),
-                PropType::Int => value.is_i64() || value.is_u64(),
-                PropType::Float => value.is_number(),
-                PropType::Bool => value.is_boolean(),
-                PropType::Timestamp => value.is_i64() || value.is_string(),
-                PropType::List => value.is_array(),
-                PropType::Json => true,
-            };
-            if !ok {
-                let expected = if def.ty == PropType::Enum {
-                    format!("one of {}", def.values.join("|"))
-                } else {
-                    format!("{:?}", def.ty).to_lowercase()
-                };
-                return Err(Error::invalid(format!("{kind}.{name} must be {expected}, got {value}")));
+            if !def.accepts(value) {
+                return Err(Error::invalid(format!("{kind}.{name} must be {}, got {value}", def.expected())));
             }
         }
         if creating {

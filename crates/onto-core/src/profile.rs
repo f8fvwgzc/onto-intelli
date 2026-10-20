@@ -223,6 +223,6 @@ impl crate::Ontology {
     /// Schema additions proposed from data the schema does not describe yet.
     pub fn suggest_schema(&self, p: &crate::Principal, workspace: Option<&str>) -> crate::Result<SchemaSuggestion> {
         let prof = self.profile(p, workspace)?;
-        Ok(suggest(self.schema(), &prof))
+        Ok(suggest(&self.schema(), &prof))
     }
 }
