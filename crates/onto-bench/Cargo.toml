@@ -1,0 +1,15 @@
+[package]
+name = "onto-bench"
+description = "Load benchmark: a synthetic enterprise graph on PostgreSQL, timed queries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+onto-intelli = { workspace = true, features = ["sqlite", "postgres"] }
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+fastrand.workspace = true

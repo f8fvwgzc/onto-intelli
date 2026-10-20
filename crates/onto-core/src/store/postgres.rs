@@ -512,15 +512,15 @@ impl PgStore {
                 copy.finish().await?;
             }
             sqlx::query(sql(format!(
-                "INSERT INTO {te} (id, kind, workspace, doc, updated_at) SELECT id, kind, workspace, doc, updated_at \
-                 FROM onto_import_e ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
+                "INSERT INTO {te} (id, kind, workspace, doc, updated_at) SELECT DISTINCT ON (id) id, kind, workspace, doc, updated_at \
+                 FROM onto_import_e ORDER BY id ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
                  doc = excluded.doc, updated_at = excluded.updated_at"
             )))
             .execute(&mut *tx)
             .await?;
             sqlx::query(sql(format!(
-                "INSERT INTO {tl} (src, rel, dst, doc) SELECT src, rel, dst, doc FROM onto_import_l \
-                 ON CONFLICT (src, rel, dst) DO UPDATE SET doc = excluded.doc"
+                "INSERT INTO {tl} (src, rel, dst, doc) SELECT DISTINCT ON (src, rel, dst) src, rel, dst, doc FROM onto_import_l \
+                 ORDER BY src, rel, dst ON CONFLICT (src, rel, dst) DO UPDATE SET doc = excluded.doc"
             )))
             .execute(&mut *tx)
             .await?;

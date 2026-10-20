@@ -149,35 +149,54 @@ pub fn shortest_path(
     if from == to {
         return Some(Vec::new());
     }
-    let mut prev: HashMap<String, Hop> = HashMap::new();
-    let mut queue = VecDeque::from([(from.to_string(), 0usize)]);
-    let mut seen = HashSet::from([from.to_string()]);
-    while let Some((id, depth)) = queue.pop_front() {
-        if depth >= max_depth {
-            continue;
-        }
-        for step in g.steps(&id) {
-            if seen.contains(step.other) || !g.get(step.other).is_some_and(can_read) {
-                continue;
-            }
-            seen.insert(step.other.to_string());
-            let hop = Hop { from: id.clone(), rel: schema.display_rel(step.rel, step.dir), to: step.other.to_string() };
-            prev.insert(step.other.to_string(), hop);
-            if step.other == to {
-                let mut path = Vec::new();
-                let mut cur = to.to_string();
-                while let Some(h) = prev.get(&cur) {
-                    cur = h.from.clone();
-                    path.push(h.clone());
-                    if cur == from {
-                        break;
-                    }
+    // Bidirectional breadth-first search: expand the smaller frontier one
+    // level at a time and stop where the two searches meet. Each side keeps
+    // how it reached a node: (previous node, relation, direction walked).
+    type Parents = HashMap<String, Option<(String, String, Dir)>>;
+    let mut fwd: Parents = HashMap::from([(from.to_string(), None)]);
+    let mut bwd: Parents = HashMap::from([(to.to_string(), None)]);
+    let (mut ff, mut fb) = (vec![from.to_string()], vec![to.to_string()]);
+    let mut depth = 0;
+    while !ff.is_empty() && !fb.is_empty() && depth < max_depth {
+        let forward = ff.len() <= fb.len();
+        let (frontier, mine, other) = if forward { (&mut ff, &mut fwd, &bwd) } else { (&mut fb, &mut bwd, &fwd) };
+        let mut next = Vec::new();
+        let mut meet: Option<String> = None;
+        'level: for id in frontier.iter() {
+            for step in g.steps(id) {
+                if mine.contains_key(step.other) || !g.get(step.other).is_some_and(can_read) {
+                    continue;
                 }
-                path.reverse();
-                return Some(path);
+                mine.insert(step.other.to_string(), Some((id.clone(), step.rel.to_string(), step.dir)));
+                if other.contains_key(step.other) {
+                    meet = Some(step.other.to_string());
+                    break 'level;
+                }
+                next.push(step.other.to_string());
             }
-            queue.push_back((step.other.to_string(), depth + 1));
         }
+        if let Some(m) = meet {
+            let mut head = Vec::new();
+            let mut cur = m.clone();
+            while let Some(Some((prev, rel, dir))) = fwd.get(&cur) {
+                head.push(Hop { from: prev.clone(), rel: schema.display_rel(rel, *dir), to: cur.clone() });
+                cur = prev.clone();
+            }
+            head.reverse();
+            let mut cur = m;
+            while let Some(Some((prev, rel, dir))) = bwd.get(&cur) {
+                let back = match dir {
+                    Dir::Out => Dir::In,
+                    Dir::In => Dir::Out,
+                    Dir::Both => Dir::Both,
+                };
+                head.push(Hop { from: cur.clone(), rel: schema.display_rel(rel, back), to: prev.clone() });
+                cur = prev.clone();
+            }
+            return Some(head);
+        }
+        *frontier = next;
+        depth += 1;
     }
     None
 }

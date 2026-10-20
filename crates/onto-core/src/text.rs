@@ -32,21 +32,29 @@ fn stem(w: &str) -> String {
     }
 }
 
+/// BM25 over integer document slots: postings map slots to term frequencies,
+/// scores accumulate in a dense array, and only the best candidates are
+/// passed through the caller's filter.
 #[derive(Clone, Default)]
 pub struct TextIndex {
-    docs: HashMap<String, u32>,
-    terms: HashMap<String, Vec<String>>,
-    postings: HashMap<String, HashMap<String, u32>>,
+    slot: HashMap<String, u32>,
+    ids: Vec<String>,
+    /// Document length in terms; 0 marks a free slot.
+    lens: Vec<u32>,
+    free: Vec<u32>,
+    terms: Vec<Vec<String>>,
+    postings: HashMap<String, HashMap<u32, u32>>,
     total_len: u64,
+    live: usize,
 }
 
 impl TextIndex {
     pub fn len(&self) -> usize {
-        self.docs.len()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
-        self.docs.is_empty()
+        self.live == 0
     }
 
     pub fn upsert(&mut self, id: &str, text: &str) {
@@ -59,55 +67,102 @@ impl TextIndex {
         for t in &terms {
             *tf.entry(t.as_str()).or_default() += 1;
         }
+        let s = match self.free.pop() {
+            Some(s) => s,
+            None => {
+                self.ids.push(String::new());
+                self.lens.push(0);
+                self.terms.push(Vec::new());
+                (self.ids.len() - 1) as u32
+            }
+        };
         for (t, c) in &tf {
-            self.postings.entry((*t).to_string()).or_default().insert(id.to_string(), *c);
+            self.postings.entry((*t).to_string()).or_default().insert(s, *c);
         }
         self.total_len += terms.len() as u64;
-        self.docs.insert(id.to_string(), terms.len() as u32);
-        self.terms.insert(id.to_string(), tf.into_keys().map(str::to_string).collect());
+        self.ids[s as usize] = id.to_string();
+        self.lens[s as usize] = terms.len() as u32;
+        self.terms[s as usize] = tf.into_keys().map(str::to_string).collect();
+        self.slot.insert(id.to_string(), s);
+        self.live += 1;
     }
 
     pub fn remove(&mut self, id: &str) {
-        let Some(len) = self.docs.remove(id) else { return };
-        self.total_len -= u64::from(len);
-        for t in self.terms.remove(id).unwrap_or_default() {
+        let Some(s) = self.slot.remove(id) else { return };
+        let i = s as usize;
+        self.total_len -= u64::from(self.lens[i]);
+        for t in std::mem::take(&mut self.terms[i]) {
             if let Some(p) = self.postings.get_mut(&t) {
-                p.remove(id);
+                p.remove(&s);
                 if p.is_empty() {
                     self.postings.remove(&t);
                 }
             }
         }
+        self.lens[i] = 0;
+        self.ids[i].clear();
+        self.free.push(s);
+        self.live -= 1;
     }
 
-    /// BM25 ranking (k1 = 1.2, b = 0.75). `keep` filters candidate ids.
     pub fn search(&self, query: &str, limit: usize, mut keep: impl FnMut(&str) -> bool) -> Vec<(String, f32)> {
-        if self.docs.is_empty() || limit == 0 {
+        if self.live == 0 || limit == 0 {
             return Vec::new();
         }
         let mut q = tokenize(query);
         q.sort();
         q.dedup();
-        let n = self.docs.len() as f32;
+        let n = self.live as f32;
         let avg = (self.total_len as f32 / n).max(1.0);
         let (k1, b) = (1.2_f32, 0.75_f32);
-        let mut scores: HashMap<&str, f32> = HashMap::new();
+        let mut scores = vec![0f32; self.ids.len()];
+        let mut touched: Vec<u32> = Vec::new();
         for term in &q {
             let Some(posting) = self.postings.get(term) else { continue };
             let df = posting.len() as f32;
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            for (doc, tf) in posting {
-                let dl = *self.docs.get(doc).unwrap_or(&1) as f32;
-                let tf = *tf as f32;
-                *scores.entry(doc.as_str()).or_default() +=
-                    idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avg));
+            for (&doc, &tf) in posting {
+                let slot = &mut scores[doc as usize];
+                if *slot == 0.0 {
+                    touched.push(doc);
+                }
+                let dl = self.lens[doc as usize] as f32;
+                let tf = tf as f32;
+                *slot += idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avg));
             }
         }
-        let mut ranked: Vec<(String, f32)> =
-            scores.into_iter().filter(|(id, _)| keep(id)).map(|(id, s)| (id.to_string(), s)).collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(limit);
-        ranked
+        let order = |a: &u32, b: &u32| {
+            scores[*b as usize]
+                .total_cmp(&scores[*a as usize])
+                .then_with(|| self.ids[*a as usize].cmp(&self.ids[*b as usize]))
+        };
+        // Best candidates first; the filter only sees as many as it takes.
+        let want = (limit * 8).max(64).min(touched.len());
+        if want < touched.len() {
+            touched.select_nth_unstable_by(want, order);
+        }
+        let (head, tail) = touched.split_at_mut(want);
+        head.sort_unstable_by(order);
+        let mut out = Vec::with_capacity(limit);
+        for &d in head.iter() {
+            if keep(&self.ids[d as usize]) {
+                out.push((self.ids[d as usize].clone(), scores[d as usize]));
+                if out.len() == limit {
+                    return out;
+                }
+            }
+        }
+        // The filter rejected most of the best matches: keep going in order.
+        tail.sort_unstable_by(order);
+        for &d in tail.iter() {
+            if keep(&self.ids[d as usize]) {
+                out.push((self.ids[d as usize].clone(), scores[d as usize]));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 

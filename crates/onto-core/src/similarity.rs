@@ -54,38 +54,102 @@ fn quantize(v: &[f32]) -> Vec<i8> {
     v.iter().map(|x| (x * 127.0).round().clamp(-127.0, 127.0) as i8).collect()
 }
 
-fn dot_q(q: &[f32], v: &[i8]) -> f32 {
-    q.iter().zip(v).map(|(a, b)| a * f32::from(*b)).sum::<f32>() / 127.0
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(x, y)| i32::from(*x) * i32::from(*y)).sum()
 }
 
+/// Scale of a dot product of two quantized unit vectors.
+const SCALE: f32 = 127.0 * 127.0;
+
+/// Quantized vectors stored contiguously (`DIM` bytes each) so a scan is a
+/// straight pass over memory the compiler vectorizes; large indexes are
+/// scanned on several threads.
 #[derive(Clone, Default)]
 pub struct VectorIndex {
-    vecs: HashMap<String, Vec<i8>>,
+    ids: Vec<String>,
+    data: Vec<i8>,
+    slot: HashMap<String, usize>,
 }
 
 impl VectorIndex {
     pub fn len(&self) -> usize {
-        self.vecs.len()
+        self.ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vecs.is_empty()
+        self.ids.is_empty()
     }
 
     pub fn upsert(&mut self, id: &str, text: &str) {
         let v = embed(text);
         if v.iter().all(|x| *x == 0.0) {
-            self.vecs.remove(id);
-        } else {
-            self.vecs.insert(id.to_string(), quantize(&v));
+            self.remove(id);
+            return;
+        }
+        let q = quantize(&v);
+        match self.slot.get(id) {
+            Some(&i) => self.data[i * DIM..(i + 1) * DIM].copy_from_slice(&q),
+            None => {
+                self.slot.insert(id.to_string(), self.ids.len());
+                self.ids.push(id.to_string());
+                self.data.extend_from_slice(&q);
+            }
         }
     }
 
     pub fn remove(&mut self, id: &str) {
-        self.vecs.remove(id);
+        let Some(i) = self.slot.remove(id) else { return };
+        let last = self.ids.len() - 1;
+        if i != last {
+            self.ids.swap(i, last);
+            self.data.copy_within(last * DIM..(last + 1) * DIM, i * DIM);
+            self.slot.insert(self.ids[i].clone(), i);
+        }
+        self.ids.pop();
+        self.data.truncate(last * DIM);
     }
 
-    /// Brute-force cosine top-k (fast enough for ~100k entities).
+    /// The `k` best (slot, score) at or above `min`, best first.
+    fn top(&self, q: &[i8], min: i32, k: usize) -> Vec<(usize, i32)> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let scan = |start: usize, rows: &[i8]| -> Vec<(i32, usize)> {
+            let mut heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::with_capacity(k + 1);
+            for (n, row) in rows.as_chunks::<DIM>().0.iter().enumerate() {
+                let s = dot_i8(q, row);
+                if s < min || (heap.len() == k && heap.peek().is_some_and(|Reverse((m, _))| s <= *m)) {
+                    continue;
+                }
+                heap.push(Reverse((s, start + n)));
+                if heap.len() > k {
+                    heap.pop();
+                }
+            }
+            heap.into_iter().map(|Reverse(x)| x).collect()
+        };
+        let n = self.ids.len();
+        let threads = if n < 50_000 { 1 } else { std::thread::available_parallelism().map_or(4, |p| p.get()).min(8) };
+        let mut all: Vec<(i32, usize)> = if threads == 1 {
+            scan(0, &self.data)
+        } else {
+            let per = n.div_ceil(threads);
+            std::thread::scope(|sc| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let (a, b) = (t * per, ((t + 1) * per).min(n));
+                        let rows = &self.data[a * DIM..b * DIM];
+                        sc.spawn(move || scan(a, rows))
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            })
+        };
+        all.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| self.ids[a.1].cmp(&self.ids[b.1])));
+        all.truncate(k);
+        all.into_iter().map(|(s, i)| (i, s)).collect()
+    }
+
+    /// Cosine top-k of entities that `keep` admits, scores at or above `min`.
     pub fn search(
         &self,
         query: &str,
@@ -94,16 +158,36 @@ impl VectorIndex {
         mut keep: impl FnMut(&str) -> bool,
     ) -> Vec<(String, f32)> {
         let q = embed(query);
-        if q.iter().all(|x| *x == 0.0) {
+        if q.iter().all(|x| *x == 0.0) || limit == 0 {
             return Vec::new();
         }
+        let q = quantize(&q);
+        let min_i = (min * SCALE) as i32;
+        let want = (limit * 8).max(64);
+        let best = self.top(&q, min_i, want);
+        let mut out = Vec::with_capacity(limit);
+        for (i, s) in &best {
+            if keep(&self.ids[*i]) {
+                out.push((self.ids[*i].clone(), *s as f32 / SCALE));
+                if out.len() == limit {
+                    return out;
+                }
+            }
+        }
+        if best.len() < want {
+            return out;
+        }
+        // The filter rejected most of the best matches: scan with it.
         let mut hits: Vec<(String, f32)> = self
-            .vecs
+            .data
+            .as_chunks::<DIM>()
+            .0
             .iter()
-            .map(|(id, v)| (id, dot_q(&q, v)))
-            .filter(|(_, s)| *s >= min)
-            .filter(|(id, _)| keep(id))
-            .map(|(id, s)| (id.clone(), s))
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let s = dot_i8(&q, row);
+                (s >= min_i && keep(&self.ids[i])).then(|| (self.ids[i].clone(), s as f32 / SCALE))
+            })
             .collect();
         hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         hits.truncate(limit);
