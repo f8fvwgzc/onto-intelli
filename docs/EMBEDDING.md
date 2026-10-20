@@ -149,7 +149,19 @@ types live in onto-intelli, in nexc's shape
 | read vocabulary | `execution_vocabulary` | `Vocabulary` | `GET /v1/execution/graphs/{g}/vocabulary` | `execution.vocabulary` |
 | replace vocabulary | `set_execution_vocabulary` | `SetVocabulary` | `PUT /v1/execution/graphs/{g}/vocabulary` | `execution.set_vocabulary` |
 
-## 4. Configuration keys
+## 4. The web UI
+
+`/ui` is served by `onto serve`. Embed it, or link to it, as the workspace
+map, schema editor and proposals inbox ([UI.md](UI.md)):
+
+- `[ui] embed_origins` lists nexc's origins.
+- The backend mints a browser session with `POST /v1/auth/session` (its
+  impersonating token plus `{act_as, roles, entity, tenant}`) and hands it to
+  the iframe with `postMessage` (`onto:session`).
+- Deep links preselect the workspace and the focus:
+  `#/map?workspace=main&focus=<id>`.
+
+## 5. Configuration keys
 
 ```toml
 [engine]
@@ -194,4 +206,12 @@ principal = { id = "mcp-agent", roles = ["agent"], workspaces = ["*"] }
 
 [local]
 principal = { id = "local", roles = ["admin"], workspaces = ["*"] }
+
+[ui]
+enabled = true
+embed_origins = ["https://nexc.example.com"]
+title = "Ontology"
 ```
+
+Also set `ONTO_SESSION_SECRET` to the same value of at least 32 characters
+on every replica, so browser sessions work across all of them.

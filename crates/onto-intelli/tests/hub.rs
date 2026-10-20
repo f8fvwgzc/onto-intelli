@@ -64,3 +64,18 @@ async fn sqlite_tenants_get_their_own_files() {
     assert!(hub.resolve(Some("ws_10")).await.is_ok(), "multi-tenant hubs open new tenants");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn every_listed_action_is_dispatched() {
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let i = hub.tenant("t").await.unwrap();
+    let admin = Principal::admin("x");
+    for a in onto_intelli::actions::ACTIONS {
+        if matches!(a.name, "ingest.flush" | "eval.run" | "intelli.ask" | "memory.consolidate") {
+            continue;
+        }
+        if let Err(e) = i.call(&admin, a.name, json!({})).await {
+            assert!(!e.to_string().contains("see system.actions"), "{} is listed but not dispatched", a.name);
+        }
+    }
+}

@@ -999,6 +999,26 @@ impl Ontology {
                 doc: Some(e.clone()),
             });
         }
+        for l in &staged.batch.put_links {
+            staged.batch.link_versions.push(crate::store::LinkVersion {
+                from: l.from.clone(),
+                rel: l.rel.clone(),
+                to: l.to.clone(),
+                ts: now,
+                actor: ctx.principal.id.clone(),
+                doc: Some(l.clone()),
+            });
+        }
+        for (from, rel, to) in &staged.batch.del_links {
+            staged.batch.link_versions.push(crate::store::LinkVersion {
+                from: from.clone(),
+                rel: rel.clone(),
+                to: to.clone(),
+                ts: now,
+                actor: ctx.principal.id.clone(),
+                doc: None,
+            });
+        }
         for id in &staged.batch.del_entities {
             staged.batch.versions.push(VersionRecord {
                 id: id.clone(),

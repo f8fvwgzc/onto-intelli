@@ -30,6 +30,8 @@ pub struct Config {
     pub mcp: McpConfig,
     /// The principal of callers that open the store directly (CLI, FFI).
     pub local: LocalConfig,
+    /// The web UI served by `onto serve`.
+    pub ui: UiConfig,
     /// Who may change, propose and approve schema changes.
     pub governance: Governance,
     /// Directory relative paths are resolved against (the config file's dir).
@@ -378,6 +380,12 @@ pub struct AuthConfig {
     #[serde(alias = "default_principal")]
     pub dev_principal: Principal,
     pub tokens: Vec<TokenConfig>,
+    /// Environment variable holding the secret that signs browser session
+    /// tokens (`POST /v1/auth/session`). Set the same value on every
+    /// replica; unset, each process signs with a random secret of its own.
+    pub session_secret_env: Option<String>,
+    /// Longest session a token may mint.
+    pub session_max_ttl_secs: u64,
 }
 
 impl Default for AuthConfig {
@@ -386,7 +394,27 @@ impl Default for AuthConfig {
             mode: "token".into(),
             dev_principal: Principal::new("dev", vec![Role::Admin], vec!["*".into()]),
             tokens: Vec::new(),
+            session_secret_env: Some("ONTO_SESSION_SECRET".into()),
+            session_max_ttl_secs: 12 * 3600,
         }
+    }
+}
+
+/// `[ui]`: the operator web UI (`/ui`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub enabled: bool,
+    /// Origins allowed to embed the UI in an iframe (CSP `frame-ancestors`)
+    /// and to hand it a session with `postMessage`, e.g. `https://nexc.example.com`.
+    pub embed_origins: Vec<String>,
+    /// Shown in the header and the browser tab.
+    pub title: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { enabled: true, embed_origins: Vec::new(), title: "onto-intelli".into() }
     }
 }
 

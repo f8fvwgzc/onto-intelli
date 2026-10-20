@@ -20,6 +20,9 @@
 //! * `POST /v1/schema/proposals/{id}/{approve|reject|comment|withdraw|revise}`
 //! * `GET  /v1/execution/graphs`  nexc graphs; `POST` creates one (starter vocabulary)
 //! * `GET|PUT /v1/execution/graphs/{graph}/vocabulary`  node and relation types
+//! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
+//!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`
+//! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -66,6 +69,8 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/schema/proposals", get(proposals_list).post(proposals_create))
         .route("/v1/schema/proposals/{id}", get(proposal_get))
         .route("/v1/schema/proposals/{id}/{verb}", post(proposal_verb))
+        .route("/v1/auth/session", post(session))
+        .route("/v1/auth/whoami", get(whoami))
         .route("/v1/execution/graphs", get(exec_graphs).post(exec_init))
         .route("/v1/execution/graphs/{graph}/vocabulary", get(exec_vocab).put(exec_set_vocab))
         .with_state(AppState { hub, auth })
@@ -250,6 +255,94 @@ async fn proposal_verb(
         m.insert("id".into(), Value::String(id));
     }
     run(&s, &headers, action, input).await
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SessionIn {
+    #[serde(default)]
+    act_as: Option<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    workspaces: Vec<String>,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    let input: SessionIn = match serde_json::from_value(body_or_empty(body)) {
+        Ok(i) => i,
+        Err(e) => return error_response(&Error::invalid(format!("session: {e}"))),
+    };
+    // The body names the principal the same way the x-onto-act-* headers do,
+    // so the same limits apply (impersonate_roles, workspaces, tenants).
+    let mut h = headers.clone();
+    let mut set = |name: &'static str, v: String| {
+        if let Ok(val) = v.parse() {
+            h.insert(name, val);
+        }
+    };
+    if let Some(who) = input.act_as {
+        set(crate::auth::ACT_AS, who);
+        if !input.roles.is_empty() {
+            set(crate::auth::ACT_ROLES, input.roles.join(","));
+        }
+        if !input.workspaces.is_empty() {
+            set(crate::auth::ACT_WORKSPACES, input.workspaces.join(","));
+        }
+        if let Some(e) = input.entity {
+            set(crate::auth::ACT_ENTITY, e);
+        }
+    }
+    if let Some(t) = input.tenant {
+        set(crate::auth::TENANT, t);
+    }
+    let (principal, intelli) = match caller(&s, &h).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let _ = intelli;
+    let tenant =
+        s.auth.authenticate(&h).ok().and_then(|c| c.tenant).or_else(|| Some(s.hub.default_tenant().to_string()));
+    let (token, exp) = s.auth.issue_session(principal.clone(), tenant.clone(), input.ttl_secs.unwrap_or(3600));
+    Json(json!({ "token": token, "expires_at": exp, "principal": principal, "tenant": tenant })).into_response()
+}
+
+async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let (p, intelli) = match caller(&s, &headers).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let onto = intelli.ontology();
+    let gov = &onto.options().governance;
+    let tenant =
+        s.auth.authenticate(&headers).ok().and_then(|c| c.tenant).unwrap_or_else(|| s.hub.default_tenant().to_string());
+    let tenants = if p.is_privileged() { s.hub.known_tenants().unwrap_or_default() } else { vec![tenant.clone()] };
+    let cfg = intelli.config();
+    Json(json!({
+        "principal": p,
+        "tenant": tenant,
+        "tenants": tenants,
+        "multi_tenant": s.hub.multi_tenant(),
+        "default_workspace": cfg.engine.default_workspace,
+        "dev_mode": s.auth.dev_mode(),
+        "version": onto_intelli::VERSION,
+        "schema_version": onto.schema_version(),
+        "capabilities": {
+            "read": p.allows(onto_intelli::core::Access::Read),
+            "write": p.allows(onto_intelli::core::Access::Write),
+            "apply_schema": gov.can_apply(&p) && gov.live_edits,
+            "approve": gov.can_approve(&p),
+            "propose": gov.can_propose(&p),
+        },
+        "governance": gov,
+        "ui": { "title": cfg.ui.title },
+    }))
+    .into_response()
 }
 
 async fn exec_graphs(

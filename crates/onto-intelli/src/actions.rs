@@ -55,6 +55,16 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("graph.cycles", false, "Dependency cycles. Input: {workspace?}."),
     a("graph.critical_path", false, "Execution order and critical path of open work under an entity. Input: {id}."),
     a(
+        "graph.overview",
+        false,
+        "The most connected entities of a workspace and the links among them, with per-kind counts. Input: {workspace?, kinds?, limit?}.",
+    ),
+    a(
+        "graph.snapshot",
+        false,
+        "The graph around some entities as it was at a time (entity and link history). Input: {start, ts, depth?, limit?}.",
+    ),
+    a(
         "context.build",
         false,
         "Question context graph and packed facts, no LLM call. Input: {question, workspace?, token_budget?}.",
@@ -163,6 +173,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
+    a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
     a("system.actions", false, "This list."),
 ];
 
@@ -654,6 +665,20 @@ impl Intelli {
                 to_json(&r)
             }
             "system.stats" => self.stats(),
+            "system.whoami" => {
+                let gov = &onto.options().governance;
+                Ok(json!({
+                    "principal": p,
+                    "capabilities": {
+                        "read": p.allows(onto_core::Access::Read),
+                        "write": p.allows(onto_core::Access::Write),
+                        "apply_schema": gov.can_apply(p) && gov.live_edits,
+                        "approve": gov.can_approve(p),
+                        "propose": gov.can_propose(p),
+                    },
+                    "schema_version": onto.schema_version(),
+                }))
+            }
             "system.health" => Ok(json!({
                 "status": "ok",
                 "version": crate::VERSION,
@@ -974,6 +999,8 @@ pub const GRAPH_READS: &[&str] = &[
     "graph.root_cause",
     "graph.cycles",
     "graph.critical_path",
+    "graph.overview",
+    "graph.snapshot",
     "metric.query",
     "quality.report",
 ];
@@ -1055,6 +1082,17 @@ pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str
         "graph.critical_path" => {
             let i: IdIn = parse(action, input)?;
             to_json(&onto.critical_path(p, &i.id)?)
+        }
+        "graph.overview" => {
+            let mut spec: onto_core::map::OverviewSpec = parse(action, input)?;
+            if spec.limit == 0 {
+                spec.limit = 150;
+            }
+            to_json(&onto.overview(p, &spec)?)
+        }
+        "graph.snapshot" => {
+            let spec: onto_core::map::SnapshotSpec = parse(action, input)?;
+            to_json(&onto.snapshot(p, &spec)?)
         }
         "metric.query" => {
             let mut q: MetricQuery = parse(action, input)?;

@@ -12,6 +12,10 @@
 //!   principal, limited to `impersonate_roles` and the token's workspaces.
 //! * `x-onto-tenant` picks the tenant (multi-tenant servers), limited to the
 //!   token's `tenants`.
+//! * Session tokens (`onto1.…`, minted by `POST /v1/auth/session`) carry one
+//!   principal and tenant, signed with HMAC-SHA256 and short-lived; they are
+//!   what a browser holds, so an application never hands its service token
+//!   to a page. They cannot impersonate.
 
 use http::HeaderMap;
 
@@ -36,6 +40,24 @@ struct Token {
 pub struct Auth {
     dev: Option<Principal>,
     tokens: Vec<Token>,
+    session_key: Vec<u8>,
+    session_max_ttl: u64,
+}
+
+/// What a session token says.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SessionClaims {
+    pub principal: Principal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Unix seconds.
+    pub exp: u64,
+}
+
+const SESSION_PREFIX: &str = "onto1.";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Why a request was refused: 401 (no or bad credentials) or 403 (not allowed).
@@ -114,7 +136,54 @@ impl Auth {
                     .into(),
             ));
         }
-        Ok(Self { dev, tokens })
+        let session_key = match cfg.session_secret_env.as_deref().and_then(|v| std::env::var(v).ok()) {
+            Some(s) if s.trim().len() >= 32 => s.trim().as_bytes().to_vec(),
+            Some(_) => {
+                return Err(Error::Config("the session secret must have at least 32 characters".into()));
+            }
+            None => {
+                let mut key = vec![0u8; 32];
+                getrandom::fill(&mut key).map_err(|e| Error::Unavailable(format!("random session key: {e}")))?;
+                key
+            }
+        };
+        Ok(Self { dev, tokens, session_key, session_max_ttl: cfg.session_max_ttl_secs.max(60) })
+    }
+
+    fn sign(&self, payload: &str) -> String {
+        use base64::Engine;
+        use hmac::{KeyInit, Mac};
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.session_key).expect("any key length");
+        mac.update(payload.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    /// A signed, short-lived token for one principal and tenant.
+    pub fn issue_session(&self, principal: Principal, tenant: Option<String>, ttl_secs: u64) -> (String, u64) {
+        use base64::Engine;
+        let exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
+        let claims = SessionClaims { principal, tenant, exp };
+        let body =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap_or_default());
+        let payload = format!("{SESSION_PREFIX}{body}");
+        let sig = self.sign(&payload);
+        (format!("{payload}.{sig}"), exp)
+    }
+
+    fn verify_session(&self, token: &str) -> std::result::Result<SessionClaims, AuthError> {
+        use base64::Engine;
+        let bad = || AuthError::Unauthenticated("invalid session token".into());
+        let (payload, sig) = token.rsplit_once('.').ok_or_else(bad)?;
+        if !constant_time_eq(self.sign(payload).as_bytes(), sig.as_bytes()) {
+            return Err(bad());
+        }
+        let body = payload.strip_prefix(SESSION_PREFIX).ok_or_else(bad)?;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).map_err(|_| bad())?;
+        let claims: SessionClaims = serde_json::from_slice(&raw).map_err(|_| bad())?;
+        if claims.exp <= now_secs() {
+            return Err(AuthError::Unauthenticated("session expired".into()));
+        }
+        Ok(claims)
     }
 
     pub fn dev_mode(&self) -> bool {
@@ -128,6 +197,20 @@ impl Auth {
             .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
             .or_else(|| header(h, "x-api-key"))
             .map(str::trim);
+        if let Some(tok) = presented.filter(|t| t.starts_with(SESSION_PREFIX)) {
+            let claims = self.verify_session(tok)?;
+            if header(h, ACT_AS).is_some() {
+                return Err(AuthError::Forbidden("session tokens cannot act for other principals".into()));
+            }
+            let tenant = match (&claims.tenant, tenant) {
+                (Some(bound), Some(asked)) if *bound != asked => {
+                    return Err(AuthError::Forbidden(format!("this session is for tenant {bound}, not {asked}")));
+                }
+                (Some(bound), _) => Some(bound.clone()),
+                (None, asked) => asked,
+            };
+            return Ok(Caller { principal: claims.principal, tenant });
+        }
         let token = match presented {
             Some(tok) => Some(
                 self.tokens
@@ -200,6 +283,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A trimmed, non-empty header value.
+pub fn header_value(h: &HeaderMap, name: &str) -> Option<String> {
+    header(h, name).map(str::to_string)
 }
 
 /// Workspace selected by the caller (`x-onto-workspace` header).

@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::Value;
 
-use super::{CommitRecord, Snapshot, Store, StoreStats, VersionRecord, WriteBatch};
+use super::{CommitRecord, LinkVersion, Snapshot, Store, StoreStats, VersionRecord, WriteBatch};
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::{new_id, now_ms};
@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta(key, value) VALUES ('format', '1');
 CREATE TABLE IF NOT EXISTS head (id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL);
 INSERT OR IGNORE INTO head(id, seq) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS link_versions (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    src TEXT NOT NULL,
+    rel TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    ts  INTEGER NOT NULL,
+    doc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS link_versions_src ON link_versions(src, ts);
+CREATE INDEX IF NOT EXISTS link_versions_dst ON link_versions(dst, ts);
 CREATE TABLE IF NOT EXISTS commits (
     seq      INTEGER PRIMARY KEY,
     ts       INTEGER NOT NULL,
@@ -229,6 +239,12 @@ impl Store for SqliteStore {
                 params![v.id, v.revision as i64, v.ts, serde_json::to_string(v)?],
             )?;
         }
+        for v in &b.link_versions {
+            tx.execute(
+                "INSERT INTO link_versions(src, rel, dst, ts, doc) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![v.from, v.rel, v.to, v.ts, serde_json::to_string(v)?],
+            )?;
+        }
         for (ns, key, value) in &b.kv {
             tx.execute(
                 "INSERT INTO kv(ns, key, value, expires_at) VALUES (?1, ?2, ?3, NULL)
@@ -264,6 +280,15 @@ impl Store for SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT doc FROM entity_versions WHERE ts >= ?1 ORDER BY seq DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![since, limit.min(100_000) as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|doc| parse(&doc?)).collect()
+    }
+
+    fn link_history(&self, id: &str, until: i64, limit: usize) -> Result<Vec<LinkVersion>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT doc FROM link_versions WHERE (src = ?1 OR dst = ?1) AND ts <= ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![id, until, limit.min(100_000) as i64], |r| r.get::<_, String>(0))?;
         rows.map(|doc| parse(&doc?)).collect()
     }
 

@@ -14,6 +14,7 @@ pub mod dynamic;
 pub mod http;
 pub mod routes;
 pub mod template;
+pub mod ui;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -81,6 +82,9 @@ pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Rou
     }
     if cfg.grpc.http {
         router = router.merge(http::router(hub.clone(), auth.clone()));
+        if cfg.ui.enabled {
+            router = router.merge(ui::router(&cfg.ui));
+        }
     }
     let router = router.fallback_service(dynamic::DynamicGrpc { table: table.clone(), hub, auth });
     Ok((router, table))

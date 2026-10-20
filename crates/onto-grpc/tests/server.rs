@@ -642,3 +642,94 @@ async fn execution_vocabulary_over_http_and_grpc() {
         .into_inner();
     assert!(format!("{:?}", r.fields["vocabulary"]).contains("\"qa\""), "{r:?}");
 }
+
+#[tokio::test]
+async fn web_ui_is_served_and_sessions_carry_one_principal() {
+    let mut cfg = Config::in_memory();
+    cfg.engine.tenancy = "multi".into();
+    cfg.ui.embed_origins = vec!["https://nexc.example.com".into(), "*".into()];
+    cfg.auth.tokens = vec![onto_intelli::config::TokenConfig {
+        token: Some("service-token-for-tests".into()),
+        token_env: None,
+        principal: onto_intelli::Principal::new("nexc-backend", vec![onto_intelli::Role::Member], vec!["*".into()]),
+        impersonate: true,
+        impersonate_roles: vec![onto_intelli::Role::Viewer, onto_intelli::Role::Member],
+        tenants: vec!["*".into()],
+    }];
+    let hub = onto_intelli::Hub::open(cfg).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions::default(), listener, async {
+        let _ = rx.await;
+    }));
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+    // The UI shell, with a CSP that only names valid embed origins.
+    let ui = http.get(format!("{base}/ui/")).send().await.unwrap();
+    if onto_grpc::ui::bundled() {
+        assert_eq!(ui.status(), 200);
+        let csp = ui.headers()["content-security-policy"].to_str().unwrap().to_string();
+        assert!(csp.contains("frame-ancestors 'self' https://nexc.example.com"), "{csp}");
+        assert!(!csp.contains(" * "));
+        let deep = http.get(format!("{base}/ui/proposals/abc")).send().await.unwrap();
+        assert_eq!(deep.status(), 200, "client routes fall back to the shell");
+        assert_eq!(http.get(format!("{base}/ui/assets/missing.js")).send().await.unwrap().status(), 404);
+    }
+    let cfg_json: Value = http.get(format!("{base}/ui/config.json")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(cfg_json["embed_origins"], json!(["https://nexc.example.com"]));
+    assert_eq!(http.get(format!("{base}/")).send().await.unwrap().status(), 307);
+
+    // A service mints a browser session for one of its users.
+    let minted: Value = http
+        .post(format!("{base}/v1/auth/session"))
+        .bearer_auth("service-token-for-tests")
+        .json(&json!({ "act_as": "user:7", "roles": ["member"], "entity": "person:7", "tenant": "ws_1", "ttl_secs": 600 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = minted["token"].as_str().unwrap().to_string();
+    assert!(session.starts_with("onto1."));
+    let me: Value =
+        http.get(format!("{base}/v1/auth/whoami")).bearer_auth(&session).send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["principal"]["id"], "user:7");
+    assert_eq!(me["principal"]["via"], "nexc-backend");
+    assert_eq!(me["tenant"], "ws_1");
+    assert_eq!(me["capabilities"]["write"], true);
+    assert_eq!(me["capabilities"]["apply_schema"], false);
+    // Sessions are bound to their tenant, cannot impersonate, and cannot be forged.
+    let other = http
+        .get(format!("{base}/v1/auth/whoami"))
+        .bearer_auth(&session)
+        .header("x-onto-tenant", "ws_2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 403);
+    let act = http
+        .get(format!("{base}/v1/auth/whoami"))
+        .bearer_auth(&session)
+        .header("x-onto-act-as", "user:1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(act.status(), 403);
+    let mut forged = session.clone();
+    forged.pop();
+    forged.push('A');
+    let bad = http.get(format!("{base}/v1/auth/whoami")).bearer_auth(&forged).send().await.unwrap();
+    assert_eq!(bad.status(), 401);
+    // No escalation through the session endpoint either.
+    let admin = http
+        .post(format!("{base}/v1/auth/session"))
+        .bearer_auth("service-token-for-tests")
+        .json(&json!({ "act_as": "user:7", "roles": ["admin"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), 403);
+}

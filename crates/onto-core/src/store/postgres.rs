@@ -326,6 +326,12 @@ impl PgStore {
                     "CREATE TABLE IF NOT EXISTS {s}.commits (seq BIGINT PRIMARY KEY, ts BIGINT NOT NULL, \
                      origin TEXT NOT NULL, doc JSONB NOT NULL)"
                 ),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {s}.link_versions (seq BIGSERIAL PRIMARY KEY, src TEXT NOT NULL, \
+                     rel TEXT NOT NULL, dst TEXT NOT NULL, ts BIGINT NOT NULL, doc JSONB NOT NULL)"
+                ),
+                format!("CREATE INDEX IF NOT EXISTS link_versions_src ON {s}.link_versions (src, ts)"),
+                format!("CREATE INDEX IF NOT EXISTS link_versions_dst ON {s}.link_versions (dst, ts)"),
                 format!("INSERT INTO {s}.meta (key, value) VALUES ('format', '1') ON CONFLICT DO NOTHING"),
             ];
             for stmt in ddl {
@@ -709,6 +715,11 @@ impl Store for PgStore {
             .iter()
             .map(|v| Ok((v.id.clone(), v.revision as i64, v.ts, serde_json::to_string(v)?)))
             .collect::<Result<_>>()?;
+        let link_versions: Vec<(String, String, String, i64, String)> = b
+            .link_versions
+            .iter()
+            .map(|v| Ok((v.from.clone(), v.rel.clone(), v.to.clone(), v.ts, serde_json::to_string(v)?)))
+            .collect::<Result<_>>()?;
         let kv: Vec<(String, String, String)> =
             b.kv.iter()
                 .map(|(n, k, v)| Ok((n.clone(), k.clone(), serde_json::to_string(v)?)))
@@ -850,6 +861,30 @@ impl Store for PgStore {
                 .bind(c.1)
                 .bind(c.2)
                 .bind(c.3)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for chunk in link_versions.chunks(CHUNK) {
+                let (mut src, mut rel, mut dst, mut ts, mut doc) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for (a, b, c, t, d) in chunk.iter().cloned() {
+                    src.push(a);
+                    rel.push(b);
+                    dst.push(c);
+                    ts.push(t);
+                    doc.push(d);
+                }
+                sqlx::query(sql(format!(
+                    "INSERT INTO {} (src, rel, dst, ts, doc) \
+                     SELECT s, r, d, t, doc::jsonb FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $5::text[]) \
+                     WITH ORDINALITY AS v(s, r, d, t, doc, n) ORDER BY n",
+                    tables.link_versions
+                )))
+                .bind(src)
+                .bind(rel)
+                .bind(dst)
+                .bind(ts)
+                .bind(doc)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1109,6 +1144,23 @@ impl Store for PgStore {
         })
     }
 
+    fn link_history(&self, id: &str, until: i64, limit: usize) -> Result<Vec<super::LinkVersion>> {
+        let pool = self.pool.clone();
+        let tl = self.t("link_versions");
+        let id = id.to_string();
+        self.block(async move {
+            let rows: Vec<String> = sqlx::query_scalar(sql(format!(
+                "SELECT doc::text FROM {tl} WHERE (src = $1 OR dst = $1) AND ts <= $2 ORDER BY seq DESC LIMIT $3"
+            )))
+            .bind(&id)
+            .bind(until)
+            .bind(limit.min(100_000) as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.iter().map(|d| parse(d)).collect()
+        })
+    }
+
     fn bulk_import(&self, entities: &[Entity], links: &[Link]) -> Result<u64> {
         self.copy_import(entities.to_vec(), links.to_vec())
     }
@@ -1124,6 +1176,7 @@ struct Tables {
     links: String,
     events: String,
     versions: String,
+    link_versions: String,
     kv: String,
     commits: String,
 }
@@ -1136,6 +1189,7 @@ impl Tables {
             links: s.t("links"),
             events: s.t("events"),
             versions: s.t("entity_versions"),
+            link_versions: s.t("link_versions"),
             kv: s.t("kv"),
             commits: s.t("commits"),
         }

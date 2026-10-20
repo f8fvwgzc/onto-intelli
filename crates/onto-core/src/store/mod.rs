@@ -93,6 +93,19 @@ pub struct VersionRecord {
     pub doc: Option<Entity>,
 }
 
+/// One historical state of a link (`doc = None` marks a deletion).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LinkVersion {
+    pub from: Id,
+    pub rel: String,
+    pub to: Id,
+    pub ts: i64,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<Link>,
+}
+
 /// Atomic unit of persistence.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
@@ -103,6 +116,8 @@ pub struct WriteBatch {
     pub events: Vec<Event>,
     /// Entity history written in the same transaction.
     pub versions: Vec<VersionRecord>,
+    /// Link history written in the same transaction.
+    pub link_versions: Vec<LinkVersion>,
     /// KV writes that must commit together with the graph change (ns, key, value).
     pub kv: Vec<(String, String, Value)>,
     /// Optimistic concurrency: the commit sequence this batch was staged
@@ -149,6 +164,7 @@ impl WriteBatch {
             && self.del_links.is_empty()
             && self.events.is_empty()
             && self.versions.is_empty()
+            && self.link_versions.is_empty()
             && self.kv.is_empty()
     }
 }
@@ -227,6 +243,11 @@ pub trait Store: Send + Sync {
     fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>>;
     /// Versions written at or after `since`, newest first.
     fn versions_since(&self, since: i64, limit: usize) -> Result<Vec<VersionRecord>>;
+    /// Link versions touching `id` (either end) written at or before
+    /// `until`, newest first.
+    fn link_history(&self, _id: &str, _until: i64, _limit: usize) -> Result<Vec<LinkVersion>> {
+        Ok(Vec::new())
+    }
 }
 
 pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
@@ -253,6 +274,7 @@ struct MemInner {
     seq: u64,
     events: VecDeque<Event>,
     versions: VecDeque<VersionRecord>,
+    link_versions: VecDeque<LinkVersion>,
     kv: HashMap<String, std::collections::BTreeMap<String, (Value, Option<i64>)>>,
 }
 
@@ -286,6 +308,12 @@ impl Store for MemoryStore {
                 inner.versions.pop_front();
             }
             inner.versions.push_back(v.clone());
+        }
+        for v in &batch.link_versions {
+            if inner.link_versions.len() >= self.max_events {
+                inner.link_versions.pop_front();
+            }
+            inner.link_versions.push_back(v.clone());
         }
         for (ns, key, value) in &batch.kv {
             inner.kv.entry(ns.clone()).or_default().insert(key.clone(), (value.clone(), None));
@@ -355,6 +383,18 @@ impl Store for MemoryStore {
     fn versions_since(&self, since: i64, limit: usize) -> Result<Vec<VersionRecord>> {
         let inner = self.inner.lock();
         Ok(inner.versions.iter().rev().take_while(|v| v.ts >= since).take(limit).cloned().collect())
+    }
+
+    fn link_history(&self, id: &str, until: i64, limit: usize) -> Result<Vec<LinkVersion>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .link_versions
+            .iter()
+            .rev()
+            .filter(|v| v.ts <= until && (v.from == id || v.to == id))
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     fn stats(&self) -> Result<StoreStats> {

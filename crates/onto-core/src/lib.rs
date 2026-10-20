@@ -24,6 +24,7 @@ pub mod experts;
 pub mod export;
 pub mod graph;
 pub mod live_schema;
+pub mod map;
 pub mod metrics;
 pub mod model;
 pub mod policy;
