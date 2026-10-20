@@ -166,6 +166,8 @@ fn vectors_live_in_pgvector_and_rank_like_memory() {
             x.upsert(&ctx("ann"), EntityInput::new("issue", k, title)).unwrap();
         }
     }
+    // Vectors are computed right after each write, off the write path.
+    o.flush_vectors().unwrap();
     let admin = Principal::admin("x");
     let vector = |x: &Ontology, q: &str| -> Vec<String> {
         x.search_with(&admin, q, &[], None, 3, onto_core::SearchMode::Vector, false)
@@ -187,6 +189,25 @@ fn vectors_live_in_pgvector_and_rank_like_memory() {
     );
     let b = pg.open(Schema::enterprise(), OntologyOptions::default());
     assert_eq!(vector(&b, "payments timing out"), pg_hits);
+
+    // A state change keeps the stored vector (no re-embedding, and the row
+    // update can stay HOT); a new title is re-embedded in the background.
+    let store = pg.store();
+    use onto_core::store::Store;
+    o.upsert(&ctx("ann"), EntityInput { id: Some("issue:3".into()), state: Some("open".into()), ..Default::default() })
+        .unwrap();
+    assert!(!store.vectors_pending().unwrap(), "unchanged text keeps its vector");
+    o.upsert(&ctx("ann"), EntityInput::new("issue", "3", "Kafka consumer lag")).unwrap();
+    o.flush_vectors().unwrap();
+    assert_eq!(vector(&o, "kafka consumers").first().map(String::as_str), Some("issue:3"));
+    // The background vectorizer gets there on its own too.
+    o.upsert(&ctx("ann"), EntityInput::new("issue", "5", "Flaky checkout tests")).unwrap();
+    let start = Instant::now();
+    while store.vectors_pending().unwrap() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the vectorizer did not run");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(vector(&o, "flaky checkout").first().map(String::as_str), Some("issue:5"));
 }
 
 #[test]

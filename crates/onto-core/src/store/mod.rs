@@ -117,10 +117,12 @@ pub struct WriteBatch {
     pub link_versions: Vec<LinkVersion>,
     /// KV writes that must commit together with the graph change (ns, key, value).
     pub kv: Vec<(String, String, Value)>,
-    /// Entity vectors for stores that index them ([`Store::indexes_vectors`]):
-    /// the quantized embedding of each put entity's searchable text (`None`:
-    /// no text), plus re-embedded entities after a schema change.
-    pub vectors: Vec<(Id, Option<Vec<i8>>)>,
+    /// For stores that index vectors ([`Store::indexes_vectors`]): put
+    /// entities whose searchable text did not change keep their vector;
+    /// every other put entity is marked for re-embedding.
+    pub keep_vectors: Vec<Id>,
+    /// Other entities to re-embed (their searchable text changed with the schema).
+    pub reembed: Vec<Id>,
     /// Optimistic concurrency: the commit sequence this batch was staged
     /// against. When the store's head differs, the write is refused with
     /// `Error::Stale` and nothing is written.
@@ -167,7 +169,7 @@ impl WriteBatch {
             && self.versions.is_empty()
             && self.link_versions.is_empty()
             && self.kv.is_empty()
-            && self.vectors.is_empty()
+            && self.reembed.is_empty()
     }
 }
 
@@ -264,12 +266,19 @@ pub trait Store: Send + Sync {
     fn link_history(&self, _id: &str, _until: i64, _limit: usize) -> Result<Vec<LinkVersion>> {
         Ok(Vec::new())
     }
-    /// Does the store index entity vectors itself (pgvector)? The engine then
-    /// sends [`WriteBatch::vectors`] with every write and asks
-    /// [`vector_search`](Self::vector_search) instead of keeping a vector
-    /// index in memory.
+    /// Does the store index entity vectors itself (pgvector)? Then the
+    /// engine keeps no vector index in memory: writes mark entities for
+    /// embedding ([`WriteBatch::keep_vectors`], [`WriteBatch::reembed`]), a
+    /// background thread computes them right after the commit
+    /// ([`backfill_vectors`](Self::backfill_vectors)), and searches ask
+    /// [`vector_search`](Self::vector_search). Writes never wait for the
+    /// vector index.
     fn indexes_vectors(&self) -> bool {
         false
+    }
+    /// Are entities waiting for their vector?
+    fn vectors_pending(&self) -> Result<bool> {
+        Ok(false)
     }
     /// Entities nearest to `query` (a quantized embedding) by cosine
     /// similarity, best first: at most `limit` of (id, similarity).

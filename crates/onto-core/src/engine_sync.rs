@@ -280,6 +280,42 @@ pub(crate) fn build_indexes(
     (graph, text, vectors)
 }
 
+/// Compute the vectors of entities this process writes, right after each
+/// commit and off the write path. Wakes are coalesced; while rows are still
+/// pending (another process holds the backfill lock, or more writes arrived)
+/// it retries every 100 ms. The thread ends when the ontology is dropped.
+pub(crate) fn spawn_vectorizer(inner: &Arc<Inner>) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    let _ = inner.vector_wake.set(tx);
+    let weak = Arc::downgrade(inner);
+    std::thread::Builder::new()
+        .name("onto-vectors".into())
+        .spawn(move || {
+            let mut dirty = false;
+            loop {
+                let woke =
+                    if dirty { rx.recv_timeout(Duration::from_millis(100)) } else { rx.recv().map_err(Into::into) };
+                match woke {
+                    Ok(()) => dirty = true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if !dirty {
+                    continue;
+                }
+                let Some(inner) = weak.upgrade() else { break };
+                let onto = Ontology { inner };
+                if onto.backfill_vectors().is_err() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                dirty = onto.store().vectors_pending().unwrap_or(true);
+            }
+        })
+        .map_err(|e| Error::Other(format!("starting the vectorizer: {e}")))?;
+    Ok(())
+}
+
 /// Follow a shared store: catch up whenever it says another process
 /// committed, and poll at `interval` in case a notice was missed. The thread
 /// ends when the ontology is dropped.

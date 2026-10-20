@@ -52,6 +52,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (1, "init", include_str!("../../migrations/0001_init.sql")),
     (2, "vectors", include_str!("../../migrations/0002_vectors.sql")),
     (3, "append_only", include_str!("../../migrations/0003_append_only.sql")),
+    (4, "hot_updates", include_str!("../../migrations/0004_hot_updates.sql")),
 ];
 /// Above this many entities without vectors, a backfill drops the HNSW
 /// index and builds it once at the end (much faster than row by row).
@@ -800,28 +801,22 @@ impl Store for PgStore {
         let rec = b.commit_record(0, &origin);
         let expect = b.expect_seq;
         // Serialize documents on the caller's thread.
-        let mut vectors: std::collections::HashMap<&str, Option<String>> =
-            b.vectors.iter().map(|(id, v)| (id.as_str(), v.as_deref().map(halfvec_text))).collect();
+        let keep: std::collections::HashSet<&str> = b.keep_vectors.iter().map(String::as_str).collect();
         let put_e: Vec<EntityRow> = b
             .put_entities
             .iter()
             .map(|e| {
-                let vector = vectors.remove(e.id.as_str());
                 Ok(EntityRow {
                     id: e.id.clone(),
                     kind: e.kind.clone(),
                     workspace: e.workspace.clone(),
                     doc: serde_json::to_string(e)?,
                     updated_at: e.updated_at,
-                    embedded: vector.is_some(),
-                    embedding: vector.flatten(),
+                    keep_vector: keep.contains(e.id.as_str()),
                 })
             })
             .collect::<Result<_>>()?;
-        // Vectors of entities not written here (re-embedded after a schema change).
-        let mut revector: Vec<(String, Option<String>)> =
-            vectors.into_iter().map(|(id, v)| (id.to_string(), v)).collect();
-        revector.sort();
+        let reembed = b.reembed.clone();
         let put_l: Vec<(String, String, String, String)> = b
             .put_links
             .iter()
@@ -895,49 +890,43 @@ impl Store for PgStore {
                     .execute(&mut *tx)
                     .await?;
             }
-            for chunk in put_e.chunks(CHUNK) {
-                let mut c: EntityColumns = Default::default();
-                for r in chunk.iter().cloned() {
-                    c.0.push(r.id);
-                    c.1.push(r.kind);
-                    c.2.push(r.workspace);
-                    c.3.push(r.doc);
-                    c.4.push(r.updated_at);
-                    c.5.push(r.embedding);
-                    c.6.push(r.embedded);
+            // Entities whose searchable text changed are marked for the
+            // vectorizer; the others keep their vector, so an update that
+            // touches no indexed column can stay a HOT update.
+            for keep_vector in [false, true] {
+                let rows: Vec<&EntityRow> = put_e.iter().filter(|r| r.keep_vector == keep_vector).collect();
+                for chunk in rows.chunks(CHUNK) {
+                    let mut c: EntityColumns = Default::default();
+                    for r in chunk {
+                        c.0.push(r.id.clone());
+                        c.1.push(r.kind.clone());
+                        c.2.push(r.workspace.clone());
+                        c.3.push(r.doc.clone());
+                        c.4.push(r.updated_at);
+                    }
+                    sqlx::query(sql(format!(
+                        "INSERT INTO {} (id, kind, workspace, doc, updated_at) \
+                         SELECT id, kind, ws, doc::jsonb, at FROM \
+                         UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[]) AS r(id, kind, ws, doc, at) \
+                         ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
+                         doc = excluded.doc, updated_at = excluded.updated_at{}",
+                        tables.entities,
+                        if keep_vector { "" } else { ", embedded = false" }
+                    )))
+                    .bind(c.0)
+                    .bind(c.1)
+                    .bind(c.2)
+                    .bind(c.3)
+                    .bind(c.4)
+                    .execute(&mut *tx)
+                    .await?;
                 }
-                sqlx::query(sql(format!(
-                    "INSERT INTO {} (id, kind, workspace, doc, updated_at, embedding, embedded) \
-                     SELECT id, kind, ws, doc::jsonb, at, emb::{v}.halfvec, done FROM \
-                     UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::text[], $7::bool[]) \
-                     AS r(id, kind, ws, doc, at, emb, done) \
-                     ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, workspace = excluded.workspace, \
-                     doc = excluded.doc, updated_at = excluded.updated_at, embedding = excluded.embedding, \
-                     embedded = excluded.embedded",
-                    tables.entities,
-                    v = tables.vector
-                )))
-                .bind(c.0)
-                .bind(c.1)
-                .bind(c.2)
-                .bind(c.3)
-                .bind(c.4)
-                .bind(c.5)
-                .bind(c.6)
-                .execute(&mut *tx)
-                .await?;
             }
-            for chunk in revector.chunks(CHUNK) {
-                let (ids, embs): (Vec<String>, Vec<Option<String>>) = chunk.iter().cloned().unzip();
-                sqlx::query(sql(format!(
-                    "UPDATE {} e SET embedding = v.emb::{}.halfvec, embedded = true \
-                     FROM UNNEST($1::text[], $2::text[]) AS v(id, emb) WHERE e.id = v.id",
-                    tables.entities, tables.vector
-                )))
-                .bind(ids)
-                .bind(embs)
-                .execute(&mut *tx)
-                .await?;
+            for chunk in reembed.chunks(CHUNK) {
+                sqlx::query(sql(format!("UPDATE {} SET embedded = false WHERE id = ANY($1) AND embedded", tables.entities)))
+                    .bind(chunk.to_vec())
+                    .execute(&mut *tx)
+                    .await?;
             }
             for chunk in put_l.chunks(CHUNK) {
                 let mut cols: (Vec<String>, Vec<String>, Vec<String>, Vec<String>) = Default::default();
@@ -1346,6 +1335,16 @@ impl Store for PgStore {
         true
     }
 
+    fn vectors_pending(&self) -> Result<bool> {
+        let pool = self.pool.clone();
+        let te = self.t("entities");
+        self.block(async move {
+            Ok(sqlx::query_scalar(sql(format!("SELECT EXISTS (SELECT 1 FROM {te} WHERE NOT embedded)")))
+                .fetch_one(&pool)
+                .await?)
+        })
+    }
+
     fn vector_search(&self, query: &[i8], limit: usize, filter: &VectorFilter) -> Result<Vec<(Id, f32)>> {
         if limit == 0 || query.is_empty() {
             return Ok(Vec::new());
@@ -1550,13 +1549,11 @@ struct EntityRow {
     workspace: String,
     doc: String,
     updated_at: i64,
-    /// pgvector text, `None` when the entity has no searchable text.
-    embedding: Option<String>,
-    /// The batch carried a vector for it (otherwise it is backfilled later).
-    embedded: bool,
+    /// Its searchable text did not change: keep the stored vector.
+    keep_vector: bool,
 }
 
-type EntityColumns = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<i64>, Vec<Option<String>>, Vec<bool>);
+type EntityColumns = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<i64>);
 
 #[derive(Clone)]
 struct Tables {
@@ -1568,8 +1565,6 @@ struct Tables {
     link_versions: String,
     kv: String,
     commits: String,
-    /// Quoted schema of the vector extension.
-    vector: String,
 }
 
 impl Tables {
@@ -1583,7 +1578,6 @@ impl Tables {
             link_versions: s.t("link_versions"),
             kv: s.t("kv"),
             commits: s.t("commits"),
-            vector: s.vector.schema.clone(),
         }
     }
 }

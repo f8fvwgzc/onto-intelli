@@ -249,6 +249,8 @@ struct Inner {
     /// The store that indexes entity vectors (pgvector); `vectors` stays
     /// empty then. A fork keeps its parent's.
     vector_store: Option<Arc<dyn Store>>,
+    /// Wakes the background vectorizer after a write (stores that index vectors).
+    vector_wake: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
     /// Merged-away id -> surviving id.
     redirects: RwLock<HashMap<Id, Id>>,
     store: Arc<dyn Store>,
@@ -294,6 +296,7 @@ impl Ontology {
                 text: RwLock::new(text),
                 vectors: RwLock::new(vectors),
                 vector_store,
+                vector_wake: std::sync::OnceLock::new(),
                 redirects: RwLock::new(redirects),
                 store,
                 revision: AtomicU64::new(1),
@@ -304,6 +307,9 @@ impl Ontology {
         };
         onto.bootstrap_schema(config_schema)?;
         onto.backfill_vectors()?;
+        if onto.inner.store.indexes_vectors() {
+            sync::spawn_vectorizer(&onto.inner)?;
+        }
         if let Some(interval) = follow {
             sync::spawn_follower(&onto.inner, interval)?;
         }
@@ -361,12 +367,38 @@ impl Ontology {
     /// Give entities the store holds without a vector one (after a bulk
     /// import or a migration that added vectors). Returns how many.
     pub fn backfill_vectors(&self) -> Result<usize> {
-        let Some(store) = &self.inner.vector_store else { return Ok(0) };
+        // A fork's store is in memory; the vectors of its parent are not its to write.
+        let store = &self.inner.store;
+        if !store.indexes_vectors() {
+            return Ok(0);
+        }
         let schema = self.schema();
         let embed = |entities: &[Entity]| -> Vec<Option<Vec<i8>>> {
             entities.iter().map(|e| similarity::embed_quantized(&searchable_text(&schema, e))).collect()
         };
         store.backfill_vectors(&embed)
+    }
+
+    /// Wait until every entity written so far has its vector (writes leave
+    /// that to a background thread). Tests and bulk loaders use it.
+    pub fn flush_vectors(&self) -> Result<usize> {
+        let store = self.inner.store.clone();
+        if !store.indexes_vectors() {
+            return Ok(0);
+        }
+        let start = std::time::Instant::now();
+        let mut done = 0;
+        loop {
+            done += self.backfill_vectors()?;
+            if !store.vectors_pending()? {
+                return Ok(done);
+            }
+            if start.elapsed() > std::time::Duration::from_secs(60) {
+                return Err(Error::Unavailable("entity vectors still pending after 60 s".into()));
+            }
+            // Another process holds the backfill lock and is doing the work.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Vector candidates from the store's index: (id, similarity) at or
@@ -414,6 +446,7 @@ impl Ontology {
                 // Vector search keeps using the parent's index; entities edited
                 // in the fork are found lexically.
                 vector_store: self.inner.vector_store.clone(),
+                vector_wake: std::sync::OnceLock::new(),
                 redirects: RwLock::new(self.inner.redirects.read().clone()),
                 store: Arc::new(MemoryStore::default()),
                 revision: AtomicU64::new(self.revision()),
@@ -549,31 +582,41 @@ impl Ontology {
         }
         let schema = self.schema();
         let pool = (limit * 3).max(30);
-        // Ask the store's vector index before taking the graph lock.
-        let remote = match (&self.inner.vector_store, mode) {
-            (Some(store), SearchMode::Hybrid | SearchMode::Vector) => {
-                Some(self.store_vectors(store, &schema, text, kinds, workspace, (pool * 4).max(64))?)
-            }
-            _ => None,
-        };
-        let g = self.reader(p)?;
-        let keep = |id: &str| {
+        let visible = |g: &Graph, id: &str| {
             g.get(id).is_some_and(|e| {
-                policy::visible(p, e, &g)
+                policy::visible(p, e, g)
                     && workspace.is_none_or(|w| e.workspace == w)
                     && (kinds.is_empty() || kinds.iter().any(|k| schema.kind_is(&e.kind, k)))
             })
         };
-        let lexical =
-            if mode == SearchMode::Vector { Vec::new() } else { self.inner.text.read().search(text, pool, keep) };
-        let vector = match remote {
+        // The store's vector index answers on another thread while BM25 runs here.
+        let (remote, g, lexical) = std::thread::scope(|s| {
+            let job = match (&self.inner.vector_store, mode) {
+                (Some(store), SearchMode::Hybrid | SearchMode::Vector) => {
+                    let schema = &schema;
+                    Some(s.spawn(move || self.store_vectors(store, schema, text, kinds, workspace, (pool * 4).max(64))))
+                }
+                _ => None,
+            };
+            let g = self.reader(p);
+            let lexical = match &g {
+                Ok(g) if mode != SearchMode::Vector => self.inner.text.read().search(text, pool, |id| visible(g, id)),
+                _ => Vec::new(),
+            };
+            let remote = job
+                .map(|h| h.join().unwrap_or_else(|_| Err(Error::Other("vector search panicked".into()))))
+                .transpose();
+            (remote, g, lexical)
+        });
+        let g = g?;
+        let vector = match remote? {
             Some(mut hits) => {
-                hits.retain(|(id, _)| keep(id));
+                hits.retain(|(id, _)| visible(&g, id));
                 hits.truncate(pool);
                 hits
             }
             None if mode == SearchMode::Lexical => Vec::new(),
-            None => self.inner.vectors.read().search(text, pool, MIN_VECTOR_SIMILARITY, keep),
+            None => self.inner.vectors.read().search(text, pool, MIN_VECTOR_SIMILARITY, |id| visible(&g, id)),
         };
         let mut fused: HashMap<String, (f32, Option<usize>, Option<usize>)> = HashMap::new();
         for (rank, (id, _)) in lexical.iter().enumerate() {
@@ -1091,22 +1134,30 @@ impl Ontology {
         }
         staged.batch.kv.extend(extra.kv);
         let in_memory_vectors = self.inner.vector_store.is_none();
-        if self.inner.store.indexes_vectors() {
-            let mut vectors: Vec<(Id, Option<Vec<i8>>)> = staged
+        let store_vectors = self.inner.store.indexes_vectors();
+        if store_vectors {
+            // Vectors are computed after the commit, off the write path;
+            // entities whose searchable text is unchanged keep theirs.
+            let current = self.schema();
+            staged.batch.keep_vectors = staged
                 .batch
                 .put_entities
                 .iter()
-                .map(|e| (e.id.clone(), similarity::embed_quantized(&searchable_text(&schema, e))))
+                .filter(|e| {
+                    extra.schema.is_none()
+                        && g.get(&e.id).is_some_and(|old| searchable_text(&current, old) == searchable_text(&schema, e))
+                })
+                .map(|e| e.id.clone())
                 .collect();
             if extra.schema.is_some() {
                 let put: HashSet<&str> = staged.batch.put_entities.iter().map(|e| e.id.as_str()).collect();
                 for kind in &extra.reindex {
-                    for e in g.of_kind(kind).filter(|e| !put.contains(e.id.as_str())) {
-                        vectors.push((e.id.clone(), similarity::embed_quantized(&searchable_text(&schema, e))));
-                    }
+                    staged
+                        .batch
+                        .reembed
+                        .extend(g.of_kind(kind).filter(|e| !put.contains(e.id.as_str())).map(|e| e.id.clone()));
                 }
             }
-            staged.batch.vectors = vectors;
         }
         if self.inner.store.tracks_commits() {
             staged.batch.expect_seq = Some(self.inner.seq.load(Ordering::SeqCst));
@@ -1114,6 +1165,12 @@ impl Ontology {
         let seq = self.inner.store.write(&staged.batch)?;
         if staged.batch.changes_state() {
             self.inner.seq.store(seq, Ordering::SeqCst);
+        }
+        if store_vectors
+            && (staged.batch.put_entities.len() > staged.batch.keep_vectors.len() || !staged.batch.reembed.is_empty())
+            && let Some(wake) = self.inner.vector_wake.get()
+        {
+            let _ = wake.try_send(());
         }
         {
             let mut text = self.inner.text.write();

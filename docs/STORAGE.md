@@ -76,6 +76,7 @@ TLS is rustls with aws-lc-rs and needs no system library.
 | `0001_init` | entities, links, events, entity and link history, KV, the commit log and head |
 | `0002_vectors` | `entities.embedding halfvec(512)` with an HNSW index (cosine), and `entities.embedded` |
 | `0003_append_only` | triggers that refuse `UPDATE` on `events`, `entity_versions` and `link_versions` |
+| `0004_hot_updates` | `fillfactor = 85` on `entities`, so updates that change no indexed column stay HOT |
 
 Released migrations never change; a schema change is a new migration.
 
@@ -105,17 +106,26 @@ Search fuses two rankings. BM25 runs in memory, where it ranks better than
 - Each entity's searchable text is embedded as 512 feature-hashed word and
   character-trigram buckets, quantized to integers in -127..127. These are
   exact in `halfvec` (2 bytes a component, 1 KB per entity).
-- Every write stores the vectors of the entities it puts, in the same
-  transaction. A schema change that alters what is searchable re-embeds the
-  affected kinds in the commit that changes the schema.
+- Writes never wait for the vector index. A write marks the entities it
+  puts whose searchable text changed (`embedded = false`) and keeps the
+  stored vector of the others. Right after the commit, a background thread
+  in the writing process computes the marked vectors in batches. A new or
+  retitled entity is found lexically at once and by vector a few
+  milliseconds later. `Ontology::flush_vectors()` waits for it, for tests
+  and bulk loaders.
+- An update that changes no searchable text (a state, a number) touches no
+  indexed column. With the page room that `fillfactor = 85` leaves, it is a
+  HOT update and writes no index entry at all. That matters because an
+  insert into a million-row HNSW index costs milliseconds.
+- A schema change that alters what is searchable marks the affected kinds
+  in the commit that changes the schema; the vectorizer re-embeds them.
 - A search embeds the query and asks the HNSW index for the nearest entities
   by cosine distance (`hnsw.ef_search` sized to the request). Workspace and
   kind filters go into the SQL query. Permissions are then checked in
   memory, as for every read.
-- Rows without a vector (`embedded = false`) come from bulk imports, or from
-  databases migrated before vectors existed. The first process that opens
-  the tenant computes their vectors; an advisory lock keeps others from
-  doing the same work. Above 20,000 such rows it drops the HNSW index and
+- Rows still without a vector after a crash, a bulk import or a migration
+  are computed by the first process that opens the tenant. An advisory
+  lock keeps processes from doing the same work twice. Above 20,000 such rows it drops the HNSW index and
   builds it once at the end, which is much faster than inserting row by row.
   An index left dropped by a crash is rebuilt on the next open.
 
@@ -134,9 +144,9 @@ and redirects included) goes through the same steps:
    first. The write is refused as *stale*, nothing is written, and the
    process catches up from the commit log and stages again. Retries are
    bounded, then the write fails with `conflict`.
-3. Otherwise the batch is written: entities with their vectors, links,
-   events, entity and link versions, KV, and a commit record `n + 1` listing
-   everything it touched. `NOTIFY` on the tenant's channel is delivered when,
+3. Otherwise the batch is written: entities, links, events, entity and
+   link versions, KV, and a commit record `n + 1` listing everything it
+   touched (vectors follow, see above). `NOTIFY` on the tenant's channel is delivered when,
    and only if, the transaction commits.
 
 Validation therefore always runs against the latest committed state.
@@ -144,7 +154,8 @@ Concurrent edits from different replicas never overwrite each other blindly:
 revisions stay sequential and every edit lands in history.
 
 **Reads** are served from memory, at microsecond cost, except vector
-candidates, which are one indexed query. Every process runs a follower:
+candidates: one indexed query, run on another thread while BM25 ranks the
+same question in memory. Every process runs a follower:
 
 - On a notice from another process it reads the new commit records, fetches
   the current rows of what they touched and patches the indexes. If a schema
