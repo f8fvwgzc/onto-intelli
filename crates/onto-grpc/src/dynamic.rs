@@ -15,9 +15,9 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder
 use tonic::server::{ClientStreamingService, Grpc, ServerStreamingService, UnaryService};
 use tonic::{Request, Response, Status, Streaming};
 
-use onto_intelli::{AskRequest, Error, Intelli, Principal};
+use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, workspace_header};
+use crate::auth::{Auth, AuthError, workspace_header};
 use crate::routes::{ASK_STREAM, CALL, Route, RouteTable};
 use crate::template;
 
@@ -272,7 +272,7 @@ impl ClientStreamingService<DynamicMessage> for ClientStream {
 #[derive(Clone)]
 pub struct DynamicGrpc {
     pub table: Arc<RouteTable>,
-    pub intelli: Arc<Intelli>,
+    pub hub: Arc<Hub>,
     pub auth: Arc<Auth>,
 }
 
@@ -293,12 +293,17 @@ impl tower::Service<http::Request<axum::body::Body>> for DynamicGrpc {
                 return Ok(Status::unimplemented(format!("{path} is not served (configure it in [[grpc.routes]])"))
                     .into_http());
             };
-            let principal = match this.auth.principal(req.headers()) {
-                Ok(p) => p,
-                Err(msg) => return Ok(Status::unauthenticated(msg).into_http()),
+            let caller = match this.auth.authenticate(req.headers()) {
+                Ok(c) => c,
+                Err(AuthError::Unauthenticated(m)) => return Ok(Status::unauthenticated(m).into_http()),
+                Err(AuthError::Forbidden(m)) => return Ok(Status::permission_denied(m).into_http()),
+            };
+            let intelli = match this.hub.resolve(caller.tenant.as_deref()).await {
+                Ok(i) => i,
+                Err(e) => return Ok(status_of(&e).into_http()),
             };
             let streaming = (route.method.is_client_streaming(), route.method.is_server_streaming());
-            let handler = Arc::new(Handler { route: route.clone(), intelli: this.intelli.clone(), principal });
+            let handler = Arc::new(Handler { route: route.clone(), intelli, principal: caller.principal });
             let mut grpc = Grpc::new(DynCodec::server(&route.method));
             let resp = match streaming {
                 (false, false) => grpc.unary(Unary(handler), req).await,

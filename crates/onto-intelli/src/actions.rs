@@ -270,7 +270,11 @@ impl Intelli {
     }
 
     fn ctx(&self, p: &Principal, ws: Option<String>) -> ActionContext {
-        ActionContext::new(p.clone(), self.ws_or_default(ws)).with_source("api")
+        let source = match &p.via {
+            Some(service) => format!("api via {service}"),
+            None => "api".to_string(),
+        };
+        ActionContext::new(p.clone(), self.ws_or_default(ws)).with_source(source)
     }
 
     /// Run a named action. See [`ACTIONS`].

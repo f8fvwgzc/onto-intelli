@@ -28,6 +28,11 @@ OntoHandle *onto_open_memory(void);
 /* Run any engine action (list them with action "system.actions"). */
 char *onto_call(OntoHandle *handle, const char *action, const char *input_json);
 
+/* onto_call as an explicit principal, e.g.
+ * {"id":"user:42","roles":["member"],"workspaces":["*"],"entity":"person:42"}:
+ * per-user roles and ACLs apply instead of the configured [local] principal. */
+char *onto_call_as(OntoHandle *handle, const char *principal_json, const char *action, const char *input_json);
+
 /* Shortcut for onto_call(handle, "intelli.ask", {"question": question}). */
 char *onto_ask(OntoHandle *handle, const char *question);
 

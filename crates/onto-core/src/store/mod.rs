@@ -33,7 +33,7 @@ pub use sqlite::SqliteStore;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
-pub use postgres::{PgOptions, PgStore};
+pub use postgres::{PgOptions, PgShared, PgStore};
 
 /// KV namespaces whose standalone writes other processes are told about
 /// (their readers keep them in memory). Everything committed inside a

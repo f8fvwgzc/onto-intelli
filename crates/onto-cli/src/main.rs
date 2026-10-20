@@ -26,6 +26,9 @@ struct Cli {
     /// Workspace (default: engine.default_workspace).
     #[arg(long, short, global = true)]
     workspace: Option<String>,
+    /// Tenant (default: engine.postgres.tenant); each tenant is its own ontology.
+    #[arg(long, global = true, env = "ONTO_TENANT")]
+    tenant: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -44,6 +47,10 @@ enum Command {
         /// Override grpc.listen, e.g. 0.0.0.0:50051.
         #[arg(long)]
         listen: Option<String>,
+        /// Development mode: no authentication, every caller is auth.dev_principal
+        /// (loopback addresses only).
+        #[arg(long)]
+        dev: bool,
     },
     /// Ask a question.
     Ask {
@@ -395,17 +402,20 @@ fn print_receipt(st: &Style, r: &Value) {
 
 enum Backend {
     Local { intelli: Arc<Intelli>, principal: Principal },
-    Remote { http: reqwest::Client, base: String, token: Option<String> },
+    Remote { http: reqwest::Client, base: String, token: Option<String>, tenant: Option<String> },
 }
 
 impl Backend {
     async fn call(&self, action: &str, input: Value) -> Result<Value> {
         match self {
             Backend::Local { intelli, principal } => intelli.call(principal, action, input).await,
-            Backend::Remote { http, base, token } => {
+            Backend::Remote { http, base, token, tenant } => {
                 let mut req = http.post(format!("{base}/v1/call/{action}")).json(&input);
                 if let Some(t) = token {
                     req = req.bearer_auth(t);
+                }
+                if let Some(t) = tenant {
+                    req = req.header("x-onto-tenant", t);
                 }
                 let resp = req.send().await.map_err(|e| Error::Unavailable(format!("{base}: {e}")))?;
                 let status = resp.status();
@@ -418,6 +428,8 @@ impl Backend {
                         Some("not_found") => Error::NotFound(msg),
                         Some("invalid_argument") => Error::Invalid(msg),
                         Some("permission_denied") => Error::Denied(msg),
+                        Some("conflict") => Error::Conflict(msg),
+                        Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
                         _ => Error::Other(msg),
                     })
                 }
@@ -538,12 +550,21 @@ async fn main() {
     }
 }
 
-async fn open_local(cli: &Cli) -> Result<(Arc<Intelli>, Config)> {
+fn local_config(cli: &Cli) -> Result<Config> {
     let mut cfg = Config::discover(cli.config.as_deref())?;
     if let Some(ws) = &cli.workspace {
         cfg.engine.default_workspace = ws.clone();
     }
-    let intelli = Intelli::open(cfg.clone()).await?;
+    Ok(cfg)
+}
+
+/// The local store (the `--tenant`'s, when given).
+async fn open_local(cli: &Cli) -> Result<(Arc<Intelli>, Config)> {
+    let cfg = local_config(cli)?;
+    let intelli = match &cli.tenant {
+        Some(t) => onto_intelli::Hub::open(cfg.clone()).await?.tenant(t).await?,
+        None => Intelli::open(cfg.clone()).await?,
+    };
     Ok((intelli, cfg))
 }
 
@@ -553,10 +574,11 @@ async fn backend(cli: &Cli) -> Result<Backend> {
             http: reqwest::Client::new(),
             base: url.trim_end_matches('/').to_string(),
             token: cli.token.clone(),
+            tenant: cli.tenant.clone(),
         }),
         None => {
             let (intelli, cfg) = open_local(cli).await?;
-            Ok(Backend::Local { intelli, principal: cfg.auth.default_principal })
+            Ok(Backend::Local { intelli, principal: cfg.local.principal })
         }
     }
 }
@@ -564,17 +586,30 @@ async fn backend(cli: &Cli) -> Result<Backend> {
 async fn run(cli: Cli, st: &Style) -> Result<()> {
     match &cli.command {
         Command::Init { dir, force } => init(dir, *force, st),
-        Command::Serve { listen } => {
-            let (_, mut cfg) = open_local(&cli).await?;
+        Command::Serve { listen, dev } => {
+            let mut cfg = local_config(&cli)?;
             if let Some(l) = listen {
                 cfg.grpc.listen = l.clone();
             }
-            let intelli = Intelli::open(cfg.clone()).await?;
+            if let Some(t) = &cli.tenant {
+                cfg.engine.postgres.tenant = t.clone();
+            }
+            let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            // Open the default tenant now: configuration problems show at startup.
+            let intelli = hub.tenant(hub.default_tenant()).await?;
+            let auth = if *dev || cfg.auth.mode == "dev" {
+                st.red("DEVELOPMENT MODE, no authentication")
+            } else {
+                format!("token auth ({} tokens)", cfg.auth.tokens.len())
+            };
             eprintln!(
-                "{} gRPC + HTTP on {} · storage {} · llm {} ({})",
+                "{} gRPC + HTTP on {} · storage {} · {} · tenant {}{} · llm {} ({})",
                 st.bold("onto-intelli"),
                 cfg.grpc.listen,
                 cfg.engine.storage,
+                auth,
+                hub.default_tenant(),
+                if hub.multi_tenant() { " (multi-tenant)" } else { "" },
                 intelli.llm().name(),
                 intelli.llm().model()
             );
@@ -584,7 +619,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                     st.red("!")
                 );
             }
-            onto_grpc::serve(intelli, async {
+            onto_grpc::serve_hub(hub, onto_grpc::ServeOptions { dev: *dev }, async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("\nshutting down");
             })
@@ -1205,8 +1240,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
         }
         Command::Mcp => {
             let (intelli, cfg) = open_local(&cli).await?;
-            let server =
-                onto_intelli::mcp::McpServer::new(intelli, cfg.auth.default_principal.clone(), cfg.mcp.allow_writes);
+            let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes);
             let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
             let mut out = tokio::io::stdout();
             while let Some(line) = lines.next_line().await? {
@@ -1310,7 +1344,9 @@ fn init(dir: &Path, force: bool, st: &Style) -> Result<()> {
     }
     std::fs::create_dir_all(dir.join(".onto"))?;
     println!("Created {} and {}", st.bold(&cfg_path.display().to_string()), proto.display());
-    println!("\nNext:\n  onto seed demo\n  onto ask \"Who owns Project Alpha?\"\n  onto serve");
+    println!(
+        "\nNext:\n  onto seed demo\n  onto ask \"Who owns Project Alpha?\"\n  export ONTO_TOKEN=$(openssl rand -hex 24) && onto serve\n  (or `onto serve --dev` locally: no auth, loopback only)"
+    );
     Ok(())
 }
 

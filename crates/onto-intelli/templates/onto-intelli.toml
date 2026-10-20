@@ -119,10 +119,28 @@ response = { text = "{{answer}}", facts = "{{facts}}", mode = "{{mode}}" }
 
 [mcp]
 allow_writes = false          # `onto mcp`: expose apply_action/undo_action to agents
+# MCP clients act as an agent: they read, propose schema changes, never apply or approve them.
+principal = { id = "mcp-agent", roles = ["agent"], workspaces = ["*"] }
 
 [auth]
-mode = "none"                 # none | token
-default_principal = { id = "local", roles = ["admin"], workspaces = ["*"] }
+mode = "token"                # token (default) | dev: no authentication, loopback only (or `onto serve --dev`)
+# The operator token: export ONTO_TOKEN=$(openssl rand -hex 24)
+[[auth.tokens]]
+token_env = "ONTO_TOKEN"
+principal = { id = "operator", roles = ["admin"], workspaces = ["*"] }
+# An agent with its own token:
 # [[auth.tokens]]
 # token_env = "ONTO_TOKEN_OPS"
 # principal = { id = "ops-bot", roles = ["agent"], workspaces = ["acme"], entity = "agent:ops-bot" }
+# A trusted service acting for its own users (x-onto-act-as / -roles / -workspaces / -entity
+# headers name each call's principal, so per-user roles and ACLs apply):
+# [[auth.tokens]]
+# token_env = "NEXC_ONTO_TOKEN"
+# principal = { id = "nexc-backend", roles = ["member"], workspaces = ["*"] }
+# impersonate = true
+# impersonate_roles = ["viewer", "member", "agent", "approver"]
+# tenants = ["*"]
+
+# The CLI and in-process (FFI) callers open the store directly and act as:
+[local]
+principal = { id = "local", roles = ["admin"], workspaces = ["*"] }

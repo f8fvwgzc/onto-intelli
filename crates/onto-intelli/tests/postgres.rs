@@ -98,3 +98,35 @@ async fn replicas_share_graph_schema_proposals_and_memory() {
     let store = onto_intelli::core::store::PgStore::connect(&url, &tenant, Default::default()).unwrap();
     store.drop_tenant().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hub_on_an_application_pool() {
+    let Ok(url) = std::env::var("ONTO_TEST_POSTGRES_URL") else {
+        eprintln!("skipped: set ONTO_TEST_POSTGRES_URL to run the PostgreSQL suite");
+        return;
+    };
+    // The application's own pool, as nexc would hand it over.
+    let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await.unwrap();
+    let shared = onto_intelli::core::store::PgShared::from_pool(pool).unwrap();
+    let mut cfg = Config::in_memory();
+    cfg.engine.storage = "postgres".into();
+    cfg.engine.postgres.schema_prefix = format!("onto_hub{}_", &onto_intelli::core::time::new_id("x")[2..10]);
+    cfg.engine.tenancy = "multi".into();
+    let prefix = cfg.engine.postgres.schema_prefix.clone();
+    let hub = onto_intelli::Hub::with_postgres(cfg, shared.clone()).unwrap();
+    let w1 = hub.tenant("ws_1").await.unwrap();
+    let w2 = hub.tenant("ws_2").await.unwrap();
+    let alice = Principal::named("user:alice", &["member"], &["*"]).unwrap();
+    w1.call(&alice, "entity.upsert", json!({ "id": "team:core", "title": "Core" })).await.unwrap();
+    assert!(w2.call(&alice, "entity.get", json!({ "id": "team:core" })).await.is_err());
+    let mut known = hub.known_tenants().unwrap();
+    known.sort();
+    assert_eq!(known, vec!["ws_1", "ws_2"]);
+    for t in ["ws_1", "ws_2"] {
+        shared
+            .tenant(t, onto_intelli::core::store::PgOptions { schema_prefix: prefix.clone(), ..Default::default() })
+            .unwrap()
+            .drop_tenant()
+            .unwrap();
+    }
+}

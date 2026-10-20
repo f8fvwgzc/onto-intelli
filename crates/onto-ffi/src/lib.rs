@@ -51,7 +51,7 @@ unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
 
 fn open_with(cfg: Config) -> *mut OntoHandle {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let principal = cfg.auth.default_principal.clone();
+        let principal = cfg.local.principal.clone();
         BlockingIntelli::open(cfg).map(|engine| OntoHandle { engine, principal })
     }));
     match result {
@@ -117,6 +117,44 @@ pub unsafe extern "C" fn onto_call(
             _ => json!({}),
         };
         h.engine.call(&h.principal, action, input)
+    }));
+    let body = match out {
+        Ok(Ok(result)) => json!({ "ok": true, "result": result }),
+        Ok(Err(e)) => json!({ "ok": false, "error": { "code": e.code(), "message": e.to_string() } }),
+        Err(_) => json!({ "ok": false, "error": { "code": "internal", "message": "panic inside onto-intelli" } }),
+    };
+    into_c(body.to_string())
+}
+
+/// Like `onto_call`, as an explicit principal: `principal_json` is
+/// `{"id": "user:42", "roles": ["member"], "workspaces": ["*"], "entity": "person:42"}`,
+/// so per-user roles and ACLs apply instead of the configured `[local]` principal.
+///
+/// # Safety
+/// Same as `onto_call`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn onto_call_as(
+    handle: *mut OntoHandle,
+    principal_json: *const c_char,
+    action: *const c_char,
+    input_json: *const c_char,
+) -> *mut c_char {
+    if handle.is_null() {
+        set_error("null handle");
+        return ptr::null_mut();
+    }
+    // SAFETY: non-null handle created by onto_open; shared access is thread-safe.
+    let h = unsafe { &*handle };
+    // SAFETY: forwarded caller guarantee.
+    let (who, action, input) = unsafe { (str_arg(principal_json), str_arg(action), str_arg(input_json)) };
+    let out = catch_unwind(AssertUnwindSafe(|| -> Result<Value, Error> {
+        let who: Principal = serde_json::from_str(who.ok_or_else(|| Error::invalid("principal_json is required"))?)?;
+        let action = action.ok_or_else(|| Error::invalid("action is required"))?;
+        let input: Value = match input {
+            Some(s) if !s.trim().is_empty() => serde_json::from_str(s)?,
+            _ => json!({}),
+        };
+        h.engine.call(&who, action, input)
     }));
     let body = match out {
         Ok(Ok(result)) => json!({ "ok": true, "result": result }),

@@ -128,7 +128,7 @@ when `[mcp] allow_writes = true`).
 |---|---|
 | Release binary | `curl -fsSL https://raw.githubusercontent.com/f8fvwgzc/onto-intelli/main/packaging/install.sh \| sh` |
 | From source | `cargo install --path crates/onto-cli` (or `make install`) |
-| Docker | `docker build -t onto-intelli . && docker run -p 50051:50051 -v onto:/data onto-intelli` |
+| Docker | `docker build -t onto-intelli . && docker run -p 50051:50051 -e ONTO_TOKEN=$(openssl rand -hex 24) -v onto:/data onto-intelli` |
 | Homebrew | formula template in [`packaging/homebrew/onto-intelli.rb`](packaging/homebrew/onto-intelli.rb) |
 
 One static-ish binary (`onto`, ~13 MB release). SQLite is compiled in and protos are compiled
@@ -147,7 +147,9 @@ onto show issue:421             # entity card, neighbours, derived relations
 onto deps project:alpha --cause # root-cause chains
 onto deps project:alpha --plan  # execution order + critical path
 onto chat                       # multi-turn, remembers what "it" refers to
-onto serve                      # gRPC + HTTP on 127.0.0.1:50051
+export ONTO_TOKEN=$(openssl rand -hex 24)
+onto serve                      # gRPC + HTTP on 127.0.0.1:50051 (token auth)
+onto serve --dev                # local development: no auth, loopback only
 ```
 
 Bring data in with JSONL (mutations, bare entities or GitHub `issues` webhook payloads):
@@ -187,15 +189,18 @@ block and server-side refusal fallback (`fallbacks: "default"`, disable with
   `ActionService` (plan/apply/undo governed actions), `AnalyticsService` (metrics,
   history, changes, quality, duplicates/merge, scenarios, experts, profile, export, eval),
   `MemoryService`, `EventService` (incl. client-streaming `Ingest`), `AdminService`;
+* `SchemaService`: the live schema and proposals ([docs/SCHEMA.md](docs/SCHEMA.md));
 * gRPC reflection and `grpc.health.v1`;
 * JSON over HTTP/1.1 on the same port.
 
 ```bash
-grpcurl -plaintext localhost:50051 list
-grpcurl -plaintext -d '{"question":"Who owns Project Alpha?"}' \
+grpcurl -plaintext -H "authorization: Bearer $ONTO_TOKEN" localhost:50051 list
+grpcurl -plaintext -H "authorization: Bearer $ONTO_TOKEN" -d '{"question":"Who owns Project Alpha?"}' \
   localhost:50051 onto_intelli.v1.IntelliService/Ask
-curl -s localhost:50051/v1/call/graph.root_cause -d '{"id":"project:alpha"}' -H 'content-type: application/json'
-curl -sN localhost:50051/v1/ask/stream -d '{"question":"Why is Project Alpha blocked?"}' -H 'content-type: application/json'
+curl -s localhost:50051/v1/call/graph.root_cause -H "authorization: Bearer $ONTO_TOKEN" \
+  -H 'content-type: application/json' -d '{"id":"project:alpha"}'
+curl -sN localhost:50051/v1/ask/stream -H "authorization: Bearer $ONTO_TOKEN" \
+  -H 'content-type: application/json' -d '{"question":"Why is Project Alpha blocked?"}'
 ```
 
 ### Your own proto files, no code generation
@@ -238,15 +243,33 @@ priority = "{{props.priority}}"
 
 ### Auth
 
+Authentication is on by default. A server with no token configured refuses to start;
+`onto serve --dev` (no authentication, every caller is an admin) only listens on loopback.
+
 ```toml
 [auth]
 mode = "token"
 [[auth.tokens]]
 token_env = "ONTO_TOKEN_OPS"
 principal = { id = "ops-bot", roles = ["agent"], workspaces = ["acme"], entity = "agent:ops-bot" }
+
+# A backend acting for its own users: per-call principals, per-user roles and ACLs.
+[[auth.tokens]]
+token_env = "NEXC_ONTO_TOKEN"
+principal = { id = "nexc-backend", roles = ["member"], workspaces = ["*"] }
+impersonate = true
+impersonate_roles = ["viewer", "member", "agent", "approver"]
+tenants = ["*"]
 ```
 
-`authorization: Bearer <token>` on gRPC and HTTP. `x-onto-workspace` selects the workspace.
+Every gRPC and HTTP call carries `authorization: Bearer <token>`. Optional headers (or gRPC
+metadata) refine it:
+
+| header | does |
+|---|---|
+| `x-onto-workspace` | selects the workspace |
+| `x-onto-tenant` | selects the tenant |
+| `x-onto-act-as`, `x-onto-act-roles`, `x-onto-act-workspaces`, `x-onto-act-entity` | an impersonating token names the user the call is for ([docs/EMBEDDING.md](docs/EMBEDDING.md)) |
 
 ## Embedding
 
@@ -258,6 +281,10 @@ let ctx = ActionContext::new(Principal::admin("app"), "acme");
 intelli.ontology().upsert(&ctx, EntityInput::new("issue", "9", "Login fails").state("open"))?;
 let answer = intelli.ask(&Principal::admin("app"), AskRequest::new("Who owns issue #9?")).await?;
 ```
+
+**Many tenants in one process** (`Hub`): one ontology per tenant (a PostgreSQL schema, a
+SQLite file or memory), opened on first use; `Hub::with_postgres(cfg, PgShared::from_pool(app_pool)?)`
+shares the application's sqlx pool. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 **Rust, sync** ([example](crates/onto-intelli/examples/embed_sync.rs)): `BlockingIntelli`
 owns a small runtime; the graph API (`Ontology`) is synchronous anyway.

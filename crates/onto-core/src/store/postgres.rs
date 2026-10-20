@@ -57,11 +57,92 @@ impl Default for PgOptions {
     }
 }
 
+/// A runtime the store started (shut down when the last user goes away).
+struct OwnedRuntime(Mutex<Option<Runtime>>);
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.lock().take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+#[derive(Clone)]
 enum Exec {
-    /// A runtime owned by this store (connected from a URL).
-    Own(Option<Runtime>),
+    /// A runtime started for the connection pool (connected from a URL).
+    Own(Arc<OwnedRuntime>),
     /// The runtime of a pool the application handed in.
     Shared(Handle),
+}
+
+impl Exec {
+    fn handle(&self) -> (Handle, bool) {
+        match self {
+            Exec::Own(rt) => (rt.0.lock().as_ref().map(|r| r.handle().clone()).unwrap_or_else(Handle::current), false),
+            Exec::Shared(h) => (h.clone(), true),
+        }
+    }
+}
+
+/// A PostgreSQL connection pool plus the runtime its queries run on, shared
+/// by the stores of many tenants (`PgShared::tenant`).
+#[derive(Clone)]
+pub struct PgShared {
+    pool: PgPool,
+    exec: Exec,
+}
+
+impl PgShared {
+    /// Connect with a URL; queries run on a small runtime owned by the pool.
+    pub fn connect(url: &str, opts: &PgOptions) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("onto-pg")
+            .enable_all()
+            .build()
+            .map_err(|e| Error::Unavailable(format!("starting the postgres runtime: {e}")))?;
+        let (url_s, max, timeout) = (url.to_string(), opts.max_connections, opts.connect_timeout);
+        let pool = run_on(rt.handle(), false, async move {
+            Ok(PgPoolOptions::new().max_connections(max).acquire_timeout(timeout).connect(&url_s).await?)
+        })?;
+        Ok(Self { pool, exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))) })
+    }
+
+    /// Use the application's pool (e.g. its `sqlx::PgPool`). Must be called
+    /// inside the Tokio runtime that owns the pool; queries run there.
+    pub fn from_pool(pool: PgPool) -> Result<Self> {
+        let handle = Handle::try_current().map_err(|_| {
+            Error::Config("PgShared::from_pool must be called inside the Tokio runtime that owns the pool".into())
+        })?;
+        Ok(Self { pool, exec: Exec::Shared(handle) })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// The store of one tenant (its own PostgreSQL schema), created if missing.
+    pub fn tenant(&self, tenant: &str, opts: PgOptions) -> Result<PgStore> {
+        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone())
+    }
+
+    /// Tenants with a schema under `prefix`.
+    pub fn list_tenants(&self, prefix: &str) -> Result<Vec<String>> {
+        let pool = self.pool.clone();
+        let prefix = prefix.to_string();
+        let (h, shared) = self.exec.handle();
+        run_on(&h, shared, async move {
+            let names: Vec<String> = sqlx::query_scalar(
+                "SELECT n.nspname FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid \
+                 WHERE c.relname = 'head' AND starts_with(n.nspname, $1) ORDER BY 1",
+            )
+            .bind(&prefix)
+            .fetch_all(&pool)
+            .await?;
+            Ok(names.into_iter().map(|n| n[prefix.len()..].to_string()).collect())
+        })
+    }
 }
 
 pub struct PgStore {
@@ -79,11 +160,6 @@ impl Drop for PgStore {
     fn drop(&mut self) {
         if let Some(h) = self.listener.lock().take() {
             h.abort();
-        }
-        if let Exec::Own(rt) = &mut self.exec
-            && let Some(rt) = rt.take()
-        {
-            rt.shutdown_background();
         }
     }
 }
@@ -148,28 +224,15 @@ fn sql(s: String) -> AssertSqlSafe<String> {
 }
 
 impl PgStore {
-    /// Connect with a URL on a runtime owned by the store.
+    /// Connect with a URL (a pool of its own, on a runtime of its own).
     pub fn connect(url: &str, tenant: &str, opts: PgOptions) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("onto-pg")
-            .enable_all()
-            .build()
-            .map_err(|e| Error::Unavailable(format!("starting the postgres runtime: {e}")))?;
-        let (url_s, max, timeout) = (url.to_string(), opts.max_connections, opts.connect_timeout);
-        let pool = run_on(rt.handle(), false, async move {
-            Ok(PgPoolOptions::new().max_connections(max).acquire_timeout(timeout).connect(&url_s).await?)
-        })?;
-        Self::finish(pool, tenant, opts, Exec::Own(Some(rt)))
+        PgShared::connect(url, &opts)?.tenant(tenant, opts)
     }
 
     /// Use the application's pool (e.g. its `sqlx::PgPool`). Must be called
     /// inside the pool's Tokio runtime; queries run there.
     pub fn with_pool(pool: PgPool, tenant: &str, opts: PgOptions) -> Result<Self> {
-        let handle = Handle::try_current().map_err(|_| {
-            Error::Config("PgStore::with_pool must be called inside the Tokio runtime that owns the pool".into())
-        })?;
-        Self::finish(pool, tenant, opts, Exec::Shared(handle))
+        PgShared::from_pool(pool)?.tenant(tenant, opts)
     }
 
     fn finish(pool: PgPool, tenant: &str, opts: PgOptions, exec: Exec) -> Result<Self> {
@@ -188,11 +251,7 @@ impl PgStore {
     }
 
     fn handle(&self) -> (Handle, bool) {
-        match &self.exec {
-            Exec::Own(Some(rt)) => (rt.handle().clone(), false),
-            Exec::Own(None) => (Handle::current(), false),
-            Exec::Shared(h) => (h.clone(), true),
-        }
+        self.exec.handle()
     }
 
     fn block<T, F>(&self, fut: F) -> Result<T>

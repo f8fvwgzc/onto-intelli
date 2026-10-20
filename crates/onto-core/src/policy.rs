@@ -102,6 +102,10 @@ pub struct Principal {
     /// for "my issues" questions and restricted-entity ACLs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity: Option<Id>,
+    /// The service that asserted this principal (impersonation), recorded
+    /// as the source of its audit events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 fn all_workspaces() -> Vec<String> {
@@ -110,7 +114,7 @@ fn all_workspaces() -> Vec<String> {
 
 impl Principal {
     pub fn new(id: impl Into<String>, roles: Vec<Role>, workspaces: Vec<String>) -> Self {
-        Self { id: id.into(), roles, workspaces, entity: None }
+        Self { id: id.into(), roles, workspaces, entity: None, via: None }
     }
 
     pub fn system() -> Self {
@@ -127,6 +131,12 @@ impl Principal {
 
     pub fn viewer(id: impl Into<String>, workspace: impl Into<String>) -> Self {
         Self::new(id, vec![Role::Viewer], vec![workspace.into()])
+    }
+
+    /// Build from role and workspace names (`["member", "approver"]`).
+    pub fn named(id: impl Into<String>, roles: &[&str], workspaces: &[&str]) -> Result<Self> {
+        let roles = roles.iter().map(|r| Role::parse(r)).collect::<Result<Vec<_>>>()?;
+        Ok(Self::new(id, roles, workspaces.iter().map(|w| w.to_string()).collect()))
     }
 
     pub fn with_entity(mut self, entity: impl Into<Id>) -> Self {

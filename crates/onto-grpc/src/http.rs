@@ -33,17 +33,17 @@ use axum::routing::{get, post};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 
-use onto_intelli::{AskRequest, Error, Intelli, Principal};
+use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, workspace_header};
+use crate::auth::{Auth, AuthError, workspace_header};
 
 #[derive(Clone)]
-struct AppState {
-    intelli: Arc<Intelli>,
-    auth: Arc<Auth>,
+pub struct AppState {
+    pub hub: Arc<Hub>,
+    pub auth: Arc<Auth>,
 }
 
-pub fn router(intelli: Arc<Intelli>, auth: Arc<Auth>) -> axum::Router {
+pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
     axum::Router::new()
         .route("/healthz", get(health))
         .route("/v1/actions", get(actions))
@@ -64,10 +64,10 @@ pub fn router(intelli: Arc<Intelli>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/schema/proposals", get(proposals_list).post(proposals_create))
         .route("/v1/schema/proposals/{id}", get(proposal_get))
         .route("/v1/schema/proposals/{id}/{verb}", post(proposal_verb))
-        .with_state(AppState { intelli, auth })
+        .with_state(AppState { hub, auth })
 }
 
-fn error_response(e: &Error) -> Response {
+pub fn error_response(e: &Error) -> Response {
     let status = match e {
         Error::NotFound(_) => StatusCode::NOT_FOUND,
         Error::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -79,13 +79,17 @@ fn error_response(e: &Error) -> Response {
     (status, Json(json!({ "error": { "code": e.code(), "message": e.to_string() } }))).into_response()
 }
 
-fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, Box<Response>> {
-    state.auth.principal(headers).map_err(|msg| {
-        Box::new(
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": { "code": "unauthenticated", "message": msg } })))
-                .into_response(),
-        )
-    })
+/// Authenticate and pick the tenant's ontology.
+pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<(Principal, Arc<Intelli>), Box<Response>> {
+    let c = state.auth.authenticate(headers).map_err(|e| {
+        let (status, code) = match &e {
+            AuthError::Unauthenticated(_) => (StatusCode::UNAUTHORIZED, "unauthenticated"),
+            AuthError::Forbidden(_) => (StatusCode::FORBIDDEN, "permission_denied"),
+        };
+        Box::new((status, Json(json!({ "error": { "code": code, "message": e.to_string() } }))).into_response())
+    })?;
+    let intelli = state.hub.resolve(c.tenant.as_deref()).await.map_err(|e| Box::new(error_response(&e)))?;
+    Ok((c.principal, intelli))
 }
 
 fn with_workspace(mut input: Value, headers: &HeaderMap) -> Value {
@@ -98,11 +102,11 @@ fn with_workspace(mut input: Value, headers: &HeaderMap) -> Value {
 }
 
 async fn run(state: &AppState, headers: &HeaderMap, action: &str, input: Value) -> Response {
-    let p = match principal(state, headers) {
-        Ok(p) => p,
+    let (p, intelli) = match caller(state, headers).await {
+        Ok(c) => c,
         Err(r) => return *r,
     };
-    match state.intelli.call(&p, action, with_workspace(input, headers)).await {
+    match intelli.call(&p, action, with_workspace(input, headers)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
     }
@@ -249,15 +253,15 @@ async fn ask(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Val
 }
 
 async fn ask_stream(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    let p = match principal(&s, &headers) {
-        Ok(p) => p,
+    let (p, intelli) = match caller(&s, &headers).await {
+        Ok(c) => c,
         Err(r) => return *r,
     };
     let req: AskRequest = match serde_json::from_value(with_workspace(body, &headers)) {
         Ok(r) => r,
         Err(e) => return error_response(&Error::invalid(e)),
     };
-    let rx = s.intelli.ask_stream(p, req);
+    let rx = intelli.ask_stream(p, req);
     let events: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
             Ok(SseEvent::default().event(ev.kind.clone()).data(serde_json::to_string(&ev).unwrap_or_default()))

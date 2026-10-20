@@ -38,6 +38,7 @@ async fn start(tweak: impl FnOnce(&mut Config)) -> Server {
     let mut cfg = Config::from_toml(EXAMPLE_CONFIG).unwrap();
     cfg.base_dir = dir.clone();
     cfg.engine.storage = "memory".into();
+    cfg.auth.mode = "dev".into();
     tweak(&mut cfg);
     let intelli = Intelli::open(cfg).await.unwrap();
     seed::load_demo(&intelli, "acme").await.unwrap();
@@ -229,6 +230,9 @@ async fn http_json_and_auth() {
             token: Some("s3cret".into()),
             token_env: None,
             principal: onto_intelli::Principal::viewer("dash", "acme"),
+            impersonate: false,
+            impersonate_roles: Vec::new(),
+            tenants: vec!["*".into()],
         }];
     })
     .await;
@@ -439,4 +443,155 @@ async fn proposals_over_grpc_and_http() {
     assert_eq!(rejected["status"], "withdrawn");
     let bad = http.post(format!("{base}/v1/schema/proposals/{id}/explode")).send().await.unwrap();
     assert_eq!(bad.status(), 404);
+}
+
+/// A multi-tenant server with a service token that acts for its users.
+async fn start_hub() -> (SocketAddr, oneshot::Sender<()>) {
+    let mut cfg = Config::in_memory();
+    cfg.engine.tenancy = "multi".into();
+    cfg.engine.default_workspace = "acme".into();
+    cfg.auth.tokens = vec![
+        onto_intelli::config::TokenConfig {
+            token: Some("service-token-for-tests".into()),
+            token_env: None,
+            principal: onto_intelli::Principal::new("nexc-backend", vec![onto_intelli::Role::Member], vec!["*".into()]),
+            impersonate: true,
+            impersonate_roles: vec![onto_intelli::Role::Viewer, onto_intelli::Role::Member, onto_intelli::Role::Agent],
+            tenants: vec!["*".into()],
+        },
+        onto_intelli::config::TokenConfig {
+            token: Some("tenant-a-only-token".into()),
+            token_env: None,
+            principal: onto_intelli::Principal::admin("ops"),
+            impersonate: false,
+            impersonate_roles: Vec::new(),
+            tenants: vec!["ws_a".into()],
+        },
+    ];
+    let hub = onto_intelli::Hub::open(cfg).await.unwrap();
+    seed::load_demo(&hub.tenant("ws_a").await.unwrap(), "acme").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions::default(), listener, async {
+        let _ = rx.await;
+    }));
+    (addr, tx)
+}
+
+#[tokio::test]
+async fn tenants_are_isolated_and_services_act_for_their_users() {
+    let (addr, _stop) = start_hub().await;
+    let base = format!("http://{addr}");
+    let http = reqwest::Client::new();
+    let call = |tenant: &'static str,
+                act: Option<(&'static str, &'static str, &'static str)>,
+                action: &str,
+                body: Value| {
+        let mut req = http
+            .post(format!("{base}/v1/call/{action}"))
+            .bearer_auth("service-token-for-tests")
+            .header("x-onto-tenant", tenant)
+            .json(&body);
+        if let Some((who, roles, entity)) = act {
+            req =
+                req.header("x-onto-act-as", who).header("x-onto-act-roles", roles).header("x-onto-act-entity", entity);
+        }
+        req.send()
+    };
+    // Tenant isolation: ws_b has none of ws_a's data.
+    let a = call("ws_a", None, "entity.get", json!({ "id": "project:alpha" })).await.unwrap();
+    assert_eq!(a.status(), 200);
+    let b = call("ws_b", None, "entity.get", json!({ "id": "project:alpha" })).await.unwrap();
+    assert_eq!(b.status(), 404);
+
+    // Per-user ACLs: a restricted entity readable by Payments members only.
+    let kenji = Some(("user:kenji", "member", "person:kenji"));
+    let eve = Some(("user:eve", "member", "person:eve"));
+    call(
+        "ws_a",
+        None,
+        "entity.upsert",
+        json!({ "id": "knowledge:bands", "title": "Salary bands",
+        "props": { "visibility": "restricted", "acl": ["team:payments"] } }),
+    )
+    .await
+    .unwrap();
+    let r = call("ws_a", kenji, "entity.get", json!({ "id": "knowledge:bands" })).await.unwrap();
+    assert_eq!(r.status(), 200, "kenji is in team:payments");
+    let r = call("ws_a", eve, "entity.get", json!({ "id": "knowledge:bands" })).await.unwrap();
+    assert_eq!(r.status(), 404, "eve is not");
+    // Writes are attributed to the user, via the service.
+    let e: Value = call("ws_a", kenji, "entity.patch", json!({ "id": "issue:421", "props": { "note": "on it" } }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e["id"], "issue:421");
+    let events: Value = call("ws_a", None, "event.list", json!({ "target": "issue:421", "action": "entity.update" }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events["events"][0]["actor"], "user:kenji");
+    assert_eq!(events["events"][0]["source"], "api via nexc-backend");
+    // A viewer cannot write; an agent cannot apply schema changes.
+    let viewer = Some(("user:val", "viewer", "person:val"));
+    let r = call("ws_a", viewer, "entity.upsert", json!({ "id": "task:x", "title": "x" })).await.unwrap();
+    assert_eq!(r.status(), 403);
+    let agent = Some(("assistant", "agent", "agent:assistant"));
+    let r = call(
+        "ws_a",
+        agent,
+        "schema.apply",
+        json!({ "changes": [ { "op": "put_object_type", "name": "x", "def": {} } ] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 403);
+    // No escalation beyond impersonate_roles.
+    let admin = Some(("user:mallory", "admin", "person:mallory"));
+    let r = call("ws_a", admin, "entity.get", json!({ "id": "project:alpha" })).await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A token limited to ws_a cannot address ws_b; no token at all is refused.
+    let r = http
+        .post(format!("{base}/v1/call/entity.get"))
+        .bearer_auth("tenant-a-only-token")
+        .header("x-onto-tenant", "ws_b")
+        .json(&json!({ "id": "project:alpha" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = http.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+
+    // gRPC metadata works the same way.
+    let ch = channel(addr).await;
+    let mut onto = pb::ontology_service_client::OntologyServiceClient::new(ch);
+    let mut req = tonic::Request::new(pb::EntityRef { id: "knowledge:bands".into() });
+    req.metadata_mut().insert("authorization", "Bearer service-token-for-tests".parse().unwrap());
+    req.metadata_mut().insert("x-onto-tenant", "ws_a".parse().unwrap());
+    req.metadata_mut().insert("x-onto-act-as", "user:eve".parse().unwrap());
+    req.metadata_mut().insert("x-onto-act-roles", "member".parse().unwrap());
+    req.metadata_mut().insert("x-onto-act-entity", "person:eve".parse().unwrap());
+    assert_eq!(onto.get_entity(req).await.unwrap_err().code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn development_mode_stays_on_loopback() {
+    let intelli = Intelli::in_memory().await.unwrap();
+    let hub = onto_intelli::Hub::single(intelli);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let err =
+        onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions { dev: true }, listener, async {}).await.unwrap_err();
+    assert!(err.to_string().contains("loopback"), "{err}");
+    // Without tokens and without --dev the server refuses to start.
+    let intelli = Intelli::in_memory().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = onto_grpc::serve_on(intelli, listener, async {}).await.unwrap_err();
+    assert!(err.to_string().contains("--dev"), "{err}");
 }

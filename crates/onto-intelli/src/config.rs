@@ -28,6 +28,8 @@ pub struct Config {
     pub grpc: GrpcConfig,
     pub auth: AuthConfig,
     pub mcp: McpConfig,
+    /// The principal of callers that open the store directly (CLI, FFI).
+    pub local: LocalConfig,
     /// Who may change, propose and approve schema changes.
     pub governance: Governance,
     /// Directory relative paths are resolved against (the config file's dir).
@@ -51,6 +53,10 @@ pub struct EngineConfig {
     pub read_consistency: String,
     /// How often the follower of a shared store polls when no notice arrives.
     pub follow_interval_ms: u64,
+    /// `single`: one tenant (`engine.postgres.tenant`, or the SQLite file).
+    /// `multi`: requests choose a tenant (`x-onto-tenant`); each tenant is
+    /// its own PostgreSQL schema or SQLite file, opened on first use.
+    pub tenancy: String,
     pub postgres: PostgresConfig,
 }
 
@@ -63,6 +69,7 @@ impl Default for EngineConfig {
             ingest_queue: 1024,
             read_consistency: "eventual".into(),
             follow_interval_ms: 1_000,
+            tenancy: "single".into(),
             postgres: PostgresConfig::default(),
         }
     }
@@ -328,27 +335,56 @@ pub struct RouteConfig {
     pub workspace: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpConfig {
     /// Expose apply_action / undo_action to MCP clients.
     pub allow_writes: bool,
+    /// Who MCP clients act as. An agent by default: it reads, proposes
+    /// schema changes and (with `allow_writes`) runs action types, but never
+    /// applies or approves schema changes.
+    pub principal: Principal,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self { allow_writes: false, principal: Principal::new("mcp-agent", vec![Role::Agent], vec!["*".into()]) }
+    }
+}
+
+/// `[local]`: the CLI and in-process callers (FFI) that open the store
+/// themselves. They hold the store's credentials anyway, so this is an
+/// operator principal, not something a network caller can reach.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalConfig {
+    pub principal: Principal,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self { principal: Principal::new("local", vec![Role::Admin], vec!["*".into()]) }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
-    /// `none`: every caller is `default_principal`. `token`: bearer tokens required.
+    /// `token` (default): every gRPC/HTTP caller presents a bearer token.
+    /// `dev`: no authentication, every caller is `dev_principal`; for local
+    /// development only (refused on non-loopback addresses, or use
+    /// `onto serve --dev`).
     pub mode: String,
-    pub default_principal: Principal,
+    #[serde(alias = "default_principal")]
+    pub dev_principal: Principal,
     pub tokens: Vec<TokenConfig>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            mode: "none".into(),
-            default_principal: Principal::new("local", vec![Role::Admin], vec!["*".into()]),
+            mode: "token".into(),
+            dev_principal: Principal::new("dev", vec![Role::Admin], vec!["*".into()]),
             tokens: Vec::new(),
         }
     }
@@ -362,6 +398,22 @@ pub struct TokenConfig {
     #[serde(default)]
     pub token_env: Option<String>,
     pub principal: Principal,
+    /// A trusted service (e.g. an application backend) may act for its own
+    /// users: `x-onto-act-as`, `x-onto-act-roles`, `x-onto-act-workspaces`,
+    /// `x-onto-act-entity` then name the principal of each call, so per-user
+    /// ACLs and roles apply.
+    #[serde(default)]
+    pub impersonate: bool,
+    /// Roles an impersonating service may grant its users (never more).
+    #[serde(default)]
+    pub impersonate_roles: Vec<Role>,
+    /// Tenants this token may address (`*`: all).
+    #[serde(default = "all_tenants")]
+    pub tenants: Vec<String>,
+}
+
+fn all_tenants() -> Vec<String> {
+    vec!["*".into()]
 }
 
 impl Config {
@@ -433,6 +485,10 @@ mod tests {
     fn empty_config_uses_defaults() {
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.llm.provider, "mock");
-        assert_eq!(cfg.auth.default_principal.id, "local");
+        assert_eq!(cfg.auth.mode, "token", "authentication is on unless asked otherwise");
+        assert_eq!(cfg.local.principal.id, "local");
+        assert!(cfg.mcp.principal.is_agent());
+        let legacy = Config::from_toml("[auth]\ndefault_principal = { id = 'old', roles = ['viewer'] }\n").unwrap();
+        assert_eq!(legacy.auth.dev_principal.id, "old");
     }
 }

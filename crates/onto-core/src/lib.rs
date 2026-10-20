@@ -50,3 +50,6 @@ pub use model::*;
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use schema::{Dir, Schema};
+/// The sqlx version the PostgreSQL store is built on (hand its `PgPool` to `PgShared::from_pool`).
+#[cfg(feature = "postgres")]
+pub use sqlx;

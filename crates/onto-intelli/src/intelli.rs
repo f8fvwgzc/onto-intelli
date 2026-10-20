@@ -196,8 +196,18 @@ impl Intelli {
 
     /// Same as [`open`](Self::open) with a custom [`LlmProvider`].
     pub async fn open_with(config: Config, llm: Arc<dyn LlmProvider>) -> Result<Arc<Self>> {
-        let schema = load_schema(&config)?;
         let store = open_store(&config)?;
+        Self::open_with_store(config, store, llm).await
+    }
+
+    /// Open on a store the caller built (a tenant's `PgStore`, a shared pool,
+    /// a custom backend). The configured schema seeds the store's first version.
+    pub async fn open_with_store(
+        config: Config,
+        store: Arc<dyn Store>,
+        llm: Arc<dyn LlmProvider>,
+    ) -> Result<Arc<Self>> {
+        let schema = load_schema(&config)?;
         let onto = Ontology::open(
             schema,
             store.clone(),

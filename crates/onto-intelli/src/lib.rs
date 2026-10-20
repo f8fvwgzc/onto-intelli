@@ -31,6 +31,7 @@ pub mod context;
 pub mod conversation;
 pub mod eval;
 pub mod hash;
+pub mod hub;
 pub mod ingest;
 pub mod intelli;
 pub mod intent;
@@ -48,6 +49,7 @@ pub use onto_core::{
 };
 
 pub use config::Config;
+pub use hub::Hub;
 pub use intelli::{AnswerMode, AskEvent, AskMode, AskRequest, AskResponse, Intelli};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
