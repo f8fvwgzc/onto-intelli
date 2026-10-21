@@ -87,6 +87,11 @@ pub struct EntityInput {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Clear the state of an existing entity when `state` is unset (a
+    /// source row whose state column is null). Unset `state` alone leaves
+    /// the state as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_state: bool,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub props: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

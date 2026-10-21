@@ -1,13 +1,15 @@
 # Web UI
 
 `onto serve` serves an operator UI at `/ui`, embedded in the binary. It has
-four views:
+six views:
 
 | View | What you do there |
 |---|---|
 | **Map** | Explore the workspace graph: entities coloured by kind, kind filters, search (⌘K or `/`), click to inspect, double-click or `e` to expand a neighbourhood. **Path** traces the shortest connection between two entities; **Impact** shows what depends on an entity and its likely root cause; **History** replays the graph around the selection at any past time. |
+| **Explorer** | The Object Explorer. The start page lists every object type by category, with how many objects you can see, its backing table and its numbers of properties, links and actions (filter by name, or show only types with objects). A type opens a table of its objects: search, sortable columns (pick which ones; the choice is remembered per type in this browser), pages of 50, and a side panel of facets (click values to filter, several values of one facet mean any of them) and numeric statistics with histograms (click a bar to filter that range). Filters on the title, the state or any property are added by hand too, and stay in the address; the panel also lists the type's link types. A row opens the entity page; its action button runs an action type that takes the object (parameters, plan with checks and risk, then apply), and **New** runs a create action. ([ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md#object-explorer)) |
 | **Entities** | Browse by kind or search. Each entity page shows its properties, computed values, relations and full version history, with as-of views. |
 | **Schema** | Edit object types and typed properties, link types (from/to, cardinality, inverse), action types (parameters, preconditions, effects, roles, risk), rules and interfaces. Edits collect in a change set. Preview its impact and migrations, then **apply** it (apply roles) or **propose** it for review. Versions lists every schema version, with undo and restore. |
+| **Builder** | The ontology builder. Connectors with their crawl status and last report, **Crawl** for admins, and **Add connector** (name, `env:VAR` or URL, schemas, schedule, grants). Pick a source and **Draft**: options for tables, exclusions, a name prefix, row sync, actions and views. Review the object types (rename them, leave out types or properties), links, actions and skipped tables, each with its reason; a new name that an object type, interface or action type of the schema already has is flagged, unless that type is this table's earlier draft. **Refine with AI** (with optional instructions) shows each suggestion and whether it was kept; refining drafts afresh, so toggles reset. The advisor answers modeling questions. **Review plan** shows the `schema.plan` impact, then **Apply** (apply roles) or **Propose for review** (title and rationale, then the proposal opens). After applying, admins can crawl the source to sync its rows; a source with no registered connector says so instead. ([ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md)) |
 | **Proposals** | The review inbox: rationale, impact against today's data (re-planned when stale), diff, reviews. Approvers approve or reject; the proposer can withdraw. |
 
 It works at phone width (bottom tab bar, bottom-sheet panels), honours
@@ -86,6 +88,8 @@ session in the fragment.
 
 - `#/map?focus=<id>&mode=impact|path`
 - `#/entities/<id>`
+- `#/explore` (object types), `#/explore/<type>?q=…&sort=-prop&f=<filters as JSON>`
+- `#/build`
 - `#/schema/object_types/<name>`
 - `#/proposals/<id>`
 

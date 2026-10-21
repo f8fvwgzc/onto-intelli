@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Boxes, GitPullRequestArrow, Map as MapIcon, Search, Shapes } from "lucide-react";
+import { Blocks, Boxes, GitPullRequestArrow, Map as MapIcon, Search, Shapes, Table2 } from "lucide-react";
 
 import { call } from "../lib/api";
 import { kindColor, kindLabel } from "../lib/format";
@@ -58,8 +58,10 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     };
     const views: Item[] = [
       { key: "v:map", label: "Map", hint: "View", icon: <MapIcon className="size-4" />, run: go(["map"]) },
+      { key: "v:explore", label: "Explorer", hint: "View", icon: <Table2 className="size-4" />, run: go(["explore"]) },
       { key: "v:entities", label: "Entities", hint: "View", icon: <Boxes className="size-4" />, run: go(["entities"]) },
       { key: "v:schema", label: "Schema", hint: "View", icon: <Shapes className="size-4" />, run: go(["schema"]) },
+      { key: "v:build", label: "Builder", hint: "View", icon: <Blocks className="size-4" />, run: go(["build"]) },
       { key: "v:proposals", label: "Proposals", hint: "View", icon: <GitPullRequestArrow className="size-4" />, run: go(["proposals"]) },
     ].filter((v) => !q || v.label.toLowerCase().includes(q.toLowerCase()));
     const types: Item[] = q
@@ -73,6 +75,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
             icon: <Dot color={kindColor(k, schema)} />,
             run: go(["schema", "object_types", k]),
           }))
+          .flatMap((t) => [t, { ...t, key: `x:${t.key.slice(2)}`, hint: "Explore objects", run: go(["explore", t.key.slice(2)]) }])
       : [];
     const hits: Item[] = (results.data?.hits ?? []).map(({ entity }) => ({
       key: `e:${entity.id}`,

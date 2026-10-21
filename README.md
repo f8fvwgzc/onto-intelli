@@ -92,10 +92,11 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 
 | Capability | Try it |
 |---|---|
+| **Ontology builder** — connect a database and draft object types backed by its tables (typed properties, keys, titles, states), link types from foreign keys and join tables, and action types; refine it with the LLM, apply or propose it, sync rows into objects and browse them in the Object Explorer ([docs/ONTOLOGY_BUILDER.md](docs/ONTOLOGY_BUILDER.md)) | `onto model draft shop` · `onto model apply shop` · `onto explore order --filter state=paid` |
 | **Live schema as data** — create, change and delete object types, properties, link types, interfaces, action types, rules and metrics at runtime; every change set is validated, previewed (entities/links affected, breaking or not), migrated explicitly when it breaks data in use, versioned with diffs and point-in-time reads, audited and reversible ([docs/SCHEMA.md](docs/SCHEMA.md)) | `onto schema plan change.toml` · `onto schema apply change.toml` · `onto schema history` · `onto schema revert 2` |
 | **PostgreSQL store** (16+, with pgvector) — the durable store: versioned migrations embedded in the binary, one schema per tenant, JSONB documents, an append-only event log and history, vectors in an HNSW index. Any number of processes (replicas embedding the library, several servers) share it consistently: optimistic commits on a commit log, in-memory graph indexes refreshed through LISTEN/NOTIFY, optional read-your-writes ([docs/STORAGE.md](docs/STORAGE.md)) | `make db-up` · `onto --database-url postgres://… status` |
 | **nexc-execution vocabulary** — `extend = ["builtin:nexc-execution"]`: graphs, node types (executor, default role, stage, produces_artifact, allow_code_exec) and relation types (blocking) as validated, versioned data, read and written in nexc's shape ([docs/NEXC_EXECUTION.md](docs/NEXC_EXECUTION.md)) | `onto call execution.init_graph '{"graph":"g1"}'` |
-| **Web UI** at `/ui` — workspace map (filter, search, expand, path, impact, history slider), schema editor with impact preview and apply/propose, proposals inbox, entity browser with history; iframe-embeddable with browser sessions, works on phones ([docs/UI.md](docs/UI.md)) | `onto serve --dev` then open http://127.0.0.1:50051/ui/ |
+| **Web UI** at `/ui` — workspace map (filter, search, expand, path, impact, history slider), Object Explorer, ontology Builder, schema editor with impact preview and apply/propose, proposals inbox, entity browser with history; iframe-embeddable with browser sessions, works on phones ([docs/UI.md](docs/UI.md)) | `onto serve --dev` then open http://127.0.0.1:50051/ui/ |
 | **Benchmarked at a million entities** on PostgreSQL: graph reads in microseconds to a few ms, vector search on pgvector HNSW ~18 ms, writes ~3 ms, replication ~3 ms, 1.4 GB per replica ([docs/BENCHMARK.md](docs/BENCHMARK.md)) | `cargo run --release -p onto-bench -- --url … --entities 1000000` |
 | **Governed action types** — typed parameters, preconditions, conditional effects, roles, risk; every plan derives an inverse, so reversibility is known before running; high-risk or irreversible actions need `confirm`; atomic audit event + undo receipt | `onto do` · `onto do assign item=issue:433 assignee=person:aiko` · `onto undo <receipt>` |
 | **Natural-language commands** as gated proposals | `onto ask "Assign issue 433 to Aiko"` → proposal; add `confirm: true` to apply |
@@ -111,13 +112,14 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
 | **Graph profile** grounds prompts in patterns that exist; **drift suggestions** for data the schema doesn't cover | `onto schema profile` · `onto schema suggest` |
 | **MCP server** for agents (same permissions, writes only via action types) | `onto mcp` |
-| **Evaluation** with competency questions and evidence | `onto eval` (19/19 on the demo, 84% without the LLM) |
+| **Evaluation** with competency questions and evidence | `onto eval` (22/22 on the demo, 86% answered without the LLM) |
 | **Export** — Turtle (OWL + PROV-O provenance) and Mermaid | `onto export --format mermaid --start project:alpha` |
 
 ## A data catalog that knows what to trust
 
-Connect a database and onto-intelli maps the data estate, metadata only and
-never rows, the way Databricks Genie's knowledge layer does
+Connect a database and onto-intelli maps the data estate from its metadata,
+never its rows (unless you opt a table into [row sync](docs/ONTOLOGY_BUILDER.md#row-sync)),
+the way Databricks Genie's knowledge layer does
 ([docs/CATALOG.md](docs/CATALOG.md)):
 
 - **Connectors** crawl schemas, tables, views, columns, comments, foreign
@@ -153,8 +155,31 @@ What Genie does not offer:
 Tools: `ask`, `search`, `get_entity`, `neighbors`, `find_data`, `join_path`, `trusted_metric`,
 `authority`, `learned_facts`, `find_entities`, `explain_blockers`, `impact`, `dependencies`,
 `critical_path`, `metric`, `history`, `changes`, `experts`, `data_quality`, `what_if`,
-`list_actions`, `plan_action` (+ `apply_action`, `undo_action`, `crawl` when
-`[mcp] allow_writes = true`).
+`list_actions`, `plan_action`, `draft_ontology`, `refine_ontology`, `advise_ontology`,
+`propose_ontology`, `object_types`, `explore_objects` (+ `apply_action`, `undo_action`,
+`crawl` when `[mcp] allow_writes = true`). `propose_ontology` only ever files a proposal.
+
+## Build an ontology from your database
+
+Like Palantir's ontology builder: a crawled source becomes object types
+backed by its tables, link types from its foreign keys and join tables, and
+action types to create, edit, transition and relink objects. The draft is
+deterministic and explains every decision; the LLM can refine it and answer
+modeling questions. People with an apply role apply it, everyone else and
+every agent proposes it. Tables you opt in (`backing.sync`) become objects
+on every crawl, incrementally, and the Object Explorer filters, facets and
+summarizes them ([docs/ONTOLOGY_BUILDER.md](docs/ONTOLOGY_BUILDER.md)).
+
+```bash
+onto connect postgres env:SHOP_URL --name shop
+onto model draft shop                       # object, link and action types, each with its reason
+onto model refine shop                      # suggestions from the LLM, kept only if the schema stays valid
+onto model advise "Which link types should orders have?"
+onto model apply shop                       # a new schema version, then a crawl syncs the rows (or --propose)
+onto explore order --filter 'amount>=100' --sort=-amount
+```
+
+In the web UI: **Builder** (`#/build`) and **Explorer** (`#/explore`).
 
 ## Install
 
@@ -231,6 +256,8 @@ block and server-side refusal fallback (`fallbacks: "default"`, disable with
   history, changes, quality, duplicates/merge, scenarios, experts, profile, export, eval),
   `MemoryService`, `EventService` (incl. client-streaming `Ingest`), `AdminService`;
 * `SchemaService`: the live schema and proposals ([docs/SCHEMA.md](docs/SCHEMA.md));
+* `OntologyBuilderService` and `ObjectService`: the ontology builder and the Object Explorer
+  ([docs/ONTOLOGY_BUILDER.md](docs/ONTOLOGY_BUILDER.md));
 * gRPC reflection and `grpc.health.v1`;
 * JSON over HTTP/1.1 on the same port.
 
@@ -376,6 +403,7 @@ examples/             FFI demos, JSONL ingest sample, schema extension
 packaging/            install script, Homebrew formula; Dockerfile and CI at the root
 docs/ARCHITECTURE.md  design notes
 docs/CATALOG.md       connectors, OntoRank, learned facts
+docs/ONTOLOGY_BUILDER.md  object, link and action types from a database; row sync; Object Explorer
 docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
 ```
 

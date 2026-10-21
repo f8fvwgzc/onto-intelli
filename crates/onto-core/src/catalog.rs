@@ -139,6 +139,13 @@ pub struct ColumnInfo {
     pub primary_key: bool,
     #[serde(default)]
     pub comment: String,
+    /// The values the column may hold: the labels of a PostgreSQL enum type,
+    /// or the list of a `CHECK (col IN (…))` constraint. Empty when open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<String>,
+    /// A single-column unique constraint or unique index covers the column.
+    #[serde(default)]
+    pub unique: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -383,6 +390,10 @@ pub fn map_snapshot(snap: &CatalogSnapshot, opts: &MapOptions) -> Vec<Mapped> {
             ce.props.insert("nullable".into(), json!(c.nullable));
             ce.props.insert("position".into(), json!(c.position));
             ce.props.insert("primary_key".into(), json!(c.primary_key));
+            ce.props.insert("unique".into(), json!(c.unique));
+            if !c.enum_values.is_empty() {
+                ce.props.insert("enum_values".into(), json!(c.enum_values));
+            }
             ce.props.insert("description".into(), json!(c.comment));
             restrict(&mut ce, &list);
             out.push(Mapped { input: ce, links: Vec::new() });
@@ -539,6 +550,124 @@ impl RelationNames {
     }
 }
 
+/// Words that end a type name after `::`.
+const CAST_STOP: &[&str] = &["and", "or", "not", "in", "any", "array", "is", "like"];
+
+/// The values a single-column CHECK constraint allows `column` to take, from
+/// its definition as `pg_get_constraintdef` prints it: `CHECK ((status =
+/// ANY (ARRAY['a'::text, 'b'::text])))`, `CHECK (status IN ('a', 'b'))` or
+/// `CHECK ((status = 'a'::text))`. Empty unless the whole condition is that
+/// one comparison of the column with string literals.
+pub fn check_values(def: &str, column: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum T {
+        Word(String),
+        Lit(String),
+        Sym(char),
+        Cast,
+    }
+    let c: Vec<char> = def.trim().chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '\'' {
+            let mut lit = String::new();
+            i += 1;
+            loop {
+                match c.get(i) {
+                    None => return Vec::new(),
+                    Some('\'') if c.get(i + 1) == Some(&'\'') => {
+                        lit.push('\'');
+                        i += 2;
+                    }
+                    Some('\'') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(x) => {
+                        lit.push(*x);
+                        i += 1;
+                    }
+                }
+            }
+            toks.push(T::Lit(lit));
+        } else if ch == '"' {
+            let mut w = String::new();
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                w.push(c[i]);
+                i += 1;
+            }
+            i += 1;
+            toks.push(T::Word(w));
+        } else if ch == ':' && c.get(i + 1) == Some(&':') {
+            toks.push(T::Cast);
+            i += 2;
+        } else if ch.is_alphanumeric() || ch == '_' {
+            let start = i;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            toks.push(T::Word(c[start..i].iter().collect::<String>().to_lowercase()));
+        } else {
+            toks.push(T::Sym(ch));
+            i += 1;
+        }
+    }
+    // Casts (`::text`, `::character varying`, `::text[]`) carry no meaning here.
+    let mut clean: Vec<&T> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == T::Cast {
+            i += 1;
+            while matches!(toks.get(i), Some(T::Word(w)) if !CAST_STOP.contains(&w.as_str())) {
+                i += 1;
+            }
+            while toks.get(i) == Some(&T::Sym('[')) && toks.get(i + 1) == Some(&T::Sym(']')) {
+                i += 2;
+            }
+            continue;
+        }
+        clean.push(&toks[i]);
+        i += 1;
+    }
+    // Parentheses carry no meaning either once the shape below is checked.
+    let flat: Vec<&T> = clean.into_iter().filter(|t| !matches!(t, T::Sym('(') | T::Sym(')'))).collect();
+    let word = |i: usize, w: &str| matches!(flat.get(i), Some(T::Word(x)) if x == w);
+    if !word(0, "check") || !matches!(flat.get(1), Some(T::Word(x)) if x.eq_ignore_ascii_case(column)) {
+        return Vec::new();
+    }
+    let list_from = if word(2, "in") {
+        3
+    } else if matches!(flat.get(2), Some(T::Sym('='))) && word(3, "any") && word(4, "array") {
+        if !matches!(flat.get(5), Some(T::Sym('['))) || !matches!(flat.last(), Some(T::Sym(']'))) {
+            return Vec::new();
+        }
+        6
+    } else if matches!(flat.get(2), Some(T::Sym('='))) {
+        return match (flat.get(3), flat.len()) {
+            (Some(T::Lit(v)), 4) => vec![v.clone()],
+            _ => Vec::new(),
+        };
+    } else {
+        return Vec::new();
+    };
+    let end = if matches!(flat.last(), Some(T::Sym(']'))) { flat.len() - 1 } else { flat.len() };
+    let mut out = Vec::new();
+    for (n, t) in flat[list_from.min(end)..end].iter().enumerate() {
+        match (n % 2, t) {
+            (0, T::Lit(v)) => out.push(v.clone()),
+            (1, T::Sym(',')) => {}
+            _ => return Vec::new(),
+        }
+    }
+    out.dedup();
+    out
+}
+
 // ── incremental crawls ───────────────────────────────────────────────────
 
 /// What the previous crawl of a connector wrote: entity id → fingerprint.
@@ -577,11 +706,18 @@ fn coarse(v: &Value) -> Value {
     }
 }
 
-/// Fingerprint of an entity and its managed links (provenance excluded).
+/// The kinds whose [`COARSE`] properties are usage statistics.
+const STAT_KINDS: &[&str] = &["data_source", "db_schema", "table", "view", "column", "query"];
+
+/// Fingerprint of an entity, its state and its managed links (provenance
+/// excluded).
+/// Objects synced from rows keep every property exact: a `calls` column of
+/// a table is data, not a usage statistic.
 pub fn fingerprint(m: &Mapped) -> u64 {
+    let stats = STAT_KINDS.contains(&m.input.kind.as_str());
     let mut props = Map::new();
     for (k, v) in &m.input.props {
-        let v = if COARSE.contains(&k.as_str()) {
+        let v = if stats && COARSE.contains(&k.as_str()) {
             if k == "last_activity" { json!(v.as_i64().unwrap_or(0) / 86_400_000) } else { coarse(v) }
         } else {
             v.clone()
@@ -591,17 +727,29 @@ pub fn fingerprint(m: &Mapped) -> u64 {
     let mut links: Vec<String> =
         m.links.iter().map(|l| format!("{}|{}|{}|{}", l.from, l.rel, l.to, Value::Object(l.props.clone()))).collect();
     links.sort();
-    let doc = json!({
+    let mut doc = json!({
         "kind": m.input.kind, "title": m.input.title, "ws": m.input.workspace,
         "aliases": m.input.aliases, "props": props, "links": links,
     });
+    // The state only when it is set or cleared, so entities without one
+    // keep the fingerprints they had.
+    if m.input.state.is_some() || m.input.clear_state {
+        doc["state"] = json!(m.input.state);
+    }
     fnv(doc.to_string().as_bytes(), 0xcbf2_9ce4_8422_2325)
 }
 
 /// Compare a crawl with the previous one and the graph: upsert what
 /// changed, delete what vanished (only entities this connector wrote), and
-/// remove managed links the source no longer has.
-pub fn plan_changes(mapped: Vec<Mapped>, previous: &Fingerprints, graph: &Graph) -> CrawlPlan {
+/// remove links of `managed_rels` the source no longer has.
+///
+/// Catalog crawls pass [`MANAGED_RELS`]; links of those relations are only
+/// removed when they point at an entity the crawl wrote, so curated links
+/// to other entities survive. Any other relation named in `managed_rels`
+/// (link types backed by a foreign key column) belongs to the caller
+/// entirely: a link of it that the source no longer has is removed
+/// wherever it points.
+pub fn plan_changes(mapped: Vec<Mapped>, previous: &Fingerprints, graph: &Graph, managed_rels: &[&str]) -> CrawlPlan {
     let mut plan = CrawlPlan::default();
     let seen: HashSet<String> = mapped.iter().map(|m| m.id().to_string()).collect();
     let mut links_after: Vec<LinkInput> = Vec::new();
@@ -616,9 +764,10 @@ pub fn plan_changes(mapped: Vec<Mapped>, previous: &Fingerprints, graph: &Graph)
         // Managed links the source dropped.
         let want: HashSet<(String, String)> =
             m.links.iter().filter(|l| l.from == id).map(|l| (l.rel.clone(), l.to.clone())).collect();
-        for rel in MANAGED_RELS {
+        for rel in managed_rels {
+            let owned = !MANAGED_RELS.contains(rel);
             for to in graph.neighbors(&id, rel, Dir::Out) {
-                if !want.contains(&(rel.to_string(), to.to_string())) && previous.contains_key(to) {
+                if !want.contains(&(rel.to_string(), to.to_string())) && (owned || previous.contains_key(to)) {
                     plan.mutations.push(Mutation::Unlink(LinkInput::new(&id, *rel, to)));
                     plan.links_removed += 1;
                 }
@@ -1112,10 +1261,50 @@ mod tests {
     }
 
     #[test]
+    fn check_constraints_yield_value_lists() {
+        let v = |def: &str, col: &str| check_values(def, col);
+        assert_eq!(
+            v("CHECK ((status = ANY (ARRAY['placed'::text, 'paid'::text, 'it''s'::text])))", "status"),
+            ["placed", "paid", "it's"]
+        );
+        assert_eq!(
+            v("CHECK (((kind)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))", "kind"),
+            ["a", "b"]
+        );
+        assert_eq!(v("CHECK (status IN ('open', 'closed'))", "status"), ["open", "closed"]);
+        assert_eq!(v("CHECK ((\"Status\" = 'on'::text))", "Status"), ["on"]);
+        assert!(v("CHECK ((qty > 0))", "qty").is_empty());
+        assert!(v("CHECK ((status = ANY (ARRAY['a'::text])) AND (qty > 0))", "status").is_empty());
+        assert!(v("CHECK ((status = ANY (ARRAY['a'::text, 'b'::text])))", "other").is_empty());
+        assert!(v("CHECK ((prio = ANY (ARRAY[1, 2])))", "prio").is_empty(), "string literals only");
+    }
+
+    #[test]
+    fn columns_carry_value_lists_and_uniqueness() {
+        let mut snap = snapshot();
+        snap.relations[0].columns[1].enum_values = vec!["emea".into(), "apac".into()];
+        snap.relations[0].columns[0].unique = true;
+        let m = map_snapshot(&snap, &MapOptions { workspace: "acme".into(), ..Default::default() });
+        let get = |id: &str| m.iter().find(|x| x.id() == id).unwrap();
+        let region = &get("column:wh.sales.customers.region").input.props;
+        assert_eq!(region["enum_values"], json!(["emea", "apac"]));
+        assert_eq!(region["unique"], false);
+        assert_eq!(get("column:wh.sales.customers.id").input.props["unique"], true);
+        assert!(!get("column:wh.sales.orders.amount").input.props.contains_key("enum_values"));
+        let mut schema = crate::schema::Schema::enterprise();
+        schema.extend_toml(crate::schema::DATA_CATALOG_SCHEMA).unwrap();
+        for x in &m {
+            schema
+                .validate_entity(&x.input.kind, None, &x.input.props, true, true)
+                .unwrap_or_else(|e| panic!("{}: {e}", x.id()));
+        }
+    }
+
+    #[test]
     fn crawls_write_only_what_changed() {
         let opts = MapOptions { workspace: "acme".into(), connector: "wh".into(), ..Default::default() };
         let mut g = Graph::default();
-        let first = plan_changes(map_snapshot(&snapshot(), &opts), &Fingerprints::new(), &g);
+        let first = plan_changes(map_snapshot(&snapshot(), &opts), &Fingerprints::new(), &g, MANAGED_RELS);
         assert_eq!(first.unchanged, 0);
         assert!(first.upserted >= 8);
         for id in first.fingerprints.keys() {
@@ -1125,12 +1314,12 @@ mod tests {
         // Busier, but within the same power of two: nothing to write.
         let mut snap = snapshot();
         snap.queries[0].calls = 1000;
-        let again = plan_changes(map_snapshot(&snap, &opts), &first.fingerprints, &g);
+        let again = plan_changes(map_snapshot(&snap, &opts), &first.fingerprints, &g, MANAGED_RELS);
         assert_eq!(again.upserted, 0, "{:?}", again.mutations);
         // A comment changes and a column is dropped.
         snap.relations[0].comment = "Customers, deduplicated".into();
         snap.relations[0].columns.pop();
-        let third = plan_changes(map_snapshot(&snap, &opts), &first.fingerprints, &g);
+        let third = plan_changes(map_snapshot(&snap, &opts), &first.fingerprints, &g, MANAGED_RELS);
         assert_eq!(third.upserted, 1);
         assert_eq!(third.deleted, 1, "the dropped column");
     }

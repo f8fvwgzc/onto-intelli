@@ -259,6 +259,7 @@ pub fn try_answer(
         Intent::DataLocation => data_location(onto, p, ws, question),
         Intent::JoinPath => join_answer(onto, p, ws, question, &confident),
         Intent::TrustedMetric => trusted_metric(onto, p, ws, question, &schema),
+        Intent::Model => crate::modeling::model_answer(onto, p, question),
         Intent::Count | Intent::List => {
             let kind = c.kind.clone()?;
             let scope = confident

@@ -874,6 +874,7 @@ mod tests {
             catalog::map_snapshot(&snap, &opts),
             &Default::default(),
             &crate::graph::Graph::default(),
+            catalog::MANAGED_RELS,
         );
         let ctx = ActionContext::new(Principal::admin("crawler"), "acme");
         o.apply(&ctx, plan.mutations).unwrap();

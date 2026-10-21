@@ -39,6 +39,7 @@ pub mod intent;
 pub mod llm;
 pub mod mcp;
 pub mod memory;
+pub mod modeling;
 pub mod resolve;
 pub mod seed;
 pub mod token;

@@ -531,7 +531,7 @@ impl Ontology {
         self.inner.graph.read()
     }
 
-    fn reader(&self, p: &Principal) -> Result<RwLockReadGuard<'_, Graph>> {
+    pub(crate) fn reader(&self, p: &Principal) -> Result<RwLockReadGuard<'_, Graph>> {
         if !p.allows(Access::Read) {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
         }
@@ -1395,6 +1395,9 @@ impl Ontology {
                             && (!fill || e.state.is_none())
                         {
                             e.state = Some(s.clone());
+                            changed.push("state".into());
+                        } else if input.state.is_none() && input.clear_state && e.state.is_some() && !fill {
+                            e.state = None;
                             changed.push("state".into());
                         }
                         if input.replace {

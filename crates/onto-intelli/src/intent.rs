@@ -43,6 +43,8 @@ pub enum Intent {
     JoinPath,
     /// "Which revenue metric is the trusted one?"
     TrustedMetric,
+    /// "What object types can we create from the warehouse?"
+    Model,
 }
 
 impl Intent {
@@ -72,6 +74,7 @@ impl Intent {
             Intent::DataLocation => "data_location",
             Intent::JoinPath => "join_path",
             Intent::TrustedMetric => "trusted_metric",
+            Intent::Model => "model",
         }
     }
 }
@@ -149,6 +152,29 @@ const NOT_GROUP_BY: &[&str] = &[
     "required",
     "caused",
     "used",
+];
+
+/// Modeling questions: which object, link, action or property types a data
+/// source should become.
+const MODEL_WORDS: &[&str] = &[
+    " object type",
+    " link type",
+    " action type",
+    " property type",
+    " column type",
+    " ontology ",
+    " ontologies ",
+    " model the ",
+    " model our ",
+    " model my ",
+    " model these ",
+    " model this ",
+    " to model ",
+    " should i model ",
+    " should we model ",
+    " data model ",
+    " modeling ",
+    " modelling ",
 ];
 
 /// Which action type an imperative starts with (longest phrase wins).
@@ -273,6 +299,8 @@ pub fn classify(question: &str, schema: &Schema) -> Classified {
         Intent::Command
     } else if whatif {
         Intent::WhatIf
+    } else if has_any(&q, MODEL_WORDS) {
+        Intent::Model
     } else if has_any(&q, &[" join ", " joins ", " joined ", " joining "])
         && has_any(&q, &[" to ", " with ", " and ", " on "])
         && !has_any(&q, &[" team ", " project ", " meeting ", " channel ", " company ", " call "])
@@ -576,5 +604,15 @@ mod tests {
         assert_ne!(c("When did Aiko join the team?").intent, Intent::JoinPath);
         assert_ne!(c("Where is Kenji?").intent, Intent::DataLocation);
         assert_eq!(c("What is the deployment failure rate?").intent, Intent::Metric);
+    }
+
+    #[test]
+    fn classifies_modeling_questions() {
+        assert_eq!(c("What object types can we create from the warehouse?").intent, Intent::Model);
+        assert_eq!(c("How should I model the sales tables?").intent, Intent::Model);
+        assert_eq!(c("Which link types should orders have?").intent, Intent::Model);
+        assert_eq!(c("What column types does the orders table get in the ontology?").intent, Intent::Model);
+        assert_eq!(c("How do orders join to customers?").intent, Intent::JoinPath);
+        assert_ne!(c("What is the status of the pricing model?").intent, Intent::Model);
     }
 }

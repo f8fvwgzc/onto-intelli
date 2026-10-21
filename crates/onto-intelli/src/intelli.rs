@@ -724,7 +724,7 @@ impl Intelli {
     }
 
     /// LLM call with the completion cache (memory, then store).
-    async fn complete(
+    pub(crate) async fn complete(
         &self,
         req: &LlmRequest,
         sink: Option<&mpsc::Sender<AskEvent>>,

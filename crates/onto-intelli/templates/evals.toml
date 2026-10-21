@@ -117,3 +117,26 @@ name = "asset owner"
 question = "Who owns the revenue_recognized view?"
 expect = ["Finance Team"]
 expect_mode = "deterministic"
+
+# The ontology builder: object, link and property types drafted from the warehouse.
+
+[[case]]
+name = "model object types"
+question = "What object types can we create from the warehouse?"
+expect = ["customer", "order", "sales.orders"]
+expect_mode = "deterministic"
+expect_intent = "model"
+
+[[case]]
+name = "model link types"
+question = "Which link types should orders have?"
+expect = ["order → customer", "customer_id"]
+expect_mode = "deterministic"
+expect_intent = "model"
+
+[[case]]
+name = "model column types"
+question = "Which column types do customers get in the ontology?"
+expect = ["created_at timestamp"]
+expect_mode = "deterministic"
+expect_intent = "model"

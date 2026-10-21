@@ -40,13 +40,13 @@ refused, which gives you optimistic concurrency for editors.
 
 | op | fields | notes |
 |---|---|---|
-| `put_object_type` | `name`, `def`, `migrations?` | create or replace; `def` is an object type (`label`, `description`, `color`, `icon`, `category`, `extends`, `properties`, `states`, `terminal_states`, `alert_states`, `implements`, `derived`, `constraints`) |
+| `put_object_type` | `name`, `def`, `migrations?` | create or replace; `def` is an object type (`label`, `description`, `color`, `icon`, `category`, `extends`, `properties`, `states`, `terminal_states`, `alert_states`, `implements`, `derived`, `constraints`, `backing`: the table its objects come from, see [ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md#backing-in-the-schema)) |
 | `delete_object_type` | `name`, `migrations?` | |
 | `rename_object_type` | `from`, `to` | rewrites references; entity ids move from `from:key` to `to:key` and the old ids redirect |
 | `put_property` | `object_type`, `name`, `def`, `migrations?` | `def`: `type` (string, text, int, float, bool, timestamp, enum, list, json), `required`, `values`, `searchable`, `description` |
 | `delete_property` | `object_type`, `name`, `migrations?` | |
 | `rename_property` | `object_type`, `from`, `to` | moves the values |
-| `put_link_type` | `name`, `def`, `migrations?` | `from`/`to` kinds or interfaces (empty means any), `inverse`, `cardinality` (`many`/`one`), `dependency`, `symmetric`, `provenance`, `weight`, `label` |
+| `put_link_type` | `name`, `def`, `migrations?` | `from`/`to` kinds or interfaces (empty means any), `inverse`, `cardinality` (`many`/`one`), `dependency`, `symmetric`, `provenance`, `weight`, `label`, `backing` (a join table) |
 | `delete_link_type` | `name`, `migrations?` | |
 | `rename_link_type` | `from`, `to` | moves links; rewrites rules, interfaces, glossary, constraints, metrics, actions |
 | `put_interface` / `delete_interface` | `name`, `def` | |
@@ -57,6 +57,13 @@ refused, which gives you optimistic concurrency for editors.
 | `set_analysis` | `def` | root-cause, impact, scope and containment relations |
 
 New names must match `[a-z][a-z0-9_]*`.
+
+You do not have to write a change set by hand to model a database:
+`onto model draft <connector>` drafts one from the crawled catalog (object
+types backed by tables, link types from foreign keys and join tables,
+action types), and `onto model apply` applies it or files it as a proposal
+through the same steps as any other change set
+([ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md)).
 
 ## Impact and breaking changes
 
@@ -173,6 +180,8 @@ Roles are the built-ins (`viewer`, `member`, `agent`, `admin`, `system`) or
 any custom name (`schema_admin`, `approver`). Principals with the `agent`
 role never apply or approve schema changes, whatever other roles they hold;
 they file proposals. Denied attempts are audited as `authorization.denied`.
+The ontology builder follows the same rule: `ontology.apply_draft` refuses
+agents that ask to apply, and the MCP tool `propose_ontology` only proposes.
 
 ## Proposals
 

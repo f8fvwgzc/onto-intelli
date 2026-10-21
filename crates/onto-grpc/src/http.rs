@@ -20,6 +20,12 @@
 //! * `POST /v1/schema/proposals/{id}/{approve|reject|comment|withdraw|revise}`
 //! * `GET  /v1/execution/graphs`  nexc graphs; `POST` creates one (starter vocabulary)
 //! * `GET|PUT /v1/execution/graphs/{graph}/vocabulary`  node and relation types
+//! * `POST /v1/ontology/draft`   draft object, link and action types from a source
+//! * `POST /v1/ontology/refine`  the draft refined by the LLM
+//! * `POST /v1/ontology/advise`  modeling advice `{question, source?}`
+//! * `POST /v1/ontology/apply`   apply a draft, or `{mode: "propose"}` file it
+//! * `GET  /v1/objects/types`    object types with counts (`?workspace=`)
+//! * `POST /v1/objects/explore`  Object Explorer: filters, facets, statistics
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities
@@ -85,6 +91,12 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/catalog/rerank", post(catalog_rerank))
         .route("/v1/catalog/facts", get(facts_list))
         .route("/v1/catalog/facts/{id}/{verb}", post(fact_verb))
+        .route("/v1/ontology/draft", post(ontology_draft))
+        .route("/v1/ontology/refine", post(ontology_refine))
+        .route("/v1/ontology/advise", post(ontology_advise))
+        .route("/v1/ontology/apply", post(ontology_apply))
+        .route("/v1/objects/types", get(object_types))
+        .route("/v1/objects/explore", post(objects_explore))
         .with_state(AppState { hub, auth })
 }
 
@@ -514,4 +526,32 @@ async fn fact_verb(
         m.insert("id".into(), Value::String(id));
     }
     run(&s, &headers, action, input).await
+}
+
+async fn ontology_draft(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "ontology.draft", body_or_empty(body)).await
+}
+
+async fn ontology_refine(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "ontology.refine", body_or_empty(body)).await
+}
+
+async fn ontology_advise(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "ontology.advise", body_or_empty(body)).await
+}
+
+async fn ontology_apply(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "ontology.apply_draft", body_or_empty(body)).await
+}
+
+async fn object_types(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "objects.types", text_query(q)).await
+}
+
+async fn objects_explore(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "objects.explore", body_or_empty(body)).await
 }

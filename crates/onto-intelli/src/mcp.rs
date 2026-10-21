@@ -40,6 +40,19 @@ fn schema_change_props() -> Value {
     })
 }
 
+fn draft_props() -> Value {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    json!({
+        "source": s("Data source (connector name); the only crawled source when omitted"),
+        "tables": { "type": "array", "items": { "type": "string" }, "description": "schema.table names or globs (sales.*); all when omitted" },
+        "exclude": { "type": "array", "items": { "type": "string" }, "description": "Globs to leave out (default staging.*, *_tmp, *_old, *_bak, *_backup)" },
+        "prefix": s("Put before every object type name"),
+        "sync": { "type": "boolean", "description": "Materialize rows as objects (default true)" },
+        "actions": { "type": "boolean", "description": "Generate action types (default true)" },
+        "views": { "type": "boolean", "description": "Model views too" }
+    })
+}
+
 /// (tool name, engine action, description, input schema, writes)
 fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
     let s = |d: &str| json!({ "type": "string", "description": d });
@@ -277,6 +290,83 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             false,
         ),
         (
+            "draft_ontology",
+            "ontology.draft",
+            "Draft an ontology from a crawled data source, the way Palantir's ontology builder starts one: an object type per table (key, title, typed properties, states), link types from foreign keys and join tables, and create/edit/transition/relink action types, each with its reason. Read-only.",
+            obj(draft_props(), &[]),
+            false,
+        ),
+        (
+            "refine_ontology",
+            "ontology.refine",
+            "The draft improved by the server's language model (names, labels, descriptions, property types, inverses, transitions). Suggestions that would make the schema invalid are rejected and reported. Read-only.",
+            obj(
+                {
+                    let mut p = draft_props();
+                    p["instructions"] = s("What to pay attention to, e.g. 'use the names the sales team uses'");
+                    p
+                },
+                &[],
+            ),
+            false,
+        ),
+        (
+            "advise_ontology",
+            "ontology.advise",
+            "Modeling advice grounded in the draft: which tables become object types, which links and actions they get, which property types columns map to, and why.",
+            obj(
+                json!({ "question": s("The modeling question"), "source": s("Data source (connector name)") }),
+                &["question"],
+            ),
+            false,
+        ),
+        (
+            "propose_ontology",
+            "ontology.apply_draft",
+            "File the drafted ontology (or a reviewed `draft` object from draft_ontology/refine_ontology) as a schema change proposal. It is applied only when a person approves it; agents never apply schema.",
+            obj(
+                {
+                    let mut p = draft_props();
+                    p["draft"] = json!({ "type": "object", "description": "A draft returned by draft_ontology or refine_ontology, possibly edited" });
+                    p["title"] = s("Short title");
+                    p["rationale"] = s("Why the ontology is needed, with the evidence");
+                    p
+                },
+                &[],
+            ),
+            false,
+        ),
+        (
+            "object_types",
+            "objects.types",
+            "Object types with how many objects you can see, their backing table, properties, links and actions.",
+            obj(json!({ "workspace": s("Workspace") }), &[]),
+            false,
+        ),
+        (
+            "explore_objects",
+            "objects.explore",
+            "Object Explorer: the objects of one type, filtered, searched, sorted and paged, with facet counts and numeric statistics.",
+            obj(
+                json!({
+                    "kind": s("Object type or interface"),
+                    "filters": { "type": "array", "description": "Conditions that must all hold", "items": { "type": "object", "properties": {
+                        "prop": s("Property, state, title, workspace, id, created_at, updated_at or link:<rel> (a property of the same name wins; _state, _created_at and so on always name the metadata)"),
+                        "op": { "type": "string", "enum": ["eq", "ne", "in", "gt", "gte", "lt", "lte", "contains", "exists", "missing"] },
+                        "value": { "description": "Compared value (a list for in)" } }, "required": ["prop", "op"] } },
+                    "search": s("Full-text search within the type"),
+                    "sort": s("prop ascending or -prop descending"),
+                    "workspace": s("Only objects of this workspace; empty explores every workspace you may read"),
+                    "facets": { "type": "array", "items": { "type": "string" }, "description": "Fields to count values of; omitted picks the state, enum, bool and low-cardinality string properties" },
+                    "stats": { "type": "array", "items": { "type": "string" }, "description": "Properties to summarize (count, min, max, mean, sum, histogram); omitted picks the int, float and timestamp properties" },
+                    "limit": { "type": "integer" },
+                    "offset": { "type": "integer" }
+                }),
+                &["kind"],
+            ),
+            false,
+        ),
+        (
             "list_proposals",
             "schema.proposals",
             "Schema change proposals with status (open, applied, rejected, failed, withdrawn), approvals and impact.",
@@ -344,7 +434,8 @@ impl McpServer {
             }
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
-                let mut args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                // Absent and null arguments are both "no arguments".
+                let mut args = params.get("arguments").cloned().filter(|a| !a.is_null()).unwrap_or_else(|| json!({}));
                 let Some((_, action, _, _, writes)) = tools().into_iter().find(|t| t.0 == name) else {
                     return Some(Self::error(&id, -32602, &format!("unknown tool {name}")));
                 };
@@ -359,6 +450,18 @@ impl McpServer {
                 }
                 if name == "propose_schema_change" && args.get("source").is_none() {
                     args["source"] = json!("mcp");
+                }
+                // Agents never apply schema: an ontology from MCP is always a
+                // proposal, filed whatever the arguments say (no preview).
+                if name == "propose_ontology" {
+                    let Some(m) = args.as_object_mut() else {
+                        return Some(Self::error(&id, -32602, "propose_ontology takes an object of arguments"));
+                    };
+                    for k in ["propose", "preview", "no_crawl"] {
+                        m.remove(k);
+                    }
+                    m.insert("mode".into(), json!("propose"));
+                    m.insert("proposal_source".into(), json!("mcp"));
                 }
                 match self.intelli.call(&self.principal, action, args).await {
                     Ok(v) => {

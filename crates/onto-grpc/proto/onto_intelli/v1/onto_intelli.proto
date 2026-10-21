@@ -702,3 +702,76 @@ service AdminService {
   rpc Actions(google.protobuf.Empty) returns (google.protobuf.Struct);
   rpc Call(CallRequest) returns (CallResponse);
 }
+
+// ── Ontology builder: object, link and action types from a data source ──────
+// A draft is deterministic (tables → object types, foreign keys and join
+// tables → link types, edits → action types, each with its reason); the
+// LLM refines it and answers modeling questions; people apply it, agents
+// propose it. Proto3 drops false values, hence the negative flags.
+
+message DraftRequest {
+  string source = 1;              // connector name; empty: the only crawled source
+  repeated string tables = 2;     // schema.table names or globs (sales.*); empty: all
+  repeated string exclude = 3;    // globs to leave out; empty: staging.*, *_tmp, *_old, *_bak, *_backup
+  bool no_default_exclude = 4;    // exclude only what `exclude` lists
+  string prefix = 5;              // put before every object type name
+  bool no_sync = 6;               // do not materialize rows as objects
+  bool no_actions = 7;            // no action types
+  bool views = 8;                 // model views too
+  string instructions = 9;        // RefineOntology: what the model should pay attention to
+  string workspace = 10;
+}
+
+message AdviseRequest {
+  string question = 1;
+  string source = 2;              // empty: the source the question names, or the only one
+}
+
+message ApplyDraftRequest {
+  string source = 1;
+  repeated string tables = 2;
+  repeated string exclude = 3;
+  bool no_default_exclude = 4;
+  string prefix = 5;
+  bool no_sync = 6;
+  bool no_actions = 7;
+  bool views = 8;
+  google.protobuf.Struct draft = 9;   // a reviewed draft; drafted afresh when absent
+  bool propose = 10;              // file a proposal instead of applying (agents must)
+  string title = 11;
+  string rationale = 12;
+  bool no_crawl = 13;             // do not crawl the source after applying
+  string workspace = 14;
+  bool preview = 15;              // apply nothing: return the draft with its change set rebuilt
+  string proposal_source = 16;    // where a proposal comes from; ontology.apply_draft by default
+}
+
+service OntologyBuilderService {
+  rpc DraftOntology(DraftRequest) returns (google.protobuf.Struct);
+  rpc RefineOntology(DraftRequest) returns (google.protobuf.Struct);
+  rpc AdviseOntology(AdviseRequest) returns (google.protobuf.Struct);
+  rpc ApplyDraft(ApplyDraftRequest) returns (google.protobuf.Struct);
+}
+
+// ── Object Explorer ──────────────────────────────────────────────────────
+
+message ObjectTypesRequest {
+  string workspace = 1;
+}
+
+message ExploreRequest {
+  string kind = 1;                // object type or interface
+  string workspace = 2;
+  string search = 3;
+  repeated google.protobuf.Struct filters = 4;  // {prop, op: eq|ne|in|gt|gte|lt|lte|contains|exists|missing, value}
+  string sort = 5;                // prop ascending, -prop descending; _title, _state, _created_at, ... always name object fields
+  uint32 limit = 6;               // default 50, at most 1000
+  uint32 offset = 7;
+  repeated string facets = 8;     // empty: automatic
+  repeated string stats = 9;      // empty: automatic
+}
+
+service ObjectService {
+  rpc ObjectTypes(ObjectTypesRequest) returns (google.protobuf.Struct);
+  rpc Explore(ExploreRequest) returns (google.protobuf.Struct);
+}

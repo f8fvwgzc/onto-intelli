@@ -62,9 +62,11 @@ async fn crawls_metadata_grants_joins_and_answers() {
             format!("CREATE TABLE {src}.customers (id bigint PRIMARY KEY, cust_name text, region text)"),
             format!("COMMENT ON TABLE {src}.customers IS 'One row per customer'"),
             format!("COMMENT ON COLUMN {src}.customers.id IS 'Customer id'"),
+            format!("CREATE TYPE {src}.order_channel AS ENUM ('web', 'store')"),
             format!(
                 "CREATE TABLE {src}.orders (id bigint PRIMARY KEY, customer_id bigint REFERENCES {src}.customers(id), \
-                 amount numeric(12,2), status text)"
+                 amount numeric(12,2), status text CHECK (status IN ('placed', 'paid', 'refunded')), \
+                 channel {src}.order_channel, ref text UNIQUE)"
             ),
             format!("COMMENT ON TABLE {src}.orders IS 'One row per order'"),
             format!("COMMENT ON COLUMN {src}.orders.amount IS 'Order total, also known as GMV'"),
@@ -145,6 +147,25 @@ async fn crawls_metadata_grants_joins_and_answers() {
     assert_eq!(e["provenance"]["source"], "connector:postgres");
     let c_ent = o.call(&admin, "entity.get", json!({ "id": customers })).await.unwrap();
     assert_eq!(c_ent["props"]["visibility"], "internal", "PUBLIC can read customers");
+    // Value lists from CHECK constraints and enum types, unique columns.
+    let column = |name: &str| format!("column:src.{src}.orders.{name}");
+    let status = o.call(&admin, "entity.get", json!({ "id": column("status") })).await.unwrap();
+    assert_eq!(status["props"]["enum_values"], json!(["placed", "paid", "refunded"]), "{status}");
+    let channel = o.call(&admin, "entity.get", json!({ "id": column("channel") })).await.unwrap();
+    assert_eq!(channel["props"]["enum_values"], json!(["web", "store"]), "{channel}");
+    let reference = o.call(&admin, "entity.get", json!({ "id": column("ref") })).await.unwrap();
+    assert_eq!(reference["props"]["unique"], true);
+    assert_eq!(status["props"]["unique"], false);
+    // The draft models them: states from the CHECK list, an enum property.
+    let draft =
+        o.ontology().draft_ontology(&admin, &onto_intelli::core::modeling::DraftOptions::for_source("src")).unwrap();
+    let order = draft.object("order").unwrap_or_else(|| panic!("{draft:?}"));
+    assert_eq!(order.states, ["placed", "paid", "refunded"]);
+    assert!(order.properties.iter().any(|p| p.name == "channel" && p.values == ["web", "store"]));
+    assert!(order.properties.iter().any(|p| p.name == "ref" && p.unique));
+    assert!(draft.links.iter().any(|l| l.name == "customer" && l.to == "customer"), "{:?}", draft.links);
+    let plan = o.ontology().schema_plan(&admin, &draft.changes).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
     let reads = o.call(&admin, "graph.neighbors", json!({ "id": view, "rel": "reads_from" })).await.unwrap();
     assert!(reads.to_string().contains(&orders), "the view reads orders: {reads}");
 

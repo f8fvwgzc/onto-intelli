@@ -367,7 +367,13 @@ pub fn load_demo_warehouse(intelli: &Intelli, workspace: &str) -> Result<crate::
         "workspace": workspace,
         "owner_map": { "finance_owner": "team:finance", "sales_owner": "team:payments" },
     }))?;
-    let report = crate::connectors::ingest_snapshot(onto, &spec, demo_warehouse(), onto_core::time::now_ms())?;
+    let report = crate::connectors::ingest_snapshot(
+        onto,
+        &spec,
+        demo_warehouse(),
+        Default::default(),
+        onto_core::time::now_ms(),
+    )?;
     let lead = Principal::named("finance-lead", &["admin"], &["*"])?;
     if let Some(fact) = onto
         .learned_facts(&lead, Some("metric"), Some("suggested"), None, 100)?

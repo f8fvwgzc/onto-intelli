@@ -279,6 +279,32 @@ enum Command {
         #[arg(long)]
         relearn: bool,
     },
+    /// Build an ontology from a crawled data source: draft object, link and
+    /// action types, refine them with the LLM, ask for advice, apply or propose.
+    Model {
+        #[command(subcommand)]
+        sub: ModelCmd,
+    },
+    /// Object Explorer: object types with counts, or the objects of one type.
+    Explore {
+        /// Object type (or interface); none lists the types.
+        kind: Option<String>,
+        /// Conditions (repeatable): prop=value, prop!=value, prop=a,b (any of), prop>n, prop>=n,
+        /// prop<n, prop<=n, prop~text (contains), prop? (set), !prop (missing), link:rel=id.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
+        #[arg(long)]
+        search: Option<String>,
+        /// prop ascending, -prop descending.
+        #[arg(long)]
+        sort: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compile configured proto files and print the gRPC route table.
     Protos,
     /// Graph, memory, cache and token statistics.
@@ -356,6 +382,222 @@ enum SchemaCmd {
     },
     /// Withdraw an open or failed proposal.
     Withdraw { id: String },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Draft object, link and action types from a source's catalog, with the reasons.
+    Draft {
+        /// Connector name (default: the only crawled source).
+        source: Option<String>,
+        #[command(flatten)]
+        opts: DraftArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The draft refined by the LLM; suggestions that break the schema are rejected.
+    Refine {
+        source: Option<String>,
+        #[command(flatten)]
+        opts: DraftArgs,
+        /// What the model should pay attention to.
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Modeling advice grounded in the draft.
+    Advise {
+        question: Vec<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply the draft as a new schema version (apply roles), or file it as a proposal.
+    Apply {
+        source: Option<String>,
+        #[command(flatten)]
+        opts: DraftArgs,
+        /// File a proposal for review instead of applying.
+        #[arg(long)]
+        propose: bool,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        rationale: Option<String>,
+        /// Do not crawl the source after applying.
+        #[arg(long)]
+        no_crawl: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct DraftArgs {
+    /// Tables to model, schema.table or globs (repeatable; default: all).
+    #[arg(long = "table")]
+    tables: Vec<String>,
+    /// Tables to leave out, globs (repeatable; default: staging.*, *_tmp, *_old, *_bak, *_backup).
+    #[arg(long)]
+    exclude: Vec<String>,
+    /// Put before every object type name.
+    #[arg(long)]
+    prefix: Option<String>,
+    /// Do not materialize rows as objects.
+    #[arg(long)]
+    no_sync: bool,
+    /// No action types.
+    #[arg(long)]
+    no_actions: bool,
+    /// Model views too.
+    #[arg(long)]
+    views: bool,
+}
+
+impl DraftArgs {
+    fn input(&self, source: &Option<String>) -> Value {
+        let mut v = json!({
+            "source": source,
+            "tables": self.tables,
+            "prefix": self.prefix,
+            "no_sync": self.no_sync,
+            "no_actions": self.no_actions,
+            "views": self.views,
+        });
+        if !self.exclude.is_empty() {
+            v["exclude"] = json!(self.exclude);
+        }
+        v
+    }
+}
+
+fn s_of(v: &Value) -> &str {
+    v.as_str().unwrap_or_default()
+}
+
+/// "1 link type", "3 link types".
+fn n_of(n: u64, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+fn print_draft(st: &Style, d: &Value) {
+    let count = |k: &str| d[k].as_array().map(Vec::len).unwrap_or(0);
+    println!(
+        "Draft from {}: {} · {} · {}",
+        st.bold(s_of(&d["source"])),
+        n_of(count("objects") as u64, "object type"),
+        n_of(count("links") as u64, "link type"),
+        n_of(count("actions") as u64, "action type")
+    );
+    for o in d["objects"].as_array().into_iter().flatten() {
+        let key: Vec<&str> = o["key"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut head = format!(
+            "key {} · title {} · {}",
+            key.join(", "),
+            o["title"].as_str().unwrap_or("none"),
+            s_of(&o["category"])
+        );
+        if let Some(states) = o["states"].as_array().filter(|a| !a.is_empty()) {
+            let states: Vec<&str> = states.iter().filter_map(Value::as_str).collect();
+            head.push_str(&format!(" · states {}", states.join("|")));
+        }
+        println!(
+            "\n{} {} ← {}  {}",
+            st.bold(s_of(&o["name"])),
+            s_of(&o["label"]),
+            s_of(&o["table"]),
+            st.dim(&format!("{head} · confidence {:.2}", o["confidence"].as_f64().unwrap_or(0.0)))
+        );
+        for p in o["properties"].as_array().into_iter().flatten() {
+            let mut flags = Vec::new();
+            for f in ["required", "unique", "searchable"] {
+                if p[f] == true {
+                    flags.push(f);
+                }
+            }
+            println!(
+                "    {:<22} {:<10} {:<20} {}",
+                s_of(&p["name"]),
+                st.cyan(s_of(&p["ty"])),
+                s_of(&p["data_type"]),
+                st.dim(&format!("{} {}", flags.join(" "), s_of(&p["reason"])))
+            );
+        }
+        for r in o["reasons"].as_array().into_iter().flatten() {
+            println!("    {}", st.dim(&format!("· {}", s_of(r))));
+        }
+    }
+    if count("links") > 0 {
+        println!("\n{}", st.bold("Link types"));
+        for l in d["links"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<20} {} → {} ({}, {}) inverse {}  {}",
+                s_of(&l["name"]),
+                s_of(&l["from"]),
+                s_of(&l["to"]),
+                s_of(&l["cardinality"]),
+                s_of(&l["via"]).replace('_', " "),
+                l["inverse"].as_str().filter(|i| !i.is_empty()).unwrap_or("none"),
+                st.dim(s_of(&l["reason"]))
+            );
+        }
+    }
+    if count("actions") > 0 {
+        println!("\n{}", st.bold("Action types"));
+        for a in d["actions"].as_array().into_iter().flatten() {
+            println!(
+                "  {:<26} {:<10} {:<14} risk {:<6}  {}",
+                s_of(&a["name"]),
+                s_of(&a["kind"]),
+                s_of(&a["object"]),
+                s_of(&a["risk"]),
+                st.dim(s_of(&a["reason"]))
+            );
+        }
+    }
+    if count("skipped") > 0 {
+        println!("\n{}", st.bold("Not modeled"));
+        for k in d["skipped"].as_array().into_iter().flatten() {
+            println!("  {:<32} {}", s_of(&k["table"]), st.dim(s_of(&k["reason"])));
+        }
+    }
+    for n in d["notes"].as_array().into_iter().flatten() {
+        println!("{} {}", st.dim("note:"), s_of(n));
+    }
+}
+
+/// `--filter` → an explorer filter: `prop=value`, `prop!=v`, `prop=a,b`,
+/// `prop>n`, `prop>=n`, `prop<n`, `prop<=n`, `prop~text`, `prop?`, `!prop`.
+fn parse_filter(f: &str) -> Result<Value> {
+    let value = |v: &str| serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!(v));
+    if let Some(prop) = f.strip_prefix('!').filter(|p| !p.contains(['=', '<', '>', '~'])) {
+        return Ok(json!({ "prop": prop, "op": "missing" }));
+    }
+    if let Some(prop) = f.strip_suffix('?') {
+        return Ok(json!({ "prop": prop, "op": "exists" }));
+    }
+    for (sep, op) in
+        [("!=", "ne"), (">=", "gte"), ("<=", "lte"), ("=", "eq"), (">", "gt"), ("<", "lt"), ("~", "contains")]
+    {
+        if let Some((prop, v)) = f.split_once(sep).filter(|(p, _)| !p.is_empty()) {
+            if op == "eq" && v.contains(',') && !v.starts_with('[') {
+                let list: Vec<Value> = v.split(',').map(|x| value(x.trim())).collect();
+                return Ok(json!({ "prop": prop, "op": "in", "value": list }));
+            }
+            return Ok(json!({ "prop": prop, "op": op, "value": value(v) }));
+        }
+    }
+    Err(Error::invalid(format!("--filter '{f}': use prop=value, prop>n, prop~text, prop? or !prop")))
+}
+
+fn cell(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// A change set from a JSON or TOML file (`-`: JSON on stdin).
@@ -589,6 +831,19 @@ fn print_crawl(st: &Style, c: &Value) {
         c["learned"]["written"],
         c["ranked"]
     );
+    if let Some(objects) = c["objects"].as_object() {
+        for (ty, o) in objects {
+            println!(
+                "  {} {} rows · {} written, {} unchanged, {} removed{}",
+                st.cyan(ty),
+                o["rows"],
+                o["upserted"],
+                o["unchanged"],
+                o["deleted"],
+                if o["truncated"] == true { " · truncated at max_rows" } else { "" }
+            );
+        }
+    }
     for n in c["notes"].as_array().cloned().unwrap_or_default() {
         println!("  {} {}", st.dim("note:"), n.as_str().unwrap_or_default());
     }
@@ -1657,6 +1912,114 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
+        Command::Model { sub } => model(&cli, st, sub).await,
+        Command::Explore { kind, filters, search, sort, limit, offset, json: as_json } => {
+            let be = backend(&cli).await?;
+            let Some(kind) = kind else {
+                let r = be.call("objects.types", json!({ "workspace": cli.workspace })).await?;
+                if *as_json {
+                    print_json(&r);
+                    return Ok(());
+                }
+                let types = r["types"].as_array().cloned().unwrap_or_default();
+                if types.is_empty() {
+                    println!("No object types yet.");
+                }
+                for t in types {
+                    let backing = t["backing"]["table"]
+                        .as_str()
+                        .map(|tb| format!(" ← {}.{tb}", s_of(&t["backing"]["source"])))
+                        .unwrap_or_default();
+                    println!(
+                        "{:<24} {:>7}  {}",
+                        st.bold(s_of(&t["name"])),
+                        t["count"],
+                        st.dim(&format!("{} · {}{backing}", s_of(&t["label"]), s_of(&t["category"])))
+                    );
+                }
+                return Ok(());
+            };
+            let filters = filters.iter().map(|f| parse_filter(f)).collect::<Result<Vec<_>>>()?;
+            let r = be
+                .call(
+                    "objects.explore",
+                    json!({ "kind": kind, "filters": filters, "search": search, "sort": sort, "limit": limit, "offset": offset, "workspace": cli.workspace }),
+                )
+                .await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let objects = r["objects"].as_array().cloned().unwrap_or_default();
+            println!(
+                "{} {} {}",
+                st.bold(&format!("{}", r["total"])),
+                s_of(&r["label"]),
+                st.dim(&format!("objects (showing {} from {offset})", objects.len()))
+            );
+            let columns: Vec<String> = r["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["name"].as_str())
+                .filter(|c| !matches!(*c, "title" | "created_at" | "updated_at"))
+                .take(5)
+                .map(str::to_string)
+                .collect();
+            for o in &objects {
+                let is_ts = |name: &str| {
+                    r["columns"].as_array().into_iter().flatten().any(|c| c["name"] == name && c["ty"] == "timestamp")
+                };
+                let props: Vec<String> = columns
+                    .iter()
+                    .filter_map(|c| {
+                        o["props"].get(c).map(|v| match v.as_i64().filter(|_| is_ts(c)) {
+                            Some(ms) => format!("{c}={}", onto_intelli::core::time::fmt_ts(ms)),
+                            None => format!("{c}={}", cell(v)),
+                        })
+                    })
+                    .collect();
+                let line = if s_of(&o["title"]).is_empty() {
+                    let state = o["state"].as_str().map(|x| format!(" ({x})")).unwrap_or_default();
+                    format!("{}{state}", s_of(&o["id"]))
+                } else {
+                    entity_line(st, o)
+                };
+                println!("  {line}  {}", st.dim(&props.join(" ")));
+            }
+            for (name, values) in r["facets"].as_object().into_iter().flatten() {
+                let vals: Vec<String> = values
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| format!("{} {}", cell(&v["value"]), v["count"]))
+                    .collect();
+                println!("{} {}", st.cyan(&format!("{name}:")), vals.join(" · "));
+            }
+            let timestamp = |name: &str| {
+                r["columns"].as_array().into_iter().flatten().any(|c| c["name"] == name && c["ty"] == "timestamp")
+            };
+            for (name, s) in r["stats"].as_object().into_iter().flatten() {
+                let (min, max) = (s["min"].as_f64().unwrap_or(0.0), s["max"].as_f64().unwrap_or(0.0));
+                let (min, max) = if timestamp(name) {
+                    let ts = |x: f64| onto_intelli::core::time::fmt_ts(x as i64);
+                    (ts(min), ts(max))
+                } else {
+                    (format!("{min}"), format!("{max}"))
+                };
+                let mean = s["mean"].as_f64().map(|m| format!(" · mean {m:.2}")).unwrap_or_default();
+                println!(
+                    "{} {} · min {min} · max {max}{mean}",
+                    st.cyan(&format!("{name}:")),
+                    n_of(s["count"].as_u64().unwrap_or(0), "value")
+                );
+            }
+            let actions: Vec<&str> = r["actions"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if !actions.is_empty() {
+                println!("{}", st.dim(&format!("actions: {}", actions.join(", "))));
+            }
+            Ok(())
+        }
         Command::Protos => {
             let cfg = Config::discover(cli.config.as_deref())?;
             let table = onto_grpc::RouteTable::build(&cfg)?;
@@ -1678,6 +2041,130 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn model(cli: &Cli, st: &Style, sub: &ModelCmd) -> Result<()> {
+    let be = backend(cli).await?;
+    match sub {
+        ModelCmd::Draft { source, opts, json: as_json } => {
+            let d = be.call("ontology.draft", opts.input(source)).await?;
+            if *as_json {
+                print_json(&d);
+            } else {
+                print_draft(st, &d);
+                if d["objects"].as_array().is_some_and(|a| !a.is_empty()) {
+                    println!(
+                        "\n{}",
+                        st.dim(&format!(
+                            "Next: onto model apply {0}   (or --propose to file it for review)",
+                            s_of(&d["source"])
+                        ))
+                    );
+                }
+            }
+        }
+        ModelCmd::Refine { source, opts, instructions, json: as_json } => {
+            let mut input = opts.input(source);
+            input["instructions"] = json!(instructions);
+            let r = be.call("ontology.refine", input).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            print_draft(st, &r["draft"]);
+            println!(
+                "\n{} {} of {} suggestions applied · {} · {} tokens",
+                st.bold("Refined:"),
+                r["applied"],
+                r["suggestions"].as_array().map(Vec::len).unwrap_or(0),
+                s_of(&r["llm"]),
+                r["tokens"]
+            );
+            for x in r["suggestions"].as_array().into_iter().flatten() {
+                println!(
+                    "  {} {} {} → {}  {}",
+                    st.cyan(s_of(&x["target"])),
+                    s_of(&x["field"]),
+                    cell(&x["from"]),
+                    cell(&x["to"]),
+                    st.dim(s_of(&x["why"]))
+                );
+            }
+            for x in r["rejected"].as_array().into_iter().flatten() {
+                println!(
+                    "  {} {} {}: {}",
+                    st.red("rejected"),
+                    s_of(&x["suggestion"]["target"]),
+                    s_of(&x["suggestion"]["field"]),
+                    s_of(&x["error"])
+                );
+            }
+        }
+        ModelCmd::Advise { question, source, json: as_json } => {
+            let q = question.join(" ");
+            if q.trim().is_empty() {
+                return Err(Error::invalid("usage: onto model advise \"<question>\" [--source s]"));
+            }
+            let r = be.call("ontology.advise", json!({ "question": q, "source": source })).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            println!("{}", s_of(&r["answer"]));
+            for f in r["facts"].as_array().into_iter().flatten() {
+                println!("  {}", st.dim(&format!("· {}", s_of(f))));
+            }
+            println!(
+                "{}",
+                st.dim(&format!("{} · source {} · {} tokens", s_of(&r["mode"]), s_of(&r["source"]), r["tokens"]))
+            );
+            if let Some(n) = r["note"].as_str() {
+                println!("{}", st.red(&format!("note: {n}")));
+            }
+        }
+        ModelCmd::Apply { source, opts, propose, title, rationale, no_crawl, json: as_json } => {
+            let mut input = opts.input(source);
+            input["mode"] = json!(if *propose { "propose" } else { "apply" });
+            input["title"] = json!(title);
+            input["rationale"] = json!(rationale);
+            input["no_crawl"] = json!(no_crawl);
+            input["workspace"] = json!(cli.workspace);
+            let r = be.call("ontology.apply_draft", input).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let c = &r["counts"];
+            let n = |k: &str, what: &str| n_of(c[k].as_u64().unwrap_or(0), what);
+            let what = format!(
+                "{}, {}, {}",
+                n("objects", "object type"),
+                n("links", "link type"),
+                n("actions", "action type")
+            );
+            if r["mode"] == "proposed" {
+                println!(
+                    "Proposed {} ({what}) as {}; an approver applies it: onto schema approve {}",
+                    s_of(&r["source"]),
+                    st.bold(s_of(&r["proposal"]["id"])),
+                    s_of(&r["proposal"]["id"])
+                );
+            } else {
+                println!(
+                    "Applied {} as schema {} ({what})",
+                    st.bold(s_of(&r["source"])),
+                    st.bold(&format!("v{}", r["version"]["version"]))
+                );
+                for c in r["crawl"].as_array().into_iter().flatten() {
+                    print_crawl(st, c);
+                }
+                if let Some(h) = r["hint"].as_str() {
+                    println!("{}", st.dim(h));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn init(dir: &Path, force: bool, st: &Style) -> Result<()> {

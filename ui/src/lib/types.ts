@@ -97,6 +97,7 @@ export interface ObjectType {
   implements?: string[];
   derived?: Record<string, Json>;
   constraints?: Record<string, Json>;
+  backing?: Backing;
 }
 
 export interface LinkType {
@@ -273,4 +274,241 @@ export interface Whoami {
   schema_version: number;
   capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean };
   ui: { title: string };
+}
+
+// ── ontology builder (crates/onto-core/src/modeling.rs) ──────────────────
+
+export type PropType = "string" | "text" | "int" | "float" | "bool" | "timestamp" | "enum" | "list" | "json";
+
+export interface DraftProperty {
+  name: string;
+  column: string;
+  data_type: string;
+  ty: PropType;
+  required: boolean;
+  values: string[];
+  searchable: boolean;
+  unique: boolean;
+  pattern?: string;
+  description: string;
+  reason: string;
+}
+
+export interface DraftObject {
+  name: string;
+  label: string;
+  description: string;
+  table: string;
+  table_id: string;
+  category: string;
+  key: string[];
+  natural_key: boolean;
+  title: string | null;
+  state: string | null;
+  states: string[];
+  terminal_states: string[];
+  alert_states: string[];
+  properties: DraftProperty[];
+  sync: boolean;
+  confidence: number;
+  reasons: string[];
+}
+
+export interface DraftLink {
+  name: string;
+  inverse: string;
+  label: string;
+  description: string;
+  from: string;
+  to: string;
+  cardinality: "one" | "many";
+  via: "foreign_key" | "join_table" | "learned";
+  column: string | null;
+  target_column?: string;
+  table?: string;
+  confidence: number;
+  reason: string;
+}
+
+export interface DraftAction {
+  name: string;
+  object: string;
+  kind: "create" | "edit" | "transition" | "relink";
+  risk: "low" | "medium" | "high";
+  description: string;
+  phrases: string[];
+  state?: string;
+  link?: string;
+  reason: string;
+}
+
+export interface OntologyDraft {
+  source: string;
+  changes: { changes: SchemaChange[]; message?: string; migrations?: Json[] };
+  objects: DraftObject[];
+  links: DraftLink[];
+  actions: DraftAction[];
+  skipped: { table: string; reason: string }[];
+  notes: string[];
+}
+
+export interface Suggestion {
+  target: string;
+  field: string;
+  from: Json;
+  to: Json;
+  why: string;
+}
+
+export interface Refined {
+  draft: OntologyDraft;
+  suggestions: Suggestion[];
+  applied: number;
+  rejected: { suggestion: Suggestion; error: string }[];
+  llm: string;
+  tokens: number;
+}
+
+export interface Advice {
+  answer: string;
+  mode: "deterministic" | "llm";
+  facts: string[];
+  source: string;
+  tokens: number;
+  note?: string;
+}
+
+// ── connectors (crates/onto-intelli/src/connectors.rs) ───────────────────
+
+export interface ConnectorSpec {
+  name: string;
+  kind: string;
+  url: string;
+  workspace?: string;
+  title: string;
+  schemas: string[];
+  exclude_schemas: string[];
+  every_secs: number;
+  map_grants: boolean;
+  created_by: string;
+  created_at: number;
+}
+
+export interface ObjectSync {
+  rows: number;
+  upserted: number;
+  unchanged: number;
+  deleted: number;
+  invalid?: number;
+  truncated?: boolean;
+}
+
+export interface CrawlReport {
+  connector: string;
+  source: string;
+  started_at: number;
+  ms: number;
+  schemas: number;
+  tables: number;
+  views: number;
+  columns: number;
+  foreign_keys: number;
+  queries: number;
+  upserted: number;
+  unchanged: number;
+  deleted: number;
+  links_removed: number;
+  ranked: number;
+  objects?: Record<string, ObjectSync>;
+  links?: Record<string, { rows: number; linked: number; unlinked: number; skipped?: number }>;
+  notes?: string[];
+}
+
+export interface ConnectorInfo {
+  spec: ConnectorSpec;
+  last_crawl_at: number;
+  last_success_at: number;
+  last_error?: string | null;
+  crawls: number;
+  assets: number;
+  last?: CrawlReport | null;
+}
+
+// ── Object Explorer (crates/onto-core/src/explorer.rs) ───────────────────
+
+export interface Backing {
+  source: string;
+  table: string;
+  key: string[];
+  sync?: boolean;
+  title?: string;
+  state?: string;
+  properties?: Record<string, string>;
+  links?: Record<string, string>;
+  max_rows?: number;
+}
+
+export interface ObjectTypeSummary {
+  name: string;
+  label: string;
+  category: string;
+  count: number;
+  backing?: Backing;
+  properties: number;
+  links: string[];
+  actions: string[];
+  description: string;
+}
+
+export type FilterOp = "eq" | "ne" | "in" | "gt" | "gte" | "lt" | "lte" | "contains" | "exists" | "missing";
+
+export interface Filter {
+  prop: string;
+  op: FilterOp;
+  value?: Json;
+}
+
+export interface Stats {
+  count: number;
+  min: number;
+  max: number;
+  mean?: number;
+  sum?: number;
+  histogram?: { lo: number; hi: number; count: number }[];
+}
+
+export interface ExploreResult {
+  kind: string;
+  label: string;
+  total: number;
+  objects: Entity[];
+  columns: { name: string; label: string; ty: PropType }[];
+  facets: Record<string, { value: Json; count: number }[]>;
+  stats: Record<string, Stats>;
+  links: { rel: string; label: string; to: string[] }[];
+  actions: string[];
+}
+
+// ── action types at run time (crates/onto-core/src/action_types.rs) ──────
+
+export interface ActionPlan {
+  action: string;
+  params: Record<string, Json>;
+  valid: boolean;
+  checks: { ok: boolean; check: string; message: string }[];
+  preview: string[];
+  risk: "low" | "medium" | "high";
+  reversible: boolean;
+  needs_confirmation: boolean;
+  warnings: string[];
+}
+
+export interface ActionReceipt {
+  id: string;
+  action: string;
+  status: "applied" | "proposed" | "rejected" | "undone";
+  actor: string;
+  ts: number;
+  plan: ActionPlan;
+  reason?: string;
 }

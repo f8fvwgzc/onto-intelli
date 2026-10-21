@@ -101,6 +101,9 @@ pub enum GlossarySection {
 /// One edit to the schema. `put_*` creates or replaces; `delete_*` removes;
 /// `rename_*` moves a definition, rewrites references to it and migrates the
 /// data that uses it.
+// Object type definitions dwarf the other variants; change sets are short
+// lists, so boxing them would only cost every caller a `Box::new`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SchemaChange {
@@ -617,7 +620,30 @@ pub fn apply_changes(base: &Schema, changes: &[SchemaChange]) -> std::result::Re
             other => other.to_string(),
         });
     }
+    // Two object types syncing the same table would read every row twice.
+    // Only a clash the changes create is refused, so an older schema that
+    // has one can still change elsewhere.
+    let before = synced_tables(base);
+    for ((source, table), types) in synced_tables(&s) {
+        if types.len() > 1 && before.get(&(source.clone(), table.clone())) != Some(&types) {
+            errors.push(format!(
+                "object types {} all sync {source} table {table}: one object type per table (rename the existing type instead)",
+                types.join(", ")
+            ));
+        }
+    }
     if errors.is_empty() { Ok(s) } else { Err(errors) }
+}
+
+/// Object types that sync rows, by the `(source, table)` they read.
+fn synced_tables(s: &Schema) -> BTreeMap<(String, String), Vec<String>> {
+    let mut out: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for ty in s.object_types.values() {
+        if let Some(b) = ty.backing.as_ref().filter(|b| b.sync) {
+            out.entry((b.source.clone(), b.table.clone())).or_default().push(ty.name.clone());
+        }
+    }
+    out
 }
 
 fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String> {
@@ -658,6 +684,9 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
             if ty.properties.remove(name).is_none() {
                 return Err(format!("{object_type} does not declare property {name}"));
             }
+            if let Some(b) = &mut ty.backing {
+                b.properties.remove(name);
+            }
         }
         SchemaChange::RenameProperty { object_type, from, to } => {
             check_new_name("property", to)?;
@@ -667,6 +696,11 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
             }
             let def = ty.properties.remove(from).ok_or_else(|| format!("{object_type} does not declare {from}"))?;
             ty.properties.insert(to.clone(), def);
+            if let Some(b) = &mut ty.backing
+                && let Some(column) = b.properties.remove(from)
+            {
+                b.properties.insert(to.clone(), column);
+            }
             for u in ty.constraints.unique.iter_mut().filter(|u| *u == from) {
                 *u = to.clone();
             }
@@ -698,6 +732,9 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
         }
         SchemaChange::DeleteLinkType { name, .. } => {
             s.link_types.remove(name).ok_or_else(|| format!("unknown link type {name}"))?;
+            for b in s.object_types.values_mut().filter_map(|t| t.backing.as_mut()) {
+                b.links.remove(name);
+            }
         }
         SchemaChange::RenameLinkType { from, to } => {
             check_new_name("link type", to)?;
@@ -898,6 +935,11 @@ fn rewrite_rel(s: &mut Schema, from: &str, to: &str) {
     let a = &mut s.analysis;
     for list in [&mut a.root_cause, &mut a.impact, &mut a.scope, &mut a.containment] {
         list.iter_mut().for_each(step);
+    }
+    for b in s.object_types.values_mut().filter_map(|t| t.backing.as_mut()) {
+        if let Some(column) = b.links.remove(from) {
+            b.links.insert(to.to_string(), column);
+        }
     }
 }
 

@@ -718,9 +718,13 @@ async fn web_ui_is_served_and_sessions_carry_one_principal() {
         .await
         .unwrap();
     assert_eq!(act.status(), 403);
+    // Change one character inside the signature to one it is not: always a
+    // different signature, whatever the token ends with.
     let mut forged = session.clone();
-    forged.pop();
-    forged.push('A');
+    let i = forged.len() - 5;
+    let swap = if forged.as_bytes()[i] == b'A' { "B" } else { "A" };
+    forged.replace_range(i..i + 1, swap);
+    assert_ne!(forged, session);
     let bad = http.get(format!("{base}/v1/auth/whoami")).bearer_auth(&forged).send().await.unwrap();
     assert_eq!(bad.status(), 401);
     // No escalation through the session endpoint either.
@@ -732,4 +736,118 @@ async fn web_ui_is_served_and_sessions_carry_one_principal() {
         .await
         .unwrap();
     assert_eq!(admin.status(), 403);
+}
+
+#[tokio::test]
+async fn ontology_builder_and_object_explorer_over_grpc_and_http() {
+    let srv = start(|_| {}).await;
+    let ch = channel(srv.addr).await;
+    let kind_str = |v: &prost_types::Value| match &v.kind {
+        Some(prost_types::value::Kind::StringValue(s)) => s.clone(),
+        other => format!("{other:?}"),
+    };
+    let list_of = |v: &prost_types::Value| match &v.kind {
+        Some(prost_types::value::Kind::ListValue(l)) => l.values.clone(),
+        _ => Vec::new(),
+    };
+
+    // Draft over gRPC: proto3 drops false, so options are negative flags.
+    let mut builder = pb::ontology_builder_service_client::OntologyBuilderServiceClient::new(ch.clone());
+    let draft = builder
+        .draft_ontology(pb::DraftRequest { source: "warehouse".into(), no_actions: true, ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut objects: Vec<String> = list_of(&draft.fields["objects"])
+        .iter()
+        .filter_map(|o| match &o.kind {
+            Some(prost_types::value::Kind::StructValue(s)) => Some(kind_str(&s.fields["name"])),
+            _ => None,
+        })
+        .collect();
+    objects.sort();
+    assert_eq!(objects, ["customer", "order"]);
+    assert!(list_of(&draft.fields["actions"]).is_empty(), "no_actions");
+    let advice = builder
+        .advise_ontology(pb::AdviseRequest {
+            question: "Which link types should orders have?".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(kind_str(&advice.fields["answer"]).contains("customer_id"), "{advice:?}");
+
+    // A preview over gRPC applies nothing; a proposal records its origin.
+    let preview = builder
+        .apply_draft(pb::ApplyDraftRequest { source: "warehouse".into(), preview: true, ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(kind_str(&preview.fields["mode"]), "preview", "{preview:?}");
+    let proposed = builder
+        .apply_draft(pb::ApplyDraftRequest {
+            source: "warehouse".into(),
+            propose: true,
+            proposal_source: "grpc-client".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(kind_str(&proposed.fields["mode"]), "proposed", "{proposed:?}");
+    assert!(format!("{:?}", proposed.fields["proposal"]).contains("grpc-client"), "{proposed:?}");
+
+    // Apply over HTTP (the development principal is an admin).
+    let base = format!("http://{}", srv.addr);
+    let http = reqwest::Client::new();
+    let applied: Value = http
+        .post(format!("{base}/v1/ontology/apply"))
+        .json(&json!({ "source": "warehouse" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(applied["mode"], "applied", "{applied}");
+    let created: Value = http
+        .post(format!("{base}/v1/call/action.apply"))
+        .json(&json!({ "action": "create_customer", "params": { "cust_name": "Ada" }, "workspace": "acme" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["status"], "applied", "{created}");
+    let types: Value = http.get(format!("{base}/v1/objects/types")).send().await.unwrap().json().await.unwrap();
+    let customer = types["types"].as_array().unwrap().iter().find(|t| t["name"] == "customer").unwrap();
+    assert_eq!(customer["count"], 1, "{customer}");
+    let explored: Value = http
+        .post(format!("{base}/v1/objects/explore"))
+        .json(&json!({ "kind": "customer", "search": "Ada" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(explored["total"], 1, "{explored}");
+
+    // The Object Explorer over gRPC, with a filter.
+    let mut objects = pb::object_service_client::ObjectServiceClient::new(ch);
+    let r = objects
+        .explore(pb::ExploreRequest {
+            kind: "customer".into(),
+            filters: vec![struct_of(json!({ "prop": "cust_name", "op": "eq", "value": "Ada" }))],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.fields["total"].kind, Some(prost_types::value::Kind::NumberValue(1.0)), "{r:?}");
+    assert_eq!(kind_str(&r.fields["label"]), "Customer");
+    let t = objects.object_types(pb::ObjectTypesRequest::default()).await.unwrap().into_inner();
+    assert!(format!("{:?}", t.fields["types"]).contains("sales.customers"));
 }

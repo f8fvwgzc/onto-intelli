@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Boxes, GitPullRequestArrow, LogOut, Map as MapIcon, Search, Shapes } from "lucide-react";
+import { Blocks, Boxes, GitPullRequestArrow, LogOut, Map as MapIcon, Search, Shapes, Table2 } from "lucide-react";
 
 import { useOpenProposals, useWhoami } from "../lib/queries";
 import { href, useRoute } from "../lib/router";
@@ -8,10 +8,12 @@ import { CommandPalette } from "./CommandPalette";
 import { Kbd, cx } from "./ui";
 
 const NAV = [
-  { key: "map", label: "Map", icon: MapIcon },
-  { key: "entities", label: "Entities", icon: Boxes },
-  { key: "schema", label: "Schema", icon: Shapes },
-  { key: "proposals", label: "Proposals", icon: GitPullRequestArrow },
+  { key: "map", label: "Map", short: "Map", icon: MapIcon },
+  { key: "explore", label: "Explorer", short: "Explore", icon: Table2 },
+  { key: "entities", label: "Entities", short: "Entities", icon: Boxes },
+  { key: "schema", label: "Schema", short: "Schema", icon: Shapes },
+  { key: "build", label: "Builder", short: "Build", icon: Blocks },
+  { key: "proposals", label: "Proposals", short: "Proposals", icon: GitPullRequestArrow },
 ] as const;
 
 export function Shell({ children, title, embedded }: { children: ReactNode; title: string; embedded: boolean }) {
@@ -100,18 +102,19 @@ export function Shell({ children, title, embedded }: { children: ReactNode; titl
       <main className="flex min-h-0 min-w-0 flex-1 flex-col pb-14 md:pb-0">{children}</main>
 
       <nav aria-label="Main" className="fixed inset-x-0 bottom-0 z-20 flex h-14 bg-raised pb-[env(safe-area-inset-bottom)] shadow-[0_-1px_0_var(--hairline)] md:hidden">
-        {NAV.map(({ key, label, icon: Icon }) => (
+        {NAV.map(({ key, short, label, icon: Icon }) => (
           <a
             key={key}
             href={href([key], keep)}
             aria-current={active === key ? "page" : undefined}
-            className={cx("flex flex-1 flex-col items-center justify-center gap-0.5 text-[11px] font-medium", active === key ? "text-accent" : "text-ink-3")}
+            aria-label={label}
+            className={cx("flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5 px-0.5 text-[10.5px] font-medium", active === key ? "text-accent" : "text-ink-3")}
           >
-            <Icon className="size-5" aria-hidden />
-            {label}
+            <Icon className="size-5 shrink-0" aria-hidden />
+            <span className="max-w-full truncate">{short}</span>
           </a>
         ))}
-        <button onClick={() => setPalette(true)} className="flex flex-1 flex-col items-center justify-center gap-0.5 text-[11px] font-medium text-ink-3">
+        <button onClick={() => setPalette(true)} className="flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5 px-0.5 text-[10.5px] font-medium text-ink-3">
           <Search className="size-5" aria-hidden />
           Search
         </button>

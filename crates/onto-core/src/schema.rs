@@ -184,6 +184,64 @@ pub struct ObjectType {
     /// Data-quality rules checked by the quality report.
     #[serde(default, skip_serializing_if = "Constraints::is_empty")]
     pub constraints: Constraints,
+    /// The table this type's objects come from (see [`Backing`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<Backing>,
+}
+
+/// Default for [`Backing::max_rows`].
+pub const DEFAULT_MAX_ROWS: usize = 100_000;
+
+/// Where an object type's objects come from: a table of a connected data
+/// source (Palantir: the backing datasource). Each row becomes one object
+/// with id `{type}:{key}`, where the key is the values of the `key` columns
+/// joined with `.`. Only the key and the mapped columns are ever read, and
+/// only when `sync` is on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Backing {
+    /// The connector (and catalog source) the table belongs to.
+    pub source: String,
+    /// `schema.table`.
+    pub table: String,
+    /// Primary key columns, in key order.
+    pub key: Vec<String>,
+    /// Materialize the table's rows as objects of this type.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sync: bool,
+    /// Column used as the object title (the key when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Column mapped to the object state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Property → column.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+    /// Link type (from this type) → foreign key column holding the target's key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, String>,
+    /// At most this many rows are synced ([`DEFAULT_MAX_ROWS`] when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<usize>,
+}
+
+impl Backing {
+    pub fn max_rows(&self) -> usize {
+        self.max_rows.unwrap_or(DEFAULT_MAX_ROWS)
+    }
+}
+
+/// A many-to-many link type backed by a join table: each row links the
+/// object keyed by column `from` to the object keyed by column `to`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkBacking {
+    pub source: String,
+    /// `schema.table`.
+    pub table: String,
+    /// Column holding the key of the link's source object.
+    pub from: String,
+    /// Column holding the key of the link's target object.
+    pub to: String,
 }
 
 impl ObjectType {
@@ -225,6 +283,9 @@ impl ObjectType {
         }
         self.derived.extend(other.derived);
         self.constraints.merge(&other.constraints);
+        if other.backing.is_some() {
+            self.backing = other.backing;
+        }
     }
 }
 
@@ -295,6 +356,9 @@ pub struct LinkType {
     /// Relevance weight used when expanding a context graph (0..1].
     #[serde(default = "default_weight")]
     pub weight: f32,
+    /// The join table a many-to-many link type comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<LinkBacking>,
 }
 
 impl Default for LinkType {
@@ -311,6 +375,7 @@ impl Default for LinkType {
             symmetric: false,
             provenance: false,
             weight: default_weight(),
+            backing: None,
         }
     }
 }
@@ -585,6 +650,42 @@ impl Schema {
         }
         for a in self.action_types.values() {
             a.validate(self).map_err(|e| Error::Config(format!("action type {}: {e}", a.name)))?;
+        }
+        self.check_backings()
+    }
+
+    /// Backed properties must be properties of the type, backed links must
+    /// be link types the type may use as the source.
+    fn check_backings(&self) -> Result<()> {
+        for ty in self.object_types.values() {
+            let Some(b) = &ty.backing else { continue };
+            let what = format!("{}.backing", ty.name);
+            if b.source.is_empty() || b.table.is_empty() {
+                return Err(Error::Config(format!("{what}: needs a source and a table")));
+            }
+            if b.key.is_empty() || b.key.iter().any(|k| k.is_empty()) {
+                return Err(Error::Config(format!("{what}: needs at least one key column")));
+            }
+            for prop in b.properties.keys() {
+                if self.prop_def(&ty.name, prop).is_none() {
+                    return Err(Error::Config(format!("{what}: {prop} is not a property of {}", ty.name)));
+                }
+            }
+            for rel in b.links.keys() {
+                let Some(lt) = self.link_types.get(rel) else {
+                    return Err(Error::Config(format!("{what}: unknown link type {rel}")));
+                };
+                if !lt.from.is_empty() && !lt.from.iter().any(|k| self.kind_is(&ty.name, k)) {
+                    return Err(Error::Config(format!("{what}: {} may not use link type {rel}", ty.name)));
+                }
+            }
+        }
+        for lt in self.link_types.values() {
+            if let Some(b) = &lt.backing
+                && [&b.source, &b.table, &b.from, &b.to].iter().any(|v| v.is_empty())
+            {
+                return Err(Error::Config(format!("link type {}.backing: needs source, table, from and to", lt.name)));
+            }
         }
         Ok(())
     }
@@ -933,6 +1034,12 @@ impl Schema {
             if !t.states.is_empty() {
                 let _ = write!(out, "  states: {}", t.states.join(" → "));
             }
+            if let Some(b) = &t.backing {
+                let _ = write!(out, "  backed by {}:{}", b.source, b.table);
+                if b.sync {
+                    let _ = write!(out, " (synced)");
+                }
+            }
             let _ = writeln!(out);
         }
         let _ = writeln!(out, "\nLink types:");
@@ -944,6 +1051,9 @@ impl Schema {
             }
             if lt.dependency {
                 let _ = write!(out, "   [dependency]");
+            }
+            if let Some(b) = &lt.backing {
+                let _ = write!(out, "   backed by {}:{}", b.source, b.table);
             }
             let _ = writeln!(out);
         }
@@ -1062,6 +1172,84 @@ mod tests {
             .extend_toml("[object_types.bug]\nimplements = ['work_item']\nproperties.priority = { type = 'int' }\n")
             .unwrap_err();
         assert!(err.to_string().contains("interface work_item requires"));
+    }
+
+    #[test]
+    fn backings_round_trip_merge_and_validate() {
+        let text = r#"
+            [object_types.order]
+            properties.amount = { type = "float" }
+            states = ["placed", "paid"]
+            backing = { source = "wh", table = "sales.orders", key = ["id"], sync = true, state = "status", properties = { amount = "amount" }, links = { customer = "customer_id" } }
+            [object_types.customer]
+            backing = { source = "wh", table = "sales.customers", key = ["id"] }
+            [object_types.tag]
+            [link_types.customer]
+            from = ["order"]
+            to = ["customer"]
+            inverse = "orders"
+            cardinality = "one"
+            [link_types.tags]
+            from = ["order"]
+            to = ["tag"]
+            backing = { source = "wh", table = "sales.order_tags", from = "order_id", to = "tag_id" }
+        "#;
+        let s = Schema::from_toml(text).unwrap();
+        let b = s.object_types["order"].backing.clone().unwrap();
+        assert!(b.sync);
+        assert_eq!(b.max_rows(), DEFAULT_MAX_ROWS);
+        assert_eq!(b.links["customer"], "customer_id");
+        assert_eq!(s.link_types["tags"].backing.as_ref().unwrap().to, "tag_id");
+        assert!(s.describe().contains("backed by wh:sales.orders (synced)"));
+
+        // JSON round trip (the live schema stores documents as JSON).
+        let doc = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            doc["object_types"]["customer"]["backing"],
+            json!({ "source": "wh", "table": "sales.customers", "key": ["id"] })
+        );
+        assert!(doc["object_types"]["tag"].get("backing").is_none(), "unbacked types stay as they were");
+        let back = Schema::from_json(doc).unwrap();
+        assert_eq!(back.object_types["order"].backing, Some(b.clone()));
+
+        // A later layer replaces the backing; one without keeps it.
+        let mut layered = s.clone();
+        layered.extend_toml("[object_types.order]\ndescription = \"Orders\"\n").unwrap();
+        assert_eq!(layered.object_types["order"].backing, Some(b));
+        layered
+            .extend_toml("[object_types.order]\nbacking = { source = \"wh2\", table = \"s.o\", key = [\"id\"] }\n")
+            .unwrap();
+        assert_eq!(layered.object_types["order"].backing.as_ref().unwrap().source, "wh2");
+
+        let broken = |edit: &dyn Fn(&mut Backing)| {
+            let mut s = Schema::from_toml(text).unwrap();
+            edit(s.object_types.get_mut("order").unwrap().backing.as_mut().unwrap());
+            s.compile().unwrap_err().to_string()
+        };
+        assert!(
+            broken(&|b| {
+                b.properties.insert("nope".into(), "x".into());
+            })
+            .contains("nope is not a property")
+        );
+        assert!(
+            broken(&|b| {
+                b.links.insert("tags_of".into(), "x".into());
+            })
+            .contains("unknown link type")
+        );
+        assert!(broken(&|b| b.key.clear()).contains("key column"));
+        let mut wrong_side = Schema::from_toml(text).unwrap();
+        wrong_side
+            .object_types
+            .get_mut("customer")
+            .unwrap()
+            .backing
+            .as_mut()
+            .unwrap()
+            .links
+            .insert("customer".into(), "x".into());
+        assert!(wrong_side.compile().unwrap_err().to_string().contains("may not use link type customer"));
     }
 
     #[test]

@@ -301,6 +301,60 @@ fn invalid_and_stale_change_sets_are_rejected() {
 
 #[cfg(feature = "postgres")]
 #[test]
+fn backings_follow_renames_and_deletes() {
+    let (o, ctx) = world();
+    let backed = set(json!({ "changes": [
+        { "op": "put_object_type", "name": "invoice", "def": {
+            "properties": { "amount": { "type": "float" }, "memo": { "type": "text" } },
+            "backing": { "source": "erp", "table": "billing.invoices", "key": ["id"], "sync": true,
+                         "properties": { "amount": "amount_eur", "memo": "memo" }, "links": { "billed_to": "customer_id" } } } },
+        { "op": "put_link_type", "name": "billed_to", "def": { "from": ["invoice"], "to": ["team"], "cardinality": "one" } },
+        { "op": "put_link_type", "name": "tagged", "def": { "from": ["invoice"], "to": ["project"],
+            "backing": { "source": "erp", "table": "billing.invoice_projects", "from": "invoice_id", "to": "project_id" } } }
+    ] }));
+    let plan = o.schema_plan(&admin(), &backed).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+    o.schema_apply(&ctx, backed).unwrap();
+    assert_eq!(o.schema().link_types["tagged"].backing.as_ref().unwrap().table, "billing.invoice_projects");
+
+    // A changed backing is a modified field in the diff.
+    let mut def = o.schema().object_types["invoice"].clone();
+    def.backing.as_mut().unwrap().sync = false;
+    let plan = o
+        .schema_plan(
+            &admin(),
+            &set(json!({ "changes": [ { "op": "put_object_type", "name": "invoice", "def": def } ] })),
+        )
+        .unwrap();
+    assert!(plan.valid && !plan.breaking, "{plan:?}");
+    assert_eq!(plan.diff.entries[0].fields, vec!["backing"]);
+
+    // Renames and deletes keep the backing in step.
+    o.schema_apply(
+        &ctx,
+        set(json!({ "changes": [
+            { "op": "rename_property", "object_type": "invoice", "from": "amount", "to": "total" },
+            { "op": "rename_link_type", "from": "billed_to", "to": "bill_to" },
+            { "op": "delete_property", "object_type": "invoice", "name": "memo" }
+        ] })),
+    )
+    .unwrap();
+    let b = o.schema().object_types["invoice"].backing.clone().unwrap();
+    assert_eq!(serde_json::to_value(&b.properties).unwrap(), json!({ "total": "amount_eur" }));
+    assert_eq!(serde_json::to_value(&b.links).unwrap(), json!({ "bill_to": "customer_id" }));
+    o.schema_apply(&ctx, set(json!({ "changes": [ { "op": "delete_link_type", "name": "bill_to" } ] }))).unwrap();
+    assert!(o.schema().object_types["invoice"].backing.as_ref().unwrap().links.is_empty());
+
+    // A backing that names a missing property does not compile.
+    let bad = set(json!({ "changes": [
+        { "op": "put_object_type", "name": "receipt", "def": {
+            "backing": { "source": "erp", "table": "billing.receipts", "key": ["id"], "properties": { "nope": "x" } } } }
+    ] }));
+    let plan = o.schema_plan(&admin(), &bad).unwrap();
+    assert!(!plan.valid && plan.errors.iter().any(|e| e.contains("nope is not a property")), "{:?}", plan.errors);
+}
+
+#[test]
 fn stored_schema_survives_restarts_and_imports_file_changes() {
     let Some(pg) = common::TestTenant::new("restarts") else { return };
     let ctx = ActionContext::new(admin(), "acme");

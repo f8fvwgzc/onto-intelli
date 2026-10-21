@@ -81,7 +81,7 @@ consolidate_every = 25
 deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",
                          "blockers", "dependencies", "impact", "relation", "workload", "history",
                          "expert", "metric", "changes", "quality", "what_if",
-                         "data_location", "join_path", "trusted_metric"]
+                         "data_location", "join_path", "trusted_metric", "model"]
 min_confidence = 0.8
 
 [grpc]

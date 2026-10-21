@@ -286,6 +286,7 @@ impl Default for ReasoningConfig {
                 "data_location",
                 "join_path",
                 "trusted_metric",
+                "model",
             ]
             .map(String::from)
             .to_vec(),

@@ -2,7 +2,9 @@
 
 onto-intelli can map a data estate the way Databricks Genie's knowledge
 layer does, but outside any one platform. Connectors read the metadata of
-your databases, never their rows, into the ontology. A learner infers how
+your databases, never their rows, into the ontology. (The one exception is
+opt-in: tables that back a synced object type, see
+[ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md#row-sync).) A learner infers how
 the data is used, and OntoRank decides what to trust. Questions like "Which
 table holds revenue?" are then answered from the graph, deterministically
 and with zero tokens.
@@ -32,7 +34,7 @@ any other layer
 | `db_schema` | `db_schema:{connector}.{schema}` | a namespace |
 | `table` | `table:{connector}.{schema}.{name}` | tables, partitioned and foreign tables, materialized views |
 | `view` | `view:{connector}.{schema}.{name}` | views, with their SQL |
-| `column` | `column:{connector}.{schema}.{table}.{column}` | type, nullability, primary key, comment |
+| `column` | `column:{connector}.{schema}.{table}.{column}` | type, nullability, primary key, `unique`, `enum_values` (enum labels or a `CHECK` list), comment |
 | `query` | `query:{connector}.{queryid}` | a normalized statement from `pg_stat_statements` and how often it runs |
 | `learned_fact` | `learned_fact:{type}.{hash}` | an inferred join path, metric definition or synonym |
 
@@ -69,6 +71,9 @@ onto connectors --remove warehouse --purge
   transaction with a statement timeout:
   - schemas, tables, views, columns, types, primary keys, `COMMENT ON` text
     and foreign keys from `pg_catalog`;
+  - the labels of enum types (also behind a domain), single-column unique
+    constraints and unique indexes, and the value lists of single-column
+    `CHECK (col IN (…))` constraints;
   - view dependencies from `pg_depend`;
   - grants from `relacl`;
   - scans, writes and last analyze from `pg_stat_user_tables`;
@@ -77,7 +82,9 @@ onto connectors --remove warehouse --purge
     since they are not normalized. Grant `pg_read_all_stats` to see other
     roles' statements.
 
-  It never selects from a table.
+  It never selects from a table for the catalog. Rows are read only for
+  object types whose schema says `backing.sync = true`, and only their key
+  and mapped columns ([row sync](ONTOLOGY_BUILDER.md#row-sync)).
 - **Incremental.** Each crawled entity and its links get a fingerprint.
   Usage counters only count as a change when they cross a power of two, so a
   busy table is not rewritten on every crawl. A crawl writes only what
@@ -162,6 +169,20 @@ withdrawn. `onto quality` lists confident suggestions awaiting review, and
 undocumented and unowned tables. `onto schema suggest` lists the
 suggestions to review.
 
+## From the catalog to an ontology
+
+The catalog describes tables; the [ontology builder](ONTOLOGY_BUILDER.md)
+turns them into business objects. `onto model draft <connector>` proposes an
+object type per table (typed properties from the column types, keys, titles,
+states from enum columns), link types from foreign keys, join tables and
+learned joins, and action types. Applied, the drafted types are backed by
+their tables, and each crawl syncs their rows into objects.
+
+```bash
+onto model draft warehouse
+onto model apply warehouse --propose
+```
+
 ## Questions answered from the graph
 
 | question | intent | how |
@@ -192,6 +213,9 @@ context graph, which now carries the most authoritative assets.
 | `learned.run` | `Learn` | `POST /v1/call/learned.run` | |
 | `learned.certify` | `Certify` | `POST /v1/catalog/facts/{id}/certify` | |
 | `learned.reject` | `Reject` | `POST /v1/catalog/facts/{id}/reject` | |
+
+The ontology builder and Object Explorer actions (`ontology.*`,
+`objects.*`) are listed in [ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md#api).
 
 Connectors are added, removed and crawled by admins. Everything else follows
 the caller's roles and ACLs.

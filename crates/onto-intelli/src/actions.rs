@@ -201,6 +201,36 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("learned.run", true, "Infer facts from the catalog again. Input: {workspace?}."),
     a("learned.certify", true, "Certify a learned fact (approvers and admins, never agents). Input: {id, note?}."),
     a("learned.reject", true, "Reject a learned fact (approvers and admins, never agents). Input: {id, note?}."),
+    a(
+        "ontology.draft",
+        false,
+        "Draft an ontology from a crawled data source: object types from tables (typed properties, keys, titles, states), link types from foreign keys, join tables and learned joins, action types; each with its reason. No LLM. Input: {source?, tables?, exclude?, prefix?, sync?, actions?, views?}.",
+    ),
+    a(
+        "ontology.refine",
+        false,
+        "The draft improved by the LLM: renames, labels, descriptions, property types, inverses, transitions; each suggestion is kept only if the draft stays a valid schema change. Without an LLM: the draft and a note. Input: draft options + instructions?.",
+    ),
+    a(
+        "ontology.advise",
+        false,
+        "Modeling advice grounded in the draft: which tables become which object types, links, actions and property types, and why. Input: {question, source?}.",
+    ),
+    a(
+        "ontology.apply_draft",
+        true,
+        "Apply a draft as a new schema version (apply roles; agents are refused and must propose) or file it as a proposal; applying with sync crawls the source. Input: draft options or {draft}, mode? (apply|propose), title?, rationale?, no_crawl?; preview=true returns the draft with its change set rebuilt and applies nothing.",
+    ),
+    a(
+        "objects.types",
+        false,
+        "Object types with how many objects the caller can see, their backing table, properties, links and actions. Input: {workspace?}.",
+    ),
+    a(
+        "objects.explore",
+        false,
+        "Object Explorer: objects of one type filtered, searched, sorted and paged, with facet counts, numeric statistics, link and action columns. Input: {kind, filters?: [{prop, op, value}], search?, sort?, limit?, offset?, facets?, stats?, workspace?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -846,6 +876,22 @@ impl Intelli {
                     json!({ "receipt": out, "fact": onto.learned_facts(p, None, None, None, 1_000)?.into_iter().find(|f| f.id == id) }),
                 )
             }
+            "ontology.draft" => {
+                let i: crate::modeling::DraftIn = parse(action, input)?;
+                to_json(&self.draft_ontology(p, &i)?)
+            }
+            "ontology.refine" => {
+                let i: crate::modeling::RefineIn = parse(action, input)?;
+                to_json(&self.refine_ontology(p, i).await?)
+            }
+            "ontology.advise" => {
+                let i: crate::modeling::AdviseIn = parse(action, input)?;
+                to_json(&self.advise_ontology(p, i).await?)
+            }
+            "ontology.apply_draft" => {
+                let i: crate::modeling::ApplyDraftIn = parse(action, input)?;
+                self.apply_ontology_draft(p, i).await
+            }
             "system.stats" => self.stats(),
             "system.whoami" => {
                 let gov = &onto.options().governance;
@@ -1185,6 +1231,8 @@ pub const GRAPH_READS: &[&str] = &[
     "graph.snapshot",
     "metric.query",
     "quality.report",
+    "objects.types",
+    "objects.explore",
 ];
 
 /// Run a read-only graph action against any ontology (live or a scenario fork).
@@ -1287,6 +1335,14 @@ pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str
             let i: QualityIn = parse(action, input)?;
             let ws = i.workspace.unwrap_or_else(|| default_ws.to_string());
             to_json(&onto.quality(p, Some(&ws), i.kind.as_deref(), i.limit.unwrap_or(200))?)
+        }
+        "objects.types" => {
+            let w: WsIn = parse(action, input)?;
+            Ok(json!({ "types": onto.object_types(p, w.workspace.as_deref())? }))
+        }
+        "objects.explore" => {
+            let spec: onto_core::explorer::ExploreSpec = parse(action, input)?;
+            to_json(&onto.explore(p, &spec)?)
         }
         other => Err(Error::invalid(format!("{other} is not a read-only graph action"))),
     }

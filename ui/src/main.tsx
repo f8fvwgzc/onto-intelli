@@ -9,7 +9,9 @@ import { ApiError, errorText, uiConfig, type UiConfig } from "./lib/api";
 import { useWhoami } from "./lib/queries";
 import { navigate, useRoute } from "./lib/router";
 import { absorbLocation, listenForHost } from "./lib/session";
+import { BuildPage } from "./pages/BuildPage";
 import { EntitiesPage } from "./pages/EntitiesPage";
+import { ExplorePage } from "./pages/ExplorePage";
 import { MapPage } from "./pages/MapPage";
 import { ProposalsPage } from "./pages/ProposalsPage";
 import { SchemaPage } from "./pages/SchemaPage";
@@ -60,7 +62,19 @@ function App() {
   const page = route.path[0];
   return (
     <Shell title={title} embedded={embedded}>
-      {page === "schema" ? <SchemaPage /> : page === "proposals" ? <ProposalsPage /> : page === "entities" ? <EntitiesPage /> : <MapPage />}
+      {page === "schema" ? (
+        <SchemaPage />
+      ) : page === "proposals" ? (
+        <ProposalsPage />
+      ) : page === "entities" ? (
+        <EntitiesPage />
+      ) : page === "explore" ? (
+        <ExplorePage />
+      ) : page === "build" ? (
+        <BuildPage />
+      ) : (
+        <MapPage />
+      )}
     </Shell>
   );
 }

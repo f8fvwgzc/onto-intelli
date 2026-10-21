@@ -75,6 +75,8 @@ properties.data_type = { type = "string" }
 properties.nullable = { type = "bool" }
 properties.position = { type = "int" }
 properties.primary_key = { type = "bool" }
+properties.unique = { type = "bool", description = "A single-column unique constraint or unique index covers it." }
+properties.enum_values = { type = "list", description = "Values it may hold: enum type labels or a CHECK (… IN (…)) list." }
 properties.description = { type = "text", searchable = true, description = "COMMENT ON COLUMN." }
 
 [object_types.query]
