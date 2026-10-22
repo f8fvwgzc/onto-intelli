@@ -244,11 +244,62 @@ pub struct MemoryConfig {
     pub consolidate_after: usize,
     /// Run consolidation automatically every N questions (0 = never).
     pub consolidate_every: usize,
+    /// Token budget for recalled memories on the ask path (0 = unlimited).
+    pub recall_budget_tokens: usize,
+    /// ACT-R decay exponent `d` in `B = ln(Σ t_i^-d)` (time in hours).
+    pub activation_decay: f32,
+    /// Most recent access times kept per item for the activation estimate.
+    pub activation_k: usize,
+    /// Activation at which strength is 0.5.
+    pub activation_tau: f32,
+    /// Width of the logistic that maps activation to strength.
+    pub activation_s: f32,
+    /// Lowest strength of a current long-term fact or preference.
+    pub fact_floor: f32,
+    /// Consolidated, never-recalled episodes weaker than this are pruned.
+    pub prune_below: f32,
+    /// Current episodes kept per (workspace, subject); the weakest are evicted (0 = no cap).
+    pub max_episodes_per_subject: usize,
+    /// Current summaries kept per (workspace, subject) (0 = no cap).
+    pub max_summaries_per_subject: usize,
+    /// Similarity at which a new fact merges into an existing one.
+    pub merge_threshold: f32,
+    /// Token Jaccard at which a new fact about the same entities can supersede an old one.
+    pub supersede_threshold: f32,
+    /// Days a superseded item is kept for history and as-of recall (0 = forever).
+    pub superseded_ttl_days: u32,
+    /// BM25 score that maps to a lexical score of 0.5 (`s / (s + lex_saturation)`).
+    pub lex_saturation: f32,
+    /// MMR trade-off between relevance (1.0) and novelty (0.0).
+    pub mmr_lambda: f32,
+    /// Token overlap coefficient at which a candidate counts as a duplicate of a selected memory.
+    pub dup_threshold: f32,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { enabled: true, recall_k: 4, episodic_ttl_days: 30, consolidate_after: 3, consolidate_every: 25 }
+        Self {
+            enabled: true,
+            recall_k: 4,
+            episodic_ttl_days: 30,
+            consolidate_after: 3,
+            consolidate_every: 25,
+            recall_budget_tokens: 600,
+            activation_decay: 0.5,
+            activation_k: 2,
+            activation_tau: -2.5,
+            activation_s: 1.0,
+            fact_floor: 0.5,
+            prune_below: 0.4,
+            max_episodes_per_subject: 2000,
+            max_summaries_per_subject: 200,
+            merge_threshold: 0.85,
+            supersede_threshold: 0.5,
+            superseded_ttl_days: 180,
+            lex_saturation: 3.0,
+            mmr_lambda: 0.7,
+            dup_threshold: 0.8,
+        }
     }
 }
 

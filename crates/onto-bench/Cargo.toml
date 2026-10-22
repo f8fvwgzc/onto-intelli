@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["count-alloc"]
+# A counting global allocator for the heap rows of the report. Only this
+# binary links it; onto-core and onto-intelli never do.
+count-alloc = []
+
 [dependencies]
 onto-intelli = { workspace = true, features = ["postgres"] }
 tokio.workspace = true

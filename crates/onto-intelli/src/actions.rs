@@ -18,7 +18,7 @@ use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, Sc
 
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
-use crate::memory::{MemoryScope, RememberInput};
+use crate::memory::{MemoryScope, RecallOptions, RememberInput};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ActionInfo {
@@ -74,11 +74,28 @@ pub const ACTIONS: &[ActionInfo] = &[
         false,
         "Answer a question (deterministic first, LLM when reasoning is needed). Input: AskRequest.",
     ),
-    a("memory.remember", true, "Store a long-term fact or preference. Input: {text, entities?, kind?, private?}."),
-    a("memory.recall", false, "Recall memories. Input: {query, entities?, k?}."),
-    a("memory.list", false, "List memories. Input: {scope?, limit?}."),
-    a("memory.forget", true, "Delete a memory. Input: {id}."),
-    a("memory.consolidate", true, "Expire episodes and promote recurring topics to long-term memory."),
+    a(
+        "memory.remember",
+        true,
+        "Store a long-term fact or preference. A repeat merges into the existing memory; a changed fact about the same entities supersedes the old one. Input: {text, entities?, kind?, private?, supersedes? (id to replace), supersede? (false = never supersede automatically), valid_from? (ms)}.",
+    ),
+    a(
+        "memory.recall",
+        false,
+        "Recall current memories, without near-duplicates. Input: {query, entities?, k?, as_of? (ms: what was true then), budget? (tokens), include_superseded?}.",
+    ),
+    a("memory.list", false, "List memories, newest first. Input: {scope?, limit?, include_superseded?}."),
+    a("memory.forget", true, "Delete a memory; deleting a replacement reopens the memory it superseded. Input: {id}."),
+    a(
+        "memory.consolidate",
+        true,
+        "Persist access statistics, expire old items, promote recurring topics to long-term memory, prune faded episodes.",
+    ),
+    a(
+        "memory.stats",
+        false,
+        "Memory counts and efficiency counters (merged, superseded, pruned, evicted, reinforced, recall tokens).",
+    ),
     a("event.append", true, "Record an event (audit/activity). Input: EventInput."),
     a("event.list", false, "Query events. Input: {workspace?, actor?, target?, action?, since?, until?, limit?}."),
     a("ingest.batch", true, "Ingest records (mutations, entities, GitHub webhooks). Input: {records: [...], async?}."),
@@ -371,6 +388,12 @@ struct RecallIn {
     workspace: Option<String>,
     #[serde(default)]
     k: Option<usize>,
+    #[serde(default)]
+    as_of: Option<i64>,
+    #[serde(default)]
+    budget: Option<usize>,
+    #[serde(default)]
+    include_superseded: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -381,6 +404,8 @@ struct ListMemIn {
     workspace: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_superseded: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -619,15 +644,23 @@ impl Intelli {
             "memory.recall" => {
                 let r: RecallIn = parse(action, input)?;
                 let ws = self.ws_or_default(r.workspace);
-                let hits =
-                    self.memory().recall(p, &ws, &r.query, &r.entities, r.k.unwrap_or(self.config().memory.recall_k));
+                let opts = RecallOptions {
+                    as_of: r.as_of,
+                    budget_tokens: r.budget,
+                    include_superseded: r.include_superseded.unwrap_or(false),
+                    ..Default::default()
+                };
+                let k = r.k.unwrap_or(self.config().memory.recall_k);
+                let hits = self.memory().recall_with(p, &ws, &r.query, &r.entities, k, &opts);
                 Ok(json!({ "items": hits }))
             }
             "memory.list" => {
                 let l: ListMemIn = parse(action, input)?;
                 let ws = self.ws_or_default(l.workspace);
-                Ok(json!({ "items": self.memory().list(p, &ws, l.scope, l.limit.unwrap_or(50)) }))
+                let all = l.include_superseded.unwrap_or(false);
+                Ok(json!({ "items": self.memory().list_with(p, &ws, l.scope, l.limit.unwrap_or(50), all) }))
             }
+            "memory.stats" => to_json(&self.memory().stats()),
             "memory.forget" => {
                 let i: IdIn = parse(action, input)?;
                 Ok(json!({ "deleted": self.memory().forget(p, &i.id)? }))

@@ -75,6 +75,13 @@ recall_k = 4
 episodic_ttl_days = 30
 consolidate_after = 3         # repeated episodes about the same things -> long-term memory
 consolidate_every = 25
+recall_budget_tokens = 600    # recalled memories on the ask path (0 = unlimited)
+merge_threshold = 0.85        # a repeat at this similarity merges into the existing fact
+supersede_threshold = 0.5     # token overlap at which a changed fact replaces the old one
+superseded_ttl_days = 180     # history kept for as-of recall (0 = forever)
+prune_below = 0.4             # consolidated, never-recalled episodes fade out (~14 days)
+max_episodes_per_subject = 2000
+max_summaries_per_subject = 200
 
 [reasoning]
 # Intents answered straight from the graph (zero LLM tokens) when entities resolve.

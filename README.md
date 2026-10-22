@@ -384,12 +384,31 @@ token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic i
 ## Memory
 
 * **Episodic**: every answered question (asker, entities, answer), expires after
-  `episodic_ttl_days`.
+  `episodic_ttl_days`. Asking the same question again updates its episode in place.
 * **Long-term**: `memory.remember` facts and preferences (shared or private), plus summaries
   promoted by consolidation when the same entities keep coming up.
-* Recall blends BM25, entity overlap, recency and salience. Earlier answers to the *same*
-  question are never fed back as evidence; long-term facts rank with graph facts, episodes
-  rank below them.
+* **Writes are deduplicated without an LLM.** A repeat of a fact merges into it (and
+  reinforces it). A small change to a fact about the same entities, such as a different
+  name, number or negation, **supersedes** it: the old item gets `valid_to` and
+  `superseded_by` and is kept for `superseded_ttl_days`, not deleted. `supersedes: <id>`
+  replaces a memory explicitly, `supersede: false` turns the automatic rule off, and
+  `valid_from` dates a fact. Forgetting the replacement reopens the old fact.
+* **Recall** returns current memories by default. `as_of` (ms) recalls what was true then,
+  and `include_superseded` returns history too. The score blends saturating BM25, entity
+  overlap, ACT-R activation (how often and how recently a memory was used) and salience.
+  Near-duplicates are dropped (MMR), so a summary and the episodes it came from are not
+  packed together, and the ask path stops at `recall_budget_tokens` (default 600).
+  Earlier answers to the *same* question are never fed back as evidence; long-term facts
+  rank with graph facts, episodes rank below them.
+* **Consolidation** (`memory.consolidate`, and every `consolidate_every` asks in the
+  background) persists access statistics, expires old items, writes one summary per
+  recurring topic under a deterministic id (replicas upsert the same row), prunes
+  consolidated episodes nobody recalled once they fade (about 14 days), and caps episodes
+  and summaries per subject. A pass that changes nothing visible leaves the answer cache
+  alone, and the cache revision is per workspace.
+* `memory.stats` (also under `memory` in `system.stats`) reports item counts and this
+  process's counters: merged, superseded, pruned, evicted, reinforced, recalls and recall
+  tokens. Design notes and sources: [docs/MEMORY_RESEARCH.md](docs/MEMORY_RESEARCH.md).
 
 ## Project layout
 

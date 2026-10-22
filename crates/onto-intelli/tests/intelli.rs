@@ -271,3 +271,68 @@ async fn repeated_questions_do_not_feed_their_own_answers_back() {
     assert!(first_cause.text.contains("deployment:182"), "deepest root cause should lead: {}", first_cause.text);
     assert!(!ctx.text.contains("entity.create"), "CRUD audit noise in context");
 }
+
+#[tokio::test]
+async fn memory_actions_supersede_and_recall_as_of() {
+    let i = demo().await;
+    let p = admin();
+    let now = onto_core::time::now_ms();
+    let first = i
+        .call(
+            &p,
+            "memory.remember",
+            json!({ "text": "Maria is the release captain", "entities": ["role:release-captain"], "valid_from": now - 10_000 }),
+        )
+        .await
+        .unwrap();
+    let second = i
+        .call(
+            &p,
+            "memory.remember",
+            json!({ "text": "Omar is the release captain", "entities": ["role:release-captain"], "valid_from": now - 5_000 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["supersedes"], first["id"], "{second}");
+    let q = "who is the release captain";
+    let current = i.call(&p, "memory.recall", json!({ "query": q })).await.unwrap().to_string();
+    assert!(current.contains("Omar") && !current.contains("Maria"), "{current}");
+    let then = i.call(&p, "memory.recall", json!({ "query": q, "as_of": now - 7_000 })).await.unwrap().to_string();
+    assert!(then.contains("Maria") && !then.contains("Omar"), "{then}");
+    let listed = i.call(&p, "memory.list", json!({})).await.unwrap().to_string();
+    assert!(!listed.contains("Maria"), "{listed}");
+    let history = i.call(&p, "memory.list", json!({ "include_superseded": true })).await.unwrap().to_string();
+    assert!(history.contains("Maria"), "{history}");
+    // Remembering it again merges into the current fact.
+    let again = i
+        .call(
+            &p,
+            "memory.remember",
+            json!({ "text": "Omar is the release captain.", "entities": ["role:release-captain"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["id"], second["id"]);
+    let stats = i.call(&p, "memory.stats", json!({})).await.unwrap();
+    assert_eq!(stats["superseded"], 1, "{stats}");
+    assert_eq!(stats["merged"], 1, "{stats}");
+    let sys = i.call(&p, "system.stats", json!({})).await.unwrap();
+    assert!(sys["memory"]["recall_tokens"].as_u64().unwrap() > 0, "{sys}");
+}
+
+#[tokio::test]
+async fn answer_cache_survives_a_consolidation_that_changes_nothing() {
+    let i = demo().await;
+    let p = admin();
+    for q in ["who runs alpha", "is alpha late", "alpha milestones"] {
+        i.memory().record_episode(&p, "acme", None, q, "answer", &["project:alpha".into()], 0.5).unwrap();
+    }
+    let r = i.call(&p, "memory.consolidate", json!({})).await.unwrap();
+    assert_eq!(r["promoted"], 1, "{r}");
+    let q = "Why did we generate postgres-ha.tf?";
+    assert_eq!(ask(&i, q).await.mode, AnswerMode::Llm);
+    assert_eq!(ask(&i, q).await.mode, AnswerMode::AnswerCache);
+    let r = i.call(&p, "memory.consolidate", json!({})).await.unwrap();
+    assert!(r["unchanged"].as_u64().unwrap() >= 1, "{r}");
+    assert_eq!(ask(&i, q).await.mode, AnswerMode::AnswerCache, "a no-op consolidation keeps the cache");
+}

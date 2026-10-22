@@ -23,6 +23,7 @@ parking_lot.workspace = true
 toml.workspace = true
 fastrand.workspace = true
 regex-lite.workspace = true
+hashbrown.workspace = true
 sqlx-core = { workspace = true, optional = true }
 sqlx-postgres = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

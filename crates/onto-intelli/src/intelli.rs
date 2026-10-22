@@ -25,7 +25,7 @@ use crate::hash::{normalize_question, stable_hash};
 use crate::ingest::IngestQueue;
 use crate::intent::{self, Intent};
 use crate::llm::{self, ChatMessage, LlmProvider, LlmRequest, LlmResponse, StreamChunk};
-use crate::memory::{Memory, clip};
+use crate::memory::{Memory, RecallOptions, clip};
 use crate::resolve::{self, Resolved};
 use crate::token::{Ledger, LedgerStats, TokenUsage, estimate};
 
@@ -308,6 +308,13 @@ impl Intelli {
         &self.memory
     }
 
+    /// Recall options for building a question's context: the configured token
+    /// budget, and never the episode of the question being answered.
+    fn recall_options(&self, exclude_key: Option<String>) -> RecallOptions {
+        let budget = self.config.memory.recall_budget_tokens;
+        RecallOptions { budget_tokens: (budget > 0).then_some(budget), exclude_key, ..Default::default() }
+    }
+
     pub fn conversations(&self) -> &Conversations {
         &self.conversations
     }
@@ -355,7 +362,7 @@ impl Intelli {
         let entities = resolve::resolve(&self.onto, p, ws, question);
         let ids: Vec<Id> = entities.iter().map(|r| r.id.clone()).collect();
         let memories = if self.config.memory.enabled {
-            self.memory.recall(p, ws, question, &ids, self.config.memory.recall_k)
+            self.memory.recall_with(p, ws, question, &ids, self.config.memory.recall_k, &self.recall_options(None))
         } else {
             Vec::new()
         };
@@ -414,7 +421,7 @@ impl Intelli {
             &normalized,
             &mode_key,
             &revision.to_string(),
-            &self.memory.revision().to_string(),
+            &self.memory.revision_for(&ws).to_string(),
             &budget.to_string(),
         ]);
         if use_cache && let Some(mut hit) = self.answers.get(&answer_key) {
@@ -543,8 +550,9 @@ impl Intelli {
             let ids: Vec<Id> = entities.iter().map(|r| r.id.clone()).collect();
             // An earlier answer to this very question is not evidence (caches cover repeats).
             let memories: Vec<_> = if self.config.memory.enabled {
+                let opts = self.recall_options(Some(normalized.clone()));
                 self.memory
-                    .recall(p, &ws, &question, &ids, self.config.memory.recall_k + 2)
+                    .recall_with(p, &ws, &question, &ids, self.config.memory.recall_k + 2, &opts)
                     .into_iter()
                     .filter(|m| m.item.key.as_deref() != Some(normalized.as_str()))
                     .take(self.config.memory.recall_k)
@@ -693,7 +701,17 @@ impl Intelli {
         }
         let n = self.asks.fetch_add(1, Ordering::Relaxed) + 1;
         if self.config.memory.consolidate_every > 0 && n.is_multiple_of(self.config.memory.consolidate_every) {
-            let _ = self.memory.consolidate();
+            // Off the ask path; a pass already running makes this one a no-op.
+            let m = self.memory.clone();
+            let run = move || {
+                if let Err(e) = m.consolidate() {
+                    tracing::warn!("memory consolidation failed: {e}");
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => drop(rt.spawn_blocking(run)),
+                Err(_) => run(),
+            }
         }
 
         let resp = AskResponse {

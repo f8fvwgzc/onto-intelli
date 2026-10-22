@@ -66,6 +66,39 @@ async fn replicas_share_graph_schema_proposals_and_memory() {
         r["items"].as_array().is_some_and(|i| !i.is_empty())
     })
     .await;
+    // A changed fact written on B supersedes A's; A then recalls only the new one.
+    let newer = b
+        .call(
+            &admin,
+            "memory.remember",
+            json!({ "text": "Payments freezes deploys on Thursdays", "entities": ["team:payments"] }),
+        )
+        .await
+        .unwrap();
+    assert!(newer["supersedes"].is_string(), "{newer}");
+    eventually("a recalls only the new fact", async || {
+        let r = a.call(&admin, "memory.recall", json!({ "query": "deploy freeze" })).await.unwrap().to_string();
+        r.contains("Thursdays") && !r.contains("Fridays")
+    })
+    .await;
+    // Repeating it on A merges into B's item instead of adding one.
+    let again = a
+        .call(
+            &admin,
+            "memory.remember",
+            json!({ "text": "payments freezes deploys on Thursdays.", "entities": ["team:payments"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["id"], newer["id"]);
+    eventually("b sees one current fact", async || {
+        let r = b.call(&admin, "memory.list", json!({ "scope": "long_term" })).await.unwrap();
+        let facts: Vec<&serde_json::Value> =
+            r["items"].as_array().unwrap().iter().filter(|i| i.to_string().contains("freezes deploys")).collect();
+        // The merge persisted the reinforcement (A's recalls above plus the repeat).
+        facts.len() == 1 && facts[0]["hits"].as_u64().unwrap_or(0) >= 1
+    })
+    .await;
 
     // A proposal filed by an agent on A is approved on B and applies once.
     let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
@@ -93,6 +126,9 @@ async fn replicas_share_graph_schema_proposals_and_memory() {
     })
     .await;
 
+    // Close both replicas (their followers and LISTEN connections) first, so
+    // the schema is not in use when it is dropped.
+    drop((a, b));
     common::drop_tenant(&url, "onto_", &tenant);
 }
 

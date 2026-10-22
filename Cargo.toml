@@ -32,6 +32,8 @@ parking_lot = "0.12"
 toml = "0.9"
 fastrand = "2"
 regex-lite = "0.1"
+# Only `HashTable`: hash tables that store values without a separate key.
+hashbrown = { version = "0.15", default-features = false }
 # PostgreSQL through sqlx's core and driver crates: the types of `sqlx` 0.9
 # (an application's `sqlx::PgPool` is a `sqlx_postgres::PgPool`), without
 # the facade's other drivers.

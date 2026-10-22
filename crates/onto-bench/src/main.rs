@@ -19,6 +19,13 @@ use onto_intelli::core::store::{PgOptions, PgShared, Store};
 use onto_intelli::core::{EntityInput, Link, Principal};
 use onto_intelli::{ActionContext, Config, Entity, Intelli};
 
+#[cfg(feature = "count-alloc")]
+mod alloc;
+
+#[cfg(feature = "count-alloc")]
+#[global_allocator]
+static GLOBAL: alloc::Counting = alloc::Counting;
+
 #[derive(Parser)]
 struct Args {
     /// PostgreSQL URL.
@@ -254,6 +261,35 @@ fn rss_mb() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Live and peak heap in MB, when the counting allocator is linked in.
+fn heap_mb() -> Option<(f64, f64)> {
+    #[cfg(feature = "count-alloc")]
+    {
+        Some(alloc::heap_mb())
+    }
+    #[cfg(not(feature = "count-alloc"))]
+    {
+        None
+    }
+}
+
+fn reset_heap_peak() {
+    #[cfg(feature = "count-alloc")]
+    alloc::reset_peak();
+}
+
+/// Heap rows for one open: what stays allocated afterwards, per entity, and
+/// the peak above the starting point while it ran.
+fn heap_rows(what: &str, before: Option<(f64, f64)>, entities: usize) -> Vec<String> {
+    let (Some((live0, _)), Some((live1, peak))) = (before, heap_mb()) else { return Vec::new() };
+    let live = live1 - live0;
+    let per = live * 1024.0 * 1024.0 / entities.max(1) as f64;
+    vec![
+        format!("- {what}: heap live after load **{live:.0} MB** ({per:.0} B/entity, allocator-counted)"),
+        format!("- {what}: heap peak during open **{:.0} MB** above the starting point", peak - live0),
+    ]
+}
+
 struct Stat {
     name: &'static str,
     detail: String,
@@ -320,6 +356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The first open after an import also computes every vector and builds
     // the HNSW index; a replica opening later only loads the graph.
     let rss0 = rss_mb();
+    reset_heap_peak();
+    let heap0 = heap_mb();
     let mut cfg = Config::in_memory();
     cfg.engine.storage = "postgres".into();
     cfg.engine.default_workspace = "bench".into();
@@ -337,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.entities, stats.links, stats.vectors, rss1
     );
     report.push(format!(
-        "- First open{}: **{:.1} s** ({} entities, {} links, {} vectors in pgvector), resident memory {:.0} MB (+{:.0} MB)",
+        "- First open{}: **{:.1} s** ({} entities, {} links, {} vectors in pgvector), RSS {:.0} MB (+{:.0} MB)",
         if args.skip_load { "" } else { " after the import, computing every vector and building the HNSW index" },
         open_s,
         stats.entities,
@@ -346,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rss1,
         rss1 - rss0
     ));
+    report.extend(heap_rows("First open", heap0, stats.entities));
 
     if args.load_only {
         println!("## Load\n");
@@ -482,14 +521,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rcfg.engine.storage = "postgres".into();
     rcfg.engine.follow_interval_ms = 1_000;
     rcfg.memory.enabled = false;
+    reset_heap_peak();
+    let heap2 = heap_mb();
     let (rss2, t) = (rss_mb(), Instant::now());
     let replica = Intelli::open_with_store(rcfg, replica_store, onto_intelli::llm::build(&Default::default())?).await?;
     let replica_s = t.elapsed().as_secs_f64();
     report.push(format!(
-        "- Open as another replica (graph and BM25 into memory; vectors stay in PostgreSQL): **{:.1} s**, +{:.0} MB resident",
+        "- Open as another replica (graph and BM25 into memory; vectors stay in PostgreSQL): **{:.1} s**, +{:.0} MB resident (RSS)",
         replica_s,
         rss_mb() - rss2
     ));
+    let replica_entities = replica.ontology().stats()?.entities;
+    report.extend(heap_rows("Replica open", heap2, replica_entities));
     let mut s =
         Stat { name: "replication", detail: "write on one replica → visible on another".into(), samples: Vec::new() };
     for i in 0..50 {

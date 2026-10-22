@@ -61,8 +61,12 @@ terms match many entities. That is the hard case for ranking.
   in pgvector and builds the HNSW index: **5.7 to 8.8 minutes** (343 s and
   530 s in two runs). It happens once per bulk load.
 - Opening the tenant as another replica (stream every row, build the graph
-  and BM25 in memory): **25.0 s**, with **1.4 GB** of resident memory. That
-  is down from 2.6 GB when vectors were held in memory.
+  and BM25 in memory): **25.0 s**, with **1.4 GB** of resident memory as
+  `ps` reported it. That RSS figure understates the heap: macOS leaves
+  compressed pages out of RSS, and this run was under memory pressure. The
+  allocator-counted heap of the same structures was about 6.3 KB per entity
+  before the compact layouts (about 6 GB per million) and about 3.8 KB after
+  them; see "Heap footprint at 200,000 entities" below.
 
 | Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |
 |---|---|---:|---:|---:|---:|---:|
@@ -121,6 +125,30 @@ terms match many entities. That is the hard case for ranking.
   link history: about 95 ms for a depth-1 neighbourhood. Batching those
   queries is the obvious next step.
 - **Memory and startup.** Every process holds its tenants' graph and BM25:
-  about 1.4 GB per million entities on this data set, and about 25 s to
-  open. Size replicas for the tenants they serve. Hub tenants stay open once
+  about 3.8 GB of heap per million entities on this data set (allocator
+  counted at 100,000 and 200,000 entities and scaled linearly; it was about
+  6.3 GB before the compact layouts), and about 25 s to open. Size replicas for the tenants they serve. Hub tenants stay open once
   used; there is no eviction yet.
+
+## Heap footprint at 200,000 entities
+
+`onto-bench` links a counting global allocator (feature `count-alloc`, on by
+default for that binary only) and reports the heap that stays allocated
+after an open. These numbers come from `--entities 200000 --iterations 300`
+on the same shared laptop, two runs per build, before and after the compact
+`Graph` and `TextIndex` layouts (`docs/MEMORY_RESEARCH.md`, R1–R3). The 1M
+table above was not re-run.
+
+| Build | Replica open: heap live | Bytes/entity | Heap peak during open | RSS delta (`ps`) | Replica open | BM25 search p50 / p99 ms |
+|---|---:|---:|---:|---:|---:|---|
+| Before | 1,206 MB, 1,206 MB | 6,320 | 1,414 MB | +244 MB, +481 MB | 5.3 s, 4.5 s | 1.158 / 3.605, 0.942 / 1.726 |
+| `names` as inline ids (R1) | 900 MB, 900 MB | 4,716 | 1,108 MB | +122 MB, +210 MB | 4.5 s, 4.5 s | 0.965 / 3.336, 1.164 / 2.458 |
+| Compact BM25 (R2) | 822 MB, 822 MB | 4,309 | 1,030 MB | +86 MB, +171 MB | 4.4 s, 4.5 s | 0.867 / 1.624, 0.875 / 1.475 |
+| Key-less entity and link tables (R3) | 724 MB, 724 MB | 3,797 | 900 MB | +211 MB, +415 MB | 4.8 s, 4.0 s | 0.991 / 1.657, 1.016 / 1.588 |
+
+- The heap counts are the same in both runs of a build; the RSS deltas are
+  not, so they cannot be used to size a replica.
+- At 100,000 entities the replica heap was 6,310 B/entity before and 3,791
+  after, within 1% of the 200,000 figures, so the footprint scales linearly.
+- Query latencies stayed within the run-to-run spread of this machine; this
+  note makes no latency claim.

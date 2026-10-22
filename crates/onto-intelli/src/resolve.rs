@@ -123,8 +123,7 @@ fn resolve_in(g: &Graph, schema: &Schema, p: &Principal, ws: &str, question: &st
 
     // 3. Fuzzy matching (typos, partial names) only when nothing matched exactly.
     if found.is_empty() && g.len() <= FUZZY_MAX_NAMES {
-        let names: Vec<(&String, &std::collections::BTreeSet<Id>)> =
-            g.names().filter(|(k, _)| k.len() >= 4 && !k.contains(':')).collect();
+        let names: Vec<(&String, &[Id])> = g.names().filter(|(k, _)| k.len() >= 4 && !k.contains(':')).collect();
         for n in (1..=3usize.min(words.len())).rev() {
             for start in 0..=words.len() - n {
                 if covered[start..start + n].iter().any(|c| *c) {
@@ -138,7 +137,7 @@ fn resolve_in(g: &Graph, schema: &Schema, p: &Principal, ws: &str, question: &st
                 if phrase.len() < 4 {
                     continue;
                 }
-                let mut best: Option<(f32, &std::collections::BTreeSet<Id>)> = None;
+                let mut best: Option<(f32, &[Id])> = None;
                 for (name, ids) in &names {
                     let s = similarity(&phrase, name);
                     if s >= FUZZY_THRESHOLD && best.is_none_or(|(b, _)| s > b) {
