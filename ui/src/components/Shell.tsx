@@ -5,9 +5,10 @@ import { useOpenProposals, useWhoami } from "../lib/queries";
 import { href, useRoute } from "../lib/router";
 import { clearToken, useSession } from "../lib/session";
 import { CommandPalette } from "./CommandPalette";
+import { ConsoleShell } from "./ConsoleShell";
 import { Kbd, cx } from "./ui";
 
-const NAV = [
+export const NAV = [
   { key: "map", label: "Map", short: "Map", icon: MapIcon },
   { key: "explore", label: "Explorer", short: "Explore", icon: Table2 },
   { key: "entities", label: "Entities", short: "Entities", icon: Boxes },
@@ -16,26 +17,45 @@ const NAV = [
   { key: "proposals", label: "Proposals", short: "Proposals", icon: GitPullRequestArrow },
 ] as const;
 
-export function Shell({ children, title, embedded }: { children: ReactNode; title: string; embedded: boolean }) {
+/** The app frame. With a console session it adds the project switcher and the Project group (ConsoleShell). */
+export function Shell({ children, title, embedded, consoleMode }: { children: ReactNode; title: string; embedded: boolean; consoleMode?: boolean }) {
+  if (consoleMode) return <ConsoleShell title={title}>{children}</ConsoleShell>;
+  return (
+    <OperatorShell title={title} embedded={embedded}>
+      {children}
+    </OperatorShell>
+  );
+}
+
+/** Shortcuts every shell shares: ⌘K and / open the palette (unless a page took the key). */
+export function usePaletteKeys(setPalette: (f: (p: boolean) => boolean) => void) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette((p) => !p);
+      } else if (e.key === "/" && !isTyping(e.target)) {
+        e.preventDefault();
+        setPalette(() => true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setPalette]);
+}
+
+export function isTyping(t: EventTarget | null): boolean {
+  return t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable);
+}
+
+function OperatorShell({ children, title, embedded }: { children: ReactNode; title: string; embedded: boolean }) {
   const route = useRoute();
   const me = useWhoami().data;
   const session = useSession();
   const open = useOpenProposals().data?.proposals.length ?? 0;
   const [palette, setPalette] = useState(false);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPalette((p) => !p);
-      } else if (e.key === "/" && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
-        e.preventDefault();
-        setPalette(true);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  usePaletteKeys(setPalette);
 
   const active = route.path[0];
   const keep = { workspace: session.workspace };

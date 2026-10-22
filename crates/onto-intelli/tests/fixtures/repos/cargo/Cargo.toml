@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/*", "tools/gen"]
+exclude = ["crates/skipped"]
+resolver = "2"
+
+[workspace.package]
+version = "1.4.0"
+description = "Shared description"
+
+[workspace.dependencies]
+acme-core = { path = "crates/core", version = "1.4.0" }
+serde = "1"

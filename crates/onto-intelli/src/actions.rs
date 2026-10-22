@@ -19,6 +19,8 @@ use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, Sc
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RememberInput};
+use crate::trace::{self, TraceCtx, Traced};
+use onto_core::trace::{MetricsQuery, ScoreRow, SessionQuery, TraceDetail, TraceQuery};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ActionInfo {
@@ -174,7 +176,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "connector.add",
         true,
-        "Register a data source to crawl (metadata only, never rows); admins only. Input: {name, kind?=postgres, url (or env:VAR), workspace?, schemas?, exclude_schemas?, every_secs?, map_grants?, grant_map?, owner_map?, max_queries?}.",
+        "Register a data source to crawl (metadata only, never rows); admins only. Input: {name, kind?=postgres|repo, url (or env:VAR; repo: a directory path or git URL), workspace?, schemas?, exclude_schemas?, every_secs?, map_grants?, grant_map?, owner_map?, max_queries?, repo?: {branch?, include?, exclude?, owners?}}.",
     ),
     a("connector.list", false, "Registered connectors with their last crawl (URLs redacted)."),
     a("connector.remove", true, "Remove a connector; purge=true also deletes what it crawled. Input: {name, purge?}."),
@@ -234,6 +236,32 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
+    a(
+        "trace.list",
+        false,
+        "Traces, newest first, without bodies (observers). Input: {since?, until?, name?, kind?, status?, user_id?, session_id?, model?, workspace?, mode?, tag?, min_ms?, q?, limit?, cursor?}.",
+    ),
+    a("trace.get", false, "One trace with its spans and scores (observers). Input: {id}."),
+    a(
+        "trace.metrics",
+        false,
+        "Requests, errors, latency percentiles, tokens, cost, by bucket, model, name and score (observers). Input: {since?, until?, bucket?, name?, workspace?}.",
+    ),
+    a(
+        "trace.sessions",
+        false,
+        "Sessions, the most recently active first (observers). Input: {since?, until?, user_id?, limit?, cursor?}.",
+    ),
+    a(
+        "trace.session",
+        false,
+        "A session's traces, oldest first, with inputs and outputs (observers). Input: {id, limit?}.",
+    ),
+    a(
+        "trace.score",
+        true,
+        "Score a trace (observers who may write, or the trace's own principal). Input: {trace_id, span_id?, name, value? | label?, comment?}.",
+    ),
     a("system.actions", false, "This list."),
 ];
 
@@ -426,8 +454,116 @@ impl Intelli {
         ActionContext::new(p.clone(), self.ws_or_default(ws)).with_source(source)
     }
 
-    /// Run a named action. See [`ACTIONS`].
+    /// Run a named action. See [`ACTIONS`]. Traced as `[traces] calls`
+    /// selects (`intelli.ask` always), with `source = "sdk"`.
     pub async fn call(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
+        self.call_traced(p, action, input, TraceCtx::default()).await.result
+    }
+
+    /// [`call`](Self::call) with what the caller knows about the trace.
+    /// `intelli.ask` becomes an ask trace; `action.apply` and `action.undo`
+    /// an `action` trace named `action.apply:<type>`; other calls a `call`
+    /// trace when `[traces] calls` selects them (`writes`: writing and
+    /// LLM-using actions). `eval.run` records one trace per case; the
+    /// `trace.*` actions are never traced.
+    pub async fn call_traced(&self, p: &Principal, action: &str, input: Value, ctx: TraceCtx) -> Traced<Value> {
+        match action {
+            "intelli.ask" => {
+                let req: AskRequest = match parse(action, input) {
+                    Ok(r) => r,
+                    Err(e) => return Traced::untraced(Err(e)),
+                };
+                let t = Box::pin(self.ask_traced(p, req, ctx)).await;
+                Traced { result: t.result.and_then(|r| to_json(&r)), trace_id: t.trace_id }
+            }
+            "eval.run" => {
+                let run = async {
+                    let i: EvalIn = parse(action, input)?;
+                    let cases = match (i.cases.is_empty(), &i.toml) {
+                        (false, _) => i.cases,
+                        (true, Some(t)) => crate::eval::parse_suite(t)?,
+                        (true, None) => crate::eval::parse_suite(crate::eval::DEMO_EVALS)?,
+                    };
+                    to_json(&self.eval_traced(p, cases, &ctx).await?)
+                };
+                Traced::untraced(run.await)
+            }
+            a if a.starts_with("trace.") || !self.traces_call(a) => {
+                Traced::untraced(Box::pin(self.dispatch(p, action, input)).await)
+            }
+            _ => self.call_recorded(p, action, input, ctx).await,
+        }
+    }
+
+    /// Does `[traces] calls` make a trace of `action`?
+    fn traces_call(&self, action: &str) -> bool {
+        match self.config().traces.calls.as_str() {
+            "all" => true,
+            "writes" => find(action).is_some_and(|a| a.write) || LLM_ACTIONS.contains(&action),
+            _ => false,
+        }
+    }
+
+    /// Run `action` inside a trace of its own: one `tool` span (the root),
+    /// with the generation spans of any LLM call under it.
+    async fn call_recorded(&self, p: &Principal, action: &str, input: Value, ctx: TraceCtx) -> Traced<Value> {
+        let Some(tracer) = self.start_trace(&ctx) else {
+            return Traced::untraced(Box::pin(self.dispatch(p, action, input)).await);
+        };
+        let ws = self.ws_or_default(input.get("workspace").and_then(Value::as_str).map(str::to_string));
+        let (kind, name) = match action {
+            "action.apply" => {
+                ("action", format!("action.apply:{}", input.get("action").and_then(Value::as_str).unwrap_or("?")))
+            }
+            "action.undo" => ("action", "action.undo".to_string()),
+            other => ("call", other.to_string()),
+        };
+        let mut row = trace::base_row(&ctx, p, kind, &name, &ws);
+        if tracer.captures() {
+            let mut m = Map::new();
+            if let Some(q) = input.get("question").and_then(Value::as_str).and_then(|q| tracer.text(q)) {
+                m.insert("question".into(), Value::String(q));
+            }
+            if let Some(text) = tracer.text(&input.to_string()) {
+                m.insert("input".into(), Value::String(text));
+            }
+            row.input = Some(Value::Object(m));
+        }
+        let result = trace::scope(tracer.clone(), Box::pin(self.dispatch(p, action, input))).await;
+        let mut attrs = json!({ "action": action });
+        match &result {
+            Ok(v) => {
+                if kind == "action" {
+                    let plan = &v["plan"];
+                    attrs = json!({
+                        "action": action,
+                        "action_type": v["action"],
+                        "risk": plan["risk"],
+                        "receipt": v["id"],
+                        "edits": plan["mutations"].as_array().map_or(0, Vec::len),
+                        "outcome": v["status"],
+                    });
+                    if action == "action.undo"
+                        && ctx.name.is_none()
+                        && let Some(t) = v["action"].as_str()
+                    {
+                        row.name = format!("action.undo:{t}");
+                    }
+                }
+                row.output = tracer.text(&v.to_string()).map(|o| json!({ "output": o }));
+                if let Some(e) = tracer.llm_error() {
+                    trace::fail(&mut row, "llm_error", &e);
+                }
+            }
+            Err(e) => trace::fail(&mut row, e.code(), &e.to_string()),
+        }
+        let id = tracer.id().to_string();
+        self.send_trace(tracer.finish(row, action, "tool", attrs));
+        Traced { result, trace_id: Some(id) }
+    }
+
+    /// The action table itself.
+    async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
         if GRAPH_READS.contains(&action) {
             return graph_call(onto, p, self.default_workspace(), action, input);
@@ -915,9 +1051,175 @@ impl Intelli {
                 "llm_available": self.llm().unavailable().is_none(),
             })),
             "system.actions" => Ok(json!({ "actions": ACTIONS })),
+            a if a.starts_with("trace.") => self.trace_action(p, a, input),
             other => Err(Error::not_found(format!("action '{other}' (see system.actions)"))),
         }
     }
+
+    // ── traces (docs/CONTROL_PLANE.md section 9.5) ──────────────────────────
+
+    fn trace_action(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
+        if action != "trace.score" && !p.can_observe() {
+            return Err(Error::Denied(format!(
+                "{} may not read traces (admin, developer or observer roles; an API key needs the admin scope)",
+                p.id
+            )));
+        }
+        let store = self.ontology().store();
+        match action {
+            "trace.list" => {
+                let mut q: TraceQuery = parse(action, input)?;
+                observe_scope(p, &mut q.workspace)?;
+                to_json(&store.trace_list(&q)?)
+            }
+            "trace.get" => {
+                let i: IdIn = parse(action, input)?;
+                let d = self.find_trace(&i.id)?;
+                check_trace_workspace(p, &d)?;
+                to_json(&d)
+            }
+            "trace.metrics" => {
+                let mut q: MetricsQuery = parse(action, input)?;
+                observe_scope(p, &mut q.workspace)?;
+                to_json(&store.trace_metrics(&q)?)
+            }
+            "trace.sessions" => {
+                let mut q: SessionQuery = parse(action, input)?;
+                observe_scope(p, &mut q.workspace)?;
+                to_json(&store.trace_sessions(&q)?)
+            }
+            "trace.session" => {
+                let i: SessionIn = parse(action, input)?;
+                let traces = store.trace_session(&i.id, i.limit.unwrap_or(onto_core::trace::DEFAULT_LIST))?;
+                let traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                if traces.is_empty() {
+                    return Err(Error::not_found(format!("session {}", i.id)));
+                }
+                Ok(json!({ "session_id": i.id, "traces": traces }))
+            }
+            "trace.score" => {
+                let i: ScoreIn = parse(action, input)?;
+                let score = self.score_trace(p, i)?;
+                to_json(&score)
+            }
+            other => Err(Error::not_found(format!("action '{other}' (see system.actions)"))),
+        }
+    }
+
+    /// A trace by id; when it is not stored yet, the queue is flushed and it
+    /// is looked up once more (a trace is written up to `flush_ms` after it ends).
+    fn find_trace(&self, id: &str) -> Result<TraceDetail> {
+        let store = self.ontology().store();
+        if let Some(d) = store.trace_get(id)? {
+            return Ok(d);
+        }
+        if self.traces_enabled() {
+            let flushed = match tokio::runtime::Handle::try_current() {
+                Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| h.block_on(self.flush_traces()));
+                    true
+                }
+                _ => false,
+            };
+            if flushed && let Some(d) = store.trace_get(id)? {
+                return Ok(d);
+            }
+        }
+        Err(Error::not_found(format!("trace {id}")))
+    }
+
+    fn score_trace(&self, p: &Principal, i: ScoreIn) -> Result<ScoreRow> {
+        let name = i.name.trim();
+        if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(Error::invalid("trace.score: name is 1 to 100 printable characters"));
+        }
+        if i.value.is_none() && i.label.is_none() {
+            return Err(Error::invalid("trace.score: give a value or a label"));
+        }
+        if i.value.is_some_and(|v| !v.is_finite()) {
+            return Err(Error::invalid("trace.score: value must be a finite number"));
+        }
+        let label = i.label.map(|l| l.trim().to_string());
+        if label.as_ref().is_some_and(|l| l.is_empty() || l.chars().count() > 100) {
+            return Err(Error::invalid("trace.score: label is 1 to 100 characters"));
+        }
+        if i.comment.as_ref().is_some_and(|c| c.chars().count() > 2000) {
+            return Err(Error::invalid("trace.score: comment is at most 2000 characters"));
+        }
+        let d = self.find_trace(&i.trace_id)?;
+        let own = d.trace.principal == p.id;
+        if !own && !(p.can_observe() && p.allows(onto_core::Access::Write)) {
+            return Err(Error::Denied(format!(
+                "{} may not score traces (observers who may write, or the trace's own principal)",
+                p.id
+            )));
+        }
+        check_trace_workspace(p, &d)?;
+        if let Some(s) = &i.span_id
+            && !d.spans.iter().any(|x| &x.id == s)
+        {
+            return Err(Error::not_found(format!("span {s} of trace {}", i.trace_id)));
+        }
+        let score = ScoreRow {
+            id: onto_core::time::new_id("score"),
+            trace_id: d.trace.id,
+            span_id: i.span_id,
+            ts: onto_core::time::now_ms(),
+            name: name.to_string(),
+            value: i.value,
+            label,
+            source: if p.id.starts_with("user:") { "console".into() } else { "api".into() },
+            author: Some(p.id.clone()),
+            comment: i.comment,
+        };
+        self.ontology().store().score_write(&score)?;
+        Ok(score)
+    }
+}
+
+/// Actions that call the LLM: traced with `[traces] calls = "writes"`.
+pub const LLM_ACTIONS: &[&str] = &["ontology.refine", "ontology.advise"];
+
+/// A principal limited to some workspaces reads traces of those only: it
+/// names one (or has exactly one), and only then.
+fn observe_scope(p: &Principal, ws: &mut Option<String>) -> Result<()> {
+    if p.workspaces.iter().any(|w| w == "*") {
+        return Ok(());
+    }
+    match ws {
+        Some(w) if p.in_workspace(w) => Ok(()),
+        Some(w) => Err(Error::Denied(format!("{} has no access to workspace {w}", p.id))),
+        None if p.workspaces.len() == 1 => {
+            *ws = Some(p.workspaces[0].clone());
+            Ok(())
+        }
+        None => Err(Error::Denied(format!("{} reads traces of one workspace at a time: name it", p.id))),
+    }
+}
+
+fn check_trace_workspace(p: &Principal, d: &TraceDetail) -> Result<()> {
+    if p.in_workspace(&d.trace.workspace) { Ok(()) } else { Err(Error::not_found(format!("trace {}", d.trace.id))) }
+}
+
+#[derive(Deserialize)]
+struct SessionIn {
+    id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ScoreIn {
+    trace_id: String,
+    #[serde(default)]
+    span_id: Option<String>,
+    name: String,
+    #[serde(default)]
+    value: Option<f64>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    comment: Option<String>,
 }
 
 pub fn find(name: &str) -> Option<&'static ActionInfo> {

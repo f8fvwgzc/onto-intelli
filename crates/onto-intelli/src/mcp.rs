@@ -1,4 +1,5 @@
-//! Model Context Protocol server (JSON-RPC 2.0, newline-delimited over stdio):
+//! Model Context Protocol server (JSON-RPC 2.0; newline-delimited over stdio
+//! in `onto mcp`, the Streamable HTTP transport at `POST /mcp` in onto-grpc):
 //! lets agents (Claude Code, IDEs, other MCP clients) query the same verified,
 //! permission-filtered ontology people use. Writes go through governed action
 //! types and are disabled unless `[mcp] allow_writes = true`.
@@ -10,14 +11,18 @@ use serde_json::{Value, json};
 use onto_core::Principal;
 
 use crate::intelli::Intelli;
+use crate::trace::TraceCtx;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Protocol versions this server speaks (the HTTP transport checks
+/// `Mcp-Protocol-Version` against it).
+pub const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 pub struct McpServer {
     intelli: Arc<Intelli>,
     principal: Principal,
     allow_writes: bool,
+    ctx: TraceCtx,
 }
 
 fn obj(props: Value, required: &[&str]) -> Value {
@@ -388,7 +393,15 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
 
 impl McpServer {
     pub fn new(intelli: Arc<Intelli>, principal: Principal, allow_writes: bool) -> Self {
-        Self { intelli, principal, allow_writes }
+        Self { intelli, principal, allow_writes, ctx: TraceCtx::from_source("mcp") }
+    }
+
+    /// The trace context of the calls this server makes (source `mcp` by
+    /// default; the HTTP transport adds the session id, `traceparent` and
+    /// the API key's prefix).
+    pub fn with_trace_ctx(mut self, ctx: TraceCtx) -> Self {
+        self.ctx = ctx;
+        self
     }
 
     fn reply(id: &Value, result: Value) -> Value {
@@ -463,7 +476,7 @@ impl McpServer {
                     m.insert("mode".into(), json!("propose"));
                     m.insert("proposal_source".into(), json!("mcp"));
                 }
-                match self.intelli.call(&self.principal, action, args).await {
+                match self.intelli.call_traced(&self.principal, action, args, self.ctx.clone()).await.result {
                     Ok(v) => {
                         let text = if name == "ask" {
                             let facts: Vec<String> = v["facts"]

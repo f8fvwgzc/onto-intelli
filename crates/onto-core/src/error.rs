@@ -23,6 +23,10 @@ pub enum Error {
     /// committed); the engine catches up and retries.
     #[error("stale: {0}")]
     Stale(String),
+    /// A rate limit or quota ran out: HTTP 429 (with `retry-after`), gRPC
+    /// `RESOURCE_EXHAUSTED`. The message may end in "retry in N s".
+    #[error("limited: {0}")]
+    Limited(String),
     #[error("{0}")]
     Other(String),
 }
@@ -42,8 +46,20 @@ impl Error {
             Error::Llm(_) => "llm",
             Error::Unavailable(_) => "unavailable",
             Error::Stale(_) => "aborted",
+            Error::Limited(_) => "resource_exhausted",
             Error::Other(_) => "internal",
         }
+    }
+
+    /// Seconds a client should wait before retrying a [`Error::Limited`]:
+    /// the N of "retry in N s" in its message, else 60. `None` for other errors.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        let Error::Limited(m) = self else { return None };
+        let secs = m
+            .rsplit_once("retry in ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok());
+        Some(secs.unwrap_or(60).max(1))
     }
 
     pub fn invalid(msg: impl fmt::Display) -> Self {
@@ -70,5 +86,19 @@ impl From<std::io::Error> for Error {
 impl From<toml::de::Error> for Error {
     fn from(e: toml::de::Error) -> Self {
         Error::Config(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limited_errors_carry_a_retry_time() {
+        let e = Error::Limited("asks_per_minute (60) reached; retry in 3 s".into());
+        assert_eq!(e.code(), "resource_exhausted");
+        assert_eq!(e.retry_after_secs(), Some(3));
+        assert_eq!(Error::Limited("quota".into()).retry_after_secs(), Some(60));
+        assert_eq!(Error::invalid("x").retry_after_secs(), None);
     }
 }

@@ -1,0 +1,8 @@
+[package]
+name = "acme-core"
+version.workspace = true
+description = "Domain types and rules."
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }

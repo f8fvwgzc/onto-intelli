@@ -36,6 +36,10 @@ pub struct Config {
     pub governance: Governance,
     /// Background crawls of registered connectors.
     pub connectors: ConnectorsConfig,
+    /// The control plane: organizations, projects, API keys, console sign-in.
+    pub console: ConsoleConfig,
+    /// Traces of asks, actions and calls (docs/CONTROL_PLANE.md section 9).
+    pub traces: TracesConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -140,19 +144,40 @@ impl Default for OntologyConfig {
     fn default() -> Self {
         Self {
             schema: "builtin:enterprise".into(),
-            extend: vec!["builtin:data-catalog".into()],
+            extend: vec!["builtin:data-catalog".into(), "builtin:code".into()],
             strict: false,
             schema_mode: SchemaMode::Live,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Pricing {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
     pub cached_input_per_mtok: f64,
+}
+
+/// A secret value (an API key) whose `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+
+    /// The value itself, for the one place that sends it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(****)")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +191,10 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     /// Environment variable holding the API key (keys never live in the file).
     pub api_key_env: Option<String>,
+    /// The API key itself, set in code (a project's decrypted key); used
+    /// before `api_key_env`. Never read from or written to a file.
+    #[serde(skip)]
+    pub api_key: Option<Secret>,
     pub max_output_tokens: u32,
     /// Only sent when set; several current models reject sampling parameters.
     pub temperature: Option<f32>,
@@ -185,6 +214,7 @@ impl Default for LlmConfig {
             model: String::new(),
             base_url: None,
             api_key_env: None,
+            api_key: None,
             max_output_tokens: 4096,
             temperature: None,
             effort: None,
@@ -444,6 +474,143 @@ impl Default for UiConfig {
     }
 }
 
+/// `[console]`: the control plane (docs/CONTROL_PLANE.md). Organizations,
+/// members, projects (each one a tenant), API keys and console sign-in, kept
+/// in a control store next to the tenants.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsoleConfig {
+    /// Serve the control plane. Requires `engine.tenancy = "multi"`.
+    pub enabled: bool,
+    /// Public base URL of this server: invitation links, and the OIDC
+    /// redirect URI `{public_url}/v1/console/auth/oidc/callback`. Must be
+    /// `https://` unless its host is loopback.
+    pub public_url: String,
+    /// PostgreSQL schema of the control store (in memory when
+    /// `engine.storage = "memory"`). Never a tenant's schema.
+    pub schema: String,
+    /// The first sign-in through an IdP creates the user. When false, only
+    /// invited users (by verified email) and existing users can sign in.
+    pub allow_signup: bool,
+    /// A new user with no membership gets an organization of their own.
+    pub create_org_on_signup: bool,
+    /// Verified email domains allowed to sign up; empty: any.
+    pub allowed_email_domains: Vec<String>,
+    /// Environment variable with the bootstrap admin token (at least 32
+    /// characters): `POST /v1/console/auth/token` signs in as the local
+    /// administrator.
+    pub bootstrap_token_env: Option<String>,
+    /// Console session lifetime (capped by `auth.session_max_ttl_secs`).
+    pub session_ttl_secs: u64,
+    /// Allow project LLM base URLs, and the git and PostgreSQL URLs of
+    /// connectors registered by project credentials, that resolve to
+    /// loopback or private addresses (a self-hosted Ollama, an internal git
+    /// server or database), and `ssh://` and `user@host:path` git URLs from
+    /// project credentials.
+    pub allow_private_urls: bool,
+    /// Active projects per organization (0: unlimited).
+    pub max_projects_per_org: usize,
+    /// OpenID Connect providers for console sign-in.
+    pub oidc: Vec<OidcProviderConfig>,
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            public_url: "http://127.0.0.1:50051".into(),
+            schema: "onto_control".into(),
+            allow_signup: true,
+            create_org_on_signup: true,
+            allowed_email_domains: Vec::new(),
+            bootstrap_token_env: Some("ONTO_ADMIN_TOKEN".into()),
+            session_ttl_secs: 8 * 3600,
+            allow_private_urls: false,
+            max_projects_per_org: 20,
+            oidc: Vec::new(),
+        }
+    }
+}
+
+/// `[traces]`: Langfuse-style traces of the engine's work, kept in each
+/// tenant's store (docs/CONTROL_PLANE.md section 9).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TracesConfig {
+    pub enabled: bool,
+    /// Traces older than this are deleted (a project overrides it with its
+    /// `trace_retention_days` setting, 1 to 400).
+    pub retention_days: u32,
+    /// Store question, prompt and answer text (clipped). Without it, only
+    /// lengths and token counts (a project overrides it with `capture_content`).
+    pub capture_content: bool,
+    /// Each stored text is clipped to this many bytes (at a character boundary).
+    pub max_content_bytes: usize,
+    /// Engine calls that become traces besides `intelli.ask`: `writes`
+    /// (writing actions and LLM-using actions), `all`, or `none`.
+    pub calls: String,
+    /// The background writer flushes every this many milliseconds …
+    pub flush_ms: u64,
+    /// … or this many records, whichever comes first.
+    pub flush_records: usize,
+    /// Records waiting to be written; beyond this they are dropped and
+    /// counted (`traces_dropped` in the ledger).
+    pub queue: usize,
+}
+
+impl Default for TracesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 30,
+            capture_content: true,
+            max_content_bytes: 4096,
+            calls: "writes".into(),
+            flush_ms: 500,
+            flush_records: 200,
+            queue: 10_000,
+        }
+    }
+}
+
+impl TracesConfig {
+    /// `calls` is `writes`, `all` or `none`, and the sizes are positive.
+    pub fn check(&self) -> Result<()> {
+        if !matches!(self.calls.as_str(), "writes" | "all" | "none") {
+            return Err(Error::Config(format!("traces.calls = '{}' (writes, all, none)", self.calls)));
+        }
+        if self.queue == 0 || self.flush_records == 0 || self.retention_days == 0 {
+            return Err(Error::Config("traces.queue, flush_records and retention_days must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
+/// `[[console.oidc]]`: one OpenID Connect provider (Clerk, Auth0, Supabase
+/// Auth, Google, Keycloak, Okta, Entra, ...).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcProviderConfig {
+    /// `[a-z0-9-]`, used in URLs.
+    pub id: String,
+    /// Shown on the sign-in button.
+    pub name: String,
+    pub issuer: String,
+    pub client_id: String,
+    /// Environment variable with the client secret; omit for a public
+    /// client (PKCE only).
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Extra accepted `aud` values besides `client_id`.
+    #[serde(default)]
+    pub audiences: Vec<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    ["openid", "email", "profile"].map(String::from).to_vec()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenConfig {
     /// Prefer `token_env`; a literal `token` is accepted for local testing.
@@ -540,5 +707,37 @@ mod tests {
         assert!(cfg.mcp.principal.is_agent());
         let legacy = Config::from_toml("[auth]\ndefault_principal = { id = 'old', roles = ['viewer'] }\n").unwrap();
         assert_eq!(legacy.auth.dev_principal.id, "old");
+        assert!(!cfg.console.enabled);
+        assert_eq!(cfg.console.schema, "onto_control");
+        assert!(cfg.traces.enabled && cfg.traces.capture_content);
+        assert_eq!((cfg.traces.calls.as_str(), cfg.traces.retention_days, cfg.traces.queue), ("writes", 30, 10_000));
+        assert!(cfg.traces.check().is_ok());
+        let bad = Config::from_toml("[traces]\ncalls = 'some'\n").unwrap();
+        assert!(bad.traces.check().unwrap_err().to_string().contains("writes, all, none"));
+    }
+
+    #[test]
+    fn api_keys_never_show() {
+        let cfg = LlmConfig { api_key: Some(Secret::new("sk-live-123456")), ..Default::default() };
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("Secret(****)") && !debug.contains("sk-live"), "{debug}");
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(!toml.contains("sk-live") && !toml.contains("api_key ="), "{toml}");
+        let back: LlmConfig = toml::from_str("api_key = 'from-a-file'\nprovider = 'openai'").unwrap();
+        assert!(back.api_key.is_none(), "never read from a file");
+    }
+
+    #[test]
+    fn console_section_parses() {
+        let cfg = Config::from_toml(
+            "[console]\nenabled = true\npublic_url = 'https://onto.example.com'\n\
+             [[console.oidc]]\nid = 'clerk'\nname = 'Clerk'\nissuer = 'https://x.clerk.accounts.dev'\n\
+             client_id = 'abc'\nclient_secret_env = 'ONTO_OIDC_CLERK_SECRET'\n",
+        )
+        .unwrap();
+        assert!(cfg.console.enabled);
+        assert_eq!(cfg.console.oidc[0].scopes, vec!["openid", "email", "profile"]);
+        assert_eq!(cfg.console.session_ttl_secs, 28_800);
+        assert_eq!(cfg.console.bootstrap_token_env.as_deref(), Some("ONTO_ADMIN_TOKEN"));
     }
 }

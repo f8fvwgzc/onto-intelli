@@ -339,6 +339,69 @@ metadata) refine it:
 | `x-onto-tenant` | selects the tenant |
 | `x-onto-act-as`, `x-onto-act-roles`, `x-onto-act-workspaces`, `x-onto-act-entity` | an impersonating token names the user the call is for ([docs/EMBEDDING.md](docs/EMBEDDING.md)) |
 
+## Control plane
+
+`onto serve` can also serve a hosted console, the way Clerk, Supabase and
+Langfuse do, from the same binary and PostgreSQL database:
+
+* **Organizations and sign-in**: members with roles (owner, admin,
+  developer, viewer), invitations, and sign-in through any OpenID Connect
+  provider (Clerk, Auth0, Google, Keycloak, Supabase Auth), a bootstrap
+  admin token, or `--dev`.
+* **Projects and API keys**: a project is a tenant (its own PostgreSQL
+  schema); `onto_sk_…` keys with scopes `read`, `write`, `agent` and
+  `admin`, shown once, rotated and revoked individually; a **Connect** page
+  with curl, TypeScript, Python, MCP and monorepo snippets.
+* **Bring your own LLM**: each project sets its own provider, model and key
+  (encrypted with AES-256-GCM under `ONTO_MASTER_KEY`), monthly budgets and
+  a rate limit, with daily usage and cost.
+* **Monitoring**: every question, governed action and model call becomes a
+  trace with spans (intent, resolution, retrieval, generation, tools),
+  token counts, cost and scores; sessions replay a conversation; metrics
+  show requests, errors, latency percentiles and cost per model.
+* **For services**: SDKs for [TypeScript](sdk/typescript/README.md) and
+  [Python](sdk/python/README.md), MCP over HTTP at `/mcp`, and
+  `onto connect repo` to map a monorepo's packages, dependencies and
+  CODEOWNERS into the ontology.
+
+A minimal console with a bootstrap admin token:
+
+```toml
+# onto-intelli.toml
+[engine]
+tenancy = "multi"
+
+[console]
+enabled = true
+public_url = "http://127.0.0.1:50051"   # https:// unless loopback
+```
+
+```sh
+export ONTO_DATABASE_URL=postgres://onto:onto@127.0.0.1:5441/onto
+export ONTO_SESSION_SECRET=$(openssl rand -hex 32) ONTO_MASTER_KEY=$(openssl rand -base64 32)
+export ONTO_ADMIN_TOKEN=$(openssl rand -hex 32)
+onto serve        # open http://127.0.0.1:50051/ui/ and choose "Sign in with admin token"
+```
+
+`onto serve --dev` (loopback only) signs in automatically. Then, from a
+service, with a key from **API keys**:
+
+```ts
+import { Onto } from "onto-intelli";
+const onto = new Onto({ url: "http://127.0.0.1:50051", apiKey: process.env.ONTO_API_KEY });
+console.log((await onto.ask("Who owns Project Alpha?", { sessionId: "chat-42" })).answer);
+```
+
+```sh
+onto --remote http://127.0.0.1:50051 --token "$ONTO_API_KEY" \
+  connect repo https://github.com/acme/platform --every 1h   # needs an admin-scope key
+```
+
+[docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) is the full reference: data
+model, roles, keys, sign-in with an IdP (section 15 walks through Clerk),
+BYO LLM, traces, routes, the repository connector and security.
+[docs/UI.md](docs/UI.md) describes the console pages.
+
 ## Embedding
 
 **Rust, async** ([example](crates/onto-intelli/examples/embed_async.rs)):
@@ -378,7 +441,8 @@ C: [`examples/ffi/demo.c`](examples/ffi/demo.c).
 Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers, `[connectors]`
 background crawls, `[llm]`, `[context]`
 token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic intents,
-`[grpc]` listener and routes, `[auth]`. Lookup order: `--config`, `$ONTO_CONFIG`,
+`[grpc]` listener and routes, `[auth]`, `[console]` the control plane, `[traces]` what is
+recorded and for how long. Lookup order: `--config`, `$ONTO_CONFIG`,
 `./onto-intelli.toml`, `~/.config/onto-intelli/config.toml`.
 
 ## Memory
@@ -396,7 +460,8 @@ token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic i
 ```text
 crates/onto-core      ontology: schema, graph, store (PostgreSQL/memory), events, policy, rules, deps, BM25
 crates/onto-intelli   orchestrator: intent, resolution, context graph, memory, LLM providers, caches, actions
-crates/onto-grpc      gRPC/HTTP server: built-in proto, dynamic proto routes, reflection, health, SSE
+crates/onto-grpc      gRPC/HTTP server: built-in proto, dynamic proto routes, reflection, health, SSE, console API, MCP over HTTP
+crates/onto-control   control plane: organizations, members, projects, API keys, OIDC sign-in, BYO LLM vault, usage
 crates/onto-cli       the `onto` binary
 crates/onto-ffi       C ABI (cdylib + staticlib) and header
 examples/             FFI demos, JSONL ingest sample, schema extension
@@ -404,7 +469,12 @@ packaging/            install script, Homebrew formula; Dockerfile and CI at the
 docs/ARCHITECTURE.md  design notes
 docs/CATALOG.md       connectors, OntoRank, learned facts
 docs/ONTOLOGY_BUILDER.md  object, link and action types from a database; row sync; Object Explorer
+docs/CONTROL_PLANE.md the console: sign-in, projects, API keys, BYO LLM, traces, SDKs, repository connector
+docs/UI.md            the web UI and console pages
 docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
+sdk/typescript        TypeScript SDK (zero dependencies)
+sdk/python            Python SDK (standard library only)
+ui/                   the web UI (React); built into crates/onto-grpc/ui-dist
 ```
 
 ## Development

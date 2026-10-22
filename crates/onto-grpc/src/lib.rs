@@ -5,13 +5,22 @@
 //! * **your own proto files**, compiled at startup and mapped onto engine
 //!   actions with `[[grpc.routes]]` (no code generation, no rebuild),
 //! * gRPC reflection (grpcurl, Postman) and `grpc.health.v1`,
-//! * JSON over HTTP/1.1 (`POST /v1/call/{action}`, `/v1/ask`, SSE streaming).
+//! * JSON over HTTP/1.1 (`POST /v1/call/{action}`, `/v1/ask`, SSE streaming),
+//! * MCP over HTTP (`POST /mcp`, the Streamable HTTP transport with JSON responses),
+//! * traces, sessions and metrics (`/v1/traces`, `/v1/sessions`, `/v1/metrics`,
+//!   `ObservabilityService`), with `traceparent` and `x-onto-session-id` on every call,
+//! * with a control plane ([`ServeOptions::control`]), the console API
+//!   (`/v1/console/…`), project API keys, and each project's own LLM
+//!   provider, limits and usage meter (installed as the hub's tenant hooks).
 //!
 //! A typed Rust client for the built-in API is in [`pb`].
 
 pub mod auth;
+pub mod console;
 pub mod dynamic;
 pub mod http;
+pub mod mcp_http;
+pub mod observe;
 pub mod routes;
 pub mod template;
 pub mod ui;
@@ -22,6 +31,7 @@ use std::sync::Arc;
 
 use tonic::server::NamedService;
 
+use onto_control::Control;
 use onto_intelli::{Error, Hub, Intelli, Result};
 
 pub use routes::{BUILTIN_DESCRIPTOR, RouteInfo, RouteTable};
@@ -45,6 +55,9 @@ pub struct ServeOptions {
     /// Development mode: no authentication, every caller is `auth.dev_principal`
     /// (only on loopback addresses unless `ONTO_DEV_ALLOW_REMOTE=1`).
     pub dev: bool,
+    /// The control plane (`[console] enabled`): console routes, console
+    /// sessions and project API keys.
+    pub control: Option<Arc<Control>>,
 }
 
 /// Build the complete router (gRPC + reflection + health + JSON) for one ontology.
@@ -56,7 +69,7 @@ pub async fn router(intelli: Arc<Intelli>) -> Result<(axum::Router, Arc<RouteTab
 pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Router, Arc<RouteTable>)> {
     let cfg = hub.config().clone();
     let table = Arc::new(RouteTable::build(&cfg)?);
-    let auth = Arc::new(auth::Auth::from_config(&cfg.auth, opts.dev)?);
+    let auth = Arc::new(auth::Auth::from_config_with(&cfg.auth, opts.dev, opts.control.clone())?);
     let mut router = axum::Router::new();
     if cfg.grpc.reflection {
         let builder = || {
@@ -80,8 +93,15 @@ pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Rou
         }
         router = router.route_service(&named(&health), health);
     }
+    if let Some(control) = &opts.control {
+        // Projects get their own provider, limits and usage meter.
+        onto_control::hooks::install(control, &hub, auth.dev_mode()).await;
+    }
     if cfg.grpc.http {
         router = router.merge(http::router(hub.clone(), auth.clone()));
+        if let Some(control) = &opts.control {
+            router = router.merge(console::router(hub.clone(), auth.clone(), control.clone()));
+        }
         if cfg.ui.enabled {
             router = router.merge(ui::router(&cfg.ui));
         }
@@ -135,6 +155,7 @@ pub async fn serve_hub_on(
         }
         tracing::warn!("DEVELOPMENT MODE: no authentication, every caller is {}", hub.config().auth.dev_principal.id);
     }
+    check_console(hub.config(), opts.control.as_deref(), dev)?;
     let (router, table) = router_hub(hub, &opts).await?;
     tracing::info!(?addr, routes = table.routes.len(), "onto-intelli listening (gRPC + HTTP/JSON)");
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -144,4 +165,67 @@ pub async fn serve_hub_on(
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(|e| Error::Unavailable(format!("server: {e}")))
+}
+
+/// Startup rules of the control plane: a control store when the console is
+/// enabled, multi-tenancy (each project is a tenant), HTTP on, at least one
+/// sign-in path (an OIDC provider, the bootstrap token or dev mode), and an
+/// `https://` public URL unless its host is loopback.
+pub fn check_console(cfg: &onto_intelli::Config, control: Option<&Control>, dev: bool) -> Result<()> {
+    let Some(control) = control else {
+        if cfg.console.enabled {
+            return Err(Error::Config(
+                "console.enabled = true needs a control store (ServeOptions.control; `onto serve` builds it)".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if cfg.engine.tenancy != "multi" {
+        return Err(Error::Config("the console needs engine.tenancy = \"multi\": every project is a tenant".into()));
+    }
+    if !cfg.grpc.http {
+        return Err(Error::Config("the console needs grpc.http = true (its API is HTTP/JSON)".into()));
+    }
+    let ccfg = control.config();
+    if ccfg.oidc.is_empty() && !control.bootstrap_enabled() && !dev {
+        return Err(Error::Config(format!(
+            "the console has no sign-in path: add a [[console.oidc]] provider, set {} (at least 32 characters), \
+             or run `onto serve --dev`",
+            ccfg.bootstrap_token_env.as_deref().unwrap_or("console.bootstrap_token_env")
+        )));
+    }
+    if !public_url_ok(&ccfg.public_url) {
+        return Err(Error::Config(format!(
+            "console.public_url '{}' must be https:// (http:// only for a loopback host)",
+            ccfg.public_url
+        )));
+    }
+    Ok(())
+}
+
+/// `https://…`, or `http://` with a loopback host.
+fn public_url_ok(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn public_urls() {
+        for ok in ["https://onto.example.com", "http://127.0.0.1:50051", "http://localhost", "http://[::1]:8080/x"] {
+            assert!(super::public_url_ok(ok), "{ok}");
+        }
+        for bad in ["http://onto.example.com", "http://10.0.0.1", "ftp://x", "https://", "onto.example.com"] {
+            assert!(!super::public_url_ok(bad), "{bad}");
+        }
+    }
 }

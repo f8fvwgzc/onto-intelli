@@ -56,3 +56,10 @@ export function setQuery(patch: Record<string, string | undefined>) {
   route = parse();
   listeners.forEach((l) => l());
 }
+
+/** Go to a route in place of the current history entry, updating listeners at once. */
+export function replaceRoute(path: string[], query: Record<string, string | undefined> = {}) {
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${href(path, query)}`);
+  route = parse();
+  listeners.forEach((l) => l());
+}

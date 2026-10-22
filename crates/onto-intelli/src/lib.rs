@@ -36,13 +36,16 @@ pub mod hub;
 pub mod ingest;
 pub mod intelli;
 pub mod intent;
+pub mod limits;
 pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod modeling;
+pub mod net;
 pub mod resolve;
 pub mod seed;
 pub mod token;
+pub mod trace;
 
 pub use onto_core as core;
 pub use onto_core::{

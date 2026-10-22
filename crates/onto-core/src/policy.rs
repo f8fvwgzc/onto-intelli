@@ -167,6 +167,13 @@ impl Principal {
         self.has(Role::Admin) || self.has(Role::System)
     }
 
+    /// May read traces, sessions and metrics: `admin`, `system`, or the
+    /// custom roles `developer` and `observer` (console developers and viewers).
+    pub fn can_observe(&self) -> bool {
+        self.is_privileged()
+            || self.roles.iter().any(|r| matches!(r, Role::Custom(n) if n == "developer" || n == "observer"))
+    }
+
     pub fn in_workspace(&self, ws: &str) -> bool {
         self.workspaces.iter().any(|w| w == "*" || w == ws)
     }
@@ -230,5 +237,20 @@ pub fn visible(p: &Principal, e: &Entity, graph: &Graph) -> bool {
             graph.neighbors(me, "member_of", Dir::Out).iter().any(|team| acl.contains(team))
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observers_read_traces() {
+        assert!(Principal::admin("a").can_observe());
+        assert!(Principal::system().can_observe());
+        assert!(Principal::named("d", &["member", "developer"], &["*"]).unwrap().can_observe());
+        assert!(Principal::named("v", &["viewer", "observer"], &["*"]).unwrap().can_observe());
+        assert!(!Principal::member("m", "*").can_observe());
+        assert!(!Principal::new("k", vec![Role::Agent], vec!["*".into()]).can_observe());
     }
 }

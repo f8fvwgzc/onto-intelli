@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use onto_core::{Error, Result};
 
-use super::openai::truncate;
+use super::openai::{describe, truncate};
 use super::{ChatRole, ChunkStream, LlmProvider, LlmRequest, LlmResponse, StreamChunk, api_key, sse};
 use crate::config::{LlmConfig, Pricing};
 use crate::token::TokenUsage;
@@ -27,6 +27,7 @@ const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
+    max_output_tokens: u32,
     base: String,
     key: Option<String>,
     model: String,
@@ -49,6 +50,12 @@ fn default_pricing(model: &str) -> Pricing {
 
 impl AnthropicProvider {
     pub fn new(cfg: &LlmConfig) -> Result<Self> {
+        Self::with_client(cfg, None)
+    }
+
+    /// On `client` when given (its timeout and policies apply), else on a
+    /// client with `cfg.timeout_secs`.
+    pub fn with_client(cfg: &LlmConfig, client: Option<reqwest::Client>) -> Result<Self> {
         let (key, var) = api_key(cfg, "ANTHROPIC_API_KEY");
         let model = if cfg.model.is_empty() { DEFAULT_MODEL.to_string() } else { cfg.model.clone() };
         let pricing = if cfg.pricing.input_per_mtok == 0.0 && cfg.pricing.output_per_mtok == 0.0 {
@@ -56,19 +63,23 @@ impl AnthropicProvider {
         } else {
             cfg.pricing.clone()
         };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
-            .build()
-            .map_err(|e| Error::Config(format!("http client: {e}")))?;
+        let client = match client {
+            Some(c) => c,
+            None => reqwest::Client::builder()
+                .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
+                .build()
+                .map_err(|e| Error::Config(format!("http client: {e}")))?,
+        };
         Ok(Self {
             client,
+            max_output_tokens: cfg.max_output_tokens.max(1),
             base: cfg
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com".into())
                 .trim_end_matches('/')
                 .to_string(),
-            unavailable: key.is_none().then(|| format!("environment variable {var} is not set")),
+            unavailable: key.is_none().then(|| super::missing_key(&var)),
             key,
             model,
             effort: cfg.effort.clone(),
@@ -86,7 +97,7 @@ impl AnthropicProvider {
             .collect();
         let mut body = json!({
             "model": self.model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": req.max_tokens.min(self.max_output_tokens),
             "system": [{ "type": "text", "text": req.system, "cache_control": { "type": "ephemeral" } }],
             "messages": messages,
         });
@@ -118,7 +129,7 @@ impl AnthropicProvider {
         for (k, v) in &self.headers {
             rb = rb.header(k, v);
         }
-        let resp = rb.send().await.map_err(|e| Error::Llm(format!("anthropic: {e}")))?;
+        let resp = rb.send().await.map_err(|e| Error::Llm(format!("anthropic: {}", describe(&e.without_url()))))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -159,6 +170,10 @@ impl LlmProvider for AnthropicProvider {
 
     fn unavailable(&self) -> Option<String> {
         self.unavailable.clone()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        Some(self.max_output_tokens)
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {

@@ -16,6 +16,43 @@ It works at phone width (bottom tab bar, bottom-sheet panels), honours
 `prefers-reduced-motion` and the system light/dark preference, and every
 control is keyboard reachable.
 
+## The console
+
+When the server runs the control plane (`[console] enabled`, see
+[CONTROL_PLANE.md](CONTROL_PLANE.md)), `/ui` opens as a console: people sign
+in, pick an organization and a project, and the six views above work on that
+project (its ref becomes the tenant). The shell adds an **organization and
+project switcher** at the top of the sidebar (in the header on phones), a
+**Project** group above the ontology views, and **Members** and the user menu
+(sign out, sign out everywhere) at the bottom. Controls a role cannot use are
+disabled, with a tooltip naming the role they need; the server enforces the
+roles in any case.
+
+| Route | What you do there |
+|---|---|
+| `#/signin` | Sign in: a button per identity provider (OpenID Connect), the admin token form when `ONTO_ADMIN_TOKEN` is set, automatic sign-in as the developer under `onto serve --dev`. **Use an operator token instead** opens the token form of the operator UI. |
+| `#/auth/callback` | Where the identity provider sends you back: the ticket is exchanged for a session and removed from the address, then the page you started from opens. Refused sign-ins say why. |
+| `#/invite?code=…` | The organization and role of an invitation, and the provider buttons that accept it. |
+| `#/projects` | The organization's projects with their requests over the last 7 days; **New project** (optionally with the demo data) and **New organization**. |
+| `#/overview` | Requests, error rate, latency, tokens, cost, deterministic answers and cache hits for 24 hours, 7 or 30 days, each against the previous period; charts of requests and errors, latency p50 and p95, cost by model; recent errors; a "Get connected" checklist until the first trace arrives. |
+| `#/traces` | Every traced call: search (`/`), time range, status, mode, and name, user, session, model and tag filters, all kept in the address; a latency histogram of the rows shown; `j` and `k` move through rows and Enter opens one; **Load more** pages; **Live** refreshes every 10 seconds. |
+| `#/traces/<id>` | The trace's status, latency, tokens, cost, user, session and API key prefix; the question and answer; a waterfall of its spans by start and duration, coloured by kind (select one for its attributes, input, output and tokens; Esc closes the panel); scores, with **Good**, **Bad** and **Add score** for developers and above. |
+| `#/sessions`, `#/sessions/<id>` | Sessions with their turns, errors, tokens and cost; a session replays each question and answer with its latency and mode and links to its trace. |
+| `#/usage` | A month: cost and tokens against the budgets (a warning at 80 %), asks, LLM calls, deterministic answers, the rate limit, daily stacked bars by model (cost, tokens or asks) and a table by model. |
+| `#/connect` | Ready-to-paste snippets with the project's URL and a key: curl, TypeScript and Python (dependency-free code first, then the SDKs of `sdk/typescript` and `sdk/python`), MCP (`claude mcp add --transport http …` and a generic `mcp.json`), environment variables and the monorepo connector (`onto connect repo` through the CLI with an admin-scope key). Pick a key to fill in its prefix, or **Create a key** to put its full secret in the snippets once. |
+| `#/keys` | API keys: name, prefix, scopes, creator, last use, expiry and status. **Create key** (scopes, workspaces, expiry, impersonation for admins) shows the secret once; **Rotate** (with an optional grace period for the old key) and **Revoke** (confirmed). |
+| `#/llm` | The project's own provider, model, base URL and API key (write-only: it shows `•••• last4`, with **Replace** and **Remove**), request settings, prices, budgets and rate limit; **Test connection** shows the result in place; **Use server default** removes the project's settings. |
+| `#/members` | The organization's members and their roles; pending invitations; **Invite** returns a link to send (the server sends no email, and keeps only a hash of the code, so a link can be copied only right after it is made). |
+| `#/settings` | Project name, default workspace (the console opens the ontology views in it), trace retention, content capture, the organization's name, its audit log (admins) and **Delete project** (owners, typing the name). |
+
+The console keeps its session in `sessionStorage` like any other token and
+renews it while the tab is open, once less than a quarter of its lifetime is
+left. Sign-in through an identity provider binds the login to the tab: 32
+random bytes in `sessionStorage` (`onto.login`), whose SHA-256 goes with the
+start of the sign-in and the bytes themselves with the exchange, so a callback
+link opened in another browser cannot be used. Embedded views, link tokens and
+operator tokens keep the operator UI described above.
+
 ## Signing in
 
 The UI calls the same HTTP API, under the same principal and token rules as
@@ -86,6 +123,7 @@ session in the fragment.
 
 **Deep links:**
 
+- `#/overview?range=24h|30d`, `#/traces?status=error&q=…`, `#/traces/<id>`, `#/sessions/<id>`, `#/usage?month=2026-10`, `#/connect?tab=mcp` (console)
 - `#/map?focus=<id>&mode=impact|path`
 - `#/entities/<id>`
 - `#/explore` (object types), `#/explore/<type>?q=…&sort=-prop&f=<filters as JSON>`
@@ -116,4 +154,7 @@ npm run build     # type-check, then write crates/onto-grpc/ui-dist; rebuild the
 ```
 
 The stack is React 19, TanStack Query, d3-force (map layout), Tailwind 4,
-Geist and Lucide icons: about 115 KB of gzipped JavaScript.
+Geist and Lucide icons: about 145 KB of gzipped JavaScript for the operator
+views. The console pages load on first use (about 35 KB more); their charts
+are small SVG components (`src/components/charts.tsx`) coloured from the CSS
+tokens, with no chart library.

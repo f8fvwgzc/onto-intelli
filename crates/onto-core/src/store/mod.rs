@@ -16,7 +16,8 @@
 //! as caches of the store and refresh them the same way, prompted by
 //! [`Store::subscribe`] notices (LISTEN/NOTIFY on PostgreSQL).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ use crate::Result;
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::now_ms;
+use crate::trace::{
+    self, MetricsQuery, ScoreRow, SessionPage, SessionQuery, TraceDetail, TraceMetrics, TracePage, TraceQuery,
+    TraceRecord, TraceRow,
+};
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -292,6 +297,42 @@ pub trait Store: Send + Sync {
     fn backfill_vectors(&self, _embed: EmbedFn<'_>) -> Result<usize> {
         Ok(0)
     }
+
+    // ── traces (docs/CONTROL_PLANE.md section 9); stores without them refuse ──
+
+    /// Write traces with their spans (each trace with its spans in one
+    /// transaction). A trace whose id is already stored is skipped.
+    fn trace_write(&self, _batch: &[TraceRecord]) -> Result<()> {
+        Err(trace::unsupported())
+    }
+    /// Traces matching `q`, newest first, without bodies.
+    fn trace_list(&self, _q: &TraceQuery) -> Result<TracePage> {
+        Err(trace::unsupported())
+    }
+    /// One trace with its spans and scores.
+    fn trace_get(&self, _id: &str) -> Result<Option<TraceDetail>> {
+        Err(trace::unsupported())
+    }
+    /// A session's traces, oldest first, with their bodies (at most `limit`, ≤ 200).
+    fn trace_session(&self, _id: &str, _limit: usize) -> Result<Vec<TraceRow>> {
+        Err(trace::unsupported())
+    }
+    /// Aggregates over a window.
+    fn trace_metrics(&self, _q: &MetricsQuery) -> Result<TraceMetrics> {
+        Err(trace::unsupported())
+    }
+    /// One row per session, the most recently active first.
+    fn trace_sessions(&self, _q: &SessionQuery) -> Result<SessionPage> {
+        Err(trace::unsupported())
+    }
+    fn score_write(&self, _s: &ScoreRow) -> Result<()> {
+        Err(trace::unsupported())
+    }
+    /// Delete traces, spans and scores that started before `before_ms`, in
+    /// batches, for at most about `budget`. Returns the rows deleted.
+    fn trace_vacuum(&self, _before_ms: i64, _budget: Duration) -> Result<u64> {
+        Err(trace::unsupported())
+    }
 }
 
 pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
@@ -311,6 +352,15 @@ pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
 pub struct MemoryStore {
     inner: Mutex<MemInner>,
     max_events: usize,
+    traces: Mutex<MemTraces>,
+}
+
+/// The newest [`trace::MEMORY_TRACES`] traces, and scores.
+#[derive(Default)]
+struct MemTraces {
+    records: VecDeque<TraceRecord>,
+    ids: HashSet<String>,
+    scores: VecDeque<ScoreRow>,
 }
 
 #[derive(Default)]
@@ -330,7 +380,7 @@ impl Default for MemoryStore {
 
 impl MemoryStore {
     pub fn with_event_capacity(max_events: usize) -> Self {
-        Self { inner: Mutex::new(MemInner::default()), max_events }
+        Self { inner: Mutex::new(MemInner::default()), max_events, traces: Mutex::new(MemTraces::default()) }
     }
 }
 
@@ -450,5 +500,77 @@ impl Store for MemoryStore {
             path: None,
             vectors: None,
         })
+    }
+
+    fn trace_write(&self, batch: &[TraceRecord]) -> Result<()> {
+        let mut t = self.traces.lock();
+        for r in batch {
+            if !t.ids.insert(r.trace.id.clone()) {
+                continue;
+            }
+            t.records.push_back(r.clone());
+            if t.records.len() > trace::MEMORY_TRACES
+                && let Some(old) = t.records.pop_front()
+            {
+                t.ids.remove(&old.trace.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn trace_list(&self, q: &TraceQuery) -> Result<TracePage> {
+        trace::list(self.traces.lock().records.iter(), q)
+    }
+
+    fn trace_get(&self, id: &str) -> Result<Option<TraceDetail>> {
+        let t = self.traces.lock();
+        Ok(t.records.iter().find(|r| r.trace.id == id).map(|r| trace::detail(r, t.scores.iter())))
+    }
+
+    fn trace_session(&self, id: &str, limit: usize) -> Result<Vec<TraceRow>> {
+        Ok(trace::session(self.traces.lock().records.iter(), id, limit))
+    }
+
+    fn trace_metrics(&self, q: &MetricsQuery) -> Result<TraceMetrics> {
+        let t = self.traces.lock();
+        trace::metrics(t.records.iter(), t.scores.iter(), q)
+    }
+
+    fn trace_sessions(&self, q: &SessionQuery) -> Result<SessionPage> {
+        trace::sessions(self.traces.lock().records.iter(), q)
+    }
+
+    fn score_write(&self, s: &ScoreRow) -> Result<()> {
+        let mut t = self.traces.lock();
+        if t.scores.iter().any(|x| x.id == s.id) {
+            return Ok(());
+        }
+        t.scores.push_back(s.clone());
+        if t.scores.len() > 4 * trace::MEMORY_TRACES {
+            t.scores.pop_front();
+        }
+        Ok(())
+    }
+
+    fn trace_vacuum(&self, before_ms: i64, _budget: Duration) -> Result<u64> {
+        // One pass under the lock: memory holds at most 50 000 traces.
+        let mut t = self.traces.lock();
+        let mut deleted = 0u64;
+        let MemTraces { records, ids, scores } = &mut *t;
+        records.retain_mut(|r| {
+            if r.trace.ts < before_ms {
+                deleted += 1 + r.spans.len() as u64;
+                ids.remove(&r.trace.id);
+                return false;
+            }
+            let n = r.spans.len();
+            r.spans.retain(|s| s.ts >= before_ms);
+            deleted += (n - r.spans.len()) as u64;
+            true
+        });
+        let n = scores.len();
+        scores.retain(|s| s.ts >= before_ms);
+        deleted += (n - scores.len()) as u64;
+        Ok(deleted)
     }
 }

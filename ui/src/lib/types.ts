@@ -272,7 +272,9 @@ export interface Whoami {
   dev_mode: boolean;
   version: string;
   schema_version: number;
-  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean };
+  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean };
+  console?: { user: string; role: string; org: string } | null;
+  credential?: string;
   ui: { title: string };
 }
 

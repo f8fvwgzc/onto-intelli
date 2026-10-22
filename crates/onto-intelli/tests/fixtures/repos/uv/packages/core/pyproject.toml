@@ -1,0 +1,5 @@
+[project]
+name = "Acme_Core"
+version = "0.4.0"
+description = "Core models."
+classifiers = ["Private :: Do Not Upload"]

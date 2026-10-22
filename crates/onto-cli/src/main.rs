@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use onto_intelli::config::{Config, EXAMPLE_CONFIG, EXAMPLE_PROTO, EXAMPLE_PROTO_PATH};
+use onto_intelli::trace::TraceCtx;
 use onto_intelli::{AskRequest, Error, Intelli, Principal, Result, seed};
 
 #[derive(Parser)]
@@ -202,30 +203,42 @@ enum Command {
         json: bool,
     },
     /// Register a data source and crawl it: metadata only, never rows.
+    ///
+    /// postgres: `onto connect postgres env:WAREHOUSE_URL --name warehouse`.
+    /// repo: `onto connect repo <path | git URL>` maps a monorepo's packages,
+    /// internal dependencies and CODEOWNERS (manifests only, never source files).
     Connect {
-        /// Kind of source: postgres.
+        /// Kind of source: postgres or repo.
         kind: String,
-        /// postgres://user:pass@host/db, or env:VAR to read it at crawl time (keeps the secret out of the store).
+        /// postgres: postgres://user:pass@host/db, or env:VAR to read it at crawl time (keeps the secret out of
+        /// the store). repo: a directory, or a git URL (https://…, ssh://…, git@host:path).
         url: String,
-        /// Connector name, part of entity ids (default: the database name).
+        /// Connector name, part of entity ids (default: the database or repository name).
         #[arg(long)]
         name: Option<String>,
-        /// Schemas to crawl, `*` wildcards (repeatable; default: all).
+        /// postgres: schemas to crawl, `*` wildcards (repeatable; default: all).
         #[arg(long = "schema")]
         schemas: Vec<String>,
-        /// Schemas to skip (repeatable; default: onto_*).
+        /// postgres: schemas to skip (repeatable; default: onto_*). repo: directories to skip, gitignore-style.
         #[arg(long = "exclude")]
         exclude: Vec<String>,
-        /// Background crawl interval: 15m, 1h, 900s, or 0 for on demand only.
-        #[arg(long, default_value = "15m")]
-        every: String,
-        /// Turn table grants into entity ACLs (see --grant).
+        /// repo: only packages under these directories, gitignore-style (repeatable; default: all).
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// repo: branch to clone (git URLs; default: the remote's default branch).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Background crawl interval: 15m, 1h, 900s, or 0 for on demand only (default: 15m, repo 1h).
+        #[arg(long)]
+        every: Option<String>,
+        /// postgres: turn table grants into entity ACLs (see --grant).
         #[arg(long)]
         map_grants: bool,
-        /// role=principal: whom a database role's grants map to (repeatable), e.g. analyst=team:analytics.
+        /// postgres: role=principal, whom a database role's grants map to (repeatable), e.g. analyst=team:analytics.
         #[arg(long = "grant")]
         grants: Vec<String>,
-        /// role=owner: who owns what a database role owns (repeatable), e.g. finance_owner=team:finance.
+        /// postgres: role=owner, who owns what a database role owns (repeatable), e.g. finance_owner=team:finance.
+        /// repo: owner=id, a CODEOWNERS owner mapped to an existing id (repeatable), e.g. @acme/payments=team:payments.
         #[arg(long = "owner")]
         owners: Vec<String>,
         #[arg(long)]
@@ -305,6 +318,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Control plane administration: opens the control store directly (operator).
+    Console {
+        #[command(subcommand)]
+        sub: ConsoleCmd,
+    },
     /// Compile configured proto files and print the gRPC route table.
     Protos,
     /// Graph, memory, cache and token statistics.
@@ -382,6 +400,36 @@ enum SchemaCmd {
     },
     /// Withdraw an open or failed proposal.
     Withdraw { id: String },
+}
+
+#[derive(Subcommand)]
+enum ConsoleCmd {
+    /// Create the `default` organization with the local administrator as its
+    /// owner, and adopt existing tenants as its projects.
+    Bootstrap,
+    /// Users with their organizations and roles.
+    Users,
+    /// Make a user an owner of an organization (id or slug).
+    AddOwner { user: String, org: String },
+    /// A project's API keys, or create one with --create (its secret is printed once).
+    Keys {
+        project_ref: String,
+        /// Name of a new key.
+        #[arg(long, value_name = "NAME")]
+        create: Option<String>,
+        /// Scopes of the new key (repeatable): read, write, agent, admin. The
+        /// global --workspace limits it to one workspace (default: all).
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rewrap every stored project LLM key under ONTO_MASTER_KEY (set the
+    /// old key as ONTO_MASTER_KEY_PREVIOUS); reports the rows it changed.
+    RotateMasterKey {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -731,7 +779,14 @@ enum Backend {
 impl Backend {
     async fn call(&self, action: &str, input: Value) -> Result<Value> {
         match self {
-            Backend::Local { intelli, principal } => intelli.call(principal, action, input).await,
+            Backend::Local { intelli, principal } => {
+                let t = intelli.call_traced(principal, action, input, TraceCtx::from_source("cli")).await;
+                // The process may exit right after: write its trace now.
+                if t.trace_id.is_some() || action == "eval.run" {
+                    intelli.flush_traces().await;
+                }
+                t.result
+            }
             Backend::Remote { http, base, token, tenant } => {
                 let mut req = http.post(format!("{base}/v1/call/{action}")).json(&input);
                 if let Some(t) = token {
@@ -752,6 +807,7 @@ impl Backend {
                         Some("invalid_argument") => Error::Invalid(msg),
                         Some("permission_denied") => Error::Denied(msg),
                         Some("conflict") => Error::Conflict(msg),
+                        Some("resource_exhausted") => Error::Limited(msg),
                         Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
                         _ => Error::Other(msg),
                     })
@@ -801,6 +857,31 @@ fn connector_name(url: &str) -> String {
     if name.is_empty() { "warehouse".into() } else { name }
 }
 
+/// A repository source as the server should store it: git URLs as given,
+/// local directories made absolute (a path for a remote server must be
+/// absolute already: it names a directory on that server).
+fn repo_source(src: &str, remote: bool) -> Result<String> {
+    let src = src.trim();
+    if onto_intelli::connectors::repo::looks_like_url(src) {
+        return Ok(src.to_string());
+    }
+    let path = std::path::Path::new(src);
+    if remote {
+        return if path.is_absolute() {
+            Ok(src.to_string())
+        } else {
+            Err(Error::invalid(format!("'{src}': with --remote, give the repository's absolute path on the server")))
+        };
+    }
+    let abs = path
+        .canonicalize()
+        .map_err(|e| Error::invalid(format!("repository '{src}': {e} (give a directory or a git URL)")))?;
+    if !abs.is_dir() {
+        return Err(Error::invalid(format!("repository '{src}' is not a directory")));
+    }
+    Ok(abs.to_string_lossy().to_string())
+}
+
 /// "15m" → 900, "1h" → 3600, "90s"/"90" → 90, "0" → 0.
 fn parse_every(s: &str) -> Result<u64> {
     let s = s.trim();
@@ -816,6 +897,33 @@ fn parse_every(s: &str) -> Result<u64> {
 }
 
 fn print_crawl(st: &Style, c: &Value) {
+    if let Some(r) = c["repo"].as_object() {
+        let eco: Vec<String> = r
+            .get("ecosystems")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| format!("{v} {k}")).collect())
+            .unwrap_or_default();
+        println!(
+            "Crawled {} in {} ms{}: {} packages{}, {} dependencies, {} owners · {} written, {} unchanged, {} removed",
+            st.bold(c["connector"].as_str().unwrap_or_default()),
+            c["ms"],
+            r.get("commit")
+                .and_then(Value::as_str)
+                .map(|c| format!(" at {}", &c[..c.len().min(12)]))
+                .unwrap_or_default(),
+            r.get("packages").cloned().unwrap_or_default(),
+            if eco.is_empty() { String::new() } else { format!(" ({})", eco.join(", ")) },
+            r.get("dependencies").cloned().unwrap_or_default(),
+            r.get("owners").cloned().unwrap_or_default(),
+            c["upserted"],
+            c["unchanged"],
+            c["deleted"],
+        );
+        for n in c["notes"].as_array().cloned().unwrap_or_default() {
+            println!("  {} {}", st.dim("note:"), n.as_str().unwrap_or_default());
+        }
+        return;
+    }
     println!(
         "Crawled {} in {} ms: {} schemas, {} tables, {} views, {} columns, {} queries · {} written, {} unchanged, {} removed · learned {} · ranked {}",
         st.bold(c["connector"].as_str().unwrap_or_default()),
@@ -987,11 +1095,31 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             let hub = onto_intelli::Hub::open(cfg.clone()).await?;
             // Open the default tenant now: configuration problems show at startup.
             let intelli = hub.tenant(hub.default_tenant()).await?;
-            let auth = if *dev || cfg.auth.mode == "dev" {
+            let control = if cfg.console.enabled { Some(open_control(&cfg).await?) } else { None };
+            let mut auth = if *dev || cfg.auth.mode == "dev" {
                 st.red("DEVELOPMENT MODE, no authentication")
             } else {
                 format!("token auth ({} tokens)", cfg.auth.tokens.len())
             };
+            if let Some(c) = &control {
+                c.spawn_maintenance();
+                let mut paths = Vec::new();
+                if c.bootstrap_enabled() {
+                    paths.push("bootstrap token".to_string());
+                }
+                if !cfg.console.oidc.is_empty() {
+                    paths.push(format!("{} OIDC providers", cfg.console.oidc.len()));
+                }
+                if *dev || cfg.auth.mode == "dev" {
+                    paths.push("dev".into());
+                }
+                auth.push_str(&format!(
+                    " · console ({}; keys {}; LLM keys {})",
+                    paths.join(", "),
+                    if c.can_create_keys() { "on" } else { "off: set ONTO_KEY_PEPPER or ONTO_MASTER_KEY" },
+                    if c.can_store_llm_keys() { "on" } else { "off: set ONTO_MASTER_KEY" }
+                ));
+            }
             eprintln!(
                 "{} gRPC + HTTP on {} · storage {} · {} · tenant {}{} · llm {} ({})",
                 st.bold("onto-intelli"),
@@ -1009,7 +1137,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                     st.red("!")
                 );
             }
-            onto_grpc::serve_hub(hub, onto_grpc::ServeOptions { dev: *dev }, async {
+            onto_grpc::serve_hub(hub, onto_grpc::ServeOptions { dev: *dev, control }, async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("\nshutting down");
             })
@@ -1027,8 +1155,12 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             let be = backend(&cli).await?;
             if *stream && let Backend::Local { intelli, principal } = &be {
                 let ask: AskRequest = serde_json::from_value(req)?;
-                let mut rx = intelli.ask_stream(principal.clone(), ask);
+                let (mut rx, _) =
+                    intelli.try_ask_stream_traced(principal.clone(), ask, TraceCtx::from_source("cli"))?;
                 while let Some(ev) = rx.recv().await {
+                    if ev.is_terminal() {
+                        intelli.flush_traces().await;
+                    }
                     match ev.kind.as_str() {
                         "delta" => {
                             print!("{}", ev.text);
@@ -1615,34 +1747,70 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             print_answer(st, &r, false);
             Ok(())
         }
-        Command::Connect { kind, url, name, schemas, exclude, every, map_grants, grants, owners, title, no_crawl } => {
+        Command::Connect {
+            kind,
+            url,
+            name,
+            schemas,
+            exclude,
+            include,
+            branch,
+            every,
+            map_grants,
+            grants,
+            owners,
+            title,
+            no_crawl,
+        } => {
             let be = backend(&cli).await?;
-            let name = name.clone().unwrap_or_else(|| connector_name(url));
+            let repo = kind == "repo";
+            let every = every.clone().unwrap_or_else(|| if repo { "1h".into() } else { "15m".into() });
             let pairs = |list: &[String], what: &str| -> Result<serde_json::Map<String, Value>> {
                 list.iter()
                     .map(|kv| {
                         kv.split_once('=')
                             .map(|(k, v)| (k.to_string(), json!(v)))
-                            .ok_or_else(|| Error::invalid(format!("--{what} takes role=entity, got '{kv}'")))
+                            .ok_or_else(|| Error::invalid(format!("--{what} takes key=id, got '{kv}'")))
                     })
                     .collect()
             };
+            let url = if repo { repo_source(url, cli.remote.is_some())? } else { url.clone() };
+            let name = name.clone().unwrap_or_else(|| {
+                if repo { onto_intelli::connectors::repo::name_from(&url) } else { connector_name(&url) }
+            });
             let mut spec = json!({
                 "name": name,
                 "kind": kind,
                 "url": url,
                 "workspace": cli.workspace,
-                "every_secs": parse_every(every)?,
-                "map_grants": *map_grants,
-                "grant_map": pairs(grants, "grant")?,
-                "owner_map": pairs(owners, "owner")?,
+                "every_secs": parse_every(&every)?,
                 "title": title.clone().unwrap_or_default(),
             });
-            if !schemas.is_empty() {
-                spec["schemas"] = json!(schemas);
-            }
-            if !exclude.is_empty() {
-                spec["exclude_schemas"] = json!(exclude);
+            if repo {
+                let mut r = json!({ "owners": pairs(owners, "owner")? });
+                if let Some(b) = branch {
+                    r["branch"] = json!(b);
+                }
+                if !include.is_empty() {
+                    r["include"] = json!(include);
+                }
+                if !exclude.is_empty() {
+                    r["exclude"] = json!(exclude);
+                }
+                spec["repo"] = r;
+            } else {
+                if branch.is_some() || !include.is_empty() {
+                    return Err(Error::invalid("--branch and --include apply to repo connectors"));
+                }
+                spec["map_grants"] = json!(*map_grants);
+                spec["grant_map"] = json!(pairs(grants, "grant")?);
+                spec["owner_map"] = json!(pairs(owners, "owner")?);
+                if !schemas.is_empty() {
+                    spec["schemas"] = json!(schemas);
+                }
+                if !exclude.is_empty() {
+                    spec["exclude_schemas"] = json!(exclude);
+                }
             }
             let saved = be.call("connector.add", spec).await?;
             println!(
@@ -2020,6 +2188,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
+        Command::Console { sub } => console(&cli, st, sub).await,
         Command::Protos => {
             let cfg = Config::discover(cli.config.as_deref())?;
             let table = onto_grpc::RouteTable::build(&cfg)?;
@@ -2039,6 +2208,161 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             let be = backend(&cli).await?;
             print_json(&be.call("system.stats", json!({})).await?);
             Ok(())
+        }
+    }
+}
+
+/// The control plane `onto serve` uses: the memory store with
+/// `engine.storage = "memory"`, else the PostgreSQL schema `console.schema`.
+async fn open_control(cfg: &Config) -> Result<Arc<onto_control::Control>> {
+    let opts = onto_control::ControlOptions::from_env(&cfg.console)?;
+    let control = match cfg.engine.storage.as_str() {
+        "memory" => onto_control::Control::memory(cfg.console.clone(), opts)?,
+        _ => onto_control::Control::postgres(&cfg.engine.resolve_database_url()?, cfg.console.clone(), opts).await?,
+    };
+    Ok(Arc::new(control))
+}
+
+/// `onto console …`: the operator opens the control store directly.
+async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
+    let cfg = local_config(cli)?;
+    if cfg.engine.storage == "memory" {
+        return Err(Error::Config(
+            "with engine.storage = \"memory\" the control store lives inside `onto serve` only".into(),
+        ));
+    }
+    let control = open_control(&cfg).await?;
+    let store = control.store();
+    match sub {
+        ConsoleCmd::Bootstrap => {
+            let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            let tenants = hub.known_tenants()?;
+            let signed = control.sign_in_local(&tenants).await?;
+            println!(
+                "Organization {} ({}) · owner {} ({})",
+                st.bold(&signed.org.slug),
+                signed.org.id,
+                signed.user.name,
+                signed.user.id
+            );
+            if signed.adopted.is_empty() {
+                println!("{}", st.dim("No new tenants to adopt."));
+            }
+            for p in &signed.adopted {
+                println!("  adopted tenant {} as project {}", st.cyan(&p.r#ref), p.id);
+            }
+            if !control.bootstrap_enabled() {
+                println!(
+                    "{}",
+                    st.dim(&format!(
+                        "Sign in to the console by setting {} (at least 32 characters) for `onto serve`.",
+                        cfg.console.bootstrap_token_env.as_deref().unwrap_or("console.bootstrap_token_env")
+                    ))
+                );
+            }
+            Ok(())
+        }
+        ConsoleCmd::Users => {
+            for u in store.users().await? {
+                let orgs: Vec<String> =
+                    store.orgs_of(&u.id).await?.into_iter().map(|(o, r)| format!("{} ({r})", o.slug)).collect();
+                println!(
+                    "{} {:<24} {:<28} {}{}",
+                    st.cyan(&u.id),
+                    u.name,
+                    u.email.as_deref().unwrap_or("-"),
+                    orgs.join(", "),
+                    if u.disabled { st.red(" disabled") } else { String::new() }
+                );
+            }
+            Ok(())
+        }
+        ConsoleCmd::AddOwner { user, org } => {
+            let o = store.org(org).await?.ok_or_else(|| Error::not_found(format!("organization {org}")))?;
+            store.user(user).await?.ok_or_else(|| Error::not_found(format!("user {user}")))?;
+            store.add_member(&o.id, user, onto_control::OrgRole::Owner).await?;
+            control
+                .audit(onto_control::AuditEntry::new("system", "member.role").org(&o.id).target(user).detail(json!({
+                    "to": "owner", "via": "onto console add-owner",
+                })))
+                .await;
+            println!("{user} is an owner of {}", st.bold(&o.slug));
+            Ok(())
+        }
+        ConsoleCmd::Keys { project_ref, create, scopes, json: as_json } => {
+            let p = store
+                .project_by_ref(project_ref)
+                .await?
+                .filter(onto_control::Project::active)
+                .ok_or_else(|| Error::not_found(format!("project {project_ref}")))?;
+            if let Some(name) = create {
+                let scopes = if scopes.is_empty() { vec!["read".to_string()] } else { scopes.clone() };
+                let req = onto_control::KeyRequest {
+                    name: name.clone(),
+                    scopes: scopes.iter().map(|s| onto_control::KeyScope::parse(s)).collect::<Result<_>>()?,
+                    workspaces: cli.workspace.clone().map(|w| vec![w]),
+                    ..Default::default()
+                };
+                let (key, secret) = control.create_key(&p, req, "system").await?;
+                if *as_json {
+                    print_json(&json!({ "key": key, "secret": secret }));
+                } else {
+                    println!("Created {} ({}) in project {}", st.bold(&key.prefix), key.name, p.r#ref);
+                    println!("{secret}");
+                    println!("{}", st.dim("The secret is shown once; store it now."));
+                }
+                return Ok(());
+            }
+            let keys = store.keys(&p.id).await?;
+            if *as_json {
+                print_json(&json!({ "keys": keys }));
+                return Ok(());
+            }
+            for k in keys {
+                let scopes: Vec<&str> = k.scopes.iter().map(|s| s.as_str()).collect();
+                let state = if k.revoked_at.is_some() {
+                    st.red("revoked")
+                } else if !k.usable(onto_intelli::core::time::now_ms()) {
+                    st.red("expired")
+                } else {
+                    "active".to_string()
+                };
+                println!(
+                    "{} {:<24} {:<22} {:<8} {}",
+                    st.cyan(&k.prefix),
+                    k.name,
+                    scopes.join(","),
+                    state,
+                    st.dim(&k.id)
+                );
+            }
+            Ok(())
+        }
+        ConsoleCmd::RotateMasterKey { json: as_json } => {
+            let report = control.rotate_master_key().await?;
+            if *as_json {
+                print_json(&json!(report));
+            } else {
+                println!(
+                    "Rewrapped {} LLM keys under the current ONTO_MASTER_KEY; {} already were.",
+                    st.bold(&report.rewrapped.to_string()),
+                    report.current
+                );
+                for (project, why) in &report.failed {
+                    println!("  {} {project}: {why}", st.red("failed"));
+                }
+                if report.failed.is_empty() && report.rewrapped > 0 {
+                    println!(
+                        "{}",
+                        st.dim("ONTO_MASTER_KEY_PREVIOUS can be removed once every replica runs on the new key.")
+                    );
+                }
+            }
+            if report.failed.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Invalid(format!("{} keys did not decrypt", report.failed.len())))
+            }
         }
     }
 }
@@ -2225,4 +2549,13 @@ async fn chat(cli: &Cli, st: &Style) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_line_definition_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
 }

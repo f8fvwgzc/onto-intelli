@@ -3,10 +3,12 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { Logo } from "../components/Shell";
 import { Button, Field, Input } from "../components/ui";
+import { href, navigate, useRoute } from "../lib/router";
 import { setSession, useSession } from "../lib/session";
 
-export function SignIn({ title, error, embedded }: { title: string; error?: string; embedded: boolean }) {
+export function SignIn({ title, error, embedded, consoleLink }: { title: string; error?: string; embedded: boolean; consoleLink?: boolean }) {
   const s = useSession();
+  const route = useRoute();
   const [token, setToken] = useState("");
   const [tenant, setTenant] = useState(s.tenant ?? "");
   const [workspace, setWorkspace] = useState(s.workspace ?? "");
@@ -31,8 +33,9 @@ export function SignIn({ title, error, embedded }: { title: string; error?: stri
         className="w-full max-w-[380px] rounded-modal bg-raised p-6 shadow-overlay"
         onSubmit={(e) => {
           e.preventDefault();
-          setSession({ token: token.trim() || undefined, tenant: tenant.trim() || undefined, workspace: workspace.trim() || undefined });
+          setSession({ token: token.trim() || undefined, console: false, tenant: tenant.trim() || undefined, workspace: workspace.trim() || undefined });
           void qc.invalidateQueries();
+          if (route.path[0] === "signin") navigate(["map"]);
         }}
       >
         <div className="flex items-center gap-2.5">
@@ -60,6 +63,13 @@ export function SignIn({ title, error, embedded }: { title: string; error?: stri
           </Button>
         </div>
         <p className="mt-4 text-xs text-ink-3">The token stays in this tab and is sent only to this server.</p>
+        {consoleLink ? (
+          <p className="mt-2 text-xs text-ink-3">
+            <a href={href(["signin"])} className="text-accent hover:underline">
+              Sign in to the console instead
+            </a>
+          </p>
+        ) : null}
       </form>
     </div>
   );

@@ -1,0 +1,58 @@
+# code: a repository's structure as ontology data. The repository connector
+# writes it (`onto connect repo <path | git URL>`, then `onto crawl`): the
+# packages of a monorepo (Cargo crates, npm and pnpm packages, Go modules,
+# Python projects), their internal dependencies and who owns them according
+# to CODEOWNERS. It reads metadata only (manifests and CODEOWNERS), never
+# source files.
+#
+# Layered after builtin:data-catalog by default
+# (extend = ["builtin:data-catalog", "builtin:code"]); it needs both
+# builtin:enterprise and builtin:data-catalog, because it redefines `owns`
+# and `depends_on` with their full endpoint lists.
+# Ids: repository:{connector}, package:{connector}.{ecosystem}.{package}.
+
+[object_types.package]
+label = "Package"
+category = "artifact"
+icon = "package"
+color = "#7c3aed"
+description = "A unit of code a repository builds: a Cargo crate, an npm package, a Go module or a Python project."
+properties.ecosystem = { type = "enum", values = ["cargo", "npm", "go", "python"], required = true }
+properties.path = { type = "string", description = "Directory relative to the repository root ('.' for the root)." }
+properties.version = { type = "string" }
+properties.description = { type = "text", searchable = true }
+properties.manifest = { type = "string", description = "The manifest it was read from, relative to the repository root." }
+properties.private = { type = "bool", description = "Not published (npm private, Cargo publish = false)." }
+properties.language = { type = "string" }
+properties.module = { type = "string", searchable = true, description = "Go: the full module path." }
+
+# Relations. `depends_on` and `owns` replace the ones of enterprise and
+# data-catalog (a layer replaces a link type by name), so their lists repeat
+# those endpoints and add `package`.
+
+[link_types.in_repository]
+label = "In repository"
+from = ["package"]
+to = ["repository"]
+inverse = "has_package"
+weight = 0.6
+description = "A package lives in a repository."
+
+[link_types.depends_on]
+description = "The subject needs the object to work or to finish."
+from = ["project", "task", "service", "issue", "milestone", "package"]
+to = ["project", "task", "service", "issue", "milestone", "repository", "environment", "package"]
+inverse = "required_by"
+dependency = true
+weight = 0.9
+
+[link_types.owns]
+from = ["team", "person"]
+to = ["project", "service", "repository", "knowledge", "artifact", "environment", "decision", "data_source", "db_schema", "table", "view", "package"]
+inverse = "owned_by"
+weight = 0.8
+
+[glossary.kinds]
+packages = "package"
+crate = "package"
+crates = "package"

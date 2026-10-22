@@ -1,0 +1,6 @@
+# Libraries only; the legacy one is not built.
+packages:
+  - 'libs/*'
+  - "!libs/legacy"
+catalog:
+  react: ^18.0.0

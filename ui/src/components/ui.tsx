@@ -213,6 +213,17 @@ export function Segmented<T extends string>({ value, options, onChange, label }:
 
 /** Side panel on wide screens, bottom sheet on phones. */
 export function Panel({ open, onClose, title, children, actions, wide }: { open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; actions?: ReactNode; wide?: boolean }) {
+  // Esc closes the panel (a modal dialog above it takes Esc first).
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !e.defaultPrevented && !document.querySelector("dialog[open]")) close.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
   if (!open) return null;
   return (
     <aside
@@ -241,7 +252,11 @@ export function Dialog({ open, onClose, title, children, footer, wide }: { open:
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
-    if (open && !d.open) d.showModal();
+    if (open && !d.open) {
+      d.showModal();
+      // showModal focuses the first control, the header's Close button: start in the first field instead.
+      d.querySelector<HTMLElement>("[data-dialog-body] :is(input:not([type=hidden]), select, textarea):not(:disabled)")?.focus();
+    }
     if (!open && d.open) d.close();
   }, [open]);
   return (
@@ -262,7 +277,9 @@ export function Dialog({ open, onClose, title, children, footer, wide }: { open:
               <X className="size-4" />
             </IconButton>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
+          <div data-dialog-body className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            {children}
+          </div>
           {footer ? <div className="flex flex-wrap justify-end gap-2 border-t border-hairline px-5 py-3">{footer}</div> : null}
         </div>
       ) : null}

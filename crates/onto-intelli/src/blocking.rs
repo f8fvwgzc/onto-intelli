@@ -13,6 +13,7 @@ use onto_core::{Error, Ontology, Principal, Result};
 
 use crate::config::Config;
 use crate::intelli::{AskRequest, AskResponse, Intelli};
+use crate::trace::TraceCtx;
 
 pub struct BlockingIntelli {
     rt: Runtime,
@@ -40,11 +41,11 @@ impl BlockingIntelli {
     }
 
     pub fn ask_with(&self, p: &Principal, req: AskRequest) -> Result<AskResponse> {
-        self.rt.block_on(self.inner.ask(p, req))
+        self.rt.block_on(self.inner.ask_traced(p, req, TraceCtx::from_source("ffi"))).result
     }
 
     pub fn call(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
-        self.rt.block_on(self.inner.call(p, action, input))
+        self.rt.block_on(self.inner.call_traced(p, action, input, TraceCtx::from_source("ffi"))).result
     }
 
     /// Direct synchronous graph access.

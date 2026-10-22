@@ -5,6 +5,10 @@
  *   onto_call(h, "intelli.ask", "{\"question\":\"Who owns Project Alpha?\"}")
  *   -> {"ok":true,"result":{...}}   or   {"ok":false,"error":{"code":"...","message":"..."}}
  *
+ * Error codes: not_found, invalid_argument, permission_denied, conflict,
+ * storage, config, llm, unavailable, aborted, resource_exhausted (a rate
+ * limit or quota), internal.
+ *
  * Link against libonto_intelli (.so / .dylib / .dll or the static .a / .lib).
  * Handles are thread-safe. Free every returned string with onto_string_free.
  */

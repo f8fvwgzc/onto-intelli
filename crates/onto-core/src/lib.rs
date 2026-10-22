@@ -44,6 +44,7 @@ pub mod similarity;
 pub mod store;
 pub mod text;
 pub mod time;
+pub mod trace;
 
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
