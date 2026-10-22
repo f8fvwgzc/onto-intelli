@@ -20,7 +20,7 @@ ingest_queue = 1024           # async ingestion backpressure
 
 [ontology]
 schema = "builtin:enterprise" # or a path to your own schema TOML
-extend = ["builtin:data-catalog"] # layers: data sources, tables, columns, queries, learned facts; add e.g. "schema/custom.toml"
+extend = ["builtin:data-catalog", "builtin:code"] # layers: data sources, tables, columns, queries, learned facts; packages, dependencies, owners; add e.g. "schema/custom.toml"
 strict = false                # true: reject unknown kinds/relations/properties
 schema_mode = "live"          # live: stored versions win, file edits import as new versions | config: files win
 
@@ -162,3 +162,68 @@ principal = { id = "operator", roles = ["admin"], workspaces = ["*"] }
 # The CLI and in-process (FFI) callers open the store directly and act as:
 [local]
 principal = { id = "local", roles = ["admin"], workspaces = ["*"] }
+
+# The control plane (docs/CONTROL_PLANE.md): organizations, members, projects
+# (each project is a tenant), API keys and console sign-in, kept in a
+# control store next to the tenants.
+[console]
+# Serve the console routes (/v1/console/...). Requires engine.tenancy = "multi"
+# (startup fails otherwise) and at least one sign-in path: an [[console.oidc]]
+# provider, the bootstrap token, or dev mode.
+enabled = false
+# Public base URL of this server: invitation links, and the OIDC redirect URI
+# {public_url}/v1/console/auth/oidc/callback. https:// unless the host is loopback.
+public_url = "http://127.0.0.1:50051"
+# PostgreSQL schema of the control store (in memory when engine.storage = "memory").
+schema = "onto_control"
+# First sign-in through an IdP creates the user. When false, only invited
+# users (by verified email) and existing users can sign in.
+allow_signup = true
+# A new user with no membership gets an organization of their own.
+create_org_on_signup = true
+# Verified email domains allowed to sign up; empty = any.
+allowed_email_domains = []
+# Environment variable with a bootstrap admin token (at least 32 characters):
+# POST /v1/console/auth/token signs in as the local administrator.
+# export ONTO_ADMIN_TOKEN=$(openssl rand -hex 32)
+bootstrap_token_env = "ONTO_ADMIN_TOKEN"
+# Console session lifetime (refreshed by the UI while the tab is open).
+session_ttl_secs = 28800
+# Allow project LLM base URLs, and the git and PostgreSQL URLs of connectors
+# that API keys and console sessions register, to resolve to loopback or
+# private addresses (self-hosted Ollama, an internal git server or database);
+# also lets those credentials register ssh:// and user@host:path git URLs.
+allow_private_urls = false
+# Projects per organization (0 = unlimited).
+max_projects_per_org = 20
+# API keys are stored as SHA-256(pepper || key): set ONTO_KEY_PEPPER (at least
+# 32 characters) or ONTO_MASTER_KEY (32 bytes, base64 or hex), or keys cannot
+# be created.
+
+# Sign-in through an OpenID Connect provider (Clerk, Auth0, Supabase Auth,
+# Google, Keycloak, Okta, Entra):
+# [[console.oidc]]
+# id = "clerk"                                   # [a-z0-9-], used in URLs
+# name = "Clerk"                                 # shown on the sign-in button
+# issuer = "https://example.clerk.accounts.dev"
+# client_id = "..."
+# client_secret_env = "ONTO_OIDC_CLERK_SECRET"   # omit for a public client (PKCE only)
+# scopes = ["openid", "email", "profile"]
+# audiences = []                                 # extra accepted `aud` values besides client_id
+
+# Traces of the engine's work (docs/CONTROL_PLANE.md section 9): each ask,
+# governed action and LLM-using call with its spans and token counts, kept in
+# the tenant's store and read with trace.* actions, /v1/traces and /v1/metrics.
+[traces]
+enabled = true
+retention_days = 30                # per project: the trace_retention_days setting, 1..400
+# Store question, prompt and answer text (clipped). false: metadata only.
+capture_content = true
+max_content_bytes = 4096
+# Which engine calls become traces besides intelli.ask: "writes" (writing
+# actions and LLM-using actions), "all", or "none".
+calls = "writes"
+# Background writer: flush every this many ms or records.
+flush_ms = 500
+flush_records = 200
+queue = 10000                      # records waiting; beyond this they are dropped and counted

@@ -10,6 +10,7 @@ use onto_core::{Error, Principal, Result};
 
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::clip;
+use crate::trace::TraceCtx;
 
 /// Demo suite for the seeded `acme` workspace.
 pub const DEMO_EVALS: &str = include_str!("../templates/evals.toml");
@@ -63,6 +64,9 @@ pub struct CaseResult {
     pub ms: f64,
     /// Facts the answer was based on (the evidence trail).
     pub evidence: Vec<String>,
+    /// The case's trace (scored `eval.pass`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -81,6 +85,12 @@ pub struct EvalReport {
 
 impl Intelli {
     pub async fn eval(&self, p: &Principal, cases: Vec<EvalCase>) -> Result<EvalReport> {
+        self.eval_traced(p, cases, &TraceCtx::default()).await
+    }
+
+    /// Run the cases; each one is a trace of kind `eval` named `eval.case`
+    /// (its tags and session from `ctx`) with an `eval.pass` score of 1 or 0.
+    pub async fn eval_traced(&self, p: &Principal, cases: Vec<EvalCase>, ctx: &TraceCtx) -> Result<EvalReport> {
         let mut report = EvalReport { total: cases.len(), ..Default::default() };
         let mut total_ms = 0.0;
         let mut deterministic = 0usize;
@@ -92,7 +102,16 @@ impl Intelli {
                 no_cache: true,
                 ..Default::default()
             };
-            let (passed, failures, mode, intent, answer, tokens, evidence) = match self.ask(p, req).await {
+            let name = c.name.clone().unwrap_or_else(|| format!("case {}", i + 1));
+            let mut cctx = ctx.clone();
+            cctx.otel_trace_id = None;
+            cctx.parent_span = None;
+            cctx.name = Some("eval.case".into());
+            cctx.tags.push("eval".into());
+            cctx.metadata = serde_json::json!({ "case": name });
+            let traced = self.ask_traced_as(p, req, cctx, "eval").await;
+            let trace_id = traced.trace_id;
+            let (passed, failures, mode, intent, answer, tokens, evidence) = match traced.result {
                 Ok(r) => {
                     let lower = r.answer.to_lowercase();
                     let mut failures = Vec::new();
@@ -153,11 +172,24 @@ impl Intelli {
             };
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             total_ms += ms;
+            if let Some(id) = &trace_id {
+                self.send_score(onto_core::trace::ScoreRow {
+                    id: onto_core::time::new_id("score"),
+                    trace_id: id.clone(),
+                    ts: onto_core::time::now_ms(),
+                    name: "eval.pass".into(),
+                    value: Some(if passed { 1.0 } else { 0.0 }),
+                    source: "eval".into(),
+                    author: Some(p.id.clone()),
+                    comment: (!failures.is_empty()).then(|| clip(&failures.join("; "), 500)),
+                    ..Default::default()
+                });
+            }
             if passed {
                 report.passed += 1;
             }
             report.cases.push(CaseResult {
-                name: c.name.clone().unwrap_or_else(|| format!("case {}", i + 1)),
+                name,
                 question: c.question,
                 passed,
                 failures,
@@ -167,6 +199,7 @@ impl Intelli {
                 tokens,
                 ms: (ms * 100.0).round() / 100.0,
                 evidence,
+                trace_id,
             });
         }
         report.failed = report.total - report.passed;

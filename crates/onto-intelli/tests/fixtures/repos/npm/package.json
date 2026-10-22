@@ -1,0 +1,11 @@
+{
+  "name": "acme-web-root",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "devDependencies": {
+    "prettier": "^3.0.0"
+  }
+}

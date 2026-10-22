@@ -17,8 +17,15 @@ interface Item {
   run: () => void;
 }
 
-/** ⌘K: jump to any entity (on the map, or its page with ⇧) or any view. */
-export function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
+/** A view the palette lists besides the ontology's (the console's pages). */
+export interface PaletteView {
+  key: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}
+
+/** ⌘K: jump to any entity (on the map, or its page with ⇧) or any view (`views` first: the console's). */
+export function CommandPalette({ open, onClose, views: extra = [] }: { open: boolean; onClose: () => void; views?: readonly PaletteView[] }) {
   const [q, setQ] = useState("");
   const [debounced, setDebounced] = useState("");
   const [index, setIndex] = useState(0);
@@ -57,6 +64,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       onClose();
     };
     const views: Item[] = [
+      ...extra.map((v) => ({ key: `v:${v.key}`, label: v.label, hint: "View", icon: <v.icon className="size-4" />, run: go([v.key]) })),
       { key: "v:map", label: "Map", hint: "View", icon: <MapIcon className="size-4" />, run: go(["map"]) },
       { key: "v:explore", label: "Explorer", hint: "View", icon: <Table2 className="size-4" />, run: go(["explore"]) },
       { key: "v:entities", label: "Entities", hint: "View", icon: <Boxes className="size-4" />, run: go(["entities"]) },
@@ -85,7 +93,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
       run: go(["map"], { focus: entity.id }),
     }));
     return [...hits, ...types, ...views];
-  }, [q, results.data, schema, onClose]);
+  }, [q, results.data, schema, onClose, extra]);
 
   useEffect(() => setIndex(0), [items.length]);
 

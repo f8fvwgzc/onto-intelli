@@ -1,0 +1,16 @@
+{
+  "name": "@acme/web",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@acme/ui": "workspace:*",
+    "next": "14.0.0"
+  },
+  "devDependencies": {
+    "@acme/utils": "*",
+    "typescript": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "@acme/ui": "*"
+  }
+}

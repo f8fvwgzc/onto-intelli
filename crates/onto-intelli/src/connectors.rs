@@ -45,6 +45,8 @@ use onto_core::{ActionContext, Error, EventInput, Mutation, Ontology, Principal,
 
 use crate::intelli::Intelli;
 
+pub mod repo;
+
 /// KV namespaces: connector specs and their crawl state.
 pub const NS_SPEC: &str = "connector";
 pub const NS_STATE: &str = "connector_state";
@@ -72,11 +74,13 @@ fn default_exclude() -> Vec<String> {
 pub struct ConnectorSpec {
     /// `[a-z0-9_-]`, at most 40: also the source key in entity ids.
     pub name: String,
-    /// `postgres`.
+    /// `postgres` or `repo`.
     #[serde(default = "default_kind")]
     pub kind: String,
     /// Connection URL, or `env:VAR` to read it from the environment when
-    /// crawling (keeps credentials out of the store; preferred).
+    /// crawling (keeps credentials out of the store; preferred). For `repo`:
+    /// an absolute directory path or a git URL (`https://`, `ssh://`,
+    /// `user@host:path`).
     pub url: String,
     /// Workspace the crawled assets belong to (default: the engine's).
     #[serde(default)]
@@ -104,6 +108,16 @@ pub struct ConnectorSpec {
     /// Most-called statements read from pg_stat_statements.
     #[serde(default = "default_max_queries")]
     pub max_queries: usize,
+    /// `repo` connectors: branch, include and exclude patterns, owner map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<repo::RepoOptions>,
+    /// Registered by a project credential (an API key or a console
+    /// session): the server sets it, whatever the input says. Every crawl
+    /// then checks the URL again with the SSRF rules of
+    /// docs/CONTROL_PLANE.md section 14 and connects only to the addresses
+    /// it checked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restricted: bool,
     #[serde(default)]
     pub created_by: String,
     #[serde(default)]
@@ -153,13 +167,21 @@ impl ConnectorSpec {
                 self.name
             )));
         }
-        if self.kind != "postgres" {
-            return Err(Error::invalid(format!("unknown connector kind '{}' (postgres)", self.kind)));
+        match self.kind.as_str() {
+            "postgres" => {
+                if self.url.trim().is_empty() {
+                    return Err(Error::invalid("connector url is required (postgres://… or env:VAR)"));
+                }
+                Ok(())
+            }
+            "repo" => {
+                if self.url.trim().is_empty() {
+                    return Err(Error::invalid("connector url is required (a directory path or a git URL)"));
+                }
+                repo::validate(self)
+            }
+            other => Err(Error::invalid(format!("unknown connector kind '{other}' (postgres, repo)"))),
         }
-        if self.url.trim().is_empty() {
-            return Err(Error::invalid("connector url is required (postgres://… or env:VAR)"));
-        }
-        Ok(())
     }
 
     /// The URL to connect with (`env:VAR` read now).
@@ -230,6 +252,9 @@ pub struct CrawlReport {
     pub links: BTreeMap<String, LinkSync>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Repository crawls: packages, dependencies, owners and the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<repo::RepoStats>,
 }
 
 /// Rows of one object type's table, as a crawl synced them.
@@ -312,6 +337,10 @@ pub struct ConnectorState {
     pub fingerprints: Fingerprints,
     #[serde(default)]
     pub last: Option<CrawlReport>,
+    /// Repository crawls: the commit or manifest stamp and options last
+    /// crawled (unchanged → the next crawl does nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<String>,
 }
 
 /// Reads one kind of data source.
@@ -328,10 +357,13 @@ pub trait Connector: Send + Sync {
     async fn close(&self) {}
 }
 
-pub fn connector_for(kind: &str) -> Result<Box<dyn Connector>> {
+/// The connector of `kind`. `allow_private` is `console.allow_private_urls`
+/// (the SSRF rule for [`ConnectorSpec::restricted`] specs).
+pub fn connector_for(kind: &str, allow_private: bool) -> Result<Box<dyn Connector>> {
+    let _ = allow_private;
     match kind {
         #[cfg(feature = "postgres")]
-        "postgres" => Ok(Box::new(postgres::PgConnector::default())),
+        "postgres" => Ok(Box::new(postgres::PgConnector::new(allow_private))),
         other => Err(Error::Config(format!("no connector for '{other}' in this build"))),
     }
 }
@@ -772,6 +804,7 @@ impl Intelli {
     /// Register (or replace) a connector. Admins only.
     pub fn add_connector(&self, p: &Principal, mut spec: ConnectorSpec) -> Result<ConnectorSpec> {
         require_admin(p, "add connectors")?;
+        spec.url = spec.url.trim().to_string();
         spec.validate()?;
         spec.created_by = p.id.clone();
         spec.created_at = now_ms();
@@ -881,7 +914,14 @@ impl Intelli {
         }
         let started = now_ms();
         let result = async {
-            let connector = connector_for(&spec.kind)?;
+            let allow_private = self.config().console.allow_private_urls;
+            if spec.kind == "repo" {
+                let (o, s) = (onto.clone(), spec.clone());
+                return tokio::task::spawn_blocking(move || repo::crawl(&o, &s, started, allow_private))
+                    .await
+                    .map_err(|e| Error::Other(format!("crawl task: {e}")))?;
+            }
+            let connector = connector_for(&spec.kind, allow_private)?;
             let snap = connector.snapshot(spec).await;
             let rows = match &snap {
                 Ok(snap) => fetch_rows(connector.as_ref(), spec, &onto.schema(), snap).await,
@@ -957,23 +997,118 @@ pub mod postgres {
     #[derive(Default)]
     pub struct PgConnector {
         pool: parking_lot::Mutex<Option<sqlx::PgPool>>,
+        /// `console.allow_private_urls`, for restricted specs.
+        allow_private: bool,
     }
 
-    async fn connect(spec: &ConnectorSpec, url: &str) -> Result<sqlx::PgPool> {
-        PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(15))
-            .connect(url)
-            .await
-            .map_err(|e| Error::Unavailable(format!("connector {}: {e}", spec.name)))
+    /// Query parameters a restricted URL may carry. `host`, `hostaddr` and
+    /// `port` would move the connection elsewhere (a Unix socket, too),
+    /// `sslrootcert`, `sslcert` and `sslkey` name files of the server, and
+    /// `options` sets server parameters.
+    const RESTRICTED_PARAMS: [&str; 3] = ["sslmode", "ssl-mode", "application_name"];
+
+    /// Check a PostgreSQL URL that a project credential registers (or that
+    /// a [`ConnectorSpec::restricted`] spec connects with) and build the
+    /// options to connect with: `postgres://` or `postgresql://` with a TCP
+    /// host (no Unix socket, no empty host) and a user, and no query
+    /// parameter but `sslmode` and `application_name`. Nothing comes from
+    /// the server's environment or `~/.pgpass`: the password is the URL's,
+    /// or empty. Unless `allow_private`, the host must resolve only to
+    /// public addresses, and the options connect to the first of them (the
+    /// name is kept for `sslmode=verify-full`, whose certificate check
+    /// is against the name).
+    pub async fn check_url(raw: &str, allow_private: bool) -> Result<sqlx::postgres::PgConnectOptions> {
+        use sqlx::postgres::{PgConnectOptions, PgSslMode};
+        let raw = raw.trim();
+        let bad = |why: String| Error::invalid(format!("postgres URL: {why}"));
+        let url = sqlx::Url::parse(raw).map_err(|e| bad(format!("not a URL ({e})")))?;
+        if !matches!(url.scheme(), "postgres" | "postgresql") {
+            return Err(bad(format!("scheme {} is not postgres:// or postgresql://", url.scheme())));
+        }
+        let decode = |s: &str| {
+            sqlx::percent_encoding::percent_decode_str(s)
+                .decode_utf8()
+                .map(|c| c.into_owned())
+                .map_err(|_| bad("not valid UTF-8 after percent-decoding".into()))
+        };
+        let host = match url.host() {
+            None => return Err(bad("a host is required (the default host and Unix sockets are refused)".into())),
+            Some(sqlx::url::Host::Domain(d)) => {
+                let d = decode(d)?;
+                if d.is_empty() || d.contains('/') || d.contains('\\') {
+                    return Err(bad("a host is required (the default host and Unix sockets are refused)".into()));
+                }
+                d
+            }
+            Some(sqlx::url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(sqlx::url::Host::Ipv6(ip)) => ip.to_string(),
+        };
+        let user = decode(url.username())?;
+        if user.is_empty() {
+            return Err(bad("a user name is required (postgres://user:password@host/db)".into()));
+        }
+        let password = url.password().map(decode).transpose()?.unwrap_or_default();
+        let database = decode(url.path().trim_start_matches('/'))?;
+        let mut ssl_mode = PgSslMode::Prefer;
+        let mut app = "onto-intelli".to_string();
+        for (k, v) in url.query_pairs() {
+            match &*k {
+                "sslmode" | "ssl-mode" => {
+                    ssl_mode = v.parse().map_err(|_| bad(format!("sslmode {v} is not a mode")))?;
+                }
+                "application_name" => app = v.into_owned(),
+                other => {
+                    return Err(bad(format!(
+                        "the parameter {other} is refused for connectors registered by API keys and console \
+                         sessions (only {} are accepted)",
+                        RESTRICTED_PARAMS.join(", ")
+                    )));
+                }
+            }
+        }
+        let port = url.port().unwrap_or(5432);
+        let mut opts = PgConnectOptions::new_without_pgpass()
+            .host(&host)
+            .port(port)
+            .username(&user)
+            .password(&password)
+            .database(if database.is_empty() { &user } else { &database })
+            .ssl_mode(ssl_mode)
+            .application_name(&app);
+        if !allow_private {
+            let addrs = crate::net::resolve_public("postgres URL", &host, port).await?;
+            if !matches!(ssl_mode, PgSslMode::VerifyFull) {
+                opts = opts.host(&addrs[0].to_string());
+            }
+        }
+        Ok(opts)
     }
 
     impl PgConnector {
+        pub fn new(allow_private: bool) -> Self {
+            Self { pool: Default::default(), allow_private }
+        }
+
+        /// Connect for `spec`: a restricted spec only with [`check_url`]'s
+        /// options, checked again now.
+        async fn connect(&self, spec: &ConnectorSpec, url: &str) -> Result<sqlx::PgPool> {
+            let pool = PgPoolOptions::new().max_connections(1).acquire_timeout(Duration::from_secs(15));
+            let pool = if spec.restricted {
+                let opts = check_url(url, self.allow_private)
+                    .await
+                    .map_err(|e| Error::invalid(format!("connector {}: {e}", spec.name)))?;
+                pool.connect_with(opts).await
+            } else {
+                pool.connect(url).await
+            };
+            pool.map_err(|e| Error::Unavailable(format!("connector {}: {e}", spec.name)))
+        }
+
         async fn pool(&self, spec: &ConnectorSpec) -> Result<sqlx::PgPool> {
             if let Some(pool) = self.pool.lock().clone() {
                 return Ok(pool);
             }
-            let pool = connect(spec, &spec.resolve_url()?).await?;
+            let pool = self.connect(spec, &spec.resolve_url()?).await?;
             *self.pool.lock() = Some(pool.clone());
             Ok(pool)
         }
@@ -1039,7 +1174,7 @@ pub mod postgres {
             let url = spec.resolve_url()?;
             let parsed =
                 sqlx::Url::parse(&url).map_err(|e| Error::Config(format!("connector {}: bad URL: {e}", spec.name)))?;
-            let pool = connect(spec, &url).await?;
+            let pool = self.connect(spec, &url).await?;
             let out = read(&pool, spec, &parsed).await;
             pool.close().await;
             out
@@ -1342,6 +1477,42 @@ mod tests {
     use super::*;
     use onto_core::modeling::DraftOptions;
     use parking_lot::Mutex;
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn restricted_postgres_urls_connect_only_where_checked() {
+        use postgres::check_url;
+        let opts = check_url("postgres://ro@8.8.8.8/wh?sslmode=require", false).await.unwrap();
+        assert_eq!((opts.get_host(), opts.get_port(), opts.get_username()), ("8.8.8.8", 5432, "ro"));
+        assert_eq!(opts.get_database(), Some("wh"));
+        assert!(opts.get_socket().is_none());
+        // No database: the user's, never the server's PGDATABASE.
+        assert_eq!(check_url("postgres://ro@8.8.8.8", false).await.unwrap().get_database(), Some("ro"));
+        for bad in [
+            "postgres://onto:onto@127.0.0.1:5441/onto",
+            "postgres://u@localhost/db",
+            "postgresql:///onto?host=/var/run/postgresql",
+            "postgres://u@%2Ftmp/db",
+            "postgres://u@8.8.8.8/db?hostaddr=127.0.0.1",
+            "postgres://u@8.8.8.8/db?sslcert=/etc/client.crt",
+            "postgres://8.8.8.8/db",
+        ] {
+            assert!(check_url(bad, false).await.is_err(), "{bad}");
+        }
+        let private = check_url("postgres://onto@127.0.0.1:5441/onto", true).await.unwrap();
+        assert_eq!((private.get_host(), private.get_port()), ("127.0.0.1", 5441));
+
+        // A restricted spec is checked again when the crawl connects, so a
+        // stored URL to a private address never reaches the network.
+        let i = Intelli::open(crate::Config::in_memory()).await.unwrap();
+        let admin = Principal::admin("ada");
+        for (kind, url) in [("postgres", "postgres://onto:onto@127.0.0.1:5441/onto"), ("repo", "https://127.0.0.1/r")] {
+            let spec = json!({ "name": kind, "kind": kind, "url": url, "every_secs": 0, "restricted": true });
+            i.call(&admin, "connector.add", spec).await.unwrap();
+            let e = i.call(&admin, "connector.crawl", json!({ "name": kind })).await.unwrap_err().to_string();
+            assert!(e.contains("not a public address"), "{kind}: {e}");
+        }
+    }
 
     /// Tables in memory, read the way the PostgreSQL connector reads them:
     /// key order, keyset paging, only the requested columns.

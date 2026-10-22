@@ -18,6 +18,8 @@
 //!   or the runtime of a pool handed in by the embedding application) and
 //!   the caller waits, yielding its worker thread when it is on one.
 
+mod traces;
+
 use std::future::Future;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -53,6 +55,8 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (2, "vectors", include_str!("../../migrations/0002_vectors.sql")),
     (3, "append_only", include_str!("../../migrations/0003_append_only.sql")),
     (4, "hot_updates", include_str!("../../migrations/0004_hot_updates.sql")),
+    (5, "traces", include_str!("../../migrations/0005_traces.sql")),
+    (6, "trace_otel", include_str!("../../migrations/0006_trace_otel.sql")),
 ];
 /// Above this many entities without vectors, a backfill drops the HNSW
 /// index and builds it once at the end (much faster than row by row).
@@ -240,6 +244,18 @@ impl PgShared {
     /// The store of one tenant (its own PostgreSQL schema), created if missing.
     pub fn tenant(&self, tenant: &str, opts: PgOptions) -> Result<PgStore> {
         PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone(), self.vector.clone())
+    }
+
+    /// Drop a tenant's schema and everything in it (`DROP SCHEMA … CASCADE`).
+    /// Stores already open on it fail from then on.
+    pub fn drop_tenant(&self, prefix: &str, tenant: &str) -> Result<()> {
+        let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&tenant_schema(prefix, tenant)?));
+        let pool = self.pool.clone();
+        let (h, shared) = self.exec.handle();
+        run_on(&h, shared, async move {
+            sqlx::query(sql(stmt)).execute(&pool).await?;
+            Ok(())
+        })
     }
 
     /// Tenants with a schema under `prefix`.
@@ -1536,6 +1552,38 @@ impl Store for PgStore {
             Ok(())
         })?;
         Ok(done)
+    }
+
+    fn trace_write(&self, batch: &[crate::trace::TraceRecord]) -> Result<()> {
+        self.pg_trace_write(batch)
+    }
+
+    fn trace_list(&self, q: &crate::trace::TraceQuery) -> Result<crate::trace::TracePage> {
+        self.pg_trace_list(q)
+    }
+
+    fn trace_get(&self, id: &str) -> Result<Option<crate::trace::TraceDetail>> {
+        self.pg_trace_get(id)
+    }
+
+    fn trace_session(&self, id: &str, limit: usize) -> Result<Vec<crate::trace::TraceRow>> {
+        self.pg_trace_session(id, limit)
+    }
+
+    fn trace_metrics(&self, q: &crate::trace::MetricsQuery) -> Result<crate::trace::TraceMetrics> {
+        self.pg_trace_metrics(q)
+    }
+
+    fn trace_sessions(&self, q: &crate::trace::SessionQuery) -> Result<crate::trace::SessionPage> {
+        self.pg_trace_sessions(q)
+    }
+
+    fn score_write(&self, s: &crate::trace::ScoreRow) -> Result<()> {
+        self.pg_score_write(s)
+    }
+
+    fn trace_vacuum(&self, before_ms: i64, budget: Duration) -> Result<u64> {
+        self.pg_trace_vacuum(before_ms, budget)
     }
 }
 

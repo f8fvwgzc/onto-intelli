@@ -1,0 +1,6 @@
+{
+  "name": "lib-legacy",
+  "dependencies": {
+    "lib-a": "*"
+  }
+}

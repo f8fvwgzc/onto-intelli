@@ -117,6 +117,13 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// The most output tokens this provider asks for (its own
+    /// `max_output_tokens`, which may be a project's). `None`: requests use
+    /// the server's `[llm] max_output_tokens`.
+    fn max_output_tokens(&self) -> Option<u32> {
+        None
+    }
+
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
 
     /// Token stream. Default: one chunk from [`complete`](Self::complete).
@@ -152,16 +159,35 @@ impl LlmProvider for DisabledProvider {
 
 /// Build the provider named in config.
 pub fn build(cfg: &LlmConfig) -> Result<Arc<dyn LlmProvider>> {
+    build_provider(cfg, None)
+}
+
+/// Build the provider named in config on the given HTTP client (a client
+/// with its own DNS resolver, timeout and redirect policy) instead of one of
+/// its own. The mock and disabled providers ignore it.
+#[cfg(feature = "http-llm")]
+pub fn build_with_client(cfg: &LlmConfig, client: reqwest::Client) -> Result<Arc<dyn LlmProvider>> {
+    build_provider(cfg, Some(client))
+}
+
+#[cfg(feature = "http-llm")]
+type Client = Option<reqwest::Client>;
+#[cfg(not(feature = "http-llm"))]
+type Client = Option<std::convert::Infallible>;
+
+fn build_provider(cfg: &LlmConfig, client: Client) -> Result<Arc<dyn LlmProvider>> {
     let provider = cfg.provider.trim().to_lowercase();
+    #[cfg(not(feature = "http-llm"))]
+    let _ = client;
     match provider.as_str() {
         "mock" | "" => Ok(Arc::new(MockProvider)),
         "none" | "disabled" | "off" => Ok(Arc::new(DisabledProvider)),
         #[cfg(feature = "http-llm")]
         "openai" | "openai-compatible" | "ollama" | "vllm" | "lmstudio" | "openrouter" | "groq" | "together" => {
-            Ok(Arc::new(OpenAiCompatProvider::new(cfg, &provider)?))
+            Ok(Arc::new(OpenAiCompatProvider::with_client(cfg, &provider, client)?))
         }
         #[cfg(feature = "http-llm")]
-        "anthropic" | "claude" => Ok(Arc::new(AnthropicProvider::new(cfg)?)),
+        "anthropic" | "claude" => Ok(Arc::new(AnthropicProvider::with_client(cfg, client)?)),
         other => Err(Error::Config(format!(
             "unknown llm.provider '{other}' (mock, none, openai, ollama, openai-compatible, anthropic{})",
             if cfg!(feature = "http-llm") { "" } else { "; http providers need the http-llm feature" }
@@ -169,9 +195,41 @@ pub fn build(cfg: &LlmConfig) -> Result<Arc<dyn LlmProvider>> {
     }
 }
 
-/// Read an API key from the configured (or conventional) environment variable.
+/// The API key: `cfg.api_key` when set, else the configured (or
+/// conventional) environment variable. Returns the key and the variable it
+/// came from (empty for `cfg.api_key`, or when no variable applies).
 pub fn api_key(cfg: &LlmConfig, default_env: &str) -> (Option<String>, String) {
+    if let Some(k) = cfg.api_key.as_ref().filter(|k| !k.expose().trim().is_empty()) {
+        return (Some(k.expose().to_string()), String::new());
+    }
     let var = cfg.api_key_env.clone().unwrap_or_else(|| default_env.to_string());
     let key = if var.is_empty() { None } else { std::env::var(&var).ok().filter(|k| !k.trim().is_empty()) };
     (key, var)
+}
+
+/// Why a provider that needs a key has none: the variable is unset, or no
+/// key was given at all.
+#[cfg_attr(not(feature = "http-llm"), allow(dead_code))]
+pub(crate) fn missing_key(var: &str) -> String {
+    if var.is_empty() { "no API key is set".into() } else { format!("environment variable {var} is not set") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Secret;
+
+    #[test]
+    fn the_given_key_comes_before_the_environment() {
+        let cfg = LlmConfig {
+            api_key: Some(Secret::new("sk-given")),
+            api_key_env: Some("PATH".into()),
+            ..Default::default()
+        };
+        assert_eq!(api_key(&cfg, "OPENAI_API_KEY"), (Some("sk-given".into()), String::new()));
+        // An empty variable name reads no environment at all (project providers).
+        let none = LlmConfig { api_key_env: Some(String::new()), ..Default::default() };
+        assert_eq!(api_key(&none, "PATH"), (None, String::new()));
+        assert_eq!(missing_key(""), "no API key is set");
+    }
 }

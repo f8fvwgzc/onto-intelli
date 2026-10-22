@@ -28,7 +28,13 @@
 //! * `POST /v1/objects/explore`  Object Explorer: filters, facets, statistics
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`
-//! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities
+//! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
+//!   console sessions, `console: {user, role, org}`)
+//! * `/v1/traces`, `/v1/metrics`, `/v1/sessions`: observability (see [`crate::observe`])
+//! * `POST /mcp`: MCP over HTTP (see [`crate::mcp_http`])
+//!
+//! Requests may send `x-onto-session-id` and a W3C `traceparent`; responses
+//! of traced calls carry `x-onto-trace-id`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -46,7 +52,7 @@ use serde_json::{Value, json};
 
 use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, AuthError, workspace_header};
+use crate::auth::{Auth, AuthError, Caller, Credential, guard_project_call, workspace_header};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -97,6 +103,8 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/ontology/apply", post(ontology_apply))
         .route("/v1/objects/types", get(object_types))
         .route("/v1/objects/explore", post(objects_explore))
+        .merge(crate::observe::routes())
+        .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
 }
 
@@ -107,22 +115,38 @@ pub fn error_response(e: &Error) -> Response {
         Error::Denied(_) => StatusCode::FORBIDDEN,
         Error::Conflict(_) => StatusCode::CONFLICT,
         Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Error::Limited(_) => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(json!({ "error": { "code": e.code(), "message": e.to_string() } }))).into_response()
+    let mut resp = (status, Json(json!({ "error": { "code": e.code(), "message": e.to_string() } }))).into_response();
+    if let Some(secs) = e.retry_after_secs()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+/// The response for a refused request: 401, 403 or 503.
+pub fn auth_error_response(e: &AuthError) -> Response {
+    let (status, code) = match e {
+        AuthError::Unauthenticated(_) => (StatusCode::UNAUTHORIZED, "unauthenticated"),
+        AuthError::Forbidden(_) => (StatusCode::FORBIDDEN, "permission_denied"),
+        AuthError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    };
+    (status, Json(json!({ "error": { "code": code, "message": e.to_string() } }))).into_response()
 }
 
 /// Authenticate and pick the tenant's ontology.
 pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<(Principal, Arc<Intelli>), Box<Response>> {
-    let c = state.auth.authenticate(headers).map_err(|e| {
-        let (status, code) = match &e {
-            AuthError::Unauthenticated(_) => (StatusCode::UNAUTHORIZED, "unauthenticated"),
-            AuthError::Forbidden(_) => (StatusCode::FORBIDDEN, "permission_denied"),
-        };
-        Box::new((status, Json(json!({ "error": { "code": code, "message": e.to_string() } }))).into_response())
-    })?;
+    caller_full(state, headers).await.map(|(c, i)| (c.principal, i))
+}
+
+/// Authenticate and pick the tenant's ontology, keeping the whole caller.
+pub async fn caller_full(state: &AppState, headers: &HeaderMap) -> Result<(Caller, Arc<Intelli>), Box<Response>> {
+    let c = state.auth.authenticate(headers).await.map_err(|e| Box::new(auth_error_response(&e)))?;
     let intelli = state.hub.resolve(c.tenant.as_deref()).await.map_err(|e| Box::new(error_response(&e)))?;
-    Ok((c.principal, intelli))
+    Ok((c, intelli))
 }
 
 fn with_workspace(mut input: Value, headers: &HeaderMap) -> Value {
@@ -134,15 +158,31 @@ fn with_workspace(mut input: Value, headers: &HeaderMap) -> Value {
     input
 }
 
-async fn run(state: &AppState, headers: &HeaderMap, action: &str, input: Value) -> Response {
-    let (p, intelli) = match caller(state, headers).await {
+/// Run an action for the caller, traced with the request's trace context.
+pub(crate) async fn run(state: &AppState, headers: &HeaderMap, action: &str, input: Value) -> Response {
+    let (c, intelli) = match caller_full(state, headers).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
-    match intelli.call(&p, action, with_workspace(input, headers)).await {
+    let mut input = with_workspace(input, headers);
+    if let Err(e) = guard_project_call(&c.credential, action, &mut input, state.auth.allow_private_urls()).await {
+        return error_response(&e);
+    }
+    let ctx = crate::observe::trace_ctx(headers, &c, "http");
+    let t = intelli.call_traced(&c.principal, action, input, ctx).await;
+    let resp = match t.result {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
+    };
+    with_trace_id(resp, t.trace_id.as_deref())
+}
+
+/// Add `x-onto-trace-id` when the call was traced.
+fn with_trace_id(mut resp: Response, trace_id: Option<&str>) -> Response {
+    if let Some(v) = trace_id.and_then(|id| axum::http::HeaderValue::from_str(id).ok()) {
+        resp.headers_mut().insert(crate::observe::TRACE_ID, v);
     }
+    resp
 }
 
 async fn health(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -325,29 +365,55 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
     if let Some(t) = input.tenant {
         set(crate::auth::TENANT, t);
     }
-    let (principal, intelli) = match caller(&s, &h).await {
+    let (c, _intelli) = match caller_full(&s, &h).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
-    let _ = intelli;
-    let tenant =
-        s.auth.authenticate(&h).ok().and_then(|c| c.tenant).or_else(|| Some(s.hub.default_tenant().to_string()));
-    let (token, exp) = s.auth.issue_session(principal.clone(), tenant.clone(), input.ttl_secs.unwrap_or(3600));
+    let ttl = input.ttl_secs.unwrap_or(3600);
+    let principal = c.principal.clone();
+    let (token, exp, tenant) = match &c.credential {
+        Credential::Console { .. } => {
+            return error_response(&Error::Denied(
+                "console sessions cannot mint sessions; use the console session itself".into(),
+            ));
+        }
+        // The key's delegate: refused once the key is revoked.
+        Credential::ApiKey { prefix, project, .. } => {
+            let (t, e) = s.auth.issue_key_session(principal.clone(), prefix, project, ttl);
+            (t, e, Some(project.clone()))
+        }
+        _ => {
+            let tenant = c.tenant.clone().or_else(|| Some(s.hub.default_tenant().to_string()));
+            let (t, e) = s.auth.issue_session(principal.clone(), tenant.clone(), ttl);
+            (t, e, tenant)
+        }
+    };
     Json(json!({ "token": token, "expires_at": exp, "principal": principal, "tenant": tenant })).into_response()
 }
 
 async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    let (p, intelli) = match caller(&s, &headers).await {
+    let (c, intelli) = match caller_full(&s, &headers).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
+    let p = &c.principal;
     let onto = intelli.ontology();
     let gov = &onto.options().governance;
-    let tenant =
-        s.auth.authenticate(&headers).ok().and_then(|c| c.tenant).unwrap_or_else(|| s.hub.default_tenant().to_string());
-    let tenants = if p.is_privileged() { s.hub.known_tenants().unwrap_or_default() } else { vec![tenant.clone()] };
+    let tenant = c.tenant.clone().unwrap_or_else(|| s.hub.default_tenant().to_string());
+    // Project credentials see their own project only.
+    let tenants = if p.is_privileged() && !c.credential.is_project() {
+        s.hub.known_tenants().unwrap_or_default()
+    } else {
+        vec![tenant.clone()]
+    };
+    let console = match &c.credential {
+        Credential::Console { user, role, org } => json!({ "user": user, "role": role, "org": org }),
+        _ => Value::Null,
+    };
     let cfg = intelli.config();
     Json(json!({
+        "console": console,
+        "credential": credential_kind(&c.credential),
         "principal": p,
         "tenant": tenant,
         "tenants": tenants,
@@ -359,14 +425,25 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
         "capabilities": {
             "read": p.allows(onto_intelli::core::Access::Read),
             "write": p.allows(onto_intelli::core::Access::Write),
-            "apply_schema": gov.can_apply(&p) && gov.live_edits,
-            "approve": gov.can_approve(&p),
-            "propose": gov.can_propose(&p),
+            "apply_schema": gov.can_apply(p) && gov.live_edits,
+            "approve": gov.can_approve(p),
+            "propose": gov.can_propose(p),
+            "observe": p.can_observe(),
         },
         "governance": gov,
         "ui": { "title": cfg.ui.title },
     }))
     .into_response()
+}
+
+fn credential_kind(c: &Credential) -> &'static str {
+    match c {
+        Credential::Config => "token",
+        Credential::ApiKey { .. } => "api_key",
+        Credential::Console { .. } => "console",
+        Credential::Session => "session",
+        Credential::Dev => "dev",
+    }
 }
 
 async fn exec_graphs(
@@ -403,7 +480,7 @@ async fn ask(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Val
 }
 
 async fn ask_stream(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    let (p, intelli) = match caller(&s, &headers).await {
+    let (c, intelli) = match caller_full(&s, &headers).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -411,12 +488,16 @@ async fn ask_stream(State(s): State<AppState>, headers: HeaderMap, Json(body): J
         Ok(r) => r,
         Err(e) => return error_response(&Error::invalid(e)),
     };
-    let rx = intelli.ask_stream(p, req);
+    let ctx = crate::observe::trace_ctx(&headers, &c, "http");
+    let (rx, trace_id) = match intelli.try_ask_stream_traced(c.principal, req, ctx) {
+        Ok(rx) => rx,
+        Err(e) => return error_response(&e),
+    };
     let events: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(|ev| {
             Ok(SseEvent::default().event(ev.kind.clone()).data(serde_json::to_string(&ev).unwrap_or_default()))
         }));
-    Sse::new(events).keep_alive(KeepAlive::default()).into_response()
+    with_trace_id(Sse::new(events).keep_alive(KeepAlive::default()).into_response(), trace_id.as_deref())
 }
 
 // ── data catalog ─────────────────────────────────────────────────────────

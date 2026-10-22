@@ -215,6 +215,7 @@ message AskRequest {
   bool include_context = 6;
   bool no_cache = 7;
   bool confirm = 8;               // apply commands instead of proposing them
+  google.protobuf.Struct trace = 9;   // {session_id, user_id, tags, metadata, name} of the trace
 }
 
 message ResolvedEntity {
@@ -268,6 +269,7 @@ message AskResponse {
   string note = 17;
   repeated ResolvedEntity options = 18;   // candidates when mode = clarify
   google.protobuf.Struct action = 19;     // receipt when mode = proposal | action
+  string trace_id = 20;                   // the trace that recorded this answer
 }
 
 message AskEvent {
@@ -774,4 +776,19 @@ message ExploreRequest {
 service ObjectService {
   rpc ObjectTypes(ObjectTypesRequest) returns (google.protobuf.Struct);
   rpc Explore(ExploreRequest) returns (google.protobuf.Struct);
+}
+
+// ── Observability: traces, sessions, metrics, scores ─────────────────────
+// Langfuse-style traces of asks, governed actions and LLM-using calls.
+// Reading needs a principal that may observe (console members, an
+// admin-scope API key, operator tokens). Responses are the JSON of the
+// trace.* actions (docs/CONTROL_PLANE.md section 9).
+
+service ObservabilityService {
+  rpc ListTraces(google.protobuf.Struct) returns (google.protobuf.Struct);   // trace.list
+  rpc GetTrace(EntityRef) returns (google.protobuf.Struct);                   // trace.get
+  rpc Metrics(google.protobuf.Struct) returns (google.protobuf.Struct);      // trace.metrics
+  rpc ListSessions(google.protobuf.Struct) returns (google.protobuf.Struct); // trace.sessions
+  rpc GetSession(EntityRef) returns (google.protobuf.Struct);                 // trace.session
+  rpc Score(google.protobuf.Struct) returns (google.protobuf.Struct);        // trace.score
 }

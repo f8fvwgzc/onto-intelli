@@ -1,7 +1,8 @@
 //! Many tenants in one process. Each tenant is its own ontology (its own
 //! PostgreSQL schema, or an in-memory store) with its own schema
-//! versions, proposals, memory and caches; the LLM provider is shared.
-//! Tenants open on first use and stay open.
+//! versions, proposals, memory and caches. The LLM provider is the server's
+//! unless [`TenantHooks`] (the control plane) give a tenant its own, with
+//! its limits and usage meter. Tenants open on first use and stay open.
 //!
 //! An application with workspaces maps each workspace to a tenant and passes
 //! the caller's principal on every call:
@@ -19,7 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::OnceCell;
 
 use onto_core::store::{MemoryStore, Store};
@@ -27,7 +29,40 @@ use onto_core::{Error, Result};
 
 use crate::config::Config;
 use crate::intelli::Intelli;
+use crate::limits::{Limits, UsageMeter};
 use crate::llm::{self, LlmProvider};
+
+/// What the control plane sets for one tenant (a project).
+#[derive(Clone, Default)]
+pub struct TenantSettings {
+    /// The project's own provider; `None` uses the server's `[llm]`.
+    pub llm: Option<Arc<dyn LlmProvider>>,
+    pub limits: Limits,
+    pub meter: Option<Arc<dyn UsageMeter>>,
+    /// The project's `settings_version` these settings were read at.
+    pub version: u64,
+    /// Trace retention and content capture (`None` fields: `[traces]`).
+    pub traces: crate::trace::TraceSettings,
+}
+
+impl std::fmt::Debug for TenantSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantSettings")
+            .field("llm", &self.llm.as_ref().map(|l| format!("{}/{}", l.name(), l.model())))
+            .field("limits", &self.limits)
+            .field("meter", &self.meter.is_some())
+            .field("version", &self.version)
+            .field("traces", &self.traces)
+            .finish()
+    }
+}
+
+/// Per-tenant settings from outside the engine (the control plane).
+#[async_trait]
+pub trait TenantHooks: Send + Sync {
+    /// Settings for a tenant; called when it opens and on refresh.
+    async fn settings(&self, tenant: &str) -> Result<TenantSettings>;
+}
 
 enum Backend {
     Memory,
@@ -43,6 +78,7 @@ pub struct Hub {
     backend: Backend,
     default_tenant: String,
     tenants: Mutex<HashMap<String, Arc<OnceCell<Arc<Intelli>>>>>,
+    hooks: RwLock<Option<Arc<dyn TenantHooks>>>,
 }
 
 /// `[A-Za-z0-9_.-]`, 1–128 characters.
@@ -81,10 +117,11 @@ impl Hub {
         let tenant = default_tenant(&config);
         let cell = Arc::new(OnceCell::new_with(Some(intelli.clone())));
         Arc::new(Hub {
-            llm: intelli.llm().clone(),
+            llm: intelli.llm(),
             backend: Backend::Fixed,
             default_tenant: tenant.clone(),
             tenants: Mutex::new(HashMap::from([(tenant, cell)])),
+            hooks: RwLock::new(None),
             config,
         })
     }
@@ -93,10 +130,52 @@ impl Hub {
         Arc::new(Hub {
             default_tenant: default_tenant(&config),
             tenants: Mutex::new(HashMap::new()),
+            hooks: RwLock::new(None),
             config,
             llm,
             backend,
         })
+    }
+
+    /// Settings for every tenant opened from now on (and on
+    /// [`refresh_tenant`](Self::refresh_tenant)). Tenants already open keep
+    /// theirs until refreshed.
+    pub fn set_hooks(&self, hooks: Arc<dyn TenantHooks>) {
+        *self.hooks.write() = Some(hooks);
+    }
+
+    /// The server's `[llm]` provider (tenants without their own use it).
+    pub fn default_llm(&self) -> Arc<dyn LlmProvider> {
+        self.llm.clone()
+    }
+
+    /// Read an open tenant's settings again and apply them (provider,
+    /// limits, meter). Returns whether the tenant was open; a tenant that is
+    /// not open gets its settings when it opens.
+    pub async fn refresh_tenant(&self, tenant: &str) -> Result<bool> {
+        let open = self.tenants.lock().get(tenant).and_then(|c| c.get().cloned());
+        let Some(intelli) = open else { return Ok(false) };
+        let settings = self.settings_of(tenant).await?;
+        self.apply(&intelli, settings);
+        Ok(true)
+    }
+
+    async fn settings_of(&self, tenant: &str) -> Result<TenantSettings> {
+        let hooks = self.hooks.read().clone();
+        match hooks {
+            Some(h) => h.settings(tenant).await,
+            None => Ok(TenantSettings::default()),
+        }
+    }
+
+    fn apply(&self, intelli: &Intelli, s: TenantSettings) {
+        let llm = s.llm.unwrap_or_else(|| self.llm.clone());
+        if !Arc::ptr_eq(&llm, &intelli.llm()) {
+            intelli.set_llm(llm);
+        }
+        intelli.set_limits(s.limits);
+        intelli.set_meter(s.meter);
+        intelli.set_trace_settings(s.traces);
     }
 
     pub fn config(&self) -> &Config {
@@ -117,6 +196,7 @@ impl Hub {
         if !valid_tenant(id) {
             return Err(Error::invalid(format!("invalid tenant id '{id}' (letters, digits, '_', '-', '.')")));
         }
+        self.check_reserved(id)?;
         let cell = self.tenants.lock().entry(id.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
         cell.get_or_try_init(|| self.open_tenant(id)).await.cloned()
     }
@@ -130,6 +210,44 @@ impl Hub {
             ))),
             Some(t) => self.tenant(t).await,
             None => self.tenant(&self.default_tenant.clone()).await,
+        }
+    }
+
+    /// A tenant whose PostgreSQL schema would be the control store's
+    /// (`console.schema`) is refused: with the default names, tenant `control`.
+    fn check_reserved(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "postgres")]
+        {
+            let schema = onto_core::store::postgres::tenant_schema(&self.config.engine.postgres.schema_prefix, id)?;
+            if schema == self.config.console.schema {
+                return Err(Error::invalid(format!(
+                    "tenant id '{id}' is reserved: its schema {schema} is the control store's (console.schema)"
+                )));
+            }
+        }
+        #[cfg(not(feature = "postgres"))]
+        let _ = id;
+        Ok(())
+    }
+
+    /// Forget an open tenant: the next request opens it again. Requests in
+    /// flight keep the ontology they hold. Returns whether it was known.
+    pub fn evict(&self, tenant: &str) -> bool {
+        self.tenants.lock().remove(tenant).is_some()
+    }
+
+    /// Evict a tenant and delete its data: `DROP SCHEMA {prefix}{tenant}
+    /// CASCADE` on PostgreSQL; in memory, the store goes with the last reference.
+    pub fn drop_tenant(&self, tenant: &str) -> Result<()> {
+        if !valid_tenant(tenant) {
+            return Err(Error::invalid(format!("invalid tenant id '{tenant}'")));
+        }
+        self.evict(tenant);
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(shared) => shared.drop_tenant(&self.config.engine.postgres.schema_prefix, tenant),
+            Backend::Memory => Ok(()),
+            Backend::Fixed => Err(Error::invalid("this hub serves one ontology; its tenant cannot be dropped")),
         }
     }
 
@@ -161,7 +279,11 @@ impl Hub {
                 return Err(Error::not_found(format!("tenant {id} (this hub serves one ontology)")));
             }
         };
-        Intelli::open_with_store(cfg, store, self.llm.clone()).await
+        let settings = self.settings_of(id).await?;
+        let llm = settings.llm.clone().unwrap_or_else(|| self.llm.clone());
+        let intelli = Intelli::open_with_store(cfg, store, llm).await?;
+        self.apply(&intelli, settings);
+        Ok(intelli)
     }
 }
 

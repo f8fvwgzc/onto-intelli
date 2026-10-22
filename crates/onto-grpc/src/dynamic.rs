@@ -15,9 +15,10 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder
 use tonic::server::{ClientStreamingService, Grpc, ServerStreamingService, UnaryService};
 use tonic::{Request, Response, Status, Streaming};
 
+use onto_intelli::trace::TraceCtx;
 use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, AuthError, workspace_header};
+use crate::auth::{Auth, AuthError, Credential, guard_project_call, workspace_header};
 use crate::routes::{ASK_STREAM, CALL, Route, RouteTable};
 use crate::template;
 
@@ -137,6 +138,7 @@ pub fn status_of(e: &Error) -> Status {
         Error::Conflict(_) => Status::already_exists(msg),
         Error::Unavailable(_) => Status::unavailable(msg),
         Error::Config(_) => Status::failed_precondition(msg),
+        Error::Limited(_) => Status::resource_exhausted(msg),
         _ => Status::internal(msg),
     }
 }
@@ -147,6 +149,19 @@ struct Handler {
     route: Arc<Route>,
     intelli: Arc<Intelli>,
     principal: Principal,
+    credential: Credential,
+    /// `traceparent`, `x-onto-session-id` and the API key of the request.
+    trace: TraceCtx,
+    /// `console.allow_private_urls` (the guard on git URLs).
+    allow_private: bool,
+}
+
+/// Add `x-onto-trace-id` to a response's metadata when the call was traced.
+fn with_trace_id<T>(mut resp: Response<T>, trace_id: Option<&str>) -> Response<T> {
+    if let Some(v) = trace_id.and_then(|id| id.parse().ok()) {
+        resp.metadata_mut().insert(crate::observe::TRACE_ID, v);
+    }
+    resp
 }
 
 impl Handler {
@@ -186,17 +201,26 @@ impl Handler {
         from_json(&self.route.method.output(), shaped)
     }
 
-    async fn run(&self, request: Value, ws_header: Option<String>) -> Result<DynamicMessage, Status> {
+    /// Run the route's action; also returns the id of its trace, if traced.
+    async fn run(&self, request: Value, ws_header: Option<String>) -> Result<(DynamicMessage, Option<String>), Status> {
         let input = self.input(request.clone(), ws_header);
-        let result = if self.route.action == CALL {
+        let (result, trace_id) = if self.route.action == CALL {
             let action = input.get("action").and_then(Value::as_str).unwrap_or_default().to_string();
-            let inner = input.get("input").cloned().unwrap_or(Value::Null);
-            let out = self.intelli.call(&self.principal, &action, inner).await.map_err(|e| status_of(&e))?;
-            json!({ "output": out })
+            let mut inner = input.get("input").cloned().unwrap_or(Value::Null);
+            guard_project_call(&self.credential, &action, &mut inner, self.allow_private)
+                .await
+                .map_err(|e| status_of(&e))?;
+            let t = self.intelli.call_traced(&self.principal, &action, inner, self.trace.clone()).await;
+            (json!({ "output": t.result.map_err(|e| status_of(&e))? }), t.trace_id)
         } else {
-            self.intelli.call(&self.principal, &self.route.action, input).await.map_err(|e| status_of(&e))?
+            let mut input = input;
+            guard_project_call(&self.credential, &self.route.action, &mut input, self.allow_private)
+                .await
+                .map_err(|e| status_of(&e))?;
+            let t = self.intelli.call_traced(&self.principal, &self.route.action, input, self.trace.clone()).await;
+            (t.result.map_err(|e| status_of(&e))?, t.trace_id)
         };
-        self.output(result, &request)
+        Ok((self.output(result, &request)?, trace_id))
     }
 }
 
@@ -211,7 +235,8 @@ impl UnaryService<DynamicMessage> for Unary {
         Box::pin(async move {
             let ws = workspace_header(req.metadata().as_ref());
             let json = to_json(req.get_ref())?;
-            Ok(Response::new(h.run(json, ws).await?))
+            let (msg, trace_id) = h.run(json, ws).await?;
+            Ok(with_trace_id(Response::new(msg), trace_id.as_deref()))
         })
     }
 }
@@ -230,19 +255,22 @@ impl ServerStreamingService<DynamicMessage> for ServerStream {
             let json = to_json(req.get_ref())?;
             if h.route.action != ASK_STREAM {
                 // Any other action on a server-streaming method: one message.
-                let msg = h.run(json, ws).await?;
+                let (msg, trace_id) = h.run(json, ws).await?;
                 let s: MsgStream = Box::pin(futures::stream::iter(vec![Ok(msg)]));
-                return Ok(Response::new(s));
+                return Ok(with_trace_id(Response::new(s), trace_id.as_deref()));
             }
             let input = h.input(json, ws);
             let ask: AskRequest = serde_json::from_value(input)
                 .map_err(|e| Status::invalid_argument(format!("intelli.ask_stream: {e}")))?;
-            let rx = h.intelli.ask_stream(h.principal.clone(), ask);
+            let (rx, trace_id) = h
+                .intelli
+                .try_ask_stream_traced(h.principal.clone(), ask, h.trace.clone())
+                .map_err(|e| status_of(&e))?;
             let out = h.route.method.output();
             let s: MsgStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(move |ev| {
                 serde_json::to_value(&ev).map_err(|e| Status::internal(e.to_string())).and_then(|v| from_json(&out, v))
             }));
-            Ok(Response::new(s))
+            Ok(with_trace_id(Response::new(s), trace_id.as_deref()))
         })
     }
 }
@@ -262,7 +290,8 @@ impl ClientStreamingService<DynamicMessage> for ClientStream {
             while let Some(msg) = stream.next().await {
                 records.push(to_json(&msg?)?);
             }
-            Ok(Response::new(h.run(json!({ "records": records }), ws).await?))
+            let (msg, trace_id) = h.run(json!({ "records": records }), ws).await?;
+            Ok(with_trace_id(Response::new(msg), trace_id.as_deref()))
         })
     }
 }
@@ -293,17 +322,26 @@ impl tower::Service<http::Request<axum::body::Body>> for DynamicGrpc {
                 return Ok(Status::unimplemented(format!("{path} is not served (configure it in [[grpc.routes]])"))
                     .into_http());
             };
-            let caller = match this.auth.authenticate(req.headers()) {
+            let caller = match this.auth.authenticate(req.headers()).await {
                 Ok(c) => c,
                 Err(AuthError::Unauthenticated(m)) => return Ok(Status::unauthenticated(m).into_http()),
                 Err(AuthError::Forbidden(m)) => return Ok(Status::permission_denied(m).into_http()),
+                Err(AuthError::Unavailable(m)) => return Ok(Status::unavailable(m).into_http()),
             };
             let intelli = match this.hub.resolve(caller.tenant.as_deref()).await {
                 Ok(i) => i,
                 Err(e) => return Ok(status_of(&e).into_http()),
             };
             let streaming = (route.method.is_client_streaming(), route.method.is_server_streaming());
-            let handler = Arc::new(Handler { route: route.clone(), intelli, principal: caller.principal });
+            let trace = crate::observe::trace_ctx(req.headers(), &caller, "grpc");
+            let handler = Arc::new(Handler {
+                route: route.clone(),
+                intelli,
+                principal: caller.principal,
+                credential: caller.credential,
+                trace,
+                allow_private: this.auth.allow_private_urls(),
+            });
             let mut grpc = Grpc::new(DynCodec::server(&route.method));
             let resp = match streaming {
                 (false, false) => grpc.unary(Unary(handler), req).await,

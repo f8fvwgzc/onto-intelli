@@ -1,0 +1,8 @@
+# Default owners of everything.
+*                     @acme/platform
+
+# Later rules win over earlier ones.
+/crates/              @acme/backend
+/crates/api/          @acme/api-team ada@acme.com
+crates/testkit/       @acme/qa
+/tools/               @grace

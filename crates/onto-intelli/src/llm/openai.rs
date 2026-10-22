@@ -15,6 +15,7 @@ use crate::token::TokenUsage;
 
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
+    max_output_tokens: u32,
     name: String,
     base: String,
     key: Option<String>,
@@ -28,6 +29,12 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(cfg: &LlmConfig, flavor: &str) -> Result<Self> {
+        Self::with_client(cfg, flavor, None)
+    }
+
+    /// On `client` when given (its timeout and policies apply), else on a
+    /// client with `cfg.timeout_secs`.
+    pub fn with_client(cfg: &LlmConfig, flavor: &str, client: Option<reqwest::Client>) -> Result<Self> {
         let (base, default_model, key_env) = match flavor {
             "openai" => ("https://api.openai.com/v1", "gpt-4o-mini", "OPENAI_API_KEY"),
             "ollama" => ("http://localhost:11434/v1", "llama3.2", ""),
@@ -39,14 +46,17 @@ impl OpenAiCompatProvider {
             _ => ("http://localhost:8000/v1", "default", ""),
         };
         let (key, var) = api_key(cfg, key_env);
-        let unavailable = (key.is_none() && !var.is_empty() && flavor != "ollama")
-            .then(|| format!("environment variable {var} is not set"));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
-            .build()
-            .map_err(|e| Error::Config(format!("http client: {e}")))?;
+        let unavailable = (key.is_none() && !var.is_empty() && flavor != "ollama").then(|| super::missing_key(&var));
+        let client = match client {
+            Some(c) => c,
+            None => reqwest::Client::builder()
+                .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
+                .build()
+                .map_err(|e| Error::Config(format!("http client: {e}")))?,
+        };
         Ok(Self {
             client,
+            max_output_tokens: cfg.max_output_tokens.max(1),
             name: flavor.to_string(),
             base: cfg.base_url.clone().unwrap_or_else(|| base.to_string()).trim_end_matches('/').to_string(),
             key,
@@ -66,7 +76,7 @@ impl OpenAiCompatProvider {
             messages.push(json!({ "role": role, "content": m.content }));
         }
         let mut body = json!({ "model": self.model, "messages": messages });
-        body[self.max_field] = json!(req.max_tokens);
+        body[self.max_field] = json!(req.max_tokens.min(self.max_output_tokens));
         if let Some(t) = self.temperature {
             body["temperature"] = json!(t);
         }
@@ -88,7 +98,7 @@ impl OpenAiCompatProvider {
         for (k, v) in &self.headers {
             rb = rb.header(k, v);
         }
-        let resp = rb.send().await.map_err(|e| Error::Llm(format!("{}: {e}", self.name)))?;
+        let resp = rb.send().await.map_err(|e| Error::Llm(format!("{}: {}", self.name, describe(&e.without_url()))))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -121,6 +131,10 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn unavailable(&self) -> Option<String> {
         self.unavailable.clone()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        Some(self.max_output_tokens)
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
@@ -195,6 +209,22 @@ impl LlmProvider for OpenAiCompatProvider {
         );
         Ok(Box::pin(stream))
     }
+}
+
+/// An error with its causes ("error sending request: dns error: …"), so a
+/// refused address or a TLS failure says why.
+pub(crate) fn describe(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !out.contains(&t) {
+            out.push_str(": ");
+            out.push_str(&t);
+        }
+        src = s.source();
+    }
+    out
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> &str {

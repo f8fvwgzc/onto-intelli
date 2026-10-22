@@ -587,7 +587,9 @@ async fn development_mode_stays_on_loopback() {
     let hub = onto_intelli::Hub::single(intelli);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let err =
-        onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions { dev: true }, listener, async {}).await.unwrap_err();
+        onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions { dev: true, ..Default::default() }, listener, async {})
+            .await
+            .unwrap_err();
     assert!(err.to_string().contains("loopback"), "{err}");
     // Without tokens and without --dev the server refuses to start.
     let intelli = Intelli::in_memory().await.unwrap();

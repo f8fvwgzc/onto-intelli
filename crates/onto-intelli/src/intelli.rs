@@ -24,10 +24,12 @@ use crate::conversation::{Conversation, Conversations};
 use crate::hash::{normalize_question, stable_hash};
 use crate::ingest::IngestQueue;
 use crate::intent::{self, Intent};
+use crate::limits::{Limits, RateLimiter, UsageMeter};
 use crate::llm::{self, ChatMessage, LlmProvider, LlmRequest, LlmResponse, StreamChunk};
 use crate::memory::{Memory, RecallOptions, clip};
 use crate::resolve::{self, Resolved};
 use crate::token::{Ledger, LedgerStats, TokenUsage, estimate};
+use crate::trace::{self, AskTrace, Generation, TraceCtx, TraceItem, TraceSettings, TraceSink, Traced, Tracer};
 
 const SYSTEM_PROMPT: &str = "You are onto-intelli, an enterprise execution assistant. \
 Answer using only the workspace facts in the user message: they were retrieved from the \
@@ -83,6 +85,9 @@ pub struct AskRequest {
     /// Apply commands instead of only proposing them.
     #[serde(default)]
     pub confirm: bool,
+    /// Session, user, tags, metadata and name of this question's trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<AskTrace>,
 }
 
 impl AskRequest {
@@ -137,6 +142,9 @@ pub struct AskResponse {
     pub options: Vec<Resolved>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Value>,
+    /// The trace that recorded this answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 /// Streaming event: `stage`, `entities`, `delta`, `done` or `error`.
@@ -175,12 +183,19 @@ pub struct Intelli {
     onto: Ontology,
     memory: Memory,
     conversations: Conversations,
-    llm: Arc<dyn LlmProvider>,
+    /// Swappable: a project's own provider replaces the server's (`set_llm`).
+    llm: parking_lot::RwLock<Arc<dyn LlmProvider>>,
+    limits: parking_lot::RwLock<Limits>,
+    rate: RateLimiter,
+    meter: parking_lot::RwLock<Option<Arc<dyn UsageMeter>>>,
     prompt: parking_lot::Mutex<(u64, Instant, String)>,
     answers: TtlCache<AskResponse>,
     resolutions: TtlCache<Vec<Resolved>>,
     completions: TtlCache<LlmResponse>,
     ledger: Ledger,
+    /// The background trace writer (`None` with `[traces] enabled = false`).
+    traces: Option<TraceSink>,
+    trace_settings: parking_lot::RwLock<TraceSettings>,
     ingest: IngestQueue,
     asks: AtomicUsize,
     started: Instant,
@@ -208,6 +223,8 @@ impl Intelli {
         llm: Arc<dyn LlmProvider>,
     ) -> Result<Arc<Self>> {
         let schema = load_schema(&config)?;
+        config.traces.check()?;
+        let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,
             store.clone(),
@@ -231,17 +248,25 @@ impl Intelli {
             completions: TtlCache::new(c.max_entries, Duration::from_secs(c.llm_ttl_secs)),
             ingest: IngestQueue::spawn(onto.clone(), config.engine.ingest_queue),
             ledger: Ledger::default(),
+            traces,
+            trace_settings: parking_lot::RwLock::new(TraceSettings::default()),
             asks: AtomicUsize::new(0),
             started: Instant::now(),
             prompt,
             conversations,
             memory,
             onto,
-            llm,
+            llm: parking_lot::RwLock::new(llm),
+            limits: parking_lot::RwLock::new(Limits::default()),
+            rate: RateLimiter::default(),
+            meter: parking_lot::RwLock::new(None),
             config,
         });
         if crawl.background {
             crate::connectors::spawn_scheduler(&me, Duration::from_secs(crawl.tick_secs.max(1)));
+        }
+        if me.traces.is_some() {
+            spawn_trace_retention(&me);
         }
         Ok(me)
     }
@@ -319,8 +344,55 @@ impl Intelli {
         &self.conversations
     }
 
-    pub fn llm(&self) -> &Arc<dyn LlmProvider> {
-        &self.llm
+    /// The provider in use now (a project's own, or the server's).
+    /// `max_tokens` for a request to `llm`: the provider's own limit (a
+    /// project's `max_output_tokens`), else the server's `[llm]` one.
+    pub(crate) fn max_output_tokens(&self, llm: &Arc<dyn LlmProvider>) -> u32 {
+        llm.max_output_tokens().unwrap_or(self.config.llm.max_output_tokens)
+    }
+
+    pub fn llm(&self) -> Arc<dyn LlmProvider> {
+        self.llm.read().clone()
+    }
+
+    /// Use another provider from the next call on. Cached completions and
+    /// answers go (they came from the previous provider); calls in flight
+    /// finish on the provider they started with.
+    pub fn set_llm(&self, llm: Arc<dyn LlmProvider>) {
+        *self.llm.write() = llm;
+        self.completions.clear();
+        self.answers.clear();
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits.read().clone()
+    }
+
+    /// The rate limit and monthly budget from the next call on.
+    pub fn set_limits(&self, limits: Limits) {
+        *self.limits.write() = limits;
+    }
+
+    /// Where usage is recorded, and where the budget check reads the month
+    /// so far (`None`: not metered, no budget applies).
+    pub fn set_meter(&self, meter: Option<Arc<dyn UsageMeter>>) {
+        *self.meter.write() = meter;
+    }
+
+    /// One token of the tenant's `asks_per_minute` bucket, or
+    /// [`Error::Limited`]: taken by `intelli.ask`, `intelli.ask_stream`,
+    /// `ontology.refine` and `ontology.advise`.
+    pub fn take_ask(&self) -> Result<()> {
+        let rate = self.limits.read().asks_per_minute;
+        self.rate.take(rate)
+    }
+
+    /// Record one question or LLM-using action with the meter, if any.
+    pub(crate) fn record_usage(&self, usage: &TokenUsage, llm: &dyn LlmProvider, deterministic: bool, error: bool) {
+        let meter = self.meter.read().clone();
+        if let Some(m) = meter {
+            m.record(usage, llm.name(), llm.model(), deterministic, error);
+        }
     }
 
     pub fn ingest_queue(&self) -> &IngestQueue {
@@ -328,7 +400,64 @@ impl Intelli {
     }
 
     pub fn ledger(&self) -> LedgerStats {
-        self.ledger.snapshot()
+        let mut s = self.ledger.snapshot();
+        s.traces_dropped = self.traces.as_ref().map_or(0, TraceSink::dropped);
+        s
+    }
+
+    /// A project's trace settings (retention, capture_content) from the next call on.
+    pub fn set_trace_settings(&self, s: TraceSettings) {
+        *self.trace_settings.write() = s;
+    }
+
+    /// Days traces are kept: the project's setting, else `[traces] retention_days`.
+    pub fn trace_retention_days(&self) -> u32 {
+        self.trace_settings.read().retention_days.unwrap_or(self.config.traces.retention_days).clamp(1, 400)
+    }
+
+    /// Whether question, prompt and answer text is stored on traces.
+    pub fn captures_content(&self) -> bool {
+        self.trace_settings.read().capture_content.unwrap_or(self.config.traces.capture_content)
+    }
+
+    /// Are traces recorded?
+    pub fn traces_enabled(&self) -> bool {
+        self.traces.is_some()
+    }
+
+    /// Wait until every trace and score recorded so far is written (tests,
+    /// `onto eval`, shutdown).
+    pub async fn flush_traces(&self) {
+        if let Some(s) = &self.traces {
+            s.flush().await;
+        }
+    }
+
+    /// A tracer for a new trace, when traces are on.
+    pub(crate) fn start_trace(&self, ctx: &TraceCtx) -> Option<Arc<Tracer>> {
+        self.traces.as_ref()?;
+        Some(Arc::new(Tracer::new(ctx, self.captures_content(), self.config.traces.max_content_bytes)))
+    }
+
+    /// Queue a finished trace for writing.
+    pub(crate) fn send_trace(&self, rec: onto_core::trace::TraceRecord) {
+        if let Some(s) = &self.traces {
+            s.send(TraceItem::Trace(Box::new(rec)));
+        }
+    }
+
+    /// Queue a score for writing (after the traces queued before it).
+    pub(crate) fn send_score(&self, score: onto_core::trace::ScoreRow) {
+        if let Some(s) = &self.traces {
+            s.send(TraceItem::Score(Box::new(score)));
+        }
+    }
+
+    /// Delete traces older than the retention (at most 60 s of work).
+    /// Blocking: the retention task runs it on the blocking pool.
+    pub fn vacuum_traces(&self) -> Result<u64> {
+        let before = onto_core::time::now_ms() - i64::from(self.trace_retention_days()) * 86_400_000;
+        self.onto.store().trace_vacuum(before, Duration::from_secs(60))
     }
 
     pub fn default_workspace(&self) -> &str {
@@ -336,21 +465,125 @@ impl Intelli {
     }
 
     pub async fn ask(&self, p: &Principal, req: AskRequest) -> Result<AskResponse> {
-        self.ask_inner(p, req, None).await
+        self.ask_traced(p, req, TraceCtx::default()).await.result
+    }
+
+    /// [`ask`](Self::ask) recorded as a trace with what the caller knows
+    /// (`traceparent`, session, source, API key). The response carries
+    /// `trace_id`; a refused question (rate limit) is not traced.
+    pub async fn ask_traced(&self, p: &Principal, req: AskRequest, ctx: TraceCtx) -> Traced<AskResponse> {
+        self.ask_traced_as(p, req, ctx, "ask").await
+    }
+
+    /// An ask traced as `kind` (`ask`, or `eval` for evaluation cases).
+    pub(crate) async fn ask_traced_as(
+        &self,
+        p: &Principal,
+        req: AskRequest,
+        ctx: TraceCtx,
+        kind: &'static str,
+    ) -> Traced<AskResponse> {
+        if let Err(e) = self.take_ask() {
+            return Traced::untraced(Err(e));
+        }
+        let ctx = ctx.merge(req.trace.as_ref());
+        let tracer = self.start_trace(&ctx);
+        self.ask_in(p, req, ctx, kind, None, tracer).await
+    }
+
+    /// Run the question inside `tracer` (when given) and record the trace.
+    async fn ask_in(
+        &self,
+        p: &Principal,
+        req: AskRequest,
+        ctx: TraceCtx,
+        kind: &'static str,
+        sink: Option<&mpsc::Sender<AskEvent>>,
+        tracer: Option<Arc<Tracer>>,
+    ) -> Traced<AskResponse> {
+        let Some(tracer) = tracer else { return Traced::untraced(Box::pin(self.ask_inner(p, req, sink)).await) };
+        let question = req.question.trim().to_string();
+        let ws = req
+            .workspace
+            .clone()
+            .filter(|w| !w.is_empty())
+            .unwrap_or_else(|| self.config.engine.default_workspace.clone());
+        let conversation = req.conversation_id.clone().filter(|c| !c.is_empty() && c != "new");
+        let mut result = trace::scope(tracer.clone(), Box::pin(self.ask_inner(p, req, sink))).await;
+        let id = tracer.id().to_string();
+        if let Ok(r) = &mut result {
+            r.trace_id = Some(id.clone());
+        }
+        let mut row = trace::base_row(&ctx, p, kind, "intelli.ask", &ws);
+        if row.session_id.is_none() {
+            row.session_id = result.as_ref().ok().and_then(|r| r.conversation_id.clone()).or(conversation);
+        }
+        row.input = tracer.text(&question).map(|q| json!({ "question": q }));
+        let mut attrs = json!({ "workspace": ws });
+        match &result {
+            Ok(r) => {
+                let mode = serde_json::to_value(r.mode).ok().and_then(|v| v.as_str().map(str::to_string));
+                row.request_id = Some(r.request_id.clone());
+                row.intent = Some(r.intent.as_str().to_string());
+                row.deterministic = r.mode == AnswerMode::Deterministic;
+                row.cache_hits = i64::from(r.mode == AnswerMode::AnswerCache);
+                row.context_tokens = r.efficiency.context_tokens as i64;
+                row.saved_tokens = r.efficiency.saved_tokens as i64;
+                row.output = tracer.text(&r.answer).map(|a| json!({ "answer": a }));
+                attrs = json!({ "workspace": ws, "intent": r.intent.as_str(), "mode": mode, "revision": r.revision });
+                row.mode = mode;
+                if let Some(e) = tracer.llm_error() {
+                    trace::fail(&mut row, "llm_error", &e);
+                }
+            }
+            Err(e) => trace::fail(&mut row, e.code(), &e.to_string()),
+        }
+        self.send_trace(tracer.finish(row, "intelli.ask", "span", attrs));
+        Traced { result, trace_id: Some(id) }
     }
 
     /// Streamed answer: stages, resolved entities, text deltas, then `done`.
+    /// A refused question (rate limit) is one `error` event.
     pub fn ask_stream(self: &Arc<Self>, p: Principal, req: AskRequest) -> mpsc::Receiver<AskEvent> {
+        match self.try_ask_stream(p, req) {
+            Ok(rx) => rx,
+            Err(e) => {
+                let (tx, rx) = mpsc::channel(1);
+                let _ = tx.try_send(AskEvent::new("error", e.to_string(), json!({ "code": e.code() })));
+                rx
+            }
+        }
+    }
+
+    /// [`ask_stream`](Self::ask_stream), refusing before the stream starts
+    /// when the rate limit is reached (HTTP 429 / `RESOURCE_EXHAUSTED`).
+    pub fn try_ask_stream(self: &Arc<Self>, p: Principal, req: AskRequest) -> Result<mpsc::Receiver<AskEvent>> {
+        self.try_ask_stream_traced(p, req, TraceCtx::default()).map(|(rx, _)| rx)
+    }
+
+    /// [`try_ask_stream`](Self::try_ask_stream) recorded as a trace; also
+    /// returns the trace's id (known before the stream starts).
+    pub fn try_ask_stream_traced(
+        self: &Arc<Self>,
+        p: Principal,
+        req: AskRequest,
+        ctx: TraceCtx,
+    ) -> Result<(mpsc::Receiver<AskEvent>, Option<String>)> {
+        self.take_ask()?;
+        let ctx = ctx.merge(req.trace.as_ref());
+        let tracer = self.start_trace(&ctx);
+        let trace_id = tracer.as_ref().map(|t| t.id().to_string());
         let (tx, rx) = mpsc::channel(128);
         let this = self.clone();
         tokio::spawn(async move {
-            let ev = match this.ask_inner(&p, req, Some(&tx)).await {
+            // The tracer is the task-local of this task (ask_in scopes it).
+            let ev = match this.ask_in(&p, req, ctx, "ask", Some(&tx), tracer).await.result {
                 Ok(resp) => AskEvent::new("done", "", serde_json::to_value(&resp).unwrap_or(Value::Null)),
                 Err(e) => AskEvent::new("error", e.to_string(), json!({ "code": e.code() })),
             };
             let _ = tx.send(ev).await;
         });
-        rx
+        Ok((rx, trace_id))
     }
 
     /// The question context graph for `question`, without calling the LLM.
@@ -401,6 +634,8 @@ impl Intelli {
             return Err(Error::Denied(format!("{} may not ask questions in workspace {ws}", p.id)));
         }
         let request_id = new_id("ask");
+        // One provider for the whole question, even if it is swapped meanwhile.
+        let llm = self.llm();
         let schema = self.onto.schema();
         let revision = self.onto.revision();
         let normalized = normalize_question(&question);
@@ -424,7 +659,12 @@ impl Intelli {
             &self.memory.revision_for(&ws).to_string(),
             &budget.to_string(),
         ]);
-        if use_cache && let Some(mut hit) = self.answers.get(&answer_key) {
+        let cached_answer = if use_cache { self.answers.get(&answer_key) } else { None };
+        trace::event(
+            "cache.answer",
+            || json!({ "result": if !use_cache { "off" } else if cached_answer.is_some() { "hit" } else { "miss" } }),
+        );
+        if let Some(mut hit) = cached_answer {
             let saved = hit.usage.total() + hit.efficiency.context_tokens as u64;
             self.ledger.update(|s| {
                 s.answer_cache_hits += 1;
@@ -435,16 +675,26 @@ impl Intelli {
             hit.usage = TokenUsage::default();
             hit.timings = Timings { total_ms: ms(t0), ..Default::default() };
             emit(sink, AskEvent::new("delta", hit.answer.clone(), Value::Null)).await;
+            self.record_usage(&TokenUsage::default(), llm.as_ref(), false, false);
             return Ok(hit);
         }
 
         // 2. Intent + entity resolution (deterministic, cached per revision).
+        let t_int = Instant::now();
         let classified = intent::classify(&question, &schema);
+        trace::record(
+            "intent",
+            "span",
+            t_int,
+            || json!({ "intent": classified.intent, "why": classified.why, "action": classified.action }),
+        );
         emit(sink, AskEvent::new("stage", "intent", json!({ "intent": classified.intent, "why": classified.why })))
             .await;
         let t_res = Instant::now();
         let res_key = stable_hash(&[&ws, &p.scope_key(), &normalized, &revision.to_string()]);
-        let mut entities = match self.resolutions.get(&res_key) {
+        let resolution_hit = self.resolutions.get(&res_key);
+        let resolution_cache = if resolution_hit.is_some() { "hit" } else { "miss" };
+        let mut entities = match resolution_hit {
             Some(r) => r,
             None => {
                 let r = resolve::resolve(&self.onto, p, &ws, &question);
@@ -470,6 +720,7 @@ impl Intelli {
                 .collect();
         }
         let resolve_ms = ms(t_res);
+        trace::record("resolve", "span", t_res, || json!({ "entities": entities.len(), "cache": resolution_cache }));
         emit(sink, AskEvent::new("entities", "", serde_json::to_value(&entities).unwrap_or(Value::Null))).await;
 
         let mut usage = TokenUsage::default();
@@ -479,6 +730,9 @@ impl Intelli {
         let mut note = None;
         let mut retrieve_ms = 0.0;
         let mut llm_ms = 0.0;
+        // Whether the LLM step ran, and whether its provider call failed.
+        let mut llm_step = false;
+        let mut llm_error = false;
 
         // 3. Deterministic answer straight from the graph?
         let deterministic_allowed = match req.mode {
@@ -493,21 +747,30 @@ impl Intelli {
         //     ambiguous mentions get a clarifying question.
         let mut options: Vec<Resolved> = Vec::new();
         let mut action_out: Option<Value> = None;
+        let t_pre = Instant::now();
         let pre: Option<(String, Vec<String>, AnswerMode)> = if classified.intent == Intent::Command
             && let Some(action) = classified.action.clone()
         {
             let out = crate::command::run(&self.onto, p, &ws, &action, &question, &entities, req.confirm)?;
             let mode = if out.receipt.status == "applied" { AnswerMode::Action } else { AnswerMode::Proposal };
             action_out = serde_json::to_value(&out.receipt).ok();
+            trace::record(
+                "command",
+                "span",
+                t_pre,
+                || json!({ "action": action, "status": out.receipt.status, "receipt": out.receipt.id }),
+            );
             emit(sink, AskEvent::new("delta", out.answer.clone(), Value::Null)).await;
             Some((out.answer, out.facts, mode))
         } else if deterministic_allowed && let Some((q, group)) = self.clarification(&entities) {
             options = group;
+            trace::record("clarify", "span", t_pre, || json!({ "options": options.len() }));
             emit(sink, AskEvent::new("delta", q.clone(), Value::Null)).await;
             Some((q, Vec::new(), AnswerMode::Clarify))
         } else {
             None
         };
+        let t_det = Instant::now();
         let direct = if pre.is_none() && deterministic_allowed {
             answer::try_answer(
                 &self.onto,
@@ -525,6 +788,7 @@ impl Intelli {
         let (answer_text, facts, mode) = if let Some(x) = pre {
             x
         } else if let Some(d) = direct {
+            trace::record("deterministic", "span", t_det, || json!({ "answered": true, "facts": d.facts.len() }));
             let avoided = budget.min(600) + estimate(&self.system_prompt());
             efficiency.saved_tokens = avoided;
             self.ledger.update(|s| {
@@ -542,6 +806,7 @@ impl Intelli {
                     hits.iter().map(|h| format!("{} ({})", h.entity.label(), h.entity.id)).collect();
                 format!("I can't answer that directly from the graph. Possibly relevant: {}.", list.join(", "))
             };
+            trace::record("deterministic", "span", t_det, || json!({ "answered": false, "related": hits.len() }));
             emit(sink, AskEvent::new("delta", msg.clone(), Value::Null)).await;
             (msg, Vec::new(), AnswerMode::Fallback)
         } else {
@@ -582,6 +847,17 @@ impl Intelli {
                 facts_used: pack.facts.len(),
                 facts_dropped: pack.dropped_facts,
             };
+            // Facts are never stored on traces, only their counts.
+            trace::record("retrieve", "retrieval", t_ret, || {
+                json!({
+                    "memories": memories.len(),
+                    "facts_used": efficiency.facts_used,
+                    "facts_dropped": efficiency.facts_dropped,
+                    "context_tokens": efficiency.context_tokens,
+                    "naive_tokens": efficiency.naive_tokens,
+                    "saved_tokens": efficiency.saved_tokens,
+                })
+            });
             self.ledger.update(|s| s.tokens_saved += efficiency.saved_tokens as u64);
             emit(
                 sink,
@@ -609,15 +885,16 @@ impl Intelli {
             user.push_str(&question);
             messages.push(ChatMessage::user(user));
             let llm_req =
-                LlmRequest { system: self.system_prompt(), messages, max_tokens: self.config.llm.max_output_tokens };
+                LlmRequest { system: self.system_prompt(), messages, max_tokens: self.max_output_tokens(&llm) };
             if req.include_context {
                 context_out = Some(pack);
             }
 
             let t_llm = Instant::now();
-            let result = match self.llm.unavailable() {
+            llm_step = true;
+            let result = match llm.unavailable() {
                 Some(reason) => Err(Error::Unavailable(reason)),
-                None => self.complete(&llm_req, sink, req.no_cache).await,
+                None => self.complete(&llm, &llm_req, sink, req.no_cache).await,
             };
             llm_ms = ms(t_llm);
             match result {
@@ -632,8 +909,21 @@ impl Intelli {
                     }
                     (resp.text, facts, if cached { AnswerMode::LlmCache } else { AnswerMode::Llm })
                 }
+                Err(Error::Limited(budget)) => {
+                    // The month's budget is spent: no provider call, the facts instead.
+                    note = Some(budget.clone());
+                    let fallback = if facts.is_empty() {
+                        format!("I couldn't find workspace facts for this question ({budget}).")
+                    } else {
+                        let top: Vec<&str> = facts.iter().take(6).map(String::as_str).collect();
+                        format!("The {budget}. Most relevant facts:\n• {}", top.join("\n• "))
+                    };
+                    emit(sink, AskEvent::new("delta", fallback.clone(), Value::Null)).await;
+                    (fallback, facts, AnswerMode::Fallback)
+                }
                 Err(e) => {
                     self.ledger.update(|s| s.llm_failures += 1);
+                    llm_error = true;
                     note = Some(e.to_string());
                     let fallback = if facts.is_empty() {
                         format!("I couldn't find workspace facts for this question ({e}).")
@@ -648,6 +938,7 @@ impl Intelli {
         };
 
         // 6. Remember: conversation, graph links, episodic memory, audit trail.
+        let t_rem = Instant::now();
         let entity_ids: Vec<Id> = entities.iter().map(|r| r.id.clone()).collect();
         let mut conversation_id = None;
         if let Some(c) = conv.as_mut() {
@@ -664,9 +955,9 @@ impl Intelli {
                 self.link_conversation(c, &new_topics);
             }
         }
-        if self.config.memory.enabled
-            && matches!(mode, AnswerMode::Deterministic | AnswerMode::Llm | AnswerMode::LlmCache | AnswerMode::Action)
-        {
+        let episode = self.config.memory.enabled
+            && matches!(mode, AnswerMode::Deterministic | AnswerMode::Llm | AnswerMode::LlmCache | AnswerMode::Action);
+        if episode {
             let salience = if entity_ids.is_empty() { 0.3 } else { 0.5 };
             let _ = self.memory.record_episode(
                 p,
@@ -696,9 +987,19 @@ impl Intelli {
             ..Default::default()
         };
         let ctx = ActionContext::system(&ws).with_request_id(&request_id).with_intent(classified.intent.as_str());
-        if let Err(e) = self.onto.apply(&ctx, vec![Mutation::Event(audit)]) {
-            tracing::warn!("audit event failed: {e}");
-        }
+        let audited = match self.onto.apply(&ctx, vec![Mutation::Event(audit)]) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("audit event failed: {e}");
+                false
+            }
+        };
+        trace::record(
+            "remember",
+            "span",
+            t_rem,
+            || json!({ "conversation_turn": conversation_id.is_some(), "episode": episode, "audit": audited }),
+        );
         let n = self.asks.fetch_add(1, Ordering::Relaxed) + 1;
         if self.config.memory.consolidate_every > 0 && n.is_multiple_of(self.config.memory.consolidate_every) {
             // Off the ask path; a pass already running makes this one a no-op.
@@ -725,8 +1026,8 @@ impl Intelli {
             usage,
             efficiency,
             timings: Timings { resolve_ms, retrieve_ms, llm_ms, total_ms: ms(t0) },
-            provider: self.llm.name().to_string(),
-            model: self.llm.model().to_string(),
+            provider: llm.name().to_string(),
+            model: llm.model().to_string(),
             request_id,
             revision,
             memories: memories_used,
@@ -734,21 +1035,70 @@ impl Intelli {
             options,
             action: action_out,
             note,
+            trace_id: None,
         };
+        self.record_usage(&resp.usage, llm.as_ref(), !llm_step, llm_error);
         if use_cache && matches!(mode, AnswerMode::Deterministic | AnswerMode::Llm | AnswerMode::LlmCache) {
             self.answers.put(answer_key, resp.clone());
         }
         Ok(resp)
     }
 
-    /// LLM call with the completion cache (memory, then store).
+    /// LLM call on `llm` with the completion cache (memory, then store). A
+    /// cached completion is served whatever the budget; otherwise, at or over
+    /// the monthly budget the provider is not called and the result is
+    /// [`Error::Limited`] with the reason ("monthly LLM budget of $50.00
+    /// reached").
     pub(crate) async fn complete(
         &self,
+        llm: &Arc<dyn LlmProvider>,
         req: &LlmRequest,
         sink: Option<&mpsc::Sender<AskEvent>>,
         no_cache: bool,
     ) -> Result<(LlmResponse, bool)> {
-        let key = req.cache_key(self.llm.name(), self.llm.model());
+        let tracer = trace::current();
+        let started = Instant::now();
+        let mut ttft = None;
+        let result = self.complete_inner(llm, req, sink, no_cache, started, &mut ttft).await;
+        if let Some(t) = tracer {
+            let none = TokenUsage::default();
+            let cache_on = self.config.cache.enabled && !no_cache;
+            let (usage, cache, resp) = match &result {
+                Ok((r, true)) => (&none, "hit", Some(r)),
+                Ok((r, false)) => (&r.usage, if cache_on { "miss" } else { "off" }, Some(r)),
+                Err(_) => (&none, if cache_on { "miss" } else { "off" }, None),
+            };
+            t.generation(Generation {
+                provider: llm.name(),
+                model: llm.model(),
+                request: req,
+                started,
+                ttft_ms: ttft,
+                cache,
+                usage,
+                response_model: resp.map(|r| r.model.as_str()),
+                finish_reason: resp.and_then(|r| r.finish_reason.as_deref()),
+                text: resp.map(|r| r.text.as_str()),
+                budget_exceeded: matches!(result, Err(Error::Limited(_))),
+                error: match &result {
+                    Err(Error::Limited(_)) | Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                },
+            });
+        }
+        result
+    }
+
+    async fn complete_inner(
+        &self,
+        llm: &Arc<dyn LlmProvider>,
+        req: &LlmRequest,
+        sink: Option<&mpsc::Sender<AskEvent>>,
+        no_cache: bool,
+        started: Instant,
+        ttft: &mut Option<f64>,
+    ) -> Result<(LlmResponse, bool)> {
+        let key = req.cache_key(llm.name(), llm.model());
         let cache_on = self.config.cache.enabled && !no_cache;
         if cache_on {
             let mut hit = self.completions.get(&key);
@@ -769,23 +1119,32 @@ impl Intelli {
                 return Ok((h, true));
             }
         }
+        let meter = self.meter.read().clone();
+        if let Some(m) = meter
+            && let Some(reason) = self.limits.read().budget_reached(&m.month_to_date())
+        {
+            return Err(Error::Limited(reason));
+        }
         let resp = match sink {
             Some(tx) => {
-                let mut stream = self.llm.stream(req).await?;
+                let mut stream = llm.stream(req).await?;
                 let mut text = String::new();
                 let mut done = None;
                 while let Some(chunk) = stream.next().await {
                     match chunk? {
                         StreamChunk::Delta(d) => {
+                            if ttft.is_none() {
+                                *ttft = Some(ms(started));
+                            }
                             text.push_str(&d);
                             let _ = tx.send(AskEvent::new("delta", d, Value::Null)).await;
                         }
                         StreamChunk::Done(r) => done = Some(r),
                     }
                 }
-                done.unwrap_or(LlmResponse { text, model: self.llm.model().into(), ..Default::default() })
+                done.unwrap_or(LlmResponse { text, model: llm.model().into(), ..Default::default() })
             }
-            None => self.llm.complete(req).await?,
+            None => llm.complete(req).await?,
         };
         self.ledger.record_llm(&resp.usage);
         if cache_on && !resp.text.trim().is_empty() {
@@ -826,18 +1185,19 @@ impl Intelli {
     }
 
     pub fn stats(&self) -> Result<Value> {
+        let llm = self.llm();
         Ok(json!({
             "version": crate::VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
             "ontology": self.onto.stats()?,
             "memory": self.memory.stats(),
             "llm": {
-                "provider": self.llm.name(),
-                "model": self.llm.model(),
-                "available": self.llm.unavailable().is_none(),
-                "unavailable_reason": self.llm.unavailable(),
+                "provider": llm.name(),
+                "model": llm.model(),
+                "available": llm.unavailable().is_none(),
+                "unavailable_reason": llm.unavailable(),
             },
-            "ledger": self.ledger.snapshot(),
+            "ledger": self.ledger(),
             "caches": {
                 "answers": self.answers.stats(),
                 "resolutions": self.resolutions.stats(),
@@ -846,6 +1206,26 @@ impl Intelli {
             "ingest": self.ingest.stats(),
         }))
     }
+}
+
+/// Delete old traces 5 minutes after the tenant opens, then hourly, for as
+/// long as it is open.
+fn spawn_trace_retention(me: &Arc<Intelli>) {
+    let weak = Arc::downgrade(me);
+    tokio::spawn(async move {
+        let mut wait = Duration::from_secs(300);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = Duration::from_secs(3600);
+            let Some(me) = weak.upgrade() else { break };
+            match tokio::task::spawn_blocking(move || me.vacuum_traces()).await {
+                Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "trace retention"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("trace retention: {e}"),
+                Err(e) => tracing::warn!("trace retention: {e}"),
+            }
+        }
+    });
 }
 
 /// Built-in or file schema plus `ontology.extend` layers, as configured.

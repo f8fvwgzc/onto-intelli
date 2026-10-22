@@ -4,6 +4,7 @@ members = [
     "crates/onto-core",
     "crates/onto-intelli",
     "crates/onto-grpc",
+    "crates/onto-control",
     "crates/onto-cli",
     "crates/onto-ffi",
     "crates/onto-bench",
@@ -24,6 +25,7 @@ categories = ["database", "network-programming"]
 onto-core = { path = "crates/onto-core", version = "0.2.0", default-features = false }
 onto-intelli = { path = "crates/onto-intelli", version = "0.2.0", default-features = false }
 onto-grpc = { path = "crates/onto-grpc", version = "0.2.0" }
+onto-control = { path = "crates/onto-control", version = "0.2.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,6 +47,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 futures = "0.3"
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+url = "2"
 
 tonic = "0.14"
 tonic-prost = "0.14"
@@ -62,6 +65,9 @@ hmac = "0.13"
 sha2 = "0.11"
 base64 = "0.22"
 getrandom = "0.4"
+# AES-256-GCM, signature verification, SHA-256, HMAC and a CSPRNG for the
+# control plane: the same build of AWS-LC that rustls already uses.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 bytes = "1"
 
 clap = { version = "4", features = ["derive", "env"] }

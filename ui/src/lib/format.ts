@@ -73,3 +73,45 @@ export function display(v: unknown): string {
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   return JSON.stringify(v);
 }
+
+// ── numbers for the console (metrics, costs, latencies) ─────────────────────
+
+const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+
+/** 1234 → "1.2K"; small numbers stay exact. */
+export function num(n: number): string {
+  return Math.abs(n) < 10_000 ? Math.round(n).toLocaleString() : compact.format(n);
+}
+
+/** Milliseconds as "41 ms" or "1.83 s". */
+export function ms(v: number): string {
+  if (!Number.isFinite(v)) return "–";
+  if (v === 0) return "0 ms";
+  if (v < 1) return `${v.toFixed(2)} ms`;
+  if (v < 1000) return `${Math.round(v)} ms`;
+  return `${(v / 1000).toFixed(v < 10_000 ? 2 : 1)} s`;
+}
+
+/** US dollars with enough digits for fractions of a cent. */
+export function usd(v: number): string {
+  if (v === 0) return "$0";
+  const digits = Math.abs(v) >= 1 ? 2 : Math.abs(v) >= 0.01 ? 3 : 5;
+  return `$${v.toLocaleString(undefined, { minimumFractionDigits: Math.min(digits, 2), maximumFractionDigits: digits })}`;
+}
+
+/** 0.0058 → "0.58%". */
+export function pct(v: number): string {
+  const p = v * 100;
+  return `${p >= 10 || p === 0 ? p.toFixed(0) : p.toFixed(p >= 1 ? 1 : 2)}%`;
+}
+
+/** The change from `prev` to `cur` in words: "+12% vs previous", "no change", "new". */
+export function delta(cur: number, prev: number, lowerIsBetter = false): { text: string; tone: "good" | "bad" | "flat" } {
+  if (prev === 0 && cur === 0) return { text: "no change", tone: "flat" };
+  if (prev === 0) return { text: "new this period", tone: "flat" };
+  const d = (cur - prev) / Math.abs(prev);
+  if (Math.abs(d) < 0.005) return { text: "no change", tone: "flat" };
+  const up = d > 0;
+  const better = lowerIsBetter ? !up : up;
+  return { text: `${up ? "+" : "−"}${pct(Math.abs(d))} vs previous`, tone: better ? "good" : "bad" };
+}

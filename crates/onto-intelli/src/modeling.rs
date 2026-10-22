@@ -18,6 +18,7 @@ use onto_core::{ActionContext, Error, Ontology, Principal, ProposalInput, Result
 use crate::answer::Direct;
 use crate::intelli::Intelli;
 use crate::llm::{ChatMessage, LlmRequest};
+use crate::token::TokenUsage;
 
 /// Suggestions read from one model reply, at most.
 const MAX_SUGGESTIONS: usize = 50;
@@ -898,6 +899,7 @@ impl Intelli {
     /// `ontology.refine`: the draft, improved by the model's suggestions that
     /// keep it a valid schema change.
     pub async fn refine_ontology(&self, p: &Principal, input: RefineIn) -> Result<Refined> {
+        self.take_ask()?;
         let mut draft = self.draft_ontology(p, &input.draft)?;
         let none = |mut draft: OntologyDraft, note: String| Refined {
             draft: {
@@ -910,14 +912,17 @@ impl Intelli {
             llm: "none".into(),
             tokens: 0,
         };
+        let llm = self.llm();
         if !self.modeling_llm() {
-            let why = match self.llm().unavailable() {
+            let why = match llm.unavailable() {
                 Some(reason) => format!("the language model is unavailable ({reason})"),
-                None => format!("no language model is configured (llm provider {})", self.llm().name()),
+                None => format!("no language model is configured (llm provider {})", llm.name()),
             };
+            self.record_usage(&TokenUsage::default(), llm.as_ref(), true, false);
             return Ok(none(draft, format!("{why}: this is the deterministic draft, unrefined")));
         }
         if draft.objects.is_empty() {
+            self.record_usage(&TokenUsage::default(), llm.as_ref(), true, false);
             return Ok(none(draft, "nothing to refine: the draft has no object types".into()));
         }
         let mut user = String::from("Draft ontology:\n");
@@ -929,14 +934,21 @@ impl Intelli {
         let req = LlmRequest {
             system: REFINE_SYSTEM.into(),
             messages: vec![ChatMessage::user(user)],
-            max_tokens: self.config().llm.max_output_tokens,
+            max_tokens: self.max_output_tokens(&llm),
         };
-        let (resp, cached) = match self.complete(&req, None, false).await {
+        let (resp, cached) = match self.complete(&llm, &req, None, false).await {
             Ok(r) => r,
+            Err(Error::Limited(budget)) => {
+                self.record_usage(&Default::default(), llm.as_ref(), false, false);
+                return Ok(none(draft, format!("{budget}: this is the deterministic draft")));
+            }
             Err(e) => {
+                self.record_usage(&Default::default(), llm.as_ref(), false, true);
                 return Ok(none(draft, format!("the language model failed ({e}): this is the deterministic draft")));
             }
         };
+        let none_used = TokenUsage::default();
+        self.record_usage(if cached { &none_used } else { &resp.usage }, llm.as_ref(), false, false);
         let tokens = if cached { 0 } else { resp.usage.total() };
         let suggestions = parse_suggestions(&resp.text);
         if suggestions.is_empty() {
@@ -977,6 +989,7 @@ impl Intelli {
         if input.question.trim().is_empty() {
             return Err(Error::invalid("ontology.advise needs a question"));
         }
+        self.take_ask()?;
         let source = resolve_source(self.ontology(), p, input.source.as_deref(), &input.question)?;
         let draft = self.ontology().draft_ontology(p, &DraftOptions::for_source(source.clone()))?;
         let direct = advise_from_draft(&draft, &input.question);
@@ -1003,7 +1016,9 @@ impl Intelli {
             tokens: 0,
             note,
         };
+        let llm = self.llm();
         if !reasoning || !self.modeling_llm() {
+            self.record_usage(&TokenUsage::default(), llm.as_ref(), true, false);
             return Ok(deterministic(None));
         }
         let mut user = format!("Draft ontology:\n{}\nFacts:\n", draft_summary(&draft));
@@ -1014,9 +1029,18 @@ impl Intelli {
         let req = LlmRequest {
             system: ADVISE_SYSTEM.into(),
             messages: vec![ChatMessage::user(user)],
-            max_tokens: self.config().llm.max_output_tokens,
+            max_tokens: self.max_output_tokens(&llm),
         };
-        match self.complete(&req, None, false).await {
+        let result = self.complete(&llm, &req, None, false).await;
+        let none_used = TokenUsage::default();
+        match &result {
+            Ok((resp, cached)) => {
+                self.record_usage(if *cached { &none_used } else { &resp.usage }, llm.as_ref(), false, false)
+            }
+            Err(e) => self.record_usage(&Default::default(), llm.as_ref(), false, !matches!(e, Error::Limited(_))),
+        }
+        match result {
+            Err(Error::Limited(budget)) => Ok(deterministic(Some(budget))),
             Ok((resp, cached)) if !resp.text.trim().is_empty() => Ok(Advice {
                 answer: resp.text,
                 mode: "llm".into(),

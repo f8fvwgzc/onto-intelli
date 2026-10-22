@@ -113,6 +113,12 @@ const BUILTIN_ROUTES: &[(&str, &str)] = &[
     ("onto_intelli.v1.AdminService/Schema", "schema.get"),
     ("onto_intelli.v1.AdminService/Actions", "system.actions"),
     ("onto_intelli.v1.AdminService/Call", CALL),
+    ("onto_intelli.v1.ObservabilityService/ListTraces", "trace.list"),
+    ("onto_intelli.v1.ObservabilityService/GetTrace", "trace.get"),
+    ("onto_intelli.v1.ObservabilityService/Metrics", "trace.metrics"),
+    ("onto_intelli.v1.ObservabilityService/ListSessions", "trace.sessions"),
+    ("onto_intelli.v1.ObservabilityService/GetSession", "trace.session"),
+    ("onto_intelli.v1.ObservabilityService/Score", "trace.score"),
 ];
 
 pub struct Route {

@@ -24,7 +24,9 @@ snapshot) so you can try all of this without a database of your own.
 ## The model
 
 The `data-catalog` schema package is layered on the enterprise schema by
-default (`[ontology] extend = ["builtin:data-catalog"]`). It is TOML like
+default (`[ontology] extend = ["builtin:data-catalog", "builtin:code"]`;
+`builtin:code` adds the packages of the repository connector,
+[CONTROL_PLANE.md section 13](CONTROL_PLANE.md#13-repository-connector)). It is TOML like
 any other layer
 ([`schemas/data-catalog.toml`](../crates/onto-core/schemas/data-catalog.toml)).
 
@@ -63,6 +65,11 @@ onto connectors                       # what is registered, last crawl, errors
 onto crawl warehouse                  # crawl now
 onto connectors --remove warehouse --purge
 ```
+
+`onto connect repo <path | git URL>` registers the other kind of
+connector, a repository: it maps a monorepo's packages, their internal
+dependencies and CODEOWNERS (section 13 of
+[CONTROL_PLANE.md](CONTROL_PLANE.md#13-repository-connector)).
 
 - **Credentials.** Pass `env:VAR` and the URL is read from the environment
   at crawl time, so it never reaches the store. A literal URL also works;

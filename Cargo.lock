@@ -1307,6 +1307,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "onto-control"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "onto-core",
+ "onto-intelli",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "onto-core"
 version = "0.2.0"
 dependencies = [
@@ -1328,6 +1346,7 @@ dependencies = [
 name = "onto-grpc"
 version = "0.2.0"
 dependencies = [
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -1335,7 +1354,9 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "http",
+ "onto-control",
  "onto-intelli",
+ "parking_lot",
  "prost",
  "prost-reflect",
  "prost-types",
@@ -1353,6 +1374,7 @@ dependencies = [
  "tonic-reflection",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1366,6 +1388,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",
@@ -1376,6 +1399,7 @@ name = "onto-intelli-cli"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "onto-control",
  "onto-grpc",
  "onto-intelli",
  "reqwest",

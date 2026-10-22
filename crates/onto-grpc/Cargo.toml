@@ -11,6 +11,7 @@ categories.workspace = true
 
 [dependencies]
 onto-intelli = { workspace = true, features = ["postgres", "http-llm"] }
+onto-control.workspace = true
 tonic = { workspace = true, features = ["transport", "router", "codegen"] }
 tonic-prost.workspace = true
 tonic-reflection.workspace = true
@@ -41,3 +42,6 @@ prost.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true }
+aws-lc-rs.workspace = true
+parking_lot.workspace = true
+url.workspace = true

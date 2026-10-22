@@ -1,0 +1,12 @@
+{
+  "name": "@acme/ui",
+  "version": "2.1.0",
+  "description": "Design system components.",
+  "dependencies": {
+    "@acme/utils": "workspace:^",
+    "react": "^18.0.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  }
+}

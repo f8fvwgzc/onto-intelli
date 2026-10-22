@@ -108,6 +108,9 @@ pub struct LedgerStats {
     /// Estimated prompt tokens avoided by deterministic answers, caches and
     /// context pruning (vs. sending the raw neighbourhood as JSON).
     pub tokens_saved: u64,
+    /// Trace records dropped because the trace queue was full.
+    #[serde(default)]
+    pub traces_dropped: u64,
 }
 
 /// Process-wide usage accounting.

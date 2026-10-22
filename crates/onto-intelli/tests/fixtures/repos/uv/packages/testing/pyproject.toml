@@ -1,0 +1,11 @@
+[tool.poetry]
+name = "acme-testing"
+version = "0.0.1"
+description = "Test helpers (Poetry)."
+
+[tool.poetry.dependencies]
+python = "^3.9"
+acme-core = { path = "../core" }
+
+[tool.poetry.group.dev.dependencies]
+acme_docs = "*"

@@ -23,11 +23,16 @@ pub const NEXC_EXECUTION_SCHEMA: &str = include_str!("../schemas/nexc-execution.
 /// learned facts, written by connectors (layered on enterprise by default).
 pub const DATA_CATALOG_SCHEMA: &str = include_str!("../schemas/data-catalog.toml");
 
+/// A repository's packages, their internal dependencies and owners, written
+/// by the repository connector (layered after data-catalog by default).
+pub const CODE_SCHEMA: &str = include_str!("../schemas/code.toml");
+
 /// Built-in schema packages, layered with `extend = ["builtin:<name>"]`.
 pub const PACKAGES: &[(&str, &str)] = &[
     ("enterprise", ENTERPRISE_SCHEMA),
     ("nexc-execution", NEXC_EXECUTION_SCHEMA),
     ("data-catalog", DATA_CATALOG_SCHEMA),
+    ("code", CODE_SCHEMA),
 ];
 
 /// The TOML of a built-in package.

@@ -1,0 +1,18 @@
+[package]
+name = "acme-api"
+version = "0.3.1"
+description.workspace = true
+edition = "2021"
+
+[dependencies]
+acme-core = { workspace = true }
+tokio = "1"
+
+[dev-dependencies]
+acme-testkit = { path = "../testkit" }
+
+[build-dependencies]
+acme-gen = { path = "../../tools/gen" }
+
+[target.'cfg(unix)'.dependencies]
+acme-core = { workspace = true }
