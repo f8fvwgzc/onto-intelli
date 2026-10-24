@@ -27,6 +27,7 @@ pub mod explorer;
 pub mod export;
 pub mod graph;
 pub mod learn;
+pub mod lint;
 pub mod live_schema;
 pub mod map;
 pub mod metrics;
@@ -53,6 +54,7 @@ pub use engine::{
     SearchHit, SearchMode, SyncReport,
 };
 pub use error::{Error, Result};
+pub use lint::{LintDecision, LintFeedback, LintQuery, LintReport};
 pub use live_schema::{
     Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
     SchemaVersion, SchemaVersionInfo,
