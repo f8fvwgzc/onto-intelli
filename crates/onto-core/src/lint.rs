@@ -19,9 +19,12 @@
 //!
 //! The checks, their severities and what they flag are the [`CHECKS`] table.
 //! Lint reads any [`Schema`] value, including one that never went through
-//! `Schema::compile`; checks that overlap compile-time validation
+//! `Schema::compile`: it lints a compiled copy when the schema compiles, and
+//! otherwise resolves declared inverse names itself (only `compile` fills the
+//! schema's own inverse map). Checks that overlap compile-time validation
 //! (`shape_reference`, `unknown_rule_class`) report every problem at once
-//! instead of the first.
+//! instead of the first. Rule checks consider only rules that compile; the
+//! rules they left out are listed in `partial`, never skipped silently.
 //!
 //! Feedback (`accept` or `dismiss`, with an optional note) is stored in the
 //! KV namespace [`NS_FEEDBACK`] keyed by finding id, needs write access and
@@ -122,7 +125,8 @@ pub const CHECKS: &[CheckInfo] = &[
         Severity::Warning,
         false,
         "A rule can never fire: some variable (or constant) must be of kinds no object type satisfies at once, \
-         taking subtypes, interfaces and empty-means-any endpoint lists into account.",
+         taking subtypes, interfaces, empty-means-any endpoint lists and facts other rules derive into account. \
+         Assumes asserted links respect their link type's from/to lists.",
     ),
     check(
         "recursive_rule",
@@ -233,7 +237,7 @@ pub struct LintCounts {
     pub info: usize,
 }
 
-/// A selected check that did not run, and why.
+/// A selected check that did not run (or left something out), and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotRun {
     pub check: String,
@@ -255,6 +259,10 @@ pub struct LintReport {
     /// Selected checks that did not run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_run: Vec<NotRun>,
+    /// Checks that ran but left part of the schema out (rules that do not
+    /// compile), and what they left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial: Vec<NotRun>,
     /// Version of the schema linted, when it came from an ontology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u64>,
@@ -340,7 +348,25 @@ fn run(
     can_read: &dyn Fn(&Entity) -> bool,
     selected: BTreeSet<&'static str>,
 ) -> LintReport {
-    let mut l = Linter { schema, vocab: reason::vocabulary(schema), selected: &selected, findings: Vec::new() };
+    // `Schema::resolve_rel` reads an inverse-name map only `compile` fills
+    // (and serde skips), so lint a compiled copy when the schema compiles.
+    // Otherwise resolve declared inverse names through a map built here.
+    let mut copy = schema.clone();
+    let compiled = copy.compile().is_ok();
+    let schema = if compiled { &copy } else { schema };
+    let inverses = if compiled { BTreeMap::new() } else { inverse_names(schema) };
+    let mut vocab = reason::vocabulary(schema);
+    // Without the map, `vocabulary` takes inverse names for derived relations.
+    vocab.relations.retain(|r| !inverses.contains_key(r));
+    let mut lines = Vec::new();
+    let mut uncompiled = Vec::new();
+    for (i, r) in schema.rules.iter().enumerate() {
+        match reason::compile_rule(schema, &vocab, r) {
+            Ok(l) => lines.push((i, l)),
+            Err(e) => uncompiled.push(format!("rule {} does not compile ({e}), so this check left it out", r.name)),
+        }
+    }
+    let mut l = Linter { schema, vocab, inverses, lines, selected: &selected, findings: Vec::new() };
     l.missing_description();
     l.missing_inverse();
     l.unconstrained_link();
@@ -369,11 +395,15 @@ fn run(
     findings.retain(|f| seen.insert(f.id.clone()));
     let mut checks_run = Vec::new();
     let mut not_run = Vec::new();
+    let mut partial = Vec::new();
     for c in CHECKS.iter().filter(|c| selected.contains(c.name)) {
         if c.needs_graph && g.is_none() {
             not_run.push(NotRun { check: c.name.into(), reason: "needs a graph".into() });
         } else {
             checks_run.push(c.name.to_string());
+            if RULE_CHECKS.contains(&c.name) {
+                partial.extend(uncompiled.iter().map(|why| NotRun { check: c.name.into(), reason: why.clone() }));
+            }
         }
     }
     LintReport {
@@ -382,9 +412,27 @@ fn run(
         suppressed: 0,
         checks_run,
         not_run,
+        partial,
         schema_version: None,
         means: MEANS.into(),
     }
+}
+
+/// Checks that read compiled rules (and so leave out rules that do not compile).
+const RULE_CHECKS: &[&str] = &["dead_rule", "recursive_rule"];
+
+/// Declared inverse names to their link types, as `Schema::compile` builds
+/// them (the first declaration wins; a name that is a link type is not one).
+fn inverse_names(schema: &Schema) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for (name, lt) in &schema.link_types {
+        if let Some(inv) = lt.inverse.as_deref().filter(|i| !i.trim().is_empty())
+            && !schema.link_types.contains_key(inv)
+        {
+            m.entry(inv.to_string()).or_insert_with(|| name.clone());
+        }
+    }
+    m
 }
 
 fn count(findings: &[Finding]) -> LintCounts {
@@ -434,6 +482,10 @@ pub fn apply_feedback(
 struct Linter<'a> {
     schema: &'a Schema,
     vocab: Vocabulary,
+    /// Inverse names the schema cannot resolve itself (it was not compiled).
+    inverses: BTreeMap<String, String>,
+    /// Rules that compile, with their schema index.
+    lines: Vec<(usize, RuleLine)>,
     selected: &'a BTreeSet<&'static str>,
     findings: Vec<Finding>,
 }
@@ -454,6 +506,40 @@ impl Need {
                 schema.object_types.get(kind).is_none_or(|t| t.states.is_empty() || t.states.iter().any(|x| x == s))
             }
         }
+    }
+}
+
+/// What the rules that can fire derive, for `dead_rule`.
+#[derive(Default)]
+struct Derived {
+    /// Some head has a variable predicate (never, today), so anything goes.
+    anything: bool,
+    /// Some head is `?x a ?c`: any class.
+    any_class: bool,
+    classes: BTreeSet<String>,
+    rels: BTreeSet<String>,
+}
+
+impl Derived {
+    fn add(&mut self, head: &[String; 3]) {
+        match head[1].as_str() {
+            p if p.starts_with('?') => self.anything = true,
+            "a" => match head[2].strip_prefix('#') {
+                Some(c) => {
+                    self.classes.insert(c.to_string());
+                }
+                None => self.any_class = true,
+            },
+            p => {
+                self.rels.insert(p.strip_prefix('^').unwrap_or(p).to_string());
+            }
+        }
+    }
+
+    /// Can a rule put an entity of any kind in `class` (directly, or
+    /// through a subtype or implementer the built-in rules lift)?
+    fn class(&self, schema: &Schema, class: &str) -> bool {
+        self.any_class || self.classes.iter().any(|c| schema.kind_is(c, class))
     }
 }
 
@@ -489,14 +575,9 @@ impl<'a> Linter<'a> {
         });
     }
 
-    /// Rules that compile, with their schema index.
-    fn compiled_rules(&self) -> Vec<(usize, RuleLine)> {
-        let s = self.schema;
-        s.rules
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| reason::compile_rule(s, &self.vocab, r).ok().map(|l| (i, l)))
-            .collect()
+    /// Is `name` a link type, a declared inverse name or `^link type`?
+    fn declared_rel(&self, name: &str) -> bool {
+        self.schema.resolve_rel(name).is_some() || self.inverses.contains_key(name)
     }
 
     fn missing_description(&mut self) {
@@ -686,90 +767,32 @@ impl<'a> Linter<'a> {
         if !self.on(C) {
             return;
         }
-        let s = self.schema;
-        let all: Vec<&str> = s.object_types.keys().map(String::as_str).collect();
-        let mut found = Vec::new();
-        for (ri, line) in self.compiled_rules() {
-            let rule = &s.rules[ri];
-            let at = |i: usize| {
-                if rule.is_horn() {
-                    format!("when[{i}]")
-                } else {
-                    format!("step {} {}", i + 1, rule.chain.get(i).map(String::as_str).unwrap_or("?"))
-                }
-            };
-            // Every term with what the atoms require of it, in order of first use.
-            let mut terms: Vec<(String, Vec<(Need, String)>)> = Vec::new();
-            let mut need = |term: &str, n: Need, why: String| match terms.iter_mut().find(|(t, _)| t == term) {
-                Some((_, ns)) => ns.push((n, why)),
-                None => terms.push((term.to_string(), vec![(n, why)])),
-            };
-            for (i, [subj, pred, obj]) in line.body.iter().enumerate() {
-                match pred.as_str() {
-                    "a" => {
-                        if let Some(class) = obj.strip_prefix('#')
-                            && s.is_type_or_interface(class)
-                        {
-                            need(subj, Need::Kinds(vec![class.to_string()]), format!("is a {class} ({})", at(i)));
-                        }
-                    }
-                    "state" => {
-                        if let Ok(Value::String(st)) = serde_json::from_str::<Value>(obj) {
-                            need(subj, Need::State(st.clone()), format!("is in state {st} ({})", at(i)));
-                        }
-                    }
-                    p if p.starts_with('?') || p.starts_with("prop.") => {}
-                    rel => {
-                        let Some(lt) = s.link_types.get(rel) else { continue };
-                        if lt.symmetric {
-                            if !lt.from.is_empty() && !lt.to.is_empty() {
-                                let mut ends: Vec<String> = lt.from.iter().chain(&lt.to).cloned().collect();
-                                ends.sort();
-                                ends.dedup();
-                                let why = format!("is an end of {rel}, one of [{}] ({})", ends.join(", "), at(i));
-                                need(subj, Need::Kinds(ends.clone()), why.clone());
-                                need(obj, Need::Kinds(ends), why);
-                            }
-                        } else {
-                            if !lt.from.is_empty() {
-                                let why =
-                                    format!("is the source of {rel}, one of [{}] ({})", lt.from.join(", "), at(i));
-                                need(subj, Need::Kinds(lt.from.clone()), why);
-                            }
-                            if !lt.to.is_empty() {
-                                let why = format!("is the target of {rel}, one of [{}] ({})", lt.to.join(", "), at(i));
-                                need(obj, Need::Kinds(lt.to.clone()), why);
-                            }
-                        }
-                    }
+        // Least fixpoint: a rule is live when its body is satisfiable over
+        // asserted facts plus what the live rules derive. Rule-derived links
+        // need not respect their link type's from/to lists, and a rule may
+        // put any entity in a class, so a live rule's head lifts the
+        // constraints of that relation or class. A rule outside the fixpoint
+        // can never fire first, so it never fires.
+        let n = self.lines.len();
+        let mut live = vec![false; n];
+        let mut derived = Derived::default();
+        loop {
+            let mut changed = false;
+            for (k, is_live) in live.iter_mut().enumerate() {
+                if !*is_live && self.why_dead(k, &derived).is_none() {
+                    *is_live = true;
+                    derived.add(&self.lines[k].1.head);
+                    changed = true;
                 }
             }
-            for (term, needs) in &terms {
-                // A variable may be any object type; a constant entity is of its id's kind.
-                let (shown, mut kinds): (String, Vec<&str>) =
-                    match term.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
-                        Some(id) => {
-                            let kind = id.split(':').next().unwrap_or(id);
-                            (format!("{term} (of kind {kind})"), vec![kind])
-                        }
-                        None if term.starts_with('?') => (term.clone(), all.clone()),
-                        None => continue,
-                    };
-                for (n, _) in needs {
-                    kinds.retain(|k| n.admits(s, k));
-                }
-                if kinds.is_empty() {
-                    let whys: Vec<&str> = needs.iter().map(|(_, w)| w.as_str()).collect();
-                    found.push((
-                        rule.name.clone(),
-                        format!(
-                            "rule {} can never fire: {shown} {}; no object type satisfies all of these",
-                            rule.name,
-                            whys.join(", and ")
-                        ),
-                    ));
-                    break;
-                }
+            if !changed {
+                break;
+            }
+        }
+        let mut found = Vec::new();
+        for k in (0..n).filter(|&k| !live[k]) {
+            if let Some(message) = self.why_dead(k, &derived) {
+                found.push((self.schema.rules[self.lines[k].0].name.clone(), message));
             }
         }
         for (name, message) in found {
@@ -784,13 +807,107 @@ impl<'a> Linter<'a> {
         }
     }
 
+    /// Why rule line `k` can never fire, given what live rules derive, or
+    /// `None` when some object types satisfy every term.
+    fn why_dead(&self, k: usize, derived: &Derived) -> Option<String> {
+        if derived.anything {
+            return None;
+        }
+        let s = self.schema;
+        let (ri, line) = &self.lines[k];
+        let rule = &s.rules[*ri];
+        let at = |i: usize| {
+            if rule.is_horn() {
+                format!("when[{i}]")
+            } else {
+                format!("step {} {}", i + 1, rule.chain.get(i).map(String::as_str).unwrap_or("?"))
+            }
+        };
+        // Every term with what the atoms require of it, in order of first use.
+        let mut terms: Vec<(String, Vec<(Need, String)>)> = Vec::new();
+        let mut need = |term: &str, n: Need, why: String| match terms.iter_mut().find(|(t, _)| t == term) {
+            Some((_, ns)) => ns.push((n, why)),
+            None => terms.push((term.to_string(), vec![(n, why)])),
+        };
+        for (i, [subj, pred, obj]) in line.body.iter().enumerate() {
+            match pred.as_str() {
+                "a" => {
+                    if let Some(class) = obj.strip_prefix('#')
+                        && s.is_type_or_interface(class)
+                        && !derived.class(s, class)
+                    {
+                        need(subj, Need::Kinds(vec![class.to_string()]), format!("is a {class} ({})", at(i)));
+                    }
+                }
+                "state" => {
+                    if let Ok(Value::String(st)) = serde_json::from_str::<Value>(obj) {
+                        need(subj, Need::State(st.clone()), format!("is in state {st} ({})", at(i)));
+                    }
+                }
+                p if p.starts_with('?') || p.starts_with("prop.") => {}
+                rel => {
+                    if derived.rels.contains(rel) {
+                        continue;
+                    }
+                    let Some(lt) = s.link_types.get(rel) else { continue };
+                    if lt.symmetric {
+                        if !lt.from.is_empty() && !lt.to.is_empty() {
+                            let mut ends: Vec<String> = lt.from.iter().chain(&lt.to).cloned().collect();
+                            ends.sort();
+                            ends.dedup();
+                            let why = format!("is an end of {rel}, one of [{}] ({})", ends.join(", "), at(i));
+                            need(subj, Need::Kinds(ends.clone()), why.clone());
+                            need(obj, Need::Kinds(ends), why);
+                        }
+                    } else {
+                        if !lt.from.is_empty() {
+                            let why = format!("is the source of {rel}, one of [{}] ({})", lt.from.join(", "), at(i));
+                            need(subj, Need::Kinds(lt.from.clone()), why);
+                        }
+                        if !lt.to.is_empty() {
+                            let why = format!("is the target of {rel}, one of [{}] ({})", lt.to.join(", "), at(i));
+                            need(obj, Need::Kinds(lt.to.clone()), why);
+                        }
+                    }
+                }
+            }
+        }
+        for (term, needs) in &terms {
+            // A variable may be any object type; a constant entity is of its id's kind.
+            let (shown, mut kinds): (String, Vec<&str>) = match term.strip_prefix('<').and_then(|t| t.strip_suffix('>'))
+            {
+                Some(id) => {
+                    let kind = id.split(':').next().unwrap_or(id);
+                    (format!("{term} (of kind {kind})"), vec![kind])
+                }
+                None if term.starts_with('?') => {
+                    (term.to_string(), s.object_types.keys().map(String::as_str).collect())
+                }
+                None => continue,
+            };
+            for (n, _) in needs {
+                kinds.retain(|k| n.admits(s, k));
+            }
+            if kinds.is_empty() {
+                let whys: Vec<&str> = needs.iter().map(|(_, w)| w.as_str()).collect();
+                return Some(format!(
+                    "rule {} can never fire: {shown} {}; no object type satisfies all of these, and no rule that \
+                     can fire derives facts that would",
+                    rule.name,
+                    whys.join(", and ")
+                ));
+            }
+        }
+        None
+    }
+
     fn recursive_rule(&mut self) {
         const C: &str = "recursive_rule";
         if !self.on(C) {
             return;
         }
         let s = self.schema;
-        let lines = self.compiled_rules();
+        let lines = &self.lines;
         let heads: Vec<Option<Head>> = lines
             .iter()
             .map(|(_, l)| match l.head[1].as_str() {
@@ -919,10 +1036,10 @@ impl<'a> Linter<'a> {
         for r in &s.rules {
             let derived = if r.is_horn() {
                 match r.then.get(1).and_then(Value::as_str) {
-                    Some(p) if p != "a" && !p.starts_with('?') && s.resolve_rel(p).is_none() => Some(p),
+                    Some(p) if p != "a" && !p.starts_with('?') && !self.declared_rel(p) => Some(p),
                     _ => None,
                 }
-            } else if !r.infer.is_empty() && s.resolve_rel(&r.infer).is_none() {
+            } else if !r.infer.is_empty() && !self.declared_rel(&r.infer) {
                 Some(r.infer.as_str())
             } else {
                 None
@@ -1137,8 +1254,7 @@ impl<'a> Linter<'a> {
     fn shape_problems(&self, name: &str, sh: &Shape) -> Vec<(String, Vec<String>)> {
         let s = self.schema;
         let class_ok = |c: &str| s.is_type_or_interface(c) || self.vocab.classes.contains(c);
-        let rel_ok =
-            |r: &str| s.resolve_rel(r).is_some() || self.vocab.relations.contains(r.strip_prefix('^').unwrap_or(r));
+        let rel_ok = |r: &str| self.declared_rel(r) || self.vocab.relations.contains(r.strip_prefix('^').unwrap_or(r));
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
         let mut own = Vec::new();
         if let Some(t) = &sh.target

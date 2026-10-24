@@ -10,6 +10,7 @@ use serde_json::{Map, json};
 
 use onto_core::graph::Graph;
 use onto_core::lint::{self, CHECKS, LintDecision, LintQuery, NS_FEEDBACK, Severity};
+use onto_core::reason::{self, ReasonOptions};
 use onto_core::schema::{PACKAGES, Rule, builtin_package};
 use onto_core::shape_model::{PropertyShape, Shape};
 use onto_core::{
@@ -384,6 +385,169 @@ description = "Anything likes anything."
     assert!(dead("name = 'r'\nwhen = [['?p', 'member_of', 'team:x']]\nthen = ['?p', 'a', 'm']").is_empty());
     // Relations other rules derive are not constrained.
     assert!(dead("name = 'r'\nchain = ['funds', 'r']\ninfer = 'r'").is_empty());
+}
+
+/// Rules may derive links of a declared link type outside its from/to lists,
+/// and put any entity in a class: lint must not call such rules dead when
+/// the reasoner fires them.
+#[test]
+fn dead_rules_account_for_facts_other_rules_derive() {
+    let base = r#"
+[object_types.org]
+description = "An organization."
+[object_types.person]
+description = "A person."
+[link_types.employs]
+description = "Employment."
+from = ["org"]
+to = ["person"]
+inverse = "employed_by"
+[link_types.mentors]
+description = "Mentoring."
+from = ["person"]
+to = ["person"]
+inverse = "mentored_by"
+"#;
+    let mut g = Graph::default();
+    for p in ["a", "b", "c"] {
+        g.put_entity(entity("person", p));
+    }
+    g.put_link(link("person:a", "mentors", "person:b"));
+    g.put_link(link("person:b", "mentors", "person:c"));
+    let check = |rules: &str, dead_rule: Option<&str>| {
+        let s = Schema::from_toml(&format!("{base}\n{rules}")).unwrap();
+        let r = lint::lint_checks(&s, None, &all, Some(&["dead_rule".into()])).unwrap();
+        let dead: Vec<&str> = r.findings.iter().map(|f| f.target.as_str()).collect();
+        let fired = reason::closure(&s, &g, &ReasonOptions::default(), &all).stats().by_rule;
+        match dead_rule {
+            None => assert!(dead.is_empty(), "{dead:?} {fired:?}"),
+            Some(name) => {
+                assert_eq!(dead, [format!("rule:{name}")], "{fired:?}");
+                assert_eq!(fired.get(&format!("schema/{name}")).copied().unwrap_or(0), 0, "{fired:?}");
+            }
+        }
+        // Every rule lint keeps alive here does fire on the graph.
+        for rule in &s.rules {
+            if dead_rule != Some(rule.name.as_str()) {
+                assert!(
+                    fired.get(&format!("schema/{}", rule.name)).copied().unwrap_or(0) > 0,
+                    "{}: {fired:?}",
+                    rule.name
+                );
+            }
+        }
+    };
+    // A chain rule derives employs between people, so employs twice fires.
+    check(
+        r#"
+[[rules]]
+name = "mentor_employs"
+description = "x"
+chain = ["mentors"]
+infer = "employs"
+[[rules]]
+name = "employs_twice"
+description = "x"
+chain = ["employs", "employs"]
+infer = "grand_employs"
+"#,
+        None,
+    );
+    // A Horn rule puts people in class org, so orgs_employ fires on people.
+    check(
+        r#"
+[[rules]]
+name = "employer_people"
+description = "x"
+when = [["?p", "mentors", "?q"]]
+then = ["?p", "a", "org"]
+[[rules]]
+name = "orgs_employ"
+description = "x"
+when = [["?p", "a", "org"], ["?p", "mentors", "?q"]]
+then = ["?p", "a", "boss"]
+"#,
+        None,
+    );
+    // Without the deriving rule the same rule is dead, and does not fire.
+    check(
+        r#"
+[[rules]]
+name = "employs_twice"
+description = "x"
+chain = ["employs", "employs"]
+infer = "grand_employs"
+"#,
+        Some("employs_twice"),
+    );
+    // A rule that only a dead rule would enable stays dead (least fixpoint).
+    let s = Schema::from_toml(&format!(
+        "{base}\n{}",
+        r#"
+[[rules]]
+name = "never"
+description = "x"
+chain = ["employs", "employs"]
+infer = "mentors"
+[[rules]]
+name = "after_never"
+description = "x"
+when = [["?o", "a", "org"], ["?o", "mentored_by", "?p"]]
+then = ["?o", "a", "boss"]
+"#
+    ))
+    .unwrap();
+    let r = lint::lint_checks(&s, None, &all, Some(&["dead_rule".into()])).unwrap();
+    let dead: Vec<&str> = r.findings.iter().map(|f| f.target.as_str()).collect();
+    // after_never would fire if never derived mentors from orgs; never cannot fire.
+    assert_eq!(dead, ["rule:after_never", "rule:never"], "{:#?}", r.findings);
+}
+
+/// A schema that never went through `Schema::compile` (deserialized) lints
+/// like the compiled one: inverse names resolve, nothing is misread.
+#[test]
+fn uncompiled_schema_resolves_inverse_names() {
+    let text = r#"
+[object_types.org]
+description = "An organization."
+[object_types.person]
+description = "A person."
+[link_types.employs]
+description = "Employment."
+from = ["org"]
+to = ["person"]
+inverse = "employed_by"
+[[rules]]
+name = "colleagues"
+description = "x"
+chain = ["employed_by", "employs"]
+infer = "colleague_of"
+[shapes.p]
+description = "x"
+target = "person"
+[[shapes.p.properties]]
+path = "employed_by"
+min_count = 1
+"#;
+    let compiled = Schema::from_toml(text).unwrap();
+    let raw: Schema = serde_json::from_value(serde_json::to_value(&compiled).unwrap()).unwrap();
+    let a = lint::lint(&compiled, None, &all);
+    let b = lint::lint(&raw, None, &all);
+    assert!(!a.findings.iter().any(|f| f.check == "shape_reference"), "{:#?}", a.findings);
+    assert_eq!(a, b);
+    assert!(b.partial.is_empty(), "{:?}", b.partial);
+
+    // A schema that does not compile at all still resolves inverse names,
+    // and the rule checks say which rules they left out.
+    let mut broken = raw.clone();
+    broken.link_types.get_mut("employs").unwrap().weight = 0.0;
+    assert!(broken.clone().compile().is_err());
+    let r = lint::lint(&broken, None, &all);
+    assert!(!r.findings.iter().any(|f| f.check == "shape_reference"), "{:#?}", r.findings);
+    assert!(!r.findings.iter().any(|f| f.check == "keyword_collision"), "{:#?}", r.findings);
+    let partial: Vec<&str> = r.partial.iter().map(|n| n.check.as_str()).collect();
+    assert_eq!(partial, ["dead_rule", "recursive_rule"], "{:?}", r.partial);
+    assert!(r.partial.iter().all(|n| n.reason.contains("rule colleagues does not compile")), "{:?}", r.partial);
 }
 
 #[test]
