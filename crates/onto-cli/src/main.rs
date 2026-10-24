@@ -2121,19 +2121,10 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
         Command::Mcp { profile } => {
-            // INTEGRATOR (after I1 merges): pass `Some(&local_config(&cli)?.mcp.profile)` as the second argument.
-            let profile = assure::mcp_profile(profile.as_deref(), None);
-            // INTEGRATOR (after I1 merges): delete this guard; `with_profile` below refuses unknown names.
-            if profile != "full" {
-                return Err(Error::invalid(format!(
-                    "MCP profile '{profile}': this build serves only 'full' (profiles: {})",
-                    assure::KNOWN_PROFILES.join(", ")
-                )));
-            }
             let (intelli, cfg) = open_local(&cli).await?;
-            let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes);
-            // INTEGRATOR (after I1 merges): enable the next line.
-            // let server = server.with_profile(&profile)?;
+            let profile = onto_intelli::mcp::resolve_profile(profile.as_deref(), &cfg.mcp.profile);
+            let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes)
+                .with_profile(&profile)?;
             let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
             let mut out = tokio::io::stdout();
             while let Some(line) = lines.next_line().await? {

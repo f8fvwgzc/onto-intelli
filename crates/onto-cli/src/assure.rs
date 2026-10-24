@@ -1693,33 +1693,9 @@ pub(crate) fn print_risk(st: &Style, plan: &Value) {
 
 // ── mcp profiles ──────────────────────────────────────────────────────
 
-/// The profiles the engine defines (see `onto_intelli::mcp::MCP_PROFILES`,
-/// which replaces this list once the profile hook is merged).
-pub(crate) const KNOWN_PROFILES: &[&str] =
-    &["full", "catalog", "authoring", "reasoning", "governance", "retrieval", "evaluation"];
-
-/// The MCP profile to serve: the `--profile` flag (clap reads
-/// `ONTO_MCP_PROFILE` into it when the flag is absent), else `[mcp] profile`,
-/// else `full`. A blank value counts as unset at every level.
-pub(crate) fn mcp_profile(flag_or_env: Option<&str>, config: Option<&str>) -> String {
-    fn set(v: Option<&str>) -> Option<&str> {
-        v.map(str::trim).filter(|p| !p.is_empty())
-    }
-    set(flag_or_env).or_else(|| set(config)).unwrap_or("full").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn profile_precedence_is_flag_then_config_then_full() {
-        assert_eq!(mcp_profile(Some("catalog"), Some("authoring")), "catalog");
-        assert_eq!(mcp_profile(None, Some("authoring")), "authoring");
-        assert_eq!(mcp_profile(None, None), "full");
-        assert_eq!(mcp_profile(Some(" "), Some("reasoning")), "reasoning");
-        assert_eq!(mcp_profile(Some(""), Some(" ")), "full");
-    }
 
     #[test]
     fn shape_verdicts_map_to_exit_codes() {
