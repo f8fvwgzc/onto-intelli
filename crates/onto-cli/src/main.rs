@@ -1157,7 +1157,9 @@ fn quiet_broken_pipe() {
             .map(String::as_str)
             .or_else(|| info.payload().downcast_ref::<&str>().copied())
             .unwrap_or_default();
-        if msg.contains("failed printing to stdout") && msg.contains("Broken pipe") {
+        // "Broken pipe" on Unix; Windows says ERROR_NO_DATA (232) or ERROR_BROKEN_PIPE (109).
+        let closed = ["Broken pipe", "(os error 232)", "(os error 109)"].iter().any(|m| msg.contains(m));
+        if msg.contains("failed printing to stdout") && closed {
             // 128 + SIGPIPE, what a shell reports for a process the signal ends.
             std::process::exit(141);
         }

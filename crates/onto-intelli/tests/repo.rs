@@ -19,7 +19,17 @@ impl TempDir {
     fn new(prefix: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("{prefix}{}", &onto_intelli::core::time::new_id("x")[2..]));
         std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir.canonicalize().unwrap())
+        TempDir(canonical(&dir))
+    }
+}
+
+/// `canonicalize` (macOS's `/var` is `/private/var`) without the `\\?\`
+/// prefix it adds on Windows, which git cannot write through.
+fn canonical(dir: &Path) -> PathBuf {
+    let c = dir.canonicalize().unwrap();
+    match c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(drive) if drive.as_bytes().get(1) == Some(&b':') => PathBuf::from(drive),
+        _ => c,
     }
 }
 
@@ -433,7 +443,9 @@ async fn refusals() {
     let spec =
         json!({ "name": "b", "kind": "repo", "url": "https://github.com/acme/x", "repo": { "branch": "--orphan" } });
     assert!(i.call(&admin(), "connector.add", spec).await.is_err());
-    let missing = json!({ "name": "m", "kind": "repo", "url": "/nonexistent/onto-repo", "every_secs": 0 });
+    // Absolute on every OS (`/nonexistent` has no drive on Windows).
+    let gone = t.0.join("nonexistent");
+    let missing = json!({ "name": "m", "kind": "repo", "url": gone.to_string_lossy(), "every_secs": 0 });
     i.call(&admin(), "connector.add", missing).await.unwrap();
     assert!(i.call(&admin(), "connector.crawl", json!({ "name": "m" })).await.is_err());
     // Connectors need an admin.
