@@ -79,7 +79,9 @@ pub struct SchemaProposal {
     pub status: ProposalStatus,
     /// Schema version the proposal was planned against.
     pub base_version: u64,
-    /// Impact report computed when filed (or revised).
+    /// Impact report computed when filed (or revised). Its consequences
+    /// are not stored (they depend on the reader): [`ProposalView`] plans
+    /// them for whoever reads an open proposal.
     pub plan: SchemaPlan,
     #[serde(default)]
     pub reviews: Vec<Review>,
@@ -157,11 +159,20 @@ impl Ontology {
         serde_json::from_value(v).map_err(|e| Error::Storage(format!("proposal {id}: {e}")))
     }
 
-    fn view(&self, prop: SchemaProposal, p: &Principal) -> Result<ProposalView> {
+    /// The stored plan holds no consequences (they depend on who reads):
+    /// an open proposal gets them, and the locks and risk, planned for `p`,
+    /// in its plan or, when stale, in the preview.
+    fn view(&self, mut prop: SchemaProposal, p: &Principal) -> Result<ProposalView> {
         let active = self.schema_version();
         let stale = prop.base_version != active;
-        let preview = if prop.status == ProposalStatus::Open && stale {
-            Some(self.schema_plan(p, &prop.change_set)?)
+        let preview = if prop.status == ProposalStatus::Open {
+            let fresh = self.schema_plan_as(p, &prop.change_set, Some(&prop.proposer))?;
+            if stale || fresh.base_version != prop.base_version {
+                Some(fresh)
+            } else {
+                prop.plan.with_reader_view(&fresh, &prop.change_set);
+                None
+            }
         } else {
             None
         };
@@ -227,7 +238,7 @@ impl Ontology {
             return Err(Error::Invalid(format!("the proposed change does not validate: {}", plan.errors.join("; "))));
         }
         let now = now_ms();
-        let prop = SchemaProposal {
+        let mut prop = SchemaProposal {
             id: new_id("prop"),
             title: input.title.trim().to_string(),
             rationale: input.rationale,
@@ -245,6 +256,7 @@ impl Ontology {
             updated_at: now,
             revision: 1,
         };
+        prop.plan.without_reader_facts(&prop.change_set);
         let payload = json!({
             "proposal": prop.id,
             "title": prop.title,
@@ -483,6 +495,7 @@ impl Ontology {
             prop.change_set = input.change_set.clone();
             prop.base_version = plan.base_version;
             prop.plan = plan.clone();
+            prop.plan.without_reader_facts(&prop.change_set);
             prop.status = ProposalStatus::Open;
             prop.error = None;
             prop.revision += 1;

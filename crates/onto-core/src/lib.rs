@@ -28,6 +28,7 @@ pub mod export;
 pub mod graph;
 pub mod learn;
 pub mod live_schema;
+pub mod locks;
 pub mod map;
 pub mod metrics;
 pub mod model;
@@ -54,9 +55,10 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use live_schema::{
-    Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
-    SchemaVersion, SchemaVersionInfo,
+    Consequences, Conservativity, Governance, LikelyRename, Migration, Risk, SchemaApplied, SchemaChange,
+    SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan, SchemaVersion, SchemaVersionInfo,
 };
+pub use locks::{LockViolation, SchemaLock};
 pub use model::*;
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};

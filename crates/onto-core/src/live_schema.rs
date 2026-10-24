@@ -8,6 +8,29 @@
 //! migration as a new [`SchemaVersion`] plus a `schema.change` audit event.
 //! Every version keeps the full schema document and its diff, so any version
 //! can be read back, compared, restored or undone.
+//!
+//! A plan is semantic as well as structural. Besides the entities and links
+//! in scope (the blast radius) it reports:
+//!
+//! * **Consequences** ([`Consequences`]): the facts the reasoner derives
+//!   under the planned schema and not under the current one, and the reverse,
+//!   over the same graph. An inference is not an assertion, so a change that
+//!   touches no entity and no link can still change what the ontology
+//!   entails: marking `depends_on` transitive adds a derived fact for every
+//!   dependency chain. The change is *conservative* when no added fact is
+//!   stated purely in the current vocabulary; derived facts are the engine's
+//!   opinion (`derived`), not a checker's verdict.
+//! * **Risk** ([`Risk`]): `high` when the change is breaking, needs a
+//!   migration or violates a lock; `medium` when it deletes or renames a
+//!   definition, removes a derived fact, or is not shown to be conservative;
+//!   `low` when it is purely additive and conservative. Every level carries
+//!   its reasons.
+//! * **Lock violations** (see [`crate::locks`]): a plan that deletes, renames
+//!   or breaks a locked definition is not applicable unless an admin passes
+//!   `override_locks`.
+//! * **Likely renames** ([`LikelyRename`]): a change set that deletes one
+//!   definition and adds a similar one in the same section probably meant a
+//!   rename, which keeps the data a delete would orphan.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -15,12 +38,16 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+pub use crate::action_types::Risk;
 use crate::action_types::{ActionType, Check};
 use crate::engine::{ActionContext, Extra};
 use crate::graph::{Graph, LinkKey};
+use crate::locks::{self, LockViolation, SchemaLock};
 use crate::metrics::MetricDef;
 use crate::model::{Entity, EntityInput, EntityRef, Id, LinkInput, Mutation};
-use crate::policy::{Access, Principal, Role};
+use crate::policy::{self, Access, Principal, Role};
+use crate::proposals::Proposer;
+use crate::reason::{self, AddedFact, Closure, Fact, ReasonOptions};
 use crate::schema::{Analysis, Cardinality, InterfaceType, LinkType, ObjectType, PropType, PropertyDef, Rule, Schema};
 use crate::shape_model::{Shape, ShapePath};
 use crate::store::Store;
@@ -293,6 +320,15 @@ pub struct SchemaChangeSet {
     /// Migrations for the whole set, in addition to per-change ones.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<Migration>,
+    /// Proceed although the set deletes, renames or breaks locked
+    /// definitions. Honoured for admins only; overridden violations stay in
+    /// the plan and are recorded in the `schema.change` event.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub override_locks: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,7 +395,11 @@ pub struct ChangeImpact {
     pub reasons: Vec<String>,
     /// Entities in scope: of the kind (and its subtypes), or holding the property.
     pub entities: usize,
-    /// Links in scope: of the relation, or touching removed entities.
+    /// Links in scope: of the relation, or touching removed entities. An
+    /// edit of a link type that leaves its endpoints, cardinality, symmetry,
+    /// inverse and backing alone (a flag such as `transitive`, a weight, a
+    /// label) touches none; what it does to entailment is in the plan's
+    /// consequences.
     pub links: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<Id>,
@@ -404,23 +444,178 @@ pub struct SchemaPlan {
     /// Distinct links in scope of any change.
     pub links_affected: usize,
     pub migration: MigrationSummary,
+    /// The facts that appear and disappear from the closure (see
+    /// [`Consequences`]). Present on every plan the engine computes (a
+    /// skipped block says why when they could not be computed); absent from
+    /// plans stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequences: Option<Consequences>,
+    /// `low`, `medium` or `high`, explained by `risk_reasons`.
+    #[serde(default)]
+    pub risk: Risk,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_reasons: Vec<String>,
+    /// Locked definitions the change deletes, renames or breaks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked_violations: Vec<LockViolation>,
+    /// Deletes paired with similar new definitions: probably renames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub likely_renames: Vec<LikelyRename>,
 }
 
 impl SchemaPlan {
     /// Can this plan be applied as is?
     pub fn applicable(&self) -> bool {
-        self.valid && self.needs_migration.is_empty()
+        self.valid && self.needs_migration.is_empty() && self.locked_violations.iter().all(|v| v.overridden)
+    }
+
+    /// Strip what belongs to one reader before the plan is stored where
+    /// others read it (a proposal): the consequences are facts as the
+    /// planner may see them, so the stored block holds none (only a note
+    /// that they are computed per reader), and the risk is reassessed
+    /// without them.
+    pub(crate) fn without_reader_facts(&mut self, set: &SchemaChangeSet) {
+        if self.consequences.is_none() {
+            return;
+        }
+        self.consequences = Some(Consequences::skipped(STORED_CONSEQUENCES, SCHEMA_CONSEQUENCES_MEANS));
+        (self.risk, self.risk_reasons) = assess_risk(self, set);
+    }
+
+    /// Take the reader-dependent parts of `fresh` (the same change set
+    /// planned now, against the same schema version, for one reader): its
+    /// consequences and lock violations, and the risk they imply.
+    pub(crate) fn with_reader_view(&mut self, fresh: &SchemaPlan, set: &SchemaChangeSet) {
+        self.consequences = fresh.consequences.clone();
+        self.locked_violations = fresh.locked_violations.clone();
+        (self.risk, self.risk_reasons) = assess_risk(self, set);
     }
 
     /// The refusal for a plan that cannot be applied.
     pub fn refusal(&self) -> Error {
         if !self.valid {
             Error::Invalid(format!("schema change rejected: {}", self.errors.join("; ")))
+        } else if self.locked_violations.iter().any(|v| !v.overridden) {
+            Error::Conflict(locks::refusal_text(&self.locked_violations))
         } else {
             Error::Conflict(format!("breaking change needs a migration: {}", self.needs_migration.join("; ")))
         }
     }
 }
+
+/// Is a change conservative over the current vocabulary? A word, because
+/// "not shown" is not "no".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Conservativity {
+    /// Both runs reached their fixpoint and no added fact is stated purely
+    /// in the current vocabulary.
+    Conservative,
+    /// Some added fact is stated purely in the current vocabulary.
+    NotConservative,
+    /// Skipped, or a run stopped before its fixpoint: not shown either way.
+    #[default]
+    Undetermined,
+}
+
+/// What a change does to entailment: the facts the closure holds after it
+/// and not before (`added`), and the reverse (`removed`).
+///
+/// Added facts are judged against the base signature: the names of the
+/// current schema (object types, interfaces, link types, declared
+/// properties, and the classes and relations its rules derive) plus every
+/// entity of the current closure, the keywords and every literal. An added
+/// fact all of whose terms are in the base signature says something new in
+/// the old words; the change is conservative when there is none.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Consequences {
+    pub added: usize,
+    pub removed: usize,
+    /// True only when shown: false when skipped or when either run stopped
+    /// before its fixpoint (see `verdict`).
+    pub conservative: bool,
+    #[serde(default)]
+    pub verdict: Conservativity,
+    /// Added facts stated purely in the current vocabulary.
+    pub new_over_existing_vocabulary: usize,
+    /// Added facts per rule; asserted facts (a new `extends`, a link type
+    /// made transitive) count under `asserted`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_rule: BTreeMap<String, usize>,
+    /// The first added facts (at most 20), sorted, each with the rule and
+    /// premises that derive it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples_added: Vec<AddedFact>,
+    /// The first added facts over the existing vocabulary (at most 20): the
+    /// witnesses that the change is not conservative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnesses: Vec<AddedFact>,
+    /// The first removed facts (at most 20), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples_removed: Vec<Fact>,
+    /// False when either run stopped before its fixpoint: the counts then
+    /// compare two partial closures, and the verdict is undetermined.
+    pub fixpoint_reached: bool,
+    /// Why the consequences were not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    pub means: String,
+}
+
+impl Consequences {
+    /// A block that says why it holds nothing.
+    pub fn skipped(reason: impl Into<String>, means: &str) -> Self {
+        Self { skipped: Some(reason.into()), means: means.to_string(), ..Default::default() }
+    }
+}
+
+/// What a schema plan's consequences mean.
+pub const SCHEMA_CONSEQUENCES_MEANS: &str = "Facts the reasoner derives (or the schema asserts) under the planned \
+     schema and not under the current one, and the reverse, over the graph as it stands now and as the planner may \
+     see it; migrations are not applied, their data edits are counted under `migration`. Derived facts are the \
+     engine's opinion, not a checker's verdict. `conservative` means no added fact is stated purely in the current \
+     vocabulary; it is shown only when both runs reached a fixpoint. Asserted state and property facts are left out: \
+     the graph is the same, and only what the rules read differs.";
+
+/// Why a stored proposal's plan holds no consequences.
+pub const STORED_CONSEQUENCES: &str = "consequences are computed for each reader, as that reader may see the graph, \
+     and are not stored with a proposal: read an open proposal to see them";
+
+/// What an action plan's consequences mean.
+pub const ACTION_CONSEQUENCES_MEANS: &str = "Facts the reasoner derives (or the store asserts) after this action's \
+     mutations, staged on a fork, and not before, and the reverse, as the planner may see them. Derived facts are \
+     the engine's opinion, not a checker's verdict. `conservative` uses the schema-plan definition (no added fact \
+     stated purely in the current vocabulary); for data edits it is rarely meaningful, because a new link or state \
+     between existing entities is such a fact by construction.";
+
+/// Asserted facts above this many skip the consequences of a plan.
+pub const MAX_CONSEQUENCE_FACTS: usize = 500_000;
+
+/// Samples kept per list.
+const CONSEQUENCE_SAMPLES: usize = 20;
+
+/// A delete and a put in one section that look like one renamed definition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LikelyRename {
+    /// `object_types`, `link_types` or `properties`.
+    pub section: String,
+    /// The deleted definition (`issue.sev` for a property).
+    pub from: String,
+    /// The new definition.
+    pub to: String,
+    /// 0.3 × name similarity + 0.7 × structural similarity, in [0, 1].
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+/// Pairs scoring below this are not reported.
+const RENAME_THRESHOLD: f64 = 0.6;
+
+/// Link types and properties carry only coarse structure (equal endpoints,
+/// equal type), which almost any pair shares: below this name similarity
+/// the structure is not counted and the name alone scores the pair.
+const COARSE_NAME_FLOOR: f64 = 0.6;
 
 /// One stored schema version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -660,7 +855,7 @@ fn synced_tables(s: &Schema) -> BTreeMap<(String, String), Vec<String>> {
     out
 }
 
-fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String> {
+pub(crate) fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String> {
     match c {
         SchemaChange::PutObjectType { name, def, .. } => {
             if !s.object_types.contains_key(name) {
@@ -1545,7 +1740,13 @@ pub(crate) fn plan(base: &Schema, base_version: u64, g: &Graph, set: &SchemaChan
                 }
             }
         }
-        for r in &sc.rels {
+        let touches_links = match c {
+            SchemaChange::PutLinkType { name, def, .. } => {
+                base.link_types.get(name).is_none_or(|old| link_data_changes(old, def))
+            }
+            _ => true,
+        };
+        for r in sc.rels.iter().filter(|_| touches_links) {
             for l in links_by_rel.get(r.as_str()).into_iter().flatten() {
                 imp.links += 1;
                 if imp.sample.len() < 10 {
@@ -1977,8 +2178,10 @@ pub(crate) fn plan(base: &Schema, base_version: u64, g: &Graph, set: &SchemaChan
         }
     }
     let mapped = |id: &str| -> String { id_map.get(id).cloned().unwrap_or_else(|| id.to_string()) };
-    // 1. Retyped entities are re-created under their new ids.
+    // 1. Retyped entities are re-created under their new ids, then their
+    // links (after every new id exists: retyped entities may link each other).
     let mut relinked: BTreeSet<LinkKey> = BTreeSet::new();
+    let mut relinks: Vec<Mutation> = Vec::new();
     for (id, f) in &fixes {
         let Some(new_id) = id_map.get(id.as_str()) else { continue };
         let Some(e) = g.get(id) else { continue };
@@ -2013,9 +2216,10 @@ pub(crate) fn plan(base: &Schema, base_version: u64, g: &Graph, set: &SchemaChan
             }
             let rel = link_move.get(&key).cloned().unwrap_or_else(|| rel.clone());
             let props = g.get_link(&key.0, &key.1, &key.2).map(|l| l.props.clone()).unwrap_or_default();
-            mutations.push(Mutation::Link(LinkInput { from: mapped(from), rel, to: mapped(to), props }));
+            relinks.push(Mutation::Link(LinkInput { from: mapped(from), rel, to: mapped(to), props }));
         }
     }
+    mutations.append(&mut relinks);
     // 2. Other fixes patch entities in place.
     for (id, f) in &fixes {
         if f.delete || id_map.contains_key(id.as_str()) {
@@ -2101,7 +2305,14 @@ pub(crate) fn plan(base: &Schema, base_version: u64, g: &Graph, set: &SchemaChan
         }
     }
 
+    // Deletes that look like renames.
+    let renames = likely_renames(base, &new, set);
+    for r in &renames {
+        warnings.push(rename_warning(base, g, r));
+    }
+
     let reindex: Vec<String> = all_kinds.iter().map(|k| k.to_string()).collect();
+    plan.likely_renames = renames;
     plan.entities_affected = scoped_entities.len();
     plan.links_affected = scoped_links.len();
     plan.changes = impacts;
@@ -2215,6 +2426,551 @@ fn summarize(base: &Schema, c: &SchemaChange) -> String {
         SchemaChange::DeleteGlossaryTerm { section, word } => format!("forget '{word}' ({})", section_name(*section)),
         SchemaChange::SetAnalysis { .. } => "replace the analysis settings".into(),
     }
+}
+
+/// Does `new` change what the stored links of a link type mean or allow
+/// (endpoints, cardinality, symmetry, inverse, backing)? Flags such as
+/// `transitive` or `dependency`, weights and labels leave the links alone.
+fn link_data_changes(old: &LinkType, new: &LinkType) -> bool {
+    let set = |v: &[String]| v.iter().cloned().collect::<BTreeSet<String>>();
+    set(&old.from) != set(&new.from)
+        || set(&old.to) != set(&new.to)
+        || old.cardinality != new.cardinality
+        || old.symmetric != new.symmetric
+        || old.inverse != new.inverse
+        || old.backing != new.backing
+}
+
+// ── likely renames ───────────────────────────────────────────────────────
+
+/// Jaro-Winkler similarity of two strings, 0.0..=1.0.
+fn jaro_winkler(a: &str, b: &str) -> f64 {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let window = (a.len().max(b.len()) / 2).saturating_sub(1);
+    let mut a_hit = vec![false; a.len()];
+    let mut b_hit = vec![false; b.len()];
+    let mut matches = 0usize;
+    for (i, ca) in a.iter().enumerate() {
+        let lo = i.saturating_sub(window);
+        let hi = (i + window + 1).min(b.len());
+        for j in lo..hi {
+            if !b_hit[j] && b[j] == *ca {
+                a_hit[i] = true;
+                b_hit[j] = true;
+                matches += 1;
+                break;
+            }
+        }
+    }
+    if matches == 0 {
+        return 0.0;
+    }
+    let a_seq = a.iter().zip(&a_hit).filter(|(_, h)| **h).map(|(c, _)| c);
+    let b_seq = b.iter().zip(&b_hit).filter(|(_, h)| **h).map(|(c, _)| c);
+    let transpositions = a_seq.zip(b_seq).filter(|(x, y)| x != y).count() / 2;
+    let m = matches as f64;
+    let jaro = (m / a.len() as f64 + m / b.len() as f64 + (m - transpositions as f64) / m) / 3.0;
+    let prefix = a.iter().zip(&b).take(4).take_while(|(x, y)| x == y).count() as f64;
+    jaro + prefix * 0.1 * (1.0 - jaro)
+}
+
+/// The best similarity between any name or label of one definition and any
+/// of the other (trigram Jaccard or Jaro-Winkler, whichever is higher).
+fn name_similarity(a: &[&str], b: &[&str]) -> f64 {
+    let mut best = 0.0f64;
+    for x in a.iter().filter(|x| !x.is_empty()) {
+        for y in b.iter().filter(|y| !y.is_empty()) {
+            let (x, y) = (x.to_lowercase(), y.to_lowercase());
+            let s = if x == y { 1.0 } else { (crate::text::similarity(&x, &y) as f64).max(jaro_winkler(&x, &y)) };
+            best = best.max(s);
+        }
+    }
+    best
+}
+
+/// Jaccard similarity with the shared and total counts; `None` when both
+/// sets are empty (the signal is undefined).
+fn jaccard<T: Ord>(a: &BTreeSet<T>, b: &BTreeSet<T>) -> Option<(f64, usize, usize)> {
+    let union = a.union(b).count();
+    if union == 0 {
+        return None;
+    }
+    let shared = a.intersection(b).count();
+    Some((shared as f64 / union as f64, shared, union))
+}
+
+fn names_of<'a>(it: impl IntoIterator<Item = &'a String>) -> BTreeSet<&'a str> {
+    it.into_iter().map(String::as_str).collect()
+}
+
+/// `0.3 × name + 0.7 × structure`, where structure is the weighted mean of
+/// the defined signals (renormalized); the name alone when none is defined.
+fn rename_score(name: f64, signals: &[(f64, f64)]) -> f64 {
+    let total: f64 = signals.iter().map(|(w, _)| w).sum();
+    let score = if total > 0.0 {
+        let structure = signals.iter().map(|(w, v)| w * v).sum::<f64>() / total;
+        0.3 * name + 0.7 * structure
+    } else {
+        name
+    };
+    (score * 100.0).round() / 100.0
+}
+
+fn object_type_similarity(from: &str, old: &ObjectType, to: &str, new: &ObjectType) -> (f64, Vec<String>) {
+    let name = name_similarity(&[from, &old.label], &[to, &new.label]);
+    let mut evidence = vec![format!("name similarity {name:.2} ({from} vs {to})")];
+    let mut signals = Vec::new();
+    if let Some((j, shared, union)) = jaccard(&names_of(old.properties.keys()), &names_of(new.properties.keys())) {
+        signals.push((0.4, j));
+        evidence.push(format!("properties: {shared} of {union} names shared"));
+    }
+    if old.extends.is_some() || new.extends.is_some() || !old.implements.is_empty() || !new.implements.is_empty() {
+        let same = old.extends == new.extends && names_of(&old.implements) == names_of(&new.implements);
+        signals.push((0.15, if same { 1.0 } else { 0.0 }));
+        evidence.push(if same { "same extends and implements" } else { "different extends or implements" }.into());
+    }
+    if let Some((j, shared, union)) = jaccard(&names_of(&old.states), &names_of(&new.states)) {
+        signals.push((0.15, j));
+        evidence.push(format!("states: {shared} of {union} shared"));
+    }
+    (rename_score(name, &signals), evidence)
+}
+
+fn link_type_similarity(from: &str, old: &LinkType, to: &str, new: &LinkType) -> (f64, Vec<String>) {
+    let name = name_similarity(&[from, &old.label], &[to, &new.label]);
+    let mut evidence = vec![format!("name similarity {name:.2} ({from} vs {to})")];
+    // Empty endpoint lists mean "any kind": two empty lists agree.
+    let side = |a: &[String], b: &[String]| jaccard(&names_of(a), &names_of(b)).map_or(1.0, |(j, _, _)| j);
+    let (f, t) = (side(&old.from, &new.from), side(&old.to, &new.to));
+    evidence.push(format!("endpoints: from {f:.2}, to {t:.2} alike"));
+    let same_card = old.cardinality == new.cardinality;
+    evidence.push(if same_card { "same cardinality" } else { "different cardinality" }.into());
+    let flags = [old.dependency == new.dependency, old.transitive == new.transitive, old.symmetric == new.symmetric];
+    let equal = flags.iter().filter(|x| **x).count();
+    evidence.push(format!("dependency/transitive/symmetric: {equal} of 3 flags equal"));
+    let signals = [(0.5, (f + t) / 2.0), (0.1, if same_card { 1.0 } else { 0.0 }), (0.1, equal as f64 / 3.0)];
+    (coarse_score(name, &signals, &mut evidence), evidence)
+}
+
+/// [`rename_score`] for a section with coarse structure: the name alone
+/// when it is below [`COARSE_NAME_FLOOR`].
+fn coarse_score(name: f64, signals: &[(f64, f64)], evidence: &mut Vec<String>) -> f64 {
+    if name < COARSE_NAME_FLOOR {
+        evidence.push(format!(
+            "names too far apart (below {COARSE_NAME_FLOOR:.2}) for the structure to count: the name alone scores it"
+        ));
+        rename_score(name, &[])
+    } else {
+        rename_score(name, signals)
+    }
+}
+
+fn property_similarity(from: &str, old: &PropertyDef, to: &str, new: &PropertyDef) -> (f64, Vec<String>) {
+    let name = name_similarity(&[from], &[to]);
+    let mut evidence = vec![format!("name similarity {name:.2} ({from} vs {to})")];
+    let same_type = old.ty == new.ty;
+    evidence.push(if same_type {
+        format!("same type ({})", old.expected())
+    } else {
+        format!("type {} vs {}", old.expected(), new.expected())
+    });
+    let mut signals = vec![(0.4, if same_type { 1.0 } else { 0.0 })];
+    if let Some((j, shared, union)) = jaccard(&names_of(&old.values), &names_of(&new.values)) {
+        signals.push((0.3, j));
+        evidence.push(format!("values: {shared} of {union} shared"));
+    }
+    (coarse_score(name, &signals, &mut evidence), evidence)
+}
+
+/// Pairs at or above the threshold, assigned one-to-one, best score first.
+fn assign_renames(mut candidates: Vec<LikelyRename>) -> Vec<LikelyRename> {
+    candidates.retain(|c| c.score >= RENAME_THRESHOLD);
+    candidates
+        .sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.from.cmp(&b.from)).then_with(|| a.to.cmp(&b.to)));
+    let mut used_from: BTreeSet<String> = BTreeSet::new();
+    let mut used_to: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for c in candidates {
+        if used_from.contains(&c.from) || used_to.contains(&c.to) {
+            continue;
+        }
+        used_from.insert(c.from.clone());
+        used_to.insert(c.to.clone());
+        out.push(c);
+    }
+    out
+}
+
+/// Definitions the set deletes that look renamed to definitions it adds in
+/// the same section: object types, link types, and the properties of one
+/// object type. Explicit renames are not candidates.
+fn likely_renames(base: &Schema, new: &Schema, set: &SchemaChangeSet) -> Vec<LikelyRename> {
+    let mut explicit_from: BTreeSet<String> = BTreeSet::new();
+    let mut explicit_to: BTreeSet<String> = BTreeSet::new();
+    for c in &set.changes {
+        let (section, from, to) = match c {
+            SchemaChange::RenameObjectType { from, to } => ("object_types", from.clone(), to.clone()),
+            SchemaChange::RenameLinkType { from, to } => ("link_types", from.clone(), to.clone()),
+            SchemaChange::RenameProperty { object_type, from, to } => {
+                ("properties", format!("{object_type}.{from}"), format!("{object_type}.{to}"))
+            }
+            _ => continue,
+        };
+        explicit_from.insert(format!("{section}/{from}"));
+        explicit_to.insert(format!("{section}/{to}"));
+    }
+    let candidate = |section: &str, from: &str, to: &str| {
+        !explicit_from.contains(&format!("{section}/{from}")) && !explicit_to.contains(&format!("{section}/{to}"))
+    };
+    let pair = |section: &str, from: String, to: String, (score, evidence): (f64, Vec<String>)| LikelyRename {
+        section: section.into(),
+        from,
+        to,
+        score,
+        evidence,
+    };
+    let mut out = Vec::new();
+
+    let mut cands = Vec::new();
+    for (x, old) in base.object_types.iter().filter(|(k, _)| !new.object_types.contains_key(*k)) {
+        for (y, def) in new.object_types.iter().filter(|(k, _)| !base.object_types.contains_key(*k)) {
+            if candidate("object_types", x, y) {
+                cands.push(pair("object_types", x.clone(), y.clone(), object_type_similarity(x, old, y, def)));
+            }
+        }
+    }
+    out.extend(assign_renames(cands));
+
+    let mut cands = Vec::new();
+    for (x, old) in base.link_types.iter().filter(|(k, _)| !new.link_types.contains_key(*k)) {
+        for (y, def) in new.link_types.iter().filter(|(k, _)| !base.link_types.contains_key(*k)) {
+            if candidate("link_types", x, y) {
+                cands.push(pair("link_types", x.clone(), y.clone(), link_type_similarity(x, old, y, def)));
+            }
+        }
+    }
+    out.extend(assign_renames(cands));
+
+    for (kind, old) in &base.object_types {
+        let Some(cur) = new.object_types.get(kind) else { continue };
+        let mut cands = Vec::new();
+        for (x, xdef) in old.properties.iter().filter(|(k, _)| !cur.properties.contains_key(*k)) {
+            for (y, ydef) in cur.properties.iter().filter(|(k, _)| !old.properties.contains_key(*k)) {
+                let (from, to) = (format!("{kind}.{x}"), format!("{kind}.{y}"));
+                if candidate("properties", &from, &to) {
+                    cands.push(pair("properties", from, to, property_similarity(x, xdef, y, ydef)));
+                }
+            }
+        }
+        out.extend(assign_renames(cands));
+    }
+    out
+}
+
+/// `"<X> looks renamed to <Y> (score 0.82): use rename_object_type to keep its N entities"`.
+fn rename_warning(base: &Schema, g: &Graph, r: &LikelyRename) -> String {
+    let (op, n, what) = match r.section.as_str() {
+        "object_types" => ("rename_object_type", g.of_kind(&r.from).count(), "entities"),
+        "link_types" => ("rename_link_type", g.links().filter(|l| l.rel == r.from).count(), "links"),
+        _ => {
+            let (kind, prop) = r.from.split_once('.').unwrap_or((r.from.as_str(), ""));
+            let kinds: Vec<&String> =
+                g.kinds().map(|(k, _)| k).filter(|k| *k == kind || base.kind_is(k, kind)).collect();
+            let n = kinds
+                .iter()
+                .map(|k| g.of_kind(k).filter(|e| e.props.get(prop).is_some_and(|v| !v.is_null())).count())
+                .sum();
+            ("rename_property", n, "values")
+        }
+    };
+    format!("{} looks renamed to {} (score {:.2}): use {op} to keep its {n} {what}", r.from, r.to, r.score)
+}
+
+// ── consequences ─────────────────────────────────────────────────────────
+
+/// The base signature a change is judged against, as spelled terms.
+struct Signature {
+    entities: HashSet<String>,
+    classes: HashSet<String>,
+    relations: HashSet<String>,
+    props: HashSet<String>,
+}
+
+impl Signature {
+    /// The names of `base` plus every entity of `before` (keywords and
+    /// literals are always in).
+    fn of(base: &Schema, before: &Closure) -> Self {
+        let vocab = reason::vocabulary(base);
+        let classes = base
+            .object_types
+            .keys()
+            .chain(base.interfaces.keys())
+            .chain(vocab.classes.iter())
+            .map(|n| format!("#{n}"))
+            .collect();
+        let relations = base.link_types.keys().chain(vocab.relations.iter()).cloned().collect();
+        let props = base
+            .object_types
+            .values()
+            .flat_map(|t| t.properties.keys())
+            .chain(base.interfaces.values().flat_map(|i| i.properties.keys()))
+            .cloned()
+            .collect();
+        let mut entities = HashSet::new();
+        for f in before.asserted() {
+            for t in [&f.s, &f.o] {
+                if t.starts_with('<') {
+                    entities.insert(t.clone());
+                }
+            }
+        }
+        Self { entities, classes, relations, props }
+    }
+
+    fn term(&self, t: &str) -> bool {
+        if t.starts_with('<') {
+            self.entities.contains(t)
+        } else if t.starts_with('#') {
+            self.classes.contains(t)
+        } else if let Some(p) = t.strip_prefix("prop.") {
+            self.props.contains(p)
+        } else {
+            reason::KEYWORDS.contains(&t) || self.relations.contains(t)
+        }
+    }
+
+    /// Are all terms of `f` in the signature? The object of a `state` or
+    /// `prop.*` fact is a literal, and every literal is.
+    fn covers(&self, f: &Fact) -> bool {
+        let literal = f.p == "state" || f.p.starts_with("prop.");
+        self.term(&f.s) && self.term(&f.p) && (literal || self.term(&f.o))
+    }
+}
+
+/// The consequences of going from `before` to `after`, judged against the
+/// vocabulary of `base`. With `same_data` (both closures read the same graph)
+/// asserted `state` and `prop.*` facts are left out: they differ only by
+/// what the rules of each schema read, not by what the store holds.
+pub fn closure_consequences(
+    base: &Schema,
+    before: &Closure,
+    after: &Closure,
+    same_data: bool,
+    means: &str,
+) -> Consequences {
+    let diff = before.diff(after);
+    let data_read = |f: &Fact| same_data && (f.p == "state" || f.p.starts_with("prop."));
+    let added: Vec<AddedFact> = diff.added.into_iter().filter(|a| !(a.rule.is_none() && data_read(&a.fact))).collect();
+    let removed: Vec<Fact> = diff
+        .removed
+        .into_iter()
+        .filter(|f| !(data_read(f) && before.contains(f) == Some(reason::Status::Asserted)))
+        .collect();
+    let sig = Signature::of(base, before);
+    let mut by_rule: BTreeMap<String, usize> = BTreeMap::new();
+    let mut witnesses = Vec::new();
+    let mut over = 0;
+    for a in &added {
+        *by_rule.entry(a.rule.clone().unwrap_or_else(|| "asserted".into())).or_default() += 1;
+        if sig.covers(&a.fact) {
+            over += 1;
+            if witnesses.len() < CONSEQUENCE_SAMPLES {
+                witnesses.push(a.clone());
+            }
+        }
+    }
+    let verdict = match (diff.fixpoint_reached, over) {
+        (false, _) => Conservativity::Undetermined,
+        (true, 0) => Conservativity::Conservative,
+        (true, _) => Conservativity::NotConservative,
+    };
+    Consequences {
+        added: added.len(),
+        removed: removed.len(),
+        conservative: verdict == Conservativity::Conservative,
+        verdict,
+        new_over_existing_vocabulary: over,
+        by_rule,
+        samples_added: added.into_iter().take(CONSEQUENCE_SAMPLES).collect(),
+        witnesses,
+        samples_removed: removed.into_iter().take(CONSEQUENCE_SAMPLES).collect(),
+        fixpoint_reached: diff.fixpoint_reached,
+        skipped: None,
+        means: means.to_string(),
+    }
+}
+
+/// A lower bound of the asserted facts a closure of `g` would hold: one per
+/// visible entity and one per link between visible entities. Stops counting
+/// past [`MAX_CONSEQUENCE_FACTS`].
+fn asserted_floor(g: &Graph, can_read: &dyn Fn(&Entity) -> bool) -> usize {
+    let visible: HashSet<&str> = g.entities().filter(|e| can_read(e)).map(|e| e.id.as_str()).collect();
+    let mut n = visible.len();
+    for l in g.links() {
+        if n > MAX_CONSEQUENCE_FACTS {
+            break;
+        }
+        if visible.contains(l.from.as_str()) && visible.contains(l.to.as_str()) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn too_large(n: usize) -> String {
+    format!(
+        "the graph holds at least {n} asserted facts in scope, more than {MAX_CONSEQUENCE_FACTS}: consequences are \
+         not computed (conservativity is not shown)"
+    )
+}
+
+/// The consequences of replacing schema `base` with `new` over graph `g`, as
+/// `can_read` sees it.
+pub fn schema_consequences(base: &Schema, new: &Schema, g: &Graph, can_read: &dyn Fn(&Entity) -> bool) -> Consequences {
+    let floor = asserted_floor(g, can_read);
+    if floor > MAX_CONSEQUENCE_FACTS {
+        return Consequences::skipped(too_large(floor), SCHEMA_CONSEQUENCES_MEANS);
+    }
+    let opts = ReasonOptions::default();
+    let before = reason::closure(base, g, &opts, can_read);
+    if before.asserted().len() > MAX_CONSEQUENCE_FACTS {
+        return Consequences::skipped(too_large(before.asserted().len()), SCHEMA_CONSEQUENCES_MEANS);
+    }
+    let after = reason::closure(new, g, &opts, can_read);
+    closure_consequences(base, &before, &after, true, SCHEMA_CONSEQUENCES_MEANS)
+}
+
+/// The consequences of a data edit under one schema: graph `before` as
+/// `can_before` sees it against graph `after` as `can_after` sees it.
+pub fn data_consequences(
+    schema: &Schema,
+    before: &Graph,
+    after: &Graph,
+    can_before: &dyn Fn(&Entity) -> bool,
+    can_after: &dyn Fn(&Entity) -> bool,
+) -> Consequences {
+    let floor = asserted_floor(before, can_before).max(asserted_floor(after, can_after));
+    if floor > MAX_CONSEQUENCE_FACTS {
+        return Consequences::skipped(too_large(floor), ACTION_CONSEQUENCES_MEANS);
+    }
+    let opts = ReasonOptions::default();
+    let b = reason::closure(schema, before, &opts, can_before);
+    let a = reason::closure(schema, after, &opts, can_after);
+    closure_consequences(schema, &b, &a, false, ACTION_CONSEQUENCES_MEANS)
+}
+
+// ── risk ─────────────────────────────────────────────────────────────────
+
+/// The risk word of a plan and its reasons, most severe first.
+///
+/// * `high`: the change is breaking, a breaking effect has no migration, or
+///   a lock is violated without override.
+/// * `medium`: a change deletes or renames a definition, a lock is
+///   overridden, a fact the current schema entails disappears, or the change
+///   is not shown to be conservative (not conservative, skipped, or a run
+///   stopped before its fixpoint).
+/// * `low`: purely additive and conservative.
+///
+/// A plan that does not validate is `high`: it cannot be applied, and what
+/// it would do is not shown.
+pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<String>) {
+    let mut high = Vec::new();
+    let mut medium = Vec::new();
+    if !plan.valid {
+        let n = plan.errors.len();
+        high.push(format!(
+            "the change set does not validate ({n} {}): it cannot be applied, and its effects are not shown",
+            if n == 1 { "error" } else { "errors" }
+        ));
+    }
+    if plan.breaking {
+        for imp in plan.changes.iter().filter(|i| i.breaking) {
+            high.push(format!("breaking: {} {} ({})", imp.op, imp.target, imp.reasons.join("; ")));
+        }
+        if high.is_empty() {
+            high.push("breaking: the change invalidates data or vocabulary in use".into());
+        }
+    }
+    if !plan.needs_migration.is_empty() {
+        high.push(format!("{} breaking effects have no migration", plan.needs_migration.len()));
+    }
+    for v in &plan.locked_violations {
+        let line = format!("{}/{} ({}, locked by {})", v.section, v.name, v.change, v.locked_by);
+        if v.overridden {
+            medium.push(format!("overrides the lock on {line}"));
+        } else {
+            high.push(format!("touches locked {line} without override"));
+        }
+    }
+    for c in &set.changes {
+        let op = c.op();
+        if op.starts_with("delete_") || op.starts_with("rename_") {
+            medium.push(format!("removes or moves a definition: {op} {}", c.target()));
+        }
+    }
+    if let Some(c) = &plan.consequences {
+        if c.removed > 0 {
+            medium.push(format!("{} facts the closure holds now disappear from it", c.removed));
+        }
+        match c.verdict {
+            Conservativity::Conservative => {}
+            Conservativity::NotConservative => {
+                let example = c.witnesses.first().map(|w| format!(", e.g. {}", w.fact)).unwrap_or_default();
+                medium.push(format!(
+                    "not conservative: {} added facts are stated purely in the current vocabulary{example}",
+                    c.new_over_existing_vocabulary
+                ));
+            }
+            Conservativity::Undetermined => medium.push(format!(
+                "conservativity not shown: {}",
+                c.skipped.as_deref().unwrap_or("a reasoning run stopped before its fixpoint")
+            )),
+        }
+    }
+    let risk = if !high.is_empty() {
+        Risk::High
+    } else if !medium.is_empty() {
+        Risk::Medium
+    } else {
+        Risk::Low
+    };
+    high.extend(medium);
+    (risk, high)
+}
+
+/// May a proposal's `override_locks` be honoured, as far as its proposer
+/// goes? Only for an admin that is not an agent (the approver must be an
+/// admin too).
+pub(crate) fn proposer_may_override(r: &Proposer) -> bool {
+    !r.agent && r.roles.iter().any(|x| matches!(x, Role::Admin | Role::System))
+}
+
+/// Fill a plan's lock violations and risk. The override is honoured only
+/// when `may_override` (an admin) and the set asks for it.
+pub(crate) fn assess(
+    plan: &mut SchemaPlan,
+    base: &Schema,
+    set: &SchemaChangeSet,
+    held: &[SchemaLock],
+    may_override: bool,
+) {
+    plan.locked_violations = locks::violations(base, set, &plan.changes, held, set.override_locks && may_override);
+    if set.override_locks && !may_override && !plan.locked_violations.is_empty() {
+        plan.warnings.push(
+            "override_locks is ignored: only admins may override schema locks (for a proposal, both its proposer \
+             and its approver)"
+                .into(),
+        );
+    }
+    let (risk, reasons) = assess_risk(plan, set);
+    plan.risk = risk;
+    plan.risk_reasons = reasons;
 }
 
 // ── storage of versions ──────────────────────────────────────────────────
@@ -2452,14 +3208,47 @@ impl Ontology {
         })
     }
 
-    /// Dry run: validate `set`, report its impact and the migration it implies.
+    /// Dry run: validate `set`, report its impact, the migration it implies,
+    /// its consequences for entailment (as `p` may see the graph), the locks
+    /// it touches, likely renames and its risk.
     pub fn schema_plan(&self, p: &Principal, set: &SchemaChangeSet) -> Result<SchemaPlan> {
+        self.schema_plan_as(p, set, None)
+    }
+
+    /// [`Self::schema_plan`] for a proposal's change set: its override is
+    /// honoured as the approval's commit honours it, only when the proposer
+    /// is also an admin (and not an agent).
+    pub(crate) fn schema_plan_as(
+        &self,
+        p: &Principal,
+        set: &SchemaChangeSet,
+        proposer: Option<&Proposer>,
+    ) -> Result<SchemaPlan> {
         self.schema_reader(p)?;
+        let held = locks::read_locks(&**self.store())?;
         let active = self.active_schema();
         let g = self.inner_graph_read();
         let mut planned = plan(&active.schema, active.version, &g, set, self.options().strict);
         self.check_migration(&g, &mut planned, p);
+        let can = |e: &Entity| policy::visible(p, e, &g);
+        planned.plan.consequences = Some(match &planned.schema {
+            Some(new) => schema_consequences(&active.schema, new, &g, &can),
+            None => Consequences::skipped("the change set does not compile", SCHEMA_CONSEQUENCES_MEANS),
+        });
+        let may_override = locks::can_manage(p) && proposer.is_none_or(proposer_may_override);
+        assess(&mut planned.plan, &active.schema, set, &held, may_override);
         Ok(planned.plan)
+    }
+
+    /// The consequences of `set` against the active schema and graph now,
+    /// with the schema version they were computed against (a commit computes
+    /// them before it takes the write lock).
+    fn consequences_now(&self, p: &Principal, set: &SchemaChangeSet) -> Option<(u64, Consequences)> {
+        let active = self.active_schema();
+        let new = apply_changes(&active.schema, &set.changes).ok()?;
+        let g = self.inner_graph_read();
+        let can = |e: &Entity| policy::visible(p, e, &g);
+        Some((active.version, schema_consequences(&active.schema, &new, &g, &can)))
     }
 
     /// Stage the migration to surface validation errors in the plan.
@@ -2520,10 +3309,31 @@ impl Ontology {
         origin: VersionOrigin,
     ) -> Result<SchemaApplied> {
         let mctx = migration_ctx(ctx);
+        // A proposal's override is the proposer's request: it is honoured
+        // only when both the proposer and the approver are admins, so an
+        // agent cannot route an override through an approval.
+        let proposer_may = match &origin.approve {
+            Some((pid, _, _)) => self.load_proposal(pid).is_ok_and(|r| proposer_may_override(&r.proposer)),
+            None => true,
+        };
+        let may_override = locks::can_manage(&ctx.principal) && proposer_may;
+        // Two closures can take a while: compute them before the write lock,
+        // and keep them only if the schema did not move in between.
+        let early = self.consequences_now(&ctx.principal, &set);
         let (res, (info, plan)) = self.transact(&mctx, |o, g| {
             let active = o.active_schema();
             let mut planned = plan(&active.schema, active.version, g, &set, o.options().strict);
             o.check_migration(g, &mut planned, &ctx.principal);
+            planned.plan.consequences = match &early {
+                Some((v, c)) if *v == active.version => Some(c.clone()),
+                Some(_) => Some(Consequences::skipped(
+                    "the schema moved while the change was being committed; plan it again to see its consequences",
+                    SCHEMA_CONSEQUENCES_MEANS,
+                )),
+                None => None,
+            };
+            let held = locks::read_locks(&**o.store())?;
+            assess(&mut planned.plan, &active.schema, &set, &held, may_override);
             if !planned.plan.applicable() {
                 return Err(planned.plan.refusal());
             }
@@ -2576,25 +3386,34 @@ impl Ontology {
                 rec.updated_at = now;
                 kv.push((crate::proposals::NS_PROPOSALS.into(), rec.id.clone(), serde_json::to_value(&rec)?));
             }
-            let event = o.event(
-                ctx,
-                &ctx.workspace,
-                "schema.change",
-                None,
-                now,
-                json!({
-                    "version": version,
-                    "parent": active.version,
-                    "source": origin.source,
-                    "proposal": origin.proposal,
-                    "message": set.message,
-                    "changes": set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
-                    "diff": sv.diff.summary(),
-                    "breaking": sv.breaking,
-                    "migration": sv.migration,
-                }),
-                Vec::new(),
-            );
+            let mut payload = json!({
+                "version": version,
+                "parent": active.version,
+                "source": origin.source,
+                "proposal": origin.proposal,
+                "message": set.message,
+                "changes": set.changes.iter().map(|c| format!("{} {}", c.op(), c.target())).collect::<Vec<_>>(),
+                "diff": sv.diff.summary(),
+                "breaking": sv.breaking,
+                "migration": sv.migration,
+                "risk": planned.plan.risk,
+            });
+            // Overridden locks are recorded with the change, and locks follow
+            // the definitions they name: released on delete, moved on rename.
+            let overridden: Vec<&LockViolation> =
+                planned.plan.locked_violations.iter().filter(|v| v.overridden).collect();
+            if !overridden.is_empty() {
+                let followed =
+                    locks::follow(&planned.plan.locked_violations, &held, &schema, &ctx.principal.id, &fmt_ts(now));
+                payload["override_locks"] = json!({
+                    "by": ctx.principal.id,
+                    "violations": overridden,
+                    "released": followed.released,
+                    "moved": followed.moved,
+                });
+                kv.extend(followed.kv);
+            }
+            let event = o.event(ctx, &ctx.workspace, "schema.change", None, now, payload, Vec::new());
             let mut events = origin.events.clone();
             events.push(event);
             let extra = Extra {
@@ -2677,6 +3496,7 @@ impl Ontology {
             message: format!("revert to schema version {version}"),
             migrations,
             expected_version: None,
+            override_locks: false,
         };
         self.revert_with(ctx, set, "revert", dry_run)
     }
@@ -2722,6 +3542,7 @@ impl Ontology {
             message: format!("undo schema version {version}"),
             migrations,
             expected_version: None,
+            override_locks: false,
         };
         self.revert_with(ctx, set, "undo", dry_run)
     }
@@ -2766,4 +3587,77 @@ pub(crate) fn migration_ctx(ctx: &ActionContext) -> ActionContext {
     m.principal = p;
     m.intent = Some("schema.migration".into());
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jaro_winkler_matches_reference_values() {
+        let close = |a: &str, b: &str, want: f64| {
+            let got = jaro_winkler(a, b);
+            assert!((got - want).abs() < 0.005, "{a} vs {b}: {got} (want {want})");
+        };
+        close("martha", "marhta", 0.961);
+        close("dixon", "dicksonx", 0.813);
+        close("dwayne", "duane", 0.840);
+        assert_eq!(jaro_winkler("same", "same"), 1.0);
+        assert_eq!(jaro_winkler("abc", ""), 0.0);
+        assert_eq!(jaro_winkler("abc", "xyz"), 0.0);
+    }
+
+    #[test]
+    fn rename_scores_renormalize_undefined_signals() {
+        assert_eq!(rename_score(0.5, &[]), 0.5, "no structure: the name alone");
+        assert_eq!(rename_score(0.0, &[(0.4, 1.0)]), 0.7);
+        assert_eq!(rename_score(1.0, &[(0.4, 1.0), (0.15, 0.0)]), 0.81);
+        let a = ObjectType { properties: BTreeMap::from([("x".into(), PropertyDef::default())]), ..Default::default() };
+        let (score, evidence) = object_type_similarity("bug", &a, "defect", &a.clone());
+        assert!(score >= RENAME_THRESHOLD, "{score} {evidence:?}");
+        assert!(evidence.iter().any(|e| e == "properties: 1 of 1 names shared"));
+        let b = ObjectType { properties: BTreeMap::from([("y".into(), PropertyDef::default())]), ..Default::default() };
+        assert!(object_type_similarity("bug", &a, "invoice", &b).0 < RENAME_THRESHOLD);
+    }
+
+    #[test]
+    fn renames_are_assigned_one_to_one_best_first() {
+        let r = |from: &str, to: &str, score: f64| LikelyRename {
+            section: "object_types".into(),
+            from: from.into(),
+            to: to.into(),
+            score,
+            evidence: Vec::new(),
+        };
+        let out = assign_renames(vec![r("a", "x", 0.7), r("a", "y", 0.9), r("b", "y", 0.8), r("c", "z", 0.59)]);
+        let pairs: Vec<(&str, &str)> = out.iter().map(|r| (r.from.as_str(), r.to.as_str())).collect();
+        assert_eq!(pairs, [("a", "y")], "b loses y to a; a takes y, not x; c is below the threshold");
+    }
+
+    #[test]
+    fn signature_covers_existing_names_keywords_and_literals() {
+        let schema = Schema::enterprise();
+        let before = reason::closure(&schema, &Graph::default(), &ReasonOptions::default(), &|_| true);
+        let mut sig = Signature::of(&schema, &before);
+        sig.entities.insert("<issue:1>".into());
+        assert!(sig.covers(&Fact::new("<issue:1>", "depends_on", "<issue:1>")));
+        assert!(sig.covers(&Fact::new("depends_on", "a", "transitive")));
+        assert!(sig.covers(&Fact::new("<issue:1>", "prop.priority", "\"anything\"")));
+        assert!(sig.covers(&Fact::new("<issue:1>", "state", "\"new\"")));
+        assert!(sig.covers(&Fact::new("<issue:1>", "handled_by_team", "<issue:1>")), "rule-derived relation");
+        assert!(!sig.covers(&Fact::new("<issue:1>", "a", "#brand_new")));
+        assert!(!sig.covers(&Fact::new("<issue:2>", "depends_on", "<issue:1>")), "unknown entity");
+        assert!(!sig.covers(&Fact::new("<issue:1>", "prop.unheard_of", "1")));
+    }
+
+    #[test]
+    fn link_flag_edits_leave_links_alone() {
+        let old = LinkType { from: vec!["a".into(), "b".into()], ..Default::default() };
+        let flags = LinkType { from: vec!["b".into(), "a".into()], transitive: true, weight: 0.2, ..old.clone() };
+        assert!(!link_data_changes(&old, &flags), "order of endpoints and flags do not matter");
+        let narrowed = LinkType { from: vec!["a".into()], ..old.clone() };
+        assert!(link_data_changes(&old, &narrowed));
+        let single = LinkType { cardinality: Cardinality::One, ..old.clone() };
+        assert!(link_data_changes(&old, &single));
+    }
 }
