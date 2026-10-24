@@ -350,8 +350,8 @@ enum Command {
         #[command(subcommand)]
         sub: assure::CertCmd,
     },
-    /// Shapes: validate the graph (exit 0 conforms, 1 violates, 3 undetermined),
-    /// induce a shape from data, check shape definitions.
+    /// Shapes: validate the graph (exit 0 conforms, 1 violates, 3 undetermined,
+    /// 4 the command failed), induce a shape from data, check shape definitions.
     Shapes {
         #[command(subcommand)]
         sub: assure::ShapesCmd,
@@ -359,7 +359,8 @@ enum Command {
         json: bool,
     },
     /// Lint the schema (a measurement); dismiss or accept findings. Exits 1 when an
-    /// error finding is shown (dismissed findings listed with --all do not count).
+    /// error finding is shown (dismissed findings listed with --all do not count),
+    /// 4 when the command fails.
     Lint(assure::LintArgs),
     /// Lock a schema definition: changes that delete, rename or break it are refused (admins).
     Lock(assure::LockArgs),
@@ -728,14 +729,25 @@ fn read_change_set(path: &std::path::Path) -> Result<Value> {
 fn print_plan(st: &Style, plan: &Value) {
     let valid = plan["valid"].as_bool().unwrap_or(false);
     let needs = plan["needs_migration"].as_array().cloned().unwrap_or_default();
+    // As `SchemaPlan::applicable()`: a lock violation not overridden refuses
+    // the apply whether or not any data changes.
+    let locks = plan["locked_violations"].as_array().cloned().unwrap_or_default();
+    let locked = locks.iter().any(|v| v["overridden"] != true);
+    let data = if plan["breaking"].as_bool().unwrap_or(false) {
+        st.cyan("breaking, migrated")
+    } else {
+        st.bold("non-breaking")
+    };
     let verdict = if !valid {
         st.red("invalid")
     } else if !needs.is_empty() {
         st.red("needs migration")
-    } else if plan["breaking"].as_bool().unwrap_or(false) {
-        st.cyan("breaking, migrated")
+    } else if locked {
+        st.red("locked: apply refused")
+    } else if !locks.is_empty() {
+        format!("{}, {data}", st.cyan("locked (overridden)"))
     } else {
-        st.bold("non-breaking")
+        data
     };
     println!(
         "{} {}",
@@ -1093,6 +1105,21 @@ fn print_answer(st: &Style, r: &Value, show_context: bool) {
 
 // ── main ──────────────────────────────────────────────────────────────
 
+/// The exit code when `command` fails. Commands whose exit code is a verdict
+/// (shapes validate/check, lint, reason certify, cert) use a code no verdict
+/// uses, so a script can tell a failed run from a negative verdict.
+fn failure_exit_code(command: &Command) -> i32 {
+    let verdict = match command {
+        Command::Shapes { sub, .. } => {
+            matches!(sub, assure::ShapesCmd::Validate { .. } | assure::ShapesCmd::Check { .. })
+        }
+        Command::Reason { sub, .. } => matches!(sub, assure::ReasonCmd::Certify { .. }),
+        Command::Lint(_) | Command::Cert { .. } => true,
+        _ => false,
+    };
+    if verdict { assure::EXIT_FAILED } else { 1 }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1102,9 +1129,10 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
     let st = Style { on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() };
+    let failed = failure_exit_code(&cli.command);
     if let Err(e) = run(cli, &st).await {
         eprintln!("{} {e}", st.red("error:"));
-        std::process::exit(1);
+        std::process::exit(failed);
     }
 }
 

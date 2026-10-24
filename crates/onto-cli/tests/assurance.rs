@@ -274,6 +274,8 @@ fn shapes_validate_exit_code_follows_the_verdict() {
     let cfg = cfg.to_str().unwrap();
     let out = onto(&["--config", cfg, "shapes", "validate", "--json"]);
     if !dispatched(&out, "shapes.validate") {
+        // A failed run is not a verdict: 4, never 1 (violates).
+        assert_eq!(out.code, 4, "{}", out.stderr);
         return;
     }
     let r = out.json();

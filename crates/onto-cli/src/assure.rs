@@ -76,7 +76,8 @@ pub(crate) enum ReasonCmd {
     },
     /// Certify the closure: with --out, write rules.tsv, asserted.tsv,
     /// derivations.tsv and manifest.json into DIR and check them again here
-    /// with the onto-cert library. Exits 1 when the check fails.
+    /// with the onto-cert library. Exit 0 accepted, 1 rejected, 2 malformed,
+    /// 4 when the command fails (unknown action, denied, unreachable server).
     Certify {
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
@@ -109,7 +110,8 @@ pub(crate) enum ShapesCmd {
     /// Validate the graph against the schema's shapes (a measurement).
     ///
     /// Exit codes: 0 conforms, 1 violates, 3 undetermined (some constraint,
-    /// target or shape was not evaluated, so the report cannot say "valid").
+    /// target or shape was not evaluated, so the report cannot say "valid"),
+    /// 4 the command failed (no verdict).
     Validate {
         /// Read the reasoner's closure: derived classes select targets and
         /// satisfy `class`, derived relations are followed by paths.
@@ -126,7 +128,8 @@ pub(crate) enum ShapesCmd {
     /// (TOML), with the counts behind each constraint.
     Induce { kind: String },
     /// Check shape definitions (TOML `[shapes.<name>]` tables, or JSON) against
-    /// the current schema, without validating any data.
+    /// the current schema, without validating any data. Exit 0 ok, 1 issues
+    /// found, 4 the command failed.
     Check { file: PathBuf },
 }
 
@@ -251,6 +254,11 @@ fn compact(mut v: Value) -> Value {
     }
     v
 }
+
+/// Exit code of a verdict command (shapes, lint, reason certify, cert) whose
+/// run failed before it reached a verdict: distinct from every verdict code
+/// (0-3) and from clap's usage error (2).
+pub(crate) const EXIT_FAILED: i32 = 4;
 
 /// Exit with `code` when it is not 0 (after flushing what was printed).
 fn finish(code: i32) -> Result<()> {
@@ -657,6 +665,20 @@ fn print_slice(st: &Style, r: &Value) {
     for l in r["lost_in_slice_vocabulary"].as_array().into_iter().flatten() {
         println!("  {} {} {}", st.red("lost"), fact(&l["fact"]), st.dim(&format!("by {}", s_of(&l["rule"]))));
     }
+    if r["truncated"] == true {
+        let listed = r["lost_in_slice_vocabulary"].as_array().map_or(0, Vec::len);
+        println!("  {}", st.dim(&format!("{listed} of {} lost facts listed", r["lost"])));
+    }
+    let alarm = r["slice_only"].as_array().cloned().unwrap_or_default();
+    if !alarm.is_empty() {
+        println!("{}", st.red("slice entails what the full graph does not (soundness alarm):"));
+        for f in &alarm {
+            println!("  {} {}", st.red("slice only"), fact(f));
+        }
+    }
+    if r["fixpoint_reached"] == false {
+        println!("{}", st.dim("closure is a lower bound: preserved and lost counts may change"));
+    }
     print_means(st, r);
 }
 
@@ -700,7 +722,7 @@ fn cert_files(c: &Value) -> Result<onto_cert::CertFiles> {
 
 /// Write the certificate (with `out`), check it again with the onto-cert
 /// library in this process, print the checker's verdict and exit 1 when
-/// either check rejects it.
+/// either check rejects it (2 when the local check finds it malformed).
 fn certify(st: &Style, r: &Value, out: Option<&Path>, as_json: bool) -> Result<()> {
     let files = cert_files(&r["certificate"])?;
     if let Some(dir) = out {
@@ -1678,9 +1700,12 @@ pub(crate) const KNOWN_PROFILES: &[&str] =
 
 /// The MCP profile to serve: the `--profile` flag (clap reads
 /// `ONTO_MCP_PROFILE` into it when the flag is absent), else `[mcp] profile`,
-/// else `full`.
+/// else `full`. A blank value counts as unset at every level.
 pub(crate) fn mcp_profile(flag_or_env: Option<&str>, config: Option<&str>) -> String {
-    flag_or_env.or(config).map(str::trim).filter(|p| !p.is_empty()).unwrap_or("full").to_string()
+    fn set(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|p| !p.is_empty())
+    }
+    set(flag_or_env).or_else(|| set(config)).unwrap_or("full").to_string()
 }
 
 #[cfg(test)]
@@ -1692,7 +1717,8 @@ mod tests {
         assert_eq!(mcp_profile(Some("catalog"), Some("authoring")), "catalog");
         assert_eq!(mcp_profile(None, Some("authoring")), "authoring");
         assert_eq!(mcp_profile(None, None), "full");
-        assert_eq!(mcp_profile(Some(" "), Some("reasoning")), "full");
+        assert_eq!(mcp_profile(Some(" "), Some("reasoning")), "reasoning");
+        assert_eq!(mcp_profile(Some(""), Some(" ")), "full");
     }
 
     #[test]
