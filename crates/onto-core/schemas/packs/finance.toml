@@ -1,0 +1,558 @@
+# Industry pack: banking, know-your-customer (KYC) and anti-money-laundering (AML).
+#
+# Layered on top of builtin:enterprise. Bank staff (relationship managers,
+# analysts, compliance officers) are enterprise `person`s and compliance
+# teams are enterprise `team`s. The pack adds customers (legal entities and
+# private individuals), jurisdictions, accounts, products, funds transfers,
+# KYC reviews, transaction-monitoring alerts, suspicious activity reports and
+# sanctions designations.
+#
+# Identifiers (LEI, IBAN, ISO country and currency codes) are checked only for
+# their lexical shape; check digits and registries are not consulted.
+
+[pack]
+id = "finance"
+title = "Banking, KYC and AML"
+industry = "financial_services"
+version = "1.0.0"
+description = "Customers (legal entities and private individuals), jurisdictions, bank accounts, banking products, funds transfers, KYC reviews, AML alerts, suspicious activity reports and sanctions designations, with rules for payment counterparties, sanctions exposure through control chains and enhanced due diligence. The rules flag parties and transfers for review; they are not legal determinations. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "vocabulary inspired by the EDM Council Financial Industry Business Ontology (FIBO): legal entity, control, account, payment",
+    "customer due diligence and beneficial ownership terms in the style of the FATF Recommendations",
+    "payment fields in the style of ISO 20022 credit transfers",
+    "identifier fields shaped like ISO 17442 (LEI), ISO 13616 (IBAN), ISO 3166-1 alpha-2 and ISO 4217 codes (lexical shape only)",
+]
+sample_note = "legal_entity:northwind-holdings carries a 19-character LEI; it violates shape legal_entity_identified (constraint legal_entity_identified/lei, pattern)."
+
+# ── Parties ──────────────────────────────────────────────────────────────────
+
+[object_types.legal_entity]
+implements = ["customer_party"]
+label = "Legal entity"
+category = "actor"
+description = "Company, partnership, trust, fund or other organization that is (or is connected to) a customer."
+color = "#1d4ed8"
+icon = "building-2"
+states = ["active", "dormant", "dissolved"]
+terminal_states = ["dissolved"]
+properties.lei = { type = "string", description = "Legal Entity Identifier: 18 alphanumerics and 2 check digits." }
+properties.registration_number = { type = "string" }
+properties.incorporation_country = { type = "string", pattern = "^[A-Z]{2}$", description = "ISO 3166-1 alpha-2 code." }
+properties.entity_form = { type = "enum", values = ["corporation", "partnership", "trust", "foundation", "fund", "sole_proprietorship", "government_body"] }
+
+[object_types.private_individual]
+implements = ["customer_party"]
+label = "Private individual"
+category = "actor"
+description = "Natural person who is a customer, a beneficial owner or a connected party (not a workspace member)."
+color = "#2563eb"
+icon = "user-round"
+states = ["active", "deceased"]
+terminal_states = ["deceased"]
+properties.nationality = { type = "string", pattern = "^[A-Z]{2}$" }
+properties.birth_date = { type = "timestamp" }
+properties.occupation = { type = "string" }
+properties.politically_exposed = { type = "bool", description = "Politically exposed person (PEP), a family member or a close associate." }
+
+[object_types.jurisdiction]
+label = "Jurisdiction"
+category = "container"
+description = "Country, territory or sub-national region with its own law, used for residence and risk."
+color = "#0f766e"
+icon = "globe"
+properties.iso_code = { type = "string", pattern = "^[A-Z]{2}(-[A-Z0-9]{1,3})?$", description = "ISO 3166-1 alpha-2, or ISO 3166-2 for a region." }
+properties.fatf_list = { type = "enum", values = ["none", "increased_monitoring", "call_for_action"], description = "Where the FATF public statements place the jurisdiction." }
+properties.comprehensive_sanctions = { type = "bool" }
+
+# ── Accounts and products ────────────────────────────────────────────────────
+
+[object_types.banking_product]
+label = "Banking product"
+description = "Product an account is opened under: a current account, a loan, a custody service."
+color = "#7c3aed"
+icon = "package"
+states = ["offered", "withdrawn"]
+terminal_states = ["withdrawn"]
+properties.product_family = { type = "enum", values = ["deposit", "lending", "payments", "cards", "trade_finance", "wealth"] }
+properties.inherent_risk = { type = "enum", values = ["low", "medium", "high"] }
+
+[object_types.bank_account]
+label = "Bank account"
+description = "Account at this bank or, for counterparties, at another institution."
+color = "#4f46e5"
+icon = "landmark"
+states = ["pending", "open", "frozen", "dormant", "closed"]
+terminal_states = ["closed"]
+alert_states = ["frozen"]
+properties.iban = { type = "string", pattern = "^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$" }
+properties.currency = { type = "string", pattern = "^[A-Z]{3}$", description = "ISO 4217 code." }
+properties.account_type = { type = "enum", values = ["current", "savings", "loan", "card", "custody", "correspondent"] }
+properties.servicing_bic = { type = "string", pattern = "^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$", description = "BIC of the institution holding the account." }
+properties.opened_at = { type = "timestamp" }
+properties.freeze_reason = { type = "text" }
+
+[object_types.funds_transfer]
+label = "Funds transfer"
+description = "Payment from one account to another (credit transfer, card payment, cash movement)."
+color = "#0891b2"
+icon = "arrow-right-left"
+states = ["initiated", "screening", "held", "released", "rejected", "settled"]
+terminal_states = ["rejected", "settled"]
+alert_states = ["held"]
+properties.amount = { type = "float", required = true }
+properties.currency = { type = "string", pattern = "^[A-Z]{3}$" }
+properties.channel = { type = "enum", values = ["swift", "sepa", "ach", "card", "cash", "internal"] }
+properties.value_date = { type = "timestamp" }
+properties.end_to_end_id = { type = "string", max_length = 35, description = "End-to-end reference carried with the payment." }
+properties.purpose = { type = "text", searchable = true }
+
+# ── Compliance work ──────────────────────────────────────────────────────────
+
+[object_types.kyc_review]
+label = "KYC review"
+description = "Customer due diligence case: onboarding or periodic review of a party."
+color = "#d97706"
+icon = "user-check"
+states = ["open", "in_review", "escalated", "approved", "rejected"]
+terminal_states = ["approved", "rejected"]
+alert_states = ["escalated"]
+properties.due_diligence_level = { type = "enum", values = ["simplified", "standard", "enhanced"] }
+properties.review_type = { type = "enum", values = ["onboarding", "periodic", "event_driven"] }
+properties.review_due = { type = "timestamp" }
+properties.customer_risk = { type = "enum", values = ["low", "medium", "high", "prohibited"] }
+
+[object_types.aml_alert]
+label = "AML alert"
+description = "Transaction-monitoring or screening alert that an analyst must disposition."
+color = "#dc2626"
+icon = "siren"
+states = ["new", "investigating", "escalated", "closed_false_positive", "closed_reported"]
+terminal_states = ["closed_false_positive", "closed_reported"]
+alert_states = ["new", "investigating", "escalated"]
+properties.scenario = { type = "enum", values = ["structuring", "rapid_movement", "high_risk_jurisdiction", "sanctions_screening", "unusual_cash", "dormant_reactivation"] }
+properties.score = { type = "float", description = "Model or rule score in [0, 1]." }
+properties.disposition_note = { type = "text", searchable = true }
+
+[object_types.suspicious_activity_report]
+label = "Suspicious activity report"
+category = "artifact"
+description = "Report filed with the financial intelligence unit (SAR or STR)."
+color = "#b91c1c"
+icon = "file-warning"
+states = ["draft", "filed", "acknowledged", "withdrawn"]
+terminal_states = ["acknowledged", "withdrawn"]
+properties.filed_at = { type = "timestamp" }
+properties.fiu_reference = { type = "string" }
+properties.narrative = { type = "text", searchable = true }
+
+[object_types.sanctions_designation]
+label = "Sanctions designation"
+description = "Entry on a sanctions list naming a person, an entity or a vessel."
+color = "#991b1b"
+icon = "ban"
+states = ["active", "delisted"]
+terminal_states = ["delisted"]
+properties.list_name = { type = "enum", values = ["ofac_sdn", "eu_consolidated", "un_security_council", "uk_ofsi"] }
+properties.program = { type = "string" }
+properties.listed_at = { type = "timestamp" }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.account_holder]
+description = "Party that holds the account (joint accounts have several)."
+from = ["bank_account"]
+to = ["customer_party"]
+inverse = "holds_account"
+weight = 1.0
+
+[link_types.under_product]
+description = "Product the account was opened under."
+from = ["bank_account"]
+to = ["banking_product"]
+inverse = "product_accounts"
+cardinality = "one"
+weight = 0.6
+
+[link_types.resident_in]
+description = "Jurisdiction of residence (individuals) or of incorporation and operation (entities)."
+from = ["customer_party"]
+to = ["jurisdiction"]
+inverse = "residence_of"
+weight = 0.9
+
+[link_types.sub_jurisdiction_of]
+description = "The region or territory lies within this jurisdiction."
+from = ["jurisdiction"]
+to = ["jurisdiction"]
+inverse = "has_sub_jurisdiction"
+transitive = true
+weight = 0.6
+
+[link_types.controls_entity]
+description = "The party controls the entity (ownership, voting rights or other means); control through a controlled entity is control too."
+from = ["customer_party"]
+to = ["legal_entity"]
+inverse = "controlled_by_party"
+transitive = true
+weight = 0.9
+
+[link_types.connected_party]
+description = "Parties connected by family, business association or shared address."
+from = ["customer_party"]
+to = ["customer_party"]
+symmetric = true
+weight = 0.5
+
+[link_types.relationship_manager]
+description = "Bank employee responsible for the customer relationship."
+from = ["customer_party"]
+to = ["person"]
+inverse = "manages_relationship"
+cardinality = "one"
+weight = 0.6
+
+[link_types.debits_account]
+description = "Originator account the transfer is paid from."
+from = ["funds_transfer"]
+to = ["bank_account"]
+inverse = "debited_by_transfer"
+cardinality = "one"
+weight = 1.0
+
+[link_types.credits_account]
+description = "Beneficiary account the transfer is paid to."
+from = ["funds_transfer"]
+to = ["bank_account"]
+inverse = "credited_by_transfer"
+cardinality = "one"
+weight = 1.0
+
+[link_types.reviews_party]
+description = "Party under review."
+from = ["kyc_review"]
+to = ["customer_party"]
+inverse = "kyc_reviews"
+cardinality = "one"
+weight = 0.9
+
+[link_types.alert_subject]
+description = "What the alert is about: a transfer, an account or a party."
+from = ["aml_alert"]
+to = ["funds_transfer", "bank_account", "customer_party"]
+inverse = "subject_of_alert"
+weight = 1.0
+
+[link_types.investigated_by]
+description = "Analyst working the alert or the review."
+from = ["aml_alert", "kyc_review"]
+to = ["person"]
+inverse = "investigates_case"
+cardinality = "one"
+weight = 0.7
+
+[link_types.reported_in_sar]
+description = "Suspicious activity report the alert was reported in."
+from = ["aml_alert"]
+to = ["suspicious_activity_report"]
+inverse = "reports_alert"
+weight = 0.9
+
+[link_types.matches_designation]
+description = "Confirmed screening match between a party and a sanctions designation."
+from = ["customer_party"]
+to = ["sanctions_designation"]
+inverse = "designation_matches"
+weight = 1.0
+
+[link_types.designation_jurisdiction]
+description = "Jurisdiction whose sanctions program issued the designation."
+from = ["sanctions_designation"]
+to = ["jurisdiction"]
+inverse = "designations_issued"
+cardinality = "one"
+weight = 0.4
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.customer_party]
+description = "A party the bank knows: legal entities and private individuals."
+properties.customer_number = { type = "string" }
+properties.risk_rating = { type = "enum", values = ["low", "medium", "high", "prohibited"] }
+links = ["resident_in"]
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+corporate_customer = "legal_entity"
+legal_person = "legal_entity"
+private_client = "private_individual"
+natural_person = "private_individual"
+bank_customer = "customer_party"
+kyc_party = "customer_party"
+deposit_account = "bank_account"
+current_account = "bank_account"
+wire = "funds_transfer"
+wire_transfer = "funds_transfer"
+credit_transfer = "funds_transfer"
+cdd_review = "kyc_review"
+due_diligence = "kyc_review"
+aml_case = "aml_alert"
+transaction_monitoring_alert = "aml_alert"
+sar = "suspicious_activity_report"
+str = "suspicious_activity_report"
+sdn = "sanctions_designation"
+sanctions_entry = "sanctions_designation"
+
+[glossary.relations]
+account_owner = "account_holder"
+beneficiary_account = "credits_account"
+originator_account = "debits_account"
+ubo = "controlled_by_party"
+beneficial_owner = "controlled_by_party"
+relationship_owner = "relationship_manager"
+aml_analyst = "investigated_by"
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+[[rules]]
+name = "transfer_counterparty"
+description = "A party paying from its account into another party's account pays that party."
+chain = ["holds_account", "debited_by_transfer", "credits_account", "account_holder"]
+infer = "pays_party"
+
+[[rules]]
+name = "residence_rollup"
+description = "A party resident in a region is resident in every jurisdiction the region lies within."
+chain = ["resident_in", "sub_jurisdiction_of"]
+infer = "resident_in"
+
+[[rules]]
+name = "sanctions_match"
+description = "A party matched to an active sanctions designation is a sanctioned party."
+when = [["?p", "matches_designation", "?d"], ["?d", "state", "active"]]
+then = ["?p", "a", "sanctioned_party"]
+
+[[rules]]
+name = "sanctioned_by_control"
+description = "An entity controlled by a sanctioned party is treated as sanctioned (in the spirit of ownership-and-control rules)."
+when = [["?c", "a", "sanctioned_party"], ["?c", "controls_entity", "?e"]]
+then = ["?e", "a", "sanctioned_party"]
+
+[[rules]]
+name = "sanctioned_beneficiary"
+description = "A transfer credited to an account held by a sanctioned party pays that party."
+when = [["?t", "credits_account", "?acct"], ["?acct", "account_holder", "?p"], ["?p", "a", "sanctioned_party"]]
+then = ["?t", "pays_sanctioned_party", "?p"]
+
+[[rules]]
+name = "edd_high_risk_jurisdiction"
+description = "A party resident in a jurisdiction under a FATF call for action needs enhanced due diligence."
+when = [["?p", "a", "customer_party"], ["?p", "resident_in", "?j"], ["?j", "prop.fatf_list", "call_for_action"]]
+then = ["?p", "a", "enhanced_due_diligence_party"]
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.legal_entity_identified]
+description = "Legal entities carry at most one well-formed LEI, a country of incorporation and a residence."
+target = "legal_entity"
+
+[[shapes.legal_entity_identified.properties]]
+id = "legal_entity_identified/lei"
+path = "prop.lei"
+max_count = 1
+pattern = "^[A-Z0-9]{18}[0-9]{2}$"
+message = "An LEI is 18 alphanumerics followed by 2 check digits."
+
+[[shapes.legal_entity_identified.properties]]
+id = "legal_entity_identified/country"
+path = "prop.incorporation_country"
+min_count = 1
+pattern = "^[A-Z]{2}$"
+
+[[shapes.legal_entity_identified.properties]]
+id = "legal_entity_identified/residence"
+path = "resident_in"
+min_count = 1
+class = "jurisdiction"
+
+[shapes.bank_account_held]
+description = "Every account has a holder and a currency."
+target = "bank_account"
+
+[[shapes.bank_account_held.properties]]
+id = "bank_account_held/holder"
+path = "account_holder"
+min_count = 1
+class = "customer_party"
+
+[[shapes.bank_account_held.properties]]
+id = "bank_account_held/currency"
+path = "prop.currency"
+min_count = 1
+max_count = 1
+pattern = "^[A-Z]{3}$"
+
+[shapes.funds_transfer_complete]
+description = "A transfer moves a positive amount from exactly one account to exactly one account."
+target = "funds_transfer"
+
+[[shapes.funds_transfer_complete.properties]]
+id = "funds_transfer_complete/debit"
+path = "debits_account"
+min_count = 1
+max_count = 1
+class = "bank_account"
+
+[[shapes.funds_transfer_complete.properties]]
+id = "funds_transfer_complete/credit"
+path = "credits_account"
+min_count = 1
+max_count = 1
+class = "bank_account"
+
+[[shapes.funds_transfer_complete.properties]]
+id = "funds_transfer_complete/amount"
+path = "prop.amount"
+min_count = 1
+datatype = "float"
+min_value = 0.01
+
+[[shapes.funds_transfer_complete.properties]]
+id = "funds_transfer_complete/currency"
+path = "prop.currency"
+min_count = 1
+pattern = "^[A-Z]{3}$"
+
+[shapes.kyc_review_scoped]
+description = "A KYC review names one party and a due diligence level."
+target = "kyc_review"
+
+[[shapes.kyc_review_scoped.properties]]
+id = "kyc_review_scoped/party"
+path = "reviews_party"
+min_count = 1
+max_count = 1
+class = "customer_party"
+
+[[shapes.kyc_review_scoped.properties]]
+id = "kyc_review_scoped/level"
+path = "prop.due_diligence_level"
+min_count = 1
+in = ["simplified", "standard", "enhanced"]
+
+[shapes.sar_grounded]
+description = "A suspicious activity report is grounded in at least one alert and carries a narrative."
+target = "suspicious_activity_report"
+
+[[shapes.sar_grounded.properties]]
+id = "sar_grounded/alert"
+path = "reports_alert"
+min_count = 1
+class = "aml_alert"
+
+[[shapes.sar_grounded.properties]]
+id = "sar_grounded/narrative"
+path = "prop.narrative"
+min_count = 1
+min_length = 20
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_aml_alerts]
+description = "AML alerts not yet closed, by scenario and analyst."
+kind = "aml_alert"
+measure = "count"
+filter = { open = true }
+dimensions = { scenario = "scenario", state = "state", analyst = "investigated_by" }
+certified = true
+
+[metrics.held_transfer_value]
+description = "Value of transfers held for review, by currency and channel."
+kind = "funds_transfer"
+measure = "sum"
+property = "amount"
+filter = { state = ["held"] }
+dimensions = { currency = "currency", channel = "channel" }
+
+[metrics.kyc_customers_by_risk]
+description = "Customers by risk rating and PEP status."
+kind = "customer_party"
+measure = "count"
+dimensions = { risk = "risk_rating", kind = "kind", pep = "politically_exposed" }
+
+[metrics.kyc_review_cycle_time]
+description = "Days from a KYC review being opened to its approval or rejection."
+kind = "kyc_review"
+measure = "lead_time"
+window_days = 180
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.freeze_bank_account]
+description = "Freeze an account pending investigation, recording the reason."
+phrases = ["freeze", "block account"]
+roles = ["compliance_officer", "admin"]
+risk = "high"
+parameters.account = { type = "entity", kinds = ["bank_account"], required = true }
+parameters.reason = { type = "text", required = true, cue = ["because", "for"] }
+
+[[action_types.freeze_bank_account.preconditions]]
+check = "state_in"
+param = "account"
+values = ["open", "dormant"]
+message = "Only an open or dormant account can be frozen."
+
+[[action_types.freeze_bank_account.effects]]
+patch = { id = "{account}", state = "frozen", props = { freeze_reason = "{reason}" } }
+
+[[action_types.freeze_bank_account.effects]]
+event = { action = "aml.account_frozen", target = "{account}", payload = { reason = "{reason}" } }
+
+[action_types.escalate_aml_alert]
+description = "Escalate an AML alert to an analyst for investigation."
+phrases = ["escalate"]
+risk = "medium"
+parameters.alert = { type = "entity", kinds = ["aml_alert"], required = true }
+parameters.analyst = { type = "entity", kinds = ["person"], required = true, cue = ["to"] }
+parameters.note = { type = "text" }
+
+[[action_types.escalate_aml_alert.preconditions]]
+check = "state_in"
+param = "alert"
+values = ["new", "investigating"]
+message = "Only a new or investigating alert can be escalated."
+
+[[action_types.escalate_aml_alert.effects]]
+patch = { id = "{alert}", state = "escalated" }
+
+[[action_types.escalate_aml_alert.effects]]
+link = { from = "{alert}", rel = "investigated_by", to = "{analyst}" }
+replace = true
+
+[[action_types.escalate_aml_alert.effects]]
+event = { action = "aml.alert_escalated", target = "{alert}", payload = { analyst = "{analyst}", note = "{note}" } }
+
+[action_types.file_sar]
+description = "Draft a suspicious activity report for an escalated alert and close the alert as reported."
+phrases = ["file sar", "report suspicious activity"]
+roles = ["compliance_officer", "admin"]
+risk = "high"
+parameters.alert = { type = "entity", kinds = ["aml_alert"], required = true }
+parameters.title = { type = "string", required = true }
+parameters.narrative = { type = "text", required = true }
+
+[[action_types.file_sar.preconditions]]
+check = "state_in"
+param = "alert"
+values = ["escalated"]
+message = "Only an escalated alert can be reported."
+
+[[action_types.file_sar.effects]]
+create = { kind = "suspicious_activity_report", title = "{title}", state = "draft", props = { narrative = "{narrative}" }, links = [ { rel = "reports_alert", to = "{alert}" } ] }
+
+[[action_types.file_sar.effects]]
+patch = { id = "{alert}", state = "closed_reported" }
+
+[[action_types.file_sar.effects]]
+event = { action = "aml.sar_drafted", target = "{created}", payload = { alert = "{alert}" } }
