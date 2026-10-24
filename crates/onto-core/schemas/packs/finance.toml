@@ -534,7 +534,7 @@ replace = true
 event = { action = "aml.alert_escalated", target = "{alert}", payload = { analyst = "{analyst}", note = "{note}" } }
 
 [action_types.file_sar]
-description = "Draft a suspicious activity report for an escalated alert and close the alert as reported."
+description = "File a suspicious activity report for an escalated alert with the financial intelligence unit and close the alert as reported."
 phrases = ["file sar", "report suspicious activity"]
 roles = ["compliance_officer", "admin"]
 risk = "high"
@@ -549,10 +549,10 @@ values = ["escalated"]
 message = "Only an escalated alert can be reported."
 
 [[action_types.file_sar.effects]]
-create = { kind = "suspicious_activity_report", title = "{title}", state = "draft", props = { narrative = "{narrative}" }, links = [ { rel = "reports_alert", to = "{alert}" } ] }
+create = { kind = "suspicious_activity_report", title = "{title}", state = "filed", props = { narrative = "{narrative}", filed_at = "{now}" }, links = [ { rel = "reports_alert", to = "{alert}" } ] }
 
 [[action_types.file_sar.effects]]
 patch = { id = "{alert}", state = "closed_reported" }
 
 [[action_types.file_sar.effects]]
-event = { action = "aml.sar_drafted", target = "{created}", payload = { alert = "{alert}" } }
+event = { action = "aml.sar_filed", target = "{created}", payload = { alert = "{alert}" } }

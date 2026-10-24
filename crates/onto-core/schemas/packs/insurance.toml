@@ -15,7 +15,7 @@ id = "insurance"
 title = "Property and casualty insurance"
 industry = "insurance"
 version = "1.0.0"
-description = "Policy holders, insurance policies, coverage sections, insured items, a peril taxonomy, loss events, claims, intermediaries and reinsurance treaties, with rules for which perils a policy covers, claims caused by an excluded peril or made on a lapsed policy, duplicate claims on one item, and loss events recoverable under a treaty. The rules flag claims for review; they do not decide coverage. The sample contains one deliberate shape violation (see sample_note)."
+description = "Policy holders, insurance policies, coverage sections, insured items, a peril taxonomy, loss events, claims, intermediaries and reinsurance treaties, with rules for which perils a policy's cover wording names (before exclusions, so not a coverage decision), claims caused by an excluded peril or a narrower kind of one or made on a lapsed policy, duplicate claims on one item, and loss events recoverable under a treaty. The rules flag claims for review; they do not decide coverage. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "vocabulary inspired by the ACORD insurance data standards (party, policy, coverage, claim)",
@@ -310,22 +310,28 @@ loss_cause = "caused_by_peril"
 
 # ── Inference rules ──────────────────────────────────────────────────────────
 
-[[rules]]
-name = "policy_covers"
-description = "A policy covers every peril one of its coverage sections covers."
-chain = ["coverage_sections", "covers_peril"]
-infer = "policy_covers"
+# `peril_in_cover_wording` is the perils the policy's sections name as
+# covered, before any exclusion is applied: Horn rules cannot say "covers
+# unless excluded", so this is not a coverage decision. Exclusions stay on the
+# section (`excludes_peril`) and surface on claims as `excluded_peril_claim`,
+# both for the excluded peril and for every narrower kind of it.
 
 [[rules]]
-name = "narrower_peril_cover"
-description = "A policy covering a peril also covers every narrower peril."
-chain = ["policy_covers", "has_sub_peril"]
-infer = "policy_covers"
+name = "policy_cover_wording"
+description = "A policy's cover wording names every peril one of its coverage sections covers (exclusions not applied: this does not decide coverage)."
+chain = ["coverage_sections", "covers_peril"]
+infer = "peril_in_cover_wording"
 
 [[rules]]
 name = "excluded_peril_claim"
 description = "A claim whose cause is a peril excluded by the section it invokes needs a coverage review."
 when = [["?c", "invokes_coverage", "?s"], ["?c", "caused_by_peril", "?p"], ["?s", "excludes_peril", "?p"]]
+then = ["?c", "a", "excluded_peril_claim"]
+
+[[rules]]
+name = "excluded_broader_peril_claim"
+description = "A claim whose cause is a narrower kind of a peril excluded by the section it invokes needs a coverage review."
+when = [["?c", "invokes_coverage", "?s"], ["?c", "caused_by_peril", "?p"], ["?p", "sub_peril_of", "?q"], ["?s", "excludes_peril", "?q"]]
 then = ["?c", "a", "excluded_peril_claim"]
 
 [[rules]]
@@ -472,7 +478,7 @@ dimensions = { line = "line_of_business", intermediary = "placed_through" }
 certified = true
 
 [metrics.claim_settlement_time]
-description = "Days from a claim being notified to it being paid, closed, denied or withdrawn."
+description = "Days from the claim record being created to it being paid, closed, denied or withdrawn (record creation time, not notified_at)."
 kind = "claim"
 measure = "lead_time"
 window_days = 365

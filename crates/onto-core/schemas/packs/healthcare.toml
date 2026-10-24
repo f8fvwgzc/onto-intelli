@@ -328,9 +328,9 @@ infer = "treated_by_clinician"
 
 [[rules]]
 name = "medication_exposure"
-description = "A patient receives every medication ordered for them."
-chain = ["patient_records", "orders_medication"]
-infer = "receives_medication"
+description = "A patient receives every medication on one of their active orders (draft, on-hold, completed, stopped and cancelled orders do not count)."
+when = [["?o", "for_patient", "?p"], ["?o", "orders_medication", "?m"], ["?o", "state", "active"]]
+then = ["?p", "receives_medication", "?m"]
 
 [[rules]]
 name = "drug_class_membership"
@@ -502,7 +502,7 @@ filter = { props = { interpretation = "critical" } }
 dimensions = { code = "loinc_code", patient = "for_patient" }
 
 [metrics.encounter_length]
-description = "Days from an encounter being recorded to it finishing or being cancelled."
+description = "Days from the encounter record being created to it finishing or being cancelled (record creation time, not recorded_at or admitted_at)."
 kind = "encounter"
 measure = "lead_time"
 window_days = 90
@@ -524,7 +524,7 @@ values = ["in_progress", "on_leave"]
 message = "Only an encounter in progress or on leave can be discharged."
 
 [[action_types.discharge_patient.effects]]
-patch = { id = "{encounter}", state = "finished", props = { discharge_note = "{note}" } }
+patch = { id = "{encounter}", state = "finished", props = { discharge_note = "{note}", discharged_at = "{now}" } }
 
 [[action_types.discharge_patient.effects]]
 event = { action = "encounter.discharged", target = "{encounter}", payload = { note = "{note}" } }

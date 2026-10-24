@@ -52,6 +52,11 @@ struct ActionCase {
     entity: &'static str,
     state_after: Option<&'static str>,
     link_after: Option<(&'static str, &'static str)>,
+    /// Properties the entity must carry after the action.
+    props_after: &'static [&'static str],
+    /// (relation, state): an entity linked from the case entity by the
+    /// relation must be in that state after the action.
+    linked_state_after: Option<(&'static str, &'static str)>,
 }
 
 struct PackCase {
@@ -95,6 +100,8 @@ const HEALTHCARE: PackCase = PackCase {
         ["<patient:mrn-100232>", "a", "#critical_result_patient"],
         ["<clinician:dr-lindqvist>", "notify_critical_result", "<patient:mrn-100233>"],
         ["<medication:metoprolol-50>", "in_drug_class", "<drug_class:j01c>"],
+        // mrn-100233's only metoprolol order (mo-1004) is still a draft.
+        ["<patient:mrn-100233>", "receives_medication", "<medication:metoprolol-50>"],
     ],
     actions: healthcare_actions,
 };
@@ -107,6 +114,8 @@ fn healthcare_actions() -> Vec<ActionCase> {
             entity: "encounter:enc-5001",
             state_after: Some("finished"),
             link_after: None,
+            props_after: &["discharge_note", "discharged_at"],
+            linked_state_after: None,
         },
         ActionCase {
             action: "hold_medication_order",
@@ -114,6 +123,8 @@ fn healthcare_actions() -> Vec<ActionCase> {
             entity: "medication_order:mo-1002",
             state_after: Some("on_hold"),
             link_after: None,
+            props_after: &[],
+            linked_state_after: None,
         },
         ActionCase {
             action: "assign_primary_clinician",
@@ -121,6 +132,8 @@ fn healthcare_actions() -> Vec<ActionCase> {
             entity: "patient:mrn-100233",
             state_after: None,
             link_after: Some(("primary_clinician", "clinician:dr-lindqvist")),
+            props_after: &[],
+            linked_state_after: None,
         },
     ]
 }
@@ -162,6 +175,8 @@ fn finance_actions() -> Vec<ActionCase> {
             entity: "bank_account:xa-kestrel",
             state_after: Some("frozen"),
             link_after: None,
+            props_after: &[],
+            linked_state_after: None,
         },
         ActionCase {
             action: "escalate_aml_alert",
@@ -169,6 +184,8 @@ fn finance_actions() -> Vec<ActionCase> {
             entity: "aml_alert:al-902",
             state_after: Some("escalated"),
             link_after: Some(("investigated_by", "person:ana-ruiz")),
+            props_after: &[],
+            linked_state_after: None,
         },
         ActionCase {
             action: "file_sar",
@@ -180,6 +197,9 @@ fn finance_actions() -> Vec<ActionCase> {
             entity: "aml_alert:al-902",
             state_after: Some("closed_reported"),
             link_after: None,
+            props_after: &[],
+            // The alert is closed as reported only with the report filed.
+            linked_state_after: Some(("reported_in_sar", "filed")),
         },
     ]
 }
@@ -190,11 +210,13 @@ const INSURANCE: PackCase = PackCase {
     sample: include_str!("../schemas/packs/insurance.sample.jsonl"),
     violation: ("claim_complete", "claim_complete/loss_date", "min_count", "claim:clm-20260006"),
     entailed: &[
-        ["<insurance_policy:pol-30000101>", "policy_covers", "<peril:flood>"],
-        ["<insurance_policy:pol-30000101>", "policy_covers", "<peril:storm-surge>"],
-        ["<insurance_policy:pol-30000102>", "policy_covers", "<peril:storm-surge>"],
+        // The cover wording, before exclusions: what the sections name.
+        ["<insurance_policy:pol-30000101>", "peril_in_cover_wording", "<peril:flood>"],
+        ["<insurance_policy:pol-30000102>", "peril_in_cover_wording", "<peril:natural-catastrophe>"],
         ["<peril:storm-surge>", "sub_peril_of", "<peril:natural-catastrophe>"],
         ["<claim:clm-20260002>", "a", "#excluded_peril_claim"],
+        // Storm surge is a narrower kind of flood, which cov-30000102-buildings excludes.
+        ["<claim:clm-20260007>", "a", "#excluded_peril_claim"],
         ["<claim:clm-20260004>", "a", "#claim_on_lapsed_policy"],
         ["<claim:clm-20260001>", "a", "#duplicate_item_claim"],
         ["<claim:clm-20260002>", "a", "#duplicate_item_claim"],
@@ -202,10 +224,16 @@ const INSURANCE: PackCase = PackCase {
     ],
     not_entailed: &[
         ["<claim:clm-20260001>", "a", "#excluded_peril_claim"],
+        // Windstorm is not within flood, so the flood exclusion does not touch it.
+        ["<claim:clm-20260003>", "a", "#excluded_peril_claim"],
         ["<claim:clm-20260006>", "a", "#duplicate_item_claim"],
         ["<claim:clm-20260003>", "a", "#claim_on_lapsed_policy"],
         ["<loss_event:storm-ada-2026>", "recoverable_under", "<reinsurance_treaty:qs-motor-2026>"],
-        ["<insurance_policy:pol-30000103>", "policy_covers", "<peril:flood>"],
+        ["<insurance_policy:pol-30000103>", "peril_in_cover_wording", "<peril:flood>"],
+        // No rule decides coverage (Horn rules cannot apply exclusions), and
+        // the wording holds only the perils the sections name.
+        ["<insurance_policy:pol-30000101>", "policy_covers", "<peril:storm-surge>"],
+        ["<insurance_policy:pol-30000101>", "peril_in_cover_wording", "<peril:storm-surge>"],
     ],
     actions: insurance_actions,
 };
@@ -218,6 +246,8 @@ fn insurance_actions() -> Vec<ActionCase> {
             entity: "claim:clm-20260004",
             state_after: Some("under_investigation"),
             link_after: Some(("adjusted_by", "person:hana-kim")),
+            props_after: &[],
+            linked_state_after: None,
         },
         ActionCase {
             action: "settle_claim",
@@ -225,6 +255,8 @@ fn insurance_actions() -> Vec<ActionCase> {
             entity: "claim:clm-20260003",
             state_after: Some("paid"),
             link_after: None,
+            props_after: &[],
+            linked_state_after: None,
         },
         ActionCase {
             action: "cancel_insurance_policy",
@@ -232,6 +264,8 @@ fn insurance_actions() -> Vec<ActionCase> {
             entity: "insurance_policy:pol-30000102",
             state_after: Some("cancelled"),
             link_after: None,
+            props_after: &[],
+            linked_state_after: None,
         },
     ]
 }
@@ -930,6 +964,26 @@ fn action_types_plan_apply_and_undo_on_the_sample() {
             if let Some((rel, to)) = c.link_after {
                 assert!(linked(rel, to), "{}.{}: {} {rel} {to}", pack.id, c.action, c.entity);
             }
+            for p in c.props_after {
+                assert!(
+                    e.props.get(*p).is_some_and(|v| !v.is_null()),
+                    "{}.{}: {} has no {p}",
+                    pack.id,
+                    c.action,
+                    c.entity
+                );
+            }
+            if let Some((rel, state)) = c.linked_state_after {
+                let others: Vec<String> = o.read(|g, schema| {
+                    let (base, dir) = schema.resolve_rel(rel).unwrap();
+                    g.steps_via(c.entity, &base, dir).iter().map(|s| s.other.to_string()).collect()
+                });
+                assert!(!others.is_empty(), "{}.{}: {} has no {rel}", pack.id, c.action, c.entity);
+                for id in others {
+                    let other = o.get(&admin(), &id).unwrap();
+                    assert_eq!(other.state.as_deref(), Some(state), "{}.{}: {id}", pack.id, c.action);
+                }
+            }
             // The precondition now refuses the same edit.
             let again = o.plan_action(&ctx, c.action, &params).unwrap();
             assert!(!again.valid, "{}.{}: applies twice", pack.id, c.action);
@@ -961,6 +1015,12 @@ fn metrics_evaluate_on_the_sample() {
             if matches!(r.measure, Measure::Count | Measure::Sum) {
                 assert!(r.count > 0 && r.value > 0.0, "{}.{name}: {r:?}", pack.id);
                 assert!(!r.rows.is_empty(), "{}.{name}: no rows", pack.id);
+            }
+            if r.measure == Measure::LeadTime {
+                // Lead time runs from the record's creation, so the sample
+                // (created now) reports zero days; the unit is what is pinned.
+                assert_eq!(r.unit, "days", "{}.{name}", pack.id);
+                assert!(r.value >= 0.0, "{}.{name}: {r:?}", pack.id);
             }
         }
     }
