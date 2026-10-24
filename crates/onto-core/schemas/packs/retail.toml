@@ -1,0 +1,471 @@
+# Industry pack: retail and omnichannel commerce, layered on builtin:enterprise.
+#
+# Stores and districts; SKUs in a merchandise hierarchy; stock positions and
+# planograms per store; shoppers, orders and returns; promotions and product
+# recalls. Store managers and merchandising teams are the enterprise `person`
+# and `team`.
+#
+# Enable it with `[ontology] extend = ["builtin:retail"]`, or install it live
+# as a governed schema change (pack.plan / pack.install).
+
+[pack]
+id = "retail"
+title = "Retail and omnichannel commerce"
+industry = "retail"
+version = "1.0.0"
+description = "Store and online retail: stores and districts, SKUs in a merchandise category hierarchy, stock positions and planograms per store, shoppers with loyalty tiers, orders and returns, promotions and product recalls. Vocabulary inspired by GS1 (GTIN, Global Product Classification) and the ARTS operational data model; it borrows their words and claims no compliance with any of them. Its rules (what a promotion covers across the category hierarchy, promoted stockouts, recalled stock on hand, shoppers affected by a recall) are supplied assumptions, so certificates that cite them are entailed only under those rules."
+requires = ["enterprise"]
+standards = [
+    "GS1 GTIN (Global Trade Item Number): product identification",
+    "GS1 Global Product Classification: merchandise hierarchy vocabulary",
+    "ARTS Operational Data Model (NRF): store, item and transaction vocabulary",
+]
+sample_note = "Stock position 0217-cold-brew shows on_hand -3 (a shrink adjustment posted twice), so stock_position_shape reports exactly one violation (prop.on_hand, min_value 0). Everything else in the sample conforms."
+
+# ── Stores ───────────────────────────────────────────────────────────────────
+
+[object_types.retail_store]
+label = "Store"
+category = "container"
+icon = "store"
+color = "#be185d"
+description = "A physical or online store that sells to shoppers and holds stock."
+states = ["planned", "open", "remodeling", "closed"]
+terminal_states = ["closed"]
+properties.store_number = { type = "string", required = true, pattern = "^[0-9]{3,6}$" }
+properties.store_format = { type = "enum", values = ["hypermarket", "supermarket", "convenience", "department", "outlet", "online"] }
+properties.selling_area_m2 = { type = "float" }
+constraints.unique = ["store_number"]
+
+[object_types.retail_district]
+label = "Retail district"
+category = "container"
+icon = "map"
+color = "#db2777"
+description = "A group of stores managed together; districts nest into regions."
+properties.district_code = { type = "string" }
+
+# ── Merchandise ──────────────────────────────────────────────────────────────
+
+[object_types.sku]
+label = "SKU"
+icon = "barcode"
+color = "#9d174d"
+description = "A stock keeping unit: one sellable product variant, identified by its GTIN."
+states = ["active", "discontinued", "recalled"]
+terminal_states = ["discontinued"]
+alert_states = ["recalled"]
+properties.gtin = { type = "string", required = true, pattern = "^[0-9]{8,14}$", searchable = true }
+properties.brand = { type = "string", searchable = true }
+properties.unit_price = { type = "float" }
+properties.perishable = { type = "bool" }
+constraints.unique = ["gtin"]
+
+[object_types.merch_category]
+label = "Merchandise category"
+category = "container"
+icon = "folder-tree"
+color = "#a21caf"
+description = "A node of the merchandise hierarchy (department, category, subcategory)."
+properties.merch_code = { type = "string" }
+
+[object_types.stock_position]
+label = "Stock position"
+icon = "layers"
+color = "#c026d3"
+implements = ["store_scoped"]
+description = "How much of one SKU a store holds, and whether it needs replenishing."
+properties.on_hand = { type = "int" }
+properties.reorder_point = { type = "int" }
+properties.stock_status = { type = "enum", values = ["in_stock", "low", "out_of_stock"] }
+
+[object_types.planogram]
+label = "Planogram"
+category = "artifact"
+icon = "layout-grid"
+color = "#e879f9"
+implements = ["store_scoped"]
+description = "The shelf layout of a merchandise category in a store."
+states = ["draft", "approved", "retired"]
+terminal_states = ["retired"]
+properties.bays = { type = "int" }
+properties.planogram_revision = { type = "string" }
+
+# ── Shoppers and orders ──────────────────────────────────────────────────────
+
+[object_types.shopper]
+label = "Shopper"
+category = "actor"
+icon = "user-round"
+color = "#e11d48"
+description = "A known shopper, usually a loyalty program member."
+states = ["active", "lapsed", "closed"]
+terminal_states = ["closed"]
+properties.loyalty_tier = { type = "enum", values = ["basic", "silver", "gold", "platinum"] }
+properties.marketing_opt_in = { type = "bool" }
+properties.shopper_since = { type = "timestamp" }
+
+[object_types.retail_order]
+label = "Retail order"
+icon = "shopping-cart"
+color = "#f43f5e"
+description = "A sale to a shopper, in a store or through a digital channel."
+states = ["placed", "picking", "ready", "fulfilled", "returned", "cancelled"]
+terminal_states = ["fulfilled", "returned", "cancelled"]
+properties.order_total = { type = "float" }
+properties.sales_channel = { type = "enum", values = ["store", "web", "app", "marketplace"] }
+properties.placed_at = { type = "timestamp" }
+
+[object_types.product_return]
+label = "Return"
+icon = "undo-2"
+color = "#881337"
+description = "Goods a shopper brings or sends back, and the refund decision."
+states = ["requested", "received", "refunded", "rejected"]
+terminal_states = ["refunded", "rejected"]
+properties.return_reason = { type = "enum", values = ["damaged", "wrong_item", "not_as_described", "changed_mind", "recall"] }
+properties.refund_amount = { type = "float" }
+
+# ── Promotions and recalls ───────────────────────────────────────────────────
+
+[object_types.promotion]
+label = "Promotion"
+icon = "percent"
+color = "#fb7185"
+description = "A time-boxed price or bundle offer on SKUs or whole categories."
+states = ["draft", "scheduled", "live", "ended"]
+terminal_states = ["ended"]
+properties.promo_type = { type = "enum", values = ["percent_off", "bogo", "bundle", "clearance"] }
+properties.discount_percent = { type = "float" }
+properties.starts_at = { type = "timestamp" }
+properties.ends_at = { type = "timestamp" }
+
+[object_types.product_recall]
+label = "Product recall"
+icon = "shield-alert"
+color = "#b91c1c"
+description = "A notice to pull SKUs from sale and contact the shoppers who bought them."
+states = ["announced", "in_progress", "completed"]
+terminal_states = ["completed"]
+alert_states = ["announced", "in_progress"]
+properties.hazard_level = { type = "enum", values = ["low", "medium", "high"] }
+properties.regulator_ref = { type = "string" }
+properties.announced_at = { type = "timestamp" }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.store_scoped]
+description = "Records kept per store: stock positions and planograms."
+links = ["at_store"]
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.store_in_district]
+description = "The district the store belongs to."
+from = ["retail_store"]
+to = ["retail_district"]
+inverse = "district_stores"
+cardinality = "one"
+weight = 0.7
+
+[link_types.district_within]
+description = "The district rolls up into the object district or region (transitive)."
+from = ["retail_district"]
+to = ["retail_district"]
+inverse = "district_includes"
+transitive = true
+weight = 0.5
+
+[link_types.store_managed_by]
+description = "The store manager."
+from = ["retail_store"]
+to = ["person"]
+inverse = "manages_store"
+cardinality = "one"
+weight = 0.7
+
+[link_types.in_merch_category]
+description = "The merchandise category the SKU is assigned to."
+from = ["sku"]
+to = ["merch_category"]
+inverse = "category_skus"
+cardinality = "one"
+weight = 0.8
+
+[link_types.merch_subcategory_of]
+description = "The category sits under the object category in the merchandise hierarchy (transitive)."
+from = ["merch_category"]
+to = ["merch_category"]
+inverse = "merch_subcategories"
+transitive = true
+weight = 0.6
+
+[link_types.merch_owner]
+description = "The team or person who owns the category's range and pricing."
+from = ["merch_category"]
+to = ["team", "person"]
+inverse = "owns_merch_category"
+cardinality = "one"
+weight = 0.6
+
+[link_types.at_store]
+description = "The store the record belongs to."
+from = ["store_scoped"]
+to = ["retail_store"]
+inverse = "store_records"
+cardinality = "one"
+weight = 0.8
+
+[link_types.stock_of]
+description = "The SKU the stock position counts."
+from = ["stock_position"]
+to = ["sku"]
+inverse = "stock_positions"
+cardinality = "one"
+weight = 0.9
+
+[link_types.planogram_for]
+description = "The merchandise category the planogram lays out."
+from = ["planogram"]
+to = ["merch_category"]
+inverse = "category_planograms"
+cardinality = "one"
+weight = 0.6
+
+[link_types.placed_by_shopper]
+description = "The shopper who placed the order."
+from = ["retail_order"]
+to = ["shopper"]
+inverse = "shopper_orders"
+cardinality = "one"
+weight = 0.8
+
+[link_types.fulfilled_from]
+description = "The store that fulfils the order."
+from = ["retail_order"]
+to = ["retail_store"]
+inverse = "store_orders"
+cardinality = "one"
+weight = 0.8
+
+[link_types.order_contains]
+description = "A SKU sold on the order."
+from = ["retail_order"]
+to = ["sku"]
+inverse = "ordered_in"
+weight = 0.8
+
+[link_types.return_of]
+description = "The order the return refers to."
+from = ["product_return"]
+to = ["retail_order"]
+inverse = "order_returns"
+cardinality = "one"
+weight = 0.9
+
+[link_types.returned_sku]
+description = "A SKU coming back on the return."
+from = ["product_return"]
+to = ["sku"]
+inverse = "sku_returns"
+weight = 0.7
+
+[link_types.promotes]
+description = "A SKU or a whole category the promotion applies to."
+from = ["promotion"]
+to = ["sku", "merch_category"]
+inverse = "promoted_by"
+weight = 0.8
+
+[link_types.promotion_runs_at]
+description = "A store or district where the promotion runs."
+from = ["promotion"]
+to = ["retail_store", "retail_district"]
+inverse = "store_promotions"
+weight = 0.6
+
+[link_types.recalls_sku]
+description = "A SKU the recall pulls from sale."
+from = ["product_recall"]
+to = ["sku"]
+inverse = "recalled_by"
+weight = 1.0
+
+[link_types.recall_managed_by]
+description = "The team or person running the recall."
+from = ["product_recall"]
+to = ["team", "person"]
+inverse = "manages_recall"
+cardinality = "one"
+weight = 0.6
+
+# ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
+
+[[rules]]
+name = "promotion_covers_sku"
+description = "A promotion on a SKU covers that SKU."
+when = [["?promo", "promotes", "?sku"], ["?sku", "a", "sku"]]
+then = ["?promo", "covers_sku", "?sku"]
+
+[[rules]]
+name = "promotion_covers_category"
+description = "A promotion on a category covers every SKU assigned to that category."
+chain = ["promotes", "category_skus"]
+infer = "covers_sku"
+
+[[rules]]
+name = "promotion_covers_subcategories"
+description = "A promotion on a category also covers every SKU of the categories beneath it, at any depth of the merchandise hierarchy."
+chain = ["promotes", "merch_subcategories", "category_skus"]
+infer = "covers_sku"
+
+[[rules]]
+name = "promoted_stockout"
+description = "A stock position that is out of stock while a live promotion covers its SKU (directly or through its category) loses sales."
+when = [["?p", "a", "stock_position"], ["?p", "prop.stock_status", "out_of_stock"], ["?p", "stock_of", "?sku"], ["?promo", "covers_sku", "?sku"], ["?promo", "state", "live"]]
+then = ["?p", "a", "promoted_stockout"]
+
+[[rules]]
+name = "recalled_stock_on_hand"
+description = "A store holding a stock position of a recalled SKU must pull it from the shelf."
+when = [["?r", "a", "product_recall"], ["?r", "recalls_sku", "?sku"], ["?p", "stock_of", "?sku"], ["?p", "at_store", "?store"]]
+then = ["?store", "holds_recalled_sku", "?sku"]
+
+[[rules]]
+name = "shopper_affected_by_recall"
+description = "A shopper who ordered a recalled SKU is affected by the recall and should be contacted."
+when = [["?r", "recalls_sku", "?sku"], ["?o", "order_contains", "?sku"], ["?o", "placed_by_shopper", "?c"]]
+then = ["?c", "affected_by_recall", "?r"]
+
+# ── Shapes (conditions the data should meet; a report is a measurement) ─────
+
+[shapes.sku_shape]
+description = "A SKU has a well-formed GTIN, exactly one merchandise category and a non-negative price."
+target = "sku"
+properties = [
+    { path = "prop.gtin", min_count = 1, max_count = 1, pattern = "^[0-9]{8,14}$" },
+    { path = "in_merch_category", min_count = 1, max_count = 1, class = "merch_category" },
+    { path = "prop.unit_price", min_value = 0 },
+]
+
+[shapes.retail_order_shape]
+description = "An order is fulfilled from a store, sells at least one SKU and has a non-negative total."
+target = "retail_order"
+properties = [
+    { path = "fulfilled_from", min_count = 1, max_count = 1 },
+    { path = "order_contains", min_count = 1, class = "sku" },
+    { path = "prop.order_total", min_value = 0 },
+]
+
+[shapes.stock_position_shape]
+description = "A stock position counts one SKU in one store and is never negative."
+target = "stock_position"
+properties = [
+    { path = "stock_of", min_count = 1, max_count = 1, class = "sku" },
+    { path = "at_store", min_count = 1, max_count = 1 },
+    { path = "prop.on_hand", min_count = 1, min_value = 0, message = "On-hand stock cannot be negative: look for double-posted adjustments." },
+]
+
+[shapes.promotion_shape]
+description = "A promotion applies to something and discounts at most 90 percent."
+target = "promotion"
+properties = [
+    { path = "promotes", min_count = 1 },
+    { path = "prop.discount_percent", min_value = 0, max_value = 90 },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_retail_orders]
+description = "Orders not yet fulfilled, returned or cancelled."
+kind = "retail_order"
+measure = "count"
+filter = { open = true }
+dimensions = { channel = "sales_channel", store = "fulfilled_from", district = "fulfilled_from.store_in_district", state = "state" }
+certified = true
+
+[metrics.retail_order_value]
+description = "Order value by channel and store."
+kind = "retail_order"
+measure = "sum"
+property = "order_total"
+dimensions = { channel = "sales_channel", store = "fulfilled_from" }
+
+[metrics.return_refunds]
+description = "Refunds paid on returns, by reason."
+kind = "product_return"
+measure = "sum"
+property = "refund_amount"
+filter = { state = ["refunded"] }
+dimensions = { reason = "return_reason" }
+
+# ── Action types (governed edits) ────────────────────────────────────────────
+
+[action_types.launch_promotion]
+description = "Take a scheduled promotion live."
+phrases = ["launch", "start promotion", "go live"]
+risk = "low"
+roles = ["member", "admin"]
+parameters.promotion = { type = "entity", kinds = ["promotion"], required = true }
+
+[[action_types.launch_promotion.preconditions]]
+check = "state_in"
+param = "promotion"
+values = ["scheduled"]
+message = "Only scheduled promotions can go live."
+
+[[action_types.launch_promotion.effects]]
+patch = { id = "{promotion}", state = "live" }
+
+[[action_types.launch_promotion.effects]]
+event = { action = "promotion.launched", target = "{promotion}" }
+
+[action_types.pull_recalled_sku]
+description = "Mark a SKU as recalled and attach it to the recall that pulls it from sale."
+phrases = ["recall", "pull from sale"]
+risk = "high"
+roles = ["member", "admin"]
+parameters.sku = { type = "entity", kinds = ["sku"], required = true }
+parameters.recall = { type = "entity", kinds = ["product_recall"], required = true, cue = ["under", "for"] }
+
+[[action_types.pull_recalled_sku.preconditions]]
+check = "state_not_in"
+param = "sku"
+values = ["recalled", "discontinued"]
+message = "The SKU is already recalled or discontinued."
+
+[[action_types.pull_recalled_sku.effects]]
+patch = { id = "{sku}", state = "recalled" }
+
+[[action_types.pull_recalled_sku.effects]]
+link = { from = "{recall}", rel = "recalls_sku", to = "{sku}" }
+
+[[action_types.pull_recalled_sku.effects]]
+event = { action = "sku.recalled", target = "{sku}", payload = { recall = "{recall}" } }
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+shop = "retail_store"
+storefront = "retail_store"
+retail_region = "retail_district"
+stock_keeping_unit = "sku"
+article = "sku"
+merchandise_category = "merch_category"
+merchandise = "merch_category"
+inventory = "stock_position"
+stock = "stock_position"
+shelf_layout = "planogram"
+pog = "planogram"
+loyalty_member = "shopper"
+consumer = "shopper"
+basket = "retail_order"
+online_order = "retail_order"
+rma = "product_return"
+promo = "promotion"
+markdown = "promotion"
+recall = "product_recall"
+
+[glossary.relations]
+store_manager = "store_managed_by"
+category_owner = "merch_owner"
