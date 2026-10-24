@@ -651,6 +651,11 @@ export type CertCheck =
 export interface Certified {
   certificate: Certificate;
   check: CertCheck;
+  /** The closure's own flag (the checker does not read attested fields). */
+  fixpoint_reached?: boolean;
+  rounds?: number;
+  truncated?: string;
+  means?: string;
 }
 
 /** `manifest.json` of a certificate. */

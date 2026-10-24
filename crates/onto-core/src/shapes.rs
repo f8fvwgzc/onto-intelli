@@ -46,7 +46,7 @@ use crate::model::{Entity, one_or_many};
 use crate::policy::{self, Principal};
 use crate::reason::{self, Closure, ReasonOptions};
 use crate::schema::{Dir, PropType, Schema, pattern_regex};
-use crate::shape_model::{PropertyShape, Shape, ShapePath, ShapeSeverity};
+use crate::shape_model::{MAX_PATH_STEPS, PropertyShape, Shape, ShapePath, ShapeSeverity};
 use crate::{Error, Ontology, Result};
 
 /// What a shape report is.
@@ -73,6 +73,18 @@ pub const DELTA_MEANS: &str = "Results that appear and disappear between two sha
 
 /// `node` constraints nest at most this deep; deeper checks are skipped.
 pub const MAX_NODE_DEPTH: usize = 5;
+
+/// Path steps one validation may take in all (each node a path step leaves
+/// from and each neighbour it reaches counts one). A run that spends it stops,
+/// keeps the results of the focus nodes it finished, and says so in
+/// `skipped` (without results the verdict is then undetermined).
+pub const MAX_PATH_WORK: usize = 20_000_000;
+
+/// Draft shapes one validation may carry.
+pub const MAX_DRAFTS: usize = 64;
+
+/// Property shapes the drafts of one validation may carry in all.
+pub const MAX_DRAFT_PROPERTIES: usize = 1024;
 
 /// Results listed by default (all of them are counted).
 pub const DEFAULT_LIMIT: usize = 1000;
@@ -235,6 +247,8 @@ pub enum ShapeIssueKind {
     BadBounds,
     /// Two property shapes with one id.
     DuplicateId,
+    /// A path with more steps than this engine walks.
+    TooLarge,
     /// An empty id in `target_ids`.
     BadTargetId,
     /// A new shape name that is not `[a-z][a-z0-9_]*` (at most 64 characters).
@@ -387,9 +401,28 @@ struct Eval<'a> {
     view: Option<&'a View>,
     vocab: reason::Vocabulary,
     skipped: BTreeSet<SkippedConstraint>,
+    /// Path work left (see [`MAX_PATH_WORK`]).
+    work: std::cell::Cell<usize>,
+    spent: std::cell::Cell<bool>,
 }
 
 impl<'a> Eval<'a> {
+    /// Spend `n` units of path work; false (and spent from then on) when
+    /// there is not that much left.
+    fn charge(&self, n: usize) -> bool {
+        match self.work.get().checked_sub(n) {
+            Some(left) if !self.spent.get() => {
+                self.work.set(left);
+                true
+            }
+            _ => {
+                self.work.set(0);
+                self.spent.set(true);
+                false
+            }
+        }
+    }
+
     fn skip(&mut self, shape: &str, constraint_id: Option<&str>, key: &str, reason: impl Into<String>) {
         self.skipped.insert(SkippedConstraint {
             shape: shape.to_string(),
@@ -432,6 +465,9 @@ impl<'a> Eval<'a> {
             ShapePath::State => PathPlan::State,
             ShapePath::Prop(p) if p.is_empty() => return Err("empty property name".into()),
             ShapePath::Prop(p) => PathPlan::Prop(p),
+            ShapePath::Relations(steps) if steps.len() > MAX_PATH_STEPS => {
+                return Err(format!("path {path} has {} steps, more than {MAX_PATH_STEPS}", steps.len()));
+            }
             ShapePath::Relations(steps) => {
                 let mut out = Vec::with_capacity(steps.len());
                 for s in &steps {
@@ -460,18 +496,28 @@ impl<'a> Eval<'a> {
             },
             PathPlan::Steps(steps) => {
                 let mut frontier: BTreeSet<String> = BTreeSet::from([focus.id.clone()]);
-                for st in steps {
+                'steps: for st in steps {
                     let mut next = BTreeSet::new();
                     for id in &frontier {
+                        if !self.charge(1) {
+                            break 'steps;
+                        }
                         if !st.derived {
                             for n in self.g.neighbors(id, &st.rel, st.dir) {
+                                if !self.charge(1) {
+                                    break 'steps;
+                                }
                                 if self.visible(n).is_some() {
                                     next.insert(n.to_string());
                                 }
                             }
                         }
                         if let Some(v) = self.view {
+                            let had = next.len();
                             v.neighbors(id, &st.rel, st.dir, &mut next);
+                            if !self.charge(next.len() - had) {
+                                break 'steps;
+                            }
                         }
                     }
                     frontier = next;
@@ -942,6 +988,18 @@ pub fn validate(
     q: &ShapesQuery,
     can_read: &dyn Fn(&Entity) -> bool,
 ) -> ShapeReport {
+    validate_with(schema, g, closure, q, can_read, MAX_PATH_WORK)
+}
+
+/// [`validate`] with `work` units of path work (see [`MAX_PATH_WORK`]).
+fn validate_with(
+    schema: &Schema,
+    g: &Graph,
+    closure: Option<&Closure>,
+    q: &ShapesQuery,
+    can_read: &dyn Fn(&Entity) -> bool,
+    work: usize,
+) -> ShapeReport {
     let shapes = effective_shapes(schema, &q.drafts);
     let ws = q.workspace.as_deref();
     let scope = |e: &Entity| ws.is_none_or(|w| e.workspace == w) && can_read(e);
@@ -964,6 +1022,8 @@ pub fn validate(
         view: view.as_ref(),
         vocab: reason::vocabulary(schema),
         skipped: BTreeSet::new(),
+        work: std::cell::Cell::new(work),
+        spent: std::cell::Cell::new(false),
     };
     if let Some(c) = closure {
         let refused = c.stats().refused;
@@ -991,7 +1051,7 @@ pub fn validate(
     let mut results = Vec::new();
     let mut focus_by_shape = BTreeMap::new();
     let mut unmatched = Vec::new();
-    for name in selected {
+    'shapes: for name in selected {
         let shape = &shapes[name];
         ev.static_skips(name, shape);
         if shape.deactivated || !has_target(shape) {
@@ -1017,8 +1077,25 @@ pub fn validate(
         for id in &focus {
             let Some(e) = g.get(id) else { continue };
             let mut stack = vec![(name.clone(), id.clone())];
-            results.extend(ev.focus_results(name, shape, e, 0, &mut stack));
+            let found = ev.focus_results(name, shape, e, 0, &mut stack);
+            // A walk cut by the budget may miss values: this focus node's
+            // results are not kept, and the run stops.
+            if ev.spent.get() {
+                break 'shapes;
+            }
+            results.extend(found);
         }
+    }
+    if ev.spent.get() {
+        ev.skip(
+            "*",
+            None,
+            "budget",
+            format!(
+                "evaluation stopped after {work} path steps; the results listed are those of the focus nodes \
+                 evaluated before that (shorten paths or select fewer shapes)"
+            ),
+        );
     }
     results.sort_by(|a, b| {
         (&a.shape, &a.focus, &a.constraint_id, &a.component)
@@ -1180,6 +1257,18 @@ pub fn check(schema: &Schema, shapes: &BTreeMap<String, Shape>) -> ShapeCheck {
                     }
                 }
                 ShapePath::Relations(steps) => {
+                    if steps.len() > crate::shape_model::MAX_PATH_STEPS {
+                        issue(
+                            cid,
+                            ShapeIssueKind::TooLarge,
+                            format!(
+                                "path {} has {} steps, more than {}",
+                                ps.path,
+                                steps.len(),
+                                crate::shape_model::MAX_PATH_STEPS
+                            ),
+                        );
+                    }
                     for s in &steps {
                         if s.is_empty() {
                             issue(cid, ShapeIssueKind::MissingRelation, format!("empty step in path {:?}", ps.path));
@@ -1321,6 +1410,9 @@ pub fn induce(
         view: None,
         vocab: reason::vocabulary(schema),
         skipped: BTreeSet::new(),
+        // Induction walks one step per link type it reads: linear already.
+        work: std::cell::Cell::new(usize::MAX),
+        spent: std::cell::Cell::new(false),
     };
     let mut kinds: Vec<&String> = g.kinds().map(|(k, _)| k).filter(|k| schema.kind_is(k, kind)).collect();
     kinds.sort();
@@ -1507,16 +1599,39 @@ impl Ontology {
         {
             return Err(Error::Denied(format!("{} has no access to workspace {ws}", p.id)));
         }
-        let schema = self.schema();
-        let known = |n: &String| schema.shapes.contains_key(n) || q.drafts.contains_key(n);
+        if q.drafts.len() > MAX_DRAFTS {
+            return Err(Error::invalid(format!(
+                "a validation carries at most {MAX_DRAFTS} draft shapes (this one has {})",
+                q.drafts.len()
+            )));
+        }
+        let props: usize = q.drafts.values().map(|s| s.properties.len()).sum();
+        if props > MAX_DRAFT_PROPERTIES {
+            return Err(Error::invalid(format!(
+                "the draft shapes of a validation carry at most {MAX_DRAFT_PROPERTIES} property shapes (these have \
+                 {props})"
+            )));
+        }
+        let known = |n: &String| self.schema().shapes.contains_key(n) || q.drafts.contains_key(n);
         if let Some(missing) = q.shapes.iter().find(|n| !known(n)) {
             return Err(Error::not_found(format!("shape {missing}")));
         }
+        // The closure comes from the reasoner's cache (computed without the
+        // read guard); it is used only if it describes exactly the graph and
+        // schema the shapes are evaluated over, else one is computed here.
+        let cached = if q.inferred {
+            let opts = ReasonOptions { workspace: q.workspace.clone(), ..ReasonOptions::default() };
+            Some(self.reason_at(p, &opts)?)
+        } else {
+            None
+        };
         let g = self.reader(p)?;
+        let active = self.active_schema();
+        let closure = cached
+            .filter(|(_, revision, version)| *revision == self.revision() && *version == active.version)
+            .map(|(c, _, _)| c);
         let can = |e: &Entity| policy::visible(p, e, &g);
-        // The closure is computed under this same read guard, so it describes
-        // exactly the graph the shapes are evaluated over.
-        Ok(validate(&schema, &g, None, q, &can))
+        Ok(validate(&active.schema, &g, closure.as_deref(), q, &can))
     }
 
     /// A structural dry run of shape definitions against the schema in force.
@@ -1589,5 +1704,53 @@ mod tests {
         assert_eq!(observed_type(Some(PropType::Enum), &[&c]), Some((PropType::Enum, true)));
         assert_eq!(observed_type(Some(PropType::Int), &[&c]), Some((PropType::String, false)));
         assert_eq!(observed_type(None, &[&a, &c]), None);
+    }
+
+    #[test]
+    fn path_work_is_bounded() {
+        let mut s = Schema::enterprise();
+        s.extend_toml(
+            r#"
+            [shapes.team_reach]
+            target = "issue"
+            properties = [{ path = "assigned_to.^assigned_to.assigned_to", min_count = 1 }]
+            "#,
+        )
+        .unwrap();
+        let mut g = Graph::default();
+        let e = |id: &str| Entity {
+            id: id.into(),
+            kind: id.split(':').next().unwrap_or_default().into(),
+            workspace: "acme".into(),
+            title: id.into(),
+            state: None,
+            props: Default::default(),
+            aliases: Vec::new(),
+            provenance: None,
+            created_at: 0,
+            updated_at: 0,
+            revision: 1,
+        };
+        g.put_entity(e("person:p"));
+        for i in 0..20 {
+            let id = format!("issue:{i}");
+            g.put_entity(e(&id));
+            g.put_link(crate::model::Link {
+                from: id,
+                rel: "assigned_to".into(),
+                to: "person:p".into(),
+                props: Default::default(),
+                workspace: "acme".into(),
+                created_at: 0,
+            });
+        }
+        let all = |_: &Entity| true;
+        let q = ShapesQuery::default();
+        let full = validate(&s, &g, None, &q, &all);
+        assert_eq!(full.verdict, ShapeVerdict::Conforms, "{full:?}");
+        let cut = validate_with(&s, &g, None, &q, &all, 100);
+        assert_eq!(cut.verdict, ShapeVerdict::Undetermined, "{cut:?}");
+        assert!(cut.skipped.iter().any(|k| k.key == "budget" && k.reason.contains("after 100 path steps")));
+        assert!(cut.results.is_empty());
     }
 }

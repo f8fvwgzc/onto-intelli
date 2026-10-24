@@ -419,3 +419,94 @@ async fn scenarios_reason_over_forks() {
     assert_eq!(r["results"][0]["action"], "reason.query", "{r}");
     assert!(r["results"][0]["before"]["bindings"].is_array(), "{r}");
 }
+
+/// `depends_on` made transitive and a chain of `n` tasks: n(n-1)/2 derived
+/// facts from n-1 links.
+async fn chain(i: &Intelli, n: usize) {
+    use onto_core::{ActionContext, EntityInput, Mutation};
+    let flip = transitive_depends_on(i).await;
+    ok(i, &admin(), "schema.apply", flip).await;
+    let ctx = ActionContext::new(admin(), "acme");
+    let muts = (0..n)
+        .map(|k| {
+            let e = EntityInput::new("task", format!("c{k}"), format!("Chain {k}"));
+            Mutation::Upsert(if k > 0 { e.link("depends_on", format!("task:c{}", k - 1)) } else { e })
+        })
+        .collect();
+    i.ontology().apply(&ctx, muts).unwrap();
+}
+
+#[tokio::test]
+async fn caller_knobs_are_clamped() {
+    let i = demo().await;
+    chain(&i, 60).await;
+    let v = viewer();
+    // A caller may lower the derivation bound, never raise it; samples and
+    // limits have ceilings.
+    let run = ok(&i, &v, "reason.run", json!({ "samples": 1_000_000_000u64, "max_derived": u64::MAX })).await;
+    assert!(run["derived"].as_u64().unwrap() > 1000, "{}", run["derived"]);
+    assert_eq!(run["samples"].as_array().unwrap().len(), 1000);
+    assert_eq!(run["fixpoint_reached"], true);
+    let low = ok(&i, &v, "reason.run", json!({ "max_derived": 5 })).await;
+    assert_eq!((low["derived"].as_u64(), low["fixpoint_reached"].as_bool()), (Some(5), Some(false)));
+    let q = ok(&i, &v, "reason.query", json!({ "pattern": [["?x", "depends_on", "?y"]], "limit": 1_000_000 })).await;
+    assert_eq!(q["bindings"].as_array().unwrap().len(), 1000);
+    let atoms: Vec<Value> = (0..9).map(|k| json!([format!("?x{k}"), "a", "task"])).collect();
+    let e = err(&i, &v, "reason.query", json!({ "pattern": atoms })).await;
+    assert!(e.to_string().contains("at most 8 atoms"), "{e}");
+    let evens: Vec<String> = (0..60).step_by(2).map(|k| format!("task:c{k}")).collect();
+    let slice = ok(&i, &v, "reason.slice_check", json!({ "entities": evens, "limit": 1_000_000_000u64 })).await;
+    let listed =
+        slice["lost_in_slice_vocabulary"].as_array().map_or(0, Vec::len) + slice["lost"].as_array().map_or(0, Vec::len);
+    assert!(listed <= 1000, "{listed}");
+}
+
+#[tokio::test]
+async fn a_certificate_carries_the_closures_fixpoint_flag() {
+    let i = demo().await;
+    let done = ok(&i, &admin(), "reason.certify", json!({})).await;
+    assert_eq!(done["fixpoint_reached"], true, "{}", done["fixpoint_reached"]);
+    assert!(done["rounds"].as_u64().unwrap() > 0);
+    assert!(done["means"].is_null() && done["truncated"].is_null());
+    // A chain longer than max_rounds: the closure stops, the certificate
+    // still checks, and the report says it is a lower bound.
+    use onto_core::{ActionContext, EntityInput, Mutation};
+    let rules = json!({ "message": "reach", "changes": [
+        { "op": "put_rule", "def": { "name": "reach_seed", "description": "reached from the seed",
+          "when": [["task:r0", "depends_on", "?y"]], "then": ["?y", "a", "reached"] } },
+        { "op": "put_rule", "def": { "name": "reach_step", "description": "reach spreads",
+          "when": [["?x", "a", "reached"], ["?x", "depends_on", "?y"]], "then": ["?y", "a", "reached"] } }
+    ] });
+    ok(&i, &admin(), "schema.apply", rules).await;
+    let ctx = ActionContext::new(admin(), "acme");
+    let n = 10_010;
+    // Last first, so every link's target exists.
+    let muts = (0..n)
+        .rev()
+        .map(|k| {
+            let e = EntityInput::new("task", format!("r{k}"), format!("Reach {k}"));
+            Mutation::Upsert(if k + 1 < n { e.link("depends_on", format!("task:r{}", k + 1)) } else { e })
+        })
+        .collect();
+    i.ontology().apply(&ctx, muts).unwrap();
+    let cut = ok(&i, &admin(), "reason.certify", json!({})).await;
+    assert_eq!(cut["check"]["ok"], true, "{}", cut["check"]);
+    assert_eq!(cut["fixpoint_reached"], false);
+    assert!(cut["truncated"].as_str().unwrap().contains("max_rounds"), "{}", cut["truncated"]);
+    assert!(cut["means"].as_str().unwrap().contains("lower bound"));
+}
+
+#[tokio::test]
+async fn pack_lint_counts_are_the_packs_own() {
+    let i = demo().await;
+    let before = ok(&i, &admin(), "pack.show", json!({ "id": "retail" })).await;
+    ok(&i, &admin(), "pack.install", json!({ "id": "manufacturing", "mode": "apply" })).await;
+    ok(&i, &admin(), "pack.install", json!({ "id": "retail", "mode": "apply" })).await;
+    let after = ok(&i, &admin(), "pack.show", json!({ "id": "retail" })).await;
+    assert_eq!(before["lint"]["counts"], after["lint"]["counts"], "installed or not, the pack's own findings");
+    assert_eq!(after["lint"]["new_on_current"], 0, "{}", after["lint"]);
+    let other = ok(&i, &admin(), "pack.show", json!({ "id": "manufacturing" })).await;
+    let n = |v: &Value| v["lint"]["new_findings"].as_u64().unwrap();
+    assert_eq!(n(&after), after["lint"]["findings"].as_array().unwrap().len() as u64);
+    assert!(other["lint"]["counts"].is_object());
+}

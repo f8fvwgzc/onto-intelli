@@ -327,6 +327,10 @@ pub struct SchemaChangeSet {
     pub override_locks: bool,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -645,6 +649,10 @@ pub struct Consequences {
     /// False when either run stopped before its fixpoint: the counts then
     /// compare two partial closures, and the verdict is undetermined.
     pub fixpoint_reached: bool,
+    /// Terms the two runs refused to spell (summed). Facts naming them are
+    /// left out of both closures, so the verdict is undetermined.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused: usize,
     /// Why the consequences were not computed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
@@ -906,6 +914,43 @@ fn check_new_name(what: &str, name: &str) -> std::result::Result<(), String> {
 }
 
 /// Apply `changes` to a copy of `base` and compile the result.
+/// Glossary words that name an object type or link type the changes delete
+/// (and that no later change put back) go with it: a word for a deleted
+/// definition names nothing. Words the changes delete themselves are gone
+/// already; words for other definitions stay.
+fn forget_deleted_words(base: &Schema, s: &mut Schema, changes: &[SchemaChange]) {
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    let mut rels: BTreeSet<String> = BTreeSet::new();
+    for c in changes {
+        match c {
+            SchemaChange::DeleteObjectType { name, .. } => {
+                kinds.insert(name);
+            }
+            SchemaChange::DeleteLinkType { name, .. } => {
+                rels.insert(name.clone());
+                rels.extend(base.link_types.get(name).and_then(|lt| lt.inverse.clone()));
+            }
+            _ => {}
+        }
+    }
+    if kinds.is_empty() && rels.is_empty() {
+        return;
+    }
+    let gone_kind = |k: &str| kinds.contains(k) && !s.is_type_or_interface(k);
+    let kept: BTreeMap<String, String> =
+        s.glossary.kinds.iter().filter(|(_, k)| !gone_kind(k)).map(|(w, k)| (w.clone(), k.clone())).collect();
+    s.glossary.kinds = kept;
+    // (The schema is not compiled yet: its inverse index is stale, so names
+    // are looked up in the link types themselves.)
+    let gone_rel = |r: &str| {
+        let bare = r.strip_prefix('^').unwrap_or(r);
+        rels.contains(bare) && !s.link_types.iter().any(|(n, lt)| n == bare || lt.inverse.as_deref() == Some(bare))
+    };
+    let kept: BTreeMap<String, String> =
+        s.glossary.relations.iter().filter(|(_, r)| !gone_rel(r)).map(|(w, r)| (w.clone(), r.clone())).collect();
+    s.glossary.relations = kept;
+}
+
 pub fn apply_changes(base: &Schema, changes: &[SchemaChange]) -> std::result::Result<Schema, Vec<String>> {
     let mut s = base.clone();
     let mut errors = Vec::new();
@@ -914,6 +959,7 @@ pub fn apply_changes(base: &Schema, changes: &[SchemaChange]) -> std::result::Re
             errors.push(format!("change {} ({} {}): {e}", i + 1, c.op(), c.target()));
         }
     }
+    forget_deleted_words(base, &mut s, changes);
     if errors.is_empty()
         && let Err(e) = s.compile()
     {
@@ -2504,10 +2550,11 @@ fn summarize(base: &Schema, c: &SchemaChange) -> String {
                 (_, _, Some(r)) => format!("on objects of {r}"),
                 _ => format!("on {} listed ids", def.target_ids.len()),
             };
+            let n = def.properties.len();
             format!(
-                "{} shape {name} ({target}, {} property shapes)",
+                "{} shape {name} ({target}, {n} property {})",
                 verb(base.shapes.contains_key(name)),
-                def.properties.len()
+                if n == 1 { "shape" } else { "shapes" }
             )
         }
         SchemaChange::DeleteShape { name } => format!("delete shape {name}"),
@@ -2878,7 +2925,10 @@ pub fn closure_consequences(
             }
         }
     }
-    let verdict = match (diff.fixpoint_reached, over) {
+    // A refused term drops facts from a closure: what it would add is not
+    // seen, so conservativity is not shown.
+    let refused = before.stats().refused + after.stats().refused;
+    let verdict = match (diff.fixpoint_reached && refused == 0, over) {
         (false, _) => Conservativity::Undetermined,
         (true, 0) => Conservativity::Conservative,
         (true, _) => Conservativity::NotConservative,
@@ -2894,6 +2944,7 @@ pub fn closure_consequences(
         witnesses,
         samples_removed: removed.into_iter().take(CONSEQUENCE_SAMPLES).collect(),
         fixpoint_reached: diff.fixpoint_reached,
+        refused,
         skipped: None,
         means: means.to_string(),
     }
@@ -2926,17 +2977,69 @@ fn too_large(n: usize) -> String {
 /// The consequences of replacing schema `base` with `new` over graph `g`, as
 /// `can_read` sees it.
 pub fn schema_consequences(base: &Schema, new: &Schema, g: &Graph, can_read: &dyn Fn(&Entity) -> bool) -> Consequences {
+    prepare_schema_consequences(base, new, g, can_read, None).finish(base).0
+}
+
+/// The closure before a schema change: one already computed, or the facts
+/// to compute it from.
+pub(crate) enum Before {
+    Cached(Arc<Closure>),
+    Pending(reason::Prepared),
+}
+
+/// The consequences of a schema change with the graph already read: the
+/// rules run in [`ConsequenceJob::finish`], which needs no read guard.
+pub(crate) enum ConsequenceJob {
+    Done(Consequences),
+    Run { before: Before, after: reason::Prepared },
+}
+
+/// Collect what the two closures of [`schema_consequences`] read (under the
+/// caller's read guard); `cached` is the closure of `base` for the same
+/// reader and graph, when one is at hand.
+pub(crate) fn prepare_schema_consequences(
+    base: &Schema,
+    new: &Schema,
+    g: &Graph,
+    can_read: &dyn Fn(&Entity) -> bool,
+    cached: Option<Arc<Closure>>,
+) -> ConsequenceJob {
     let floor = asserted_floor(g, can_read);
     if floor > MAX_CONSEQUENCE_FACTS {
-        return Consequences::skipped(too_large(floor), SCHEMA_CONSEQUENCES_MEANS);
+        return ConsequenceJob::Done(Consequences::skipped(too_large(floor), SCHEMA_CONSEQUENCES_MEANS));
     }
     let opts = ReasonOptions::default();
-    let before = reason::closure(base, g, &opts, can_read);
-    if before.asserted().len() > MAX_CONSEQUENCE_FACTS {
-        return Consequences::skipped(too_large(before.asserted().len()), SCHEMA_CONSEQUENCES_MEANS);
+    let before = match cached {
+        Some(c) => Before::Cached(c),
+        None => Before::Pending(reason::prepare(base, g, &opts, can_read)),
+    };
+    let asserted = match &before {
+        Before::Cached(c) => c.asserted().len(),
+        Before::Pending(p) => p.asserted(),
+    };
+    if asserted > MAX_CONSEQUENCE_FACTS {
+        return ConsequenceJob::Done(Consequences::skipped(too_large(asserted), SCHEMA_CONSEQUENCES_MEANS));
     }
-    let after = reason::closure(new, g, &opts, can_read);
-    closure_consequences(base, &before, &after, true, SCHEMA_CONSEQUENCES_MEANS)
+    ConsequenceJob::Run { before, after: reason::prepare(new, g, &opts, can_read) }
+}
+
+impl ConsequenceJob {
+    /// Run the closures and compare them; also returns the `before` closure
+    /// when this job computed it (for the caller to cache).
+    pub(crate) fn finish(self, base: &Schema) -> (Consequences, Option<Arc<Closure>>) {
+        match self {
+            ConsequenceJob::Done(c) => (c, None),
+            ConsequenceJob::Run { before, after } => {
+                let (before, fresh) = match before {
+                    Before::Cached(c) => (c, false),
+                    Before::Pending(p) => (Arc::new(p.run()), true),
+                };
+                let after = after.run();
+                let c = closure_consequences(base, &before, &after, true, SCHEMA_CONSEQUENCES_MEANS);
+                (c, fresh.then_some(before))
+            }
+        }
+    }
 }
 
 /// The consequences of a data edit under one schema: graph `before` as
@@ -3022,9 +3125,17 @@ pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<Strin
             }
             Conservativity::Undetermined => medium.push(format!(
                 "conservativity not shown: {}",
-                c.skipped.as_deref().unwrap_or("a reasoning run stopped before its fixpoint")
+                match (&c.skipped, c.refused) {
+                    (Some(why), _) => why.clone(),
+                    (None, n) if n > 0 && c.fixpoint_reached => format!(
+                        "{n} term(s) could not be spelled, so the facts naming them are left out of the closures"
+                    ),
+                    (None, _) => "a reasoning run stopped before its fixpoint".to_string(),
+                }
             )),
         }
+    } else {
+        medium.push("conservativity not shown: the plan holds no consequences (it was planned without them)".into());
     }
     let risk = if !high.is_empty() {
         Risk::High
@@ -3321,17 +3432,32 @@ impl Ontology {
         let held = locks::read_locks(&**self.store())?;
         let active = self.active_schema();
         let g = self.inner_graph_read();
+        let revision = self.revision();
         let mut planned = plan(&active.schema, active.version, &g, set, self.options().strict);
         self.check_migration(&g, &mut planned, p);
         let can = |e: &Entity| policy::visible(p, e, &g);
-        planned.plan.consequences = Some(match &planned.schema {
-            Some(new) => schema_consequences(&active.schema, new, &g, &can),
-            None => Consequences::skipped("the change set does not compile", SCHEMA_CONSEQUENCES_MEANS),
-        });
+        let job = match &planned.schema {
+            Some(new) => {
+                let cached = self.cached_closure(p, &ReasonOptions::default(), revision, active.version);
+                prepare_schema_consequences(&active.schema, new, &g, &can, cached)
+            }
+            None => ConsequenceJob::Done(Consequences::skipped(
+                "the change set does not compile",
+                SCHEMA_CONSEQUENCES_MEANS,
+            )),
+        };
         planned.plan.shapes = Some(match &planned.schema {
             Some(new) => plan_shapes(&active.schema, new, &g, &can),
             None => PlanShapes::skipped("the change set does not compile"),
         });
+        // The facts are collected; the rules run without the read guard, so
+        // a plan does not hold writers (and readers queued behind them) back.
+        drop(g);
+        let (consequences, before) = job.finish(&active.schema);
+        if let Some(before) = before {
+            self.keep_closure(p, &ReasonOptions::default(), revision, active.version, before);
+        }
+        planned.plan.consequences = Some(consequences);
         let may_override = locks::can_manage(p) && proposer.is_none_or(proposer_may_override);
         assess(&mut planned.plan, &active.schema, set, &held, may_override);
         Ok(planned.plan)
@@ -3344,8 +3470,14 @@ impl Ontology {
         let active = self.active_schema();
         let new = apply_changes(&active.schema, &set.changes).ok()?;
         let g = self.inner_graph_read();
-        let can = |e: &Entity| policy::visible(p, e, &g);
-        Some((active.version, schema_consequences(&active.schema, &new, &g, &can)))
+        let revision = self.revision();
+        let cached = self.cached_closure(p, &ReasonOptions::default(), revision, active.version);
+        let job = {
+            let can = |e: &Entity| policy::visible(p, e, &g);
+            prepare_schema_consequences(&active.schema, &new, &g, &can, cached)
+        };
+        drop(g);
+        Some((active.version, job.finish(&active.schema).0))
     }
 
     /// Stage the migration to surface validation errors in the plan.

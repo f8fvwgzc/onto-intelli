@@ -53,6 +53,9 @@ pub const W_STATES: f64 = 0.10;
 /// Link-type signal weights.
 pub const W_LINK_NAME: f64 = 0.5;
 pub const W_LINK_ENDPOINTS: f64 = 0.5;
+/// Agreement an end of a link type that cannot be compared counts for when
+/// the other end can.
+pub const UNKNOWN_END: f64 = 0.5;
 
 /// A pair scoring at least this (with structural agreement) is an `exact_match`.
 pub const EXACT_MIN: f64 = 0.85;
@@ -586,6 +589,8 @@ struct NameHit {
     same_word: bool,
     a: String,
     b: String,
+    /// With `glossary`: the word the two definitions share.
+    via: String,
 }
 
 /// Own names that are the same word win (lexical 1.0); then a glossary
@@ -599,6 +604,12 @@ fn name_signal(a: &[Name], b: &[Name]) -> NameHit {
         same_word: same(x, y),
         a: x.raw.clone(),
         b: y.raw.clone(),
+        via: String::new(),
+    };
+    // A glossary hit names the two definitions (their own first names),
+    // not the shared word twice.
+    let own = |names: &[Name], fallback: &Name| {
+        names.iter().find(|n| !n.synonym).map_or_else(|| fallback.raw.clone(), |n| n.raw.clone())
     };
     for x in a.iter().filter(|x| !x.synonym) {
         if let Some(y) = b.iter().find(|y| !y.synonym && same(x, y)) {
@@ -607,7 +618,7 @@ fn name_signal(a: &[Name], b: &[Name]) -> NameHit {
     }
     for x in a {
         if let Some(y) = b.iter().find(|y| same(x, y) && (x.synonym || y.synonym)) {
-            return hit(x, y, 1.0, true);
+            return NameHit { a: own(a, x), b: own(b, y), via: x.raw.clone(), ..hit(x, y, 1.0, true) };
         }
     }
     let mut best = NameHit::default();
@@ -902,8 +913,16 @@ fn score_link(s: &LinkFeat, t: &LinkFeat, map: &dyn Fn(&str) -> Option<String>, 
         }
     }
     let ends = (end_agreement(&s.from, &t.from, map, target), end_agreement(&s.to, &t.to, map, target));
+    // An end that cannot be compared counts as half agreement (unknown),
+    // not as absent: agreement on one shared end (every link type to
+    // `person` agrees on `to`) must not outweigh the names.
+    // (Two ends that both admit any kind are not evidence either way and stay
+    // out of the score.)
+    let unmapped = |src: &[String], tgt: &[String]| !src.is_empty() && !tgt.is_empty();
     let endpoints = match ends {
         (Some(a), Some(b)) => Some((a + b) / 2.0),
+        (Some(a), None) if unmapped(&s.to, &t.to) => Some((a + UNKNOWN_END) / 2.0),
+        (None, Some(b)) if unmapped(&s.from, &t.from) => Some((b + UNKNOWN_END) / 2.0),
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
     };
@@ -1060,7 +1079,7 @@ fn status_sentence(score: f64, tied: &[Candidate], eps: f64, sig: &Signals) -> S
 
 fn name_sentence(hit: &NameHit) -> String {
     if hit.glossary {
-        format!("name: '{}' and '{}' are the same word through a glossary (1.00)", hit.a, hit.b)
+        format!("name: '{}' and '{}' are the same word through the glossary word '{}' (1.00)", hit.a, hit.b, hit.via)
     } else if !hit.same_word && hit.value >= 1.0 {
         format!("name: '{}' vs '{}' share every word but are not the same word (similarity 1.00)", hit.a, hit.b)
     } else {
@@ -1301,10 +1320,15 @@ pub fn align(source: &Schema, target: &Schema, opts: &AlignOptions) -> AlignRepo
             let (predicate, why) = link_predicate(score, &signals);
             let (s, t) = (&slf[c.pair.s], &tlf[c.pair.t]);
             let kinds = |k: &[String]| if k.is_empty() { "any".to_string() } else { format!("[{}]", k.join(", ")) };
+            // An uncompared end counts as half agreement when the other end
+            // is compared (see `score_link`).
+            let half = if d.ends.0.is_some() != d.ends.1.is_some() { "; counts as 0.50" } else { "" };
             let end = |v: Option<f64>, a: &[String], b: &[String]| {
                 let mapped = a.iter().filter(|k| map(k).is_some()).count();
                 match v {
-                    None if !a.is_empty() && mapped == 0 => format!("not compared (no kind of {} is mapped)", kinds(a)),
+                    None if !a.is_empty() && mapped == 0 => {
+                        format!("not compared (no kind of {} is mapped{half})", kinds(a))
+                    }
                     None => "not compared".to_string(),
                     Some(v) if mapped < a.len() && mapped > 0 => {
                         format!("{} vs {} ({v:.2}; {mapped} of {} source kinds mapped)", kinds(a), kinds(b), a.len())
@@ -1964,12 +1988,23 @@ pub fn resolve_source(source: &AlignSource) -> Result<ResolvedSource> {
         .and_then(|r| r.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.trim_start_matches("builtin:").to_string()).collect())
         .unwrap_or_default();
+    // A layer never sets the schema name (that stays the base's): the
+    // source is named by its pack id, else its own `name`.
+    let own_name = doc
+        .get("pack")
+        .and_then(|p| p.get("id"))
+        .or_else(|| doc.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let layered = |bases: &[String]| -> Result<ResolvedSource> {
         let mut schema = Schema::empty();
         for b in bases {
             schema.extend_toml(schema::builtin_package(b)?)?;
         }
         schema.extend_toml(text)?;
+        if let Some(n) = &own_name {
+            schema.name = n.clone();
+        }
         Ok(ResolvedSource {
             schema,
             layered_on: bases.to_vec(),

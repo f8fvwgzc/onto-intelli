@@ -603,7 +603,7 @@ impl<'a> Linter<'a> {
                     format!("link_type:{name}"),
                     format!("link type {name} has no description"),
                     format!(
-                        "add description = \"...\" to [link_types.{name}]: what a {name} link between two objects means"
+                        "add description = \"...\" to [link_types.{name}]: what a link of type {name} between two objects means"
                     ),
                 ));
             }

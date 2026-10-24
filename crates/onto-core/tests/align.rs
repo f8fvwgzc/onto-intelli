@@ -766,3 +766,103 @@ fn a_target_taken_by_a_better_match_is_not_a_tie() {
     assert_eq!(squad.status, MatchStatus::Accepted, "{squad:#?}");
     assert!(squad.alternatives.iter().any(|c| c.target == "crew"), "{squad:#?}");
 }
+
+/// A help desk's own words, aligned in the docs against enterprise with the
+/// manufacturing pack installed.
+const HELPDESK: &str = r#"
+name = "helpdesk"
+
+[interfaces.work_unit]
+description = "Anything someone works on."
+
+[object_types.ticket]
+implements = ["work_unit"]
+description = "A customer request or incident."
+states = ["open", "in_progress", "blocked", "resolved", "closed"]
+properties.priority = { type = "enum", values = ["low", "medium", "high", "critical"] }
+properties.description = { type = "text" }
+
+[object_types.employee]
+description = "Someone on staff."
+properties.email = { type = "string" }
+properties.role = { type = "string" }
+properties.timezone = { type = "string" }
+
+[object_types.squad]
+description = "A group of employees."
+
+[link_types.assignee]
+from = ["ticket"]
+to = ["employee"]
+inverse = "assigned_tickets"
+
+[link_types.in_squad]
+from = ["employee"]
+to = ["squad"]
+inverse = "squad_members"
+
+[object_types.incident]
+extends = "ticket"
+description = "An outage reported by a customer."
+"#;
+
+fn manufacturing() -> Ontology {
+    let mut s = Schema::enterprise();
+    s.extend_source("builtin:manufacturing", |p: &str| std::path::PathBuf::from(p)).unwrap();
+    Ontology::in_memory(s)
+}
+
+#[test]
+fn a_glossary_match_names_both_definitions() {
+    let o = manufacturing();
+    let r = o
+        .schema_align(&Principal::admin("ada"), &AlignSource::Toml(HELPDESK.into()), &AlignOptions::default())
+        .unwrap();
+    let employee = r.kinds.iter().find(|m| m.source == "employee").expect("employee is aligned");
+    assert_eq!(employee.target, "person");
+    let name = &employee.evidence[0];
+    assert!(name.contains("'employee' and 'person'") && name.contains("glossary word 'employee'"), "{name}");
+}
+
+#[test]
+fn one_shared_endpoint_does_not_outweigh_the_names() {
+    let o = manufacturing();
+    let admin = Principal::admin("ada");
+    // ticket is not mapped, so only `to` compares: employee → person agrees
+    // for every link type to person, and the name decides.
+    let r = o.schema_align(&admin, &AlignSource::Toml(HELPDESK.into()), &AlignOptions::default()).unwrap();
+    let assignee = r.links.iter().find(|m| m.source == "assignee").expect("assignee is aligned");
+    assert_eq!(assignee.target, "assigned_to", "{assignee:#?}");
+    assert!(assignee.evidence.iter().any(|e| e.contains("counts as 0.50")), "{:?}", assignee.evidence);
+    // A pack's buyer and category manager are not a plant manager or a
+    // maintenance assignee, whatever their shared `person` end says.
+    let r = o.schema_align(&admin, &AlignSource::Pack("supply-chain".into()), &AlignOptions::default()).unwrap();
+    for (s, t) in [("po_buyer", "plant_manager"), ("category_managed_by", "maintenance_assignee")] {
+        assert!(
+            !r.links.iter().any(|m| m.source == s && m.target == t && m.status == MatchStatus::Accepted),
+            "{s} -> {t} accepted: {:#?}",
+            r.links.iter().find(|m| m.source == s)
+        );
+    }
+    let words: Vec<String> = r
+        .change_set
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::PutGlossaryTerm { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!words.iter().any(|t| t == "plant_manager" || t == "maintenance_assignee"), "{words:?}");
+}
+
+#[test]
+fn a_pack_source_is_named_by_its_id() {
+    let o = manufacturing();
+    let r = o
+        .schema_align(&Principal::admin("ada"), &AlignSource::Pack("supply-chain".into()), &AlignOptions::default())
+        .unwrap();
+    assert_eq!(r.source_schema, "supply-chain");
+    assert_eq!(r.target_schema, "enterprise-execution");
+    assert!(r.sssom_tsv.contains("align/supply-chain/enterprise-execution"), "{}", &r.sssom_tsv[..600]);
+}

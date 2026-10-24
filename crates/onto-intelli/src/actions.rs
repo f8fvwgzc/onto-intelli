@@ -263,7 +263,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "reason.query",
         false,
-        "Match triple patterns over asserted and derived facts. Input: {pattern: [[s, p, o], ...], workspace?, limit?}.",
+        "Match triple patterns over asserted and derived facts. Input: {pattern: [[s, p, o], ...] (at most 8 atoms), workspace?, limit? (at most 1000)}.",
     ),
     a(
         "reason.explain",
@@ -278,7 +278,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "reason.certify",
         false,
-        "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the independent onto-cert checker's report on it. Input: {workspace?}.",
+        "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the independent onto-cert checker's report on it, with the closure's fixpoint_reached (false: the derivations are a lower bound). Input: {workspace?}.",
     ),
     a(
         "reason.check_certificate",
@@ -709,10 +709,10 @@ impl Intelli {
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
-            return graph_call(onto, p, self.default_workspace(), action, input);
+            return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
         if assurance::CALLS.contains(&action) {
-            return self.assurance_call(p, action, input);
+            return blocking(|| self.assurance_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
@@ -788,6 +788,12 @@ impl Intelli {
             }
             "scenario.run" => {
                 let i: ScenarioIn = parse(action, input)?;
+                if i.queries.len() > MAX_SCENARIO_QUERIES {
+                    return Err(Error::invalid(format!(
+                        "a scenario runs at most {MAX_SCENARIO_QUERIES} queries (this one has {})",
+                        i.queries.len()
+                    )));
+                }
                 let ws = self.ws_or_default(i.workspace);
                 let fork = onto.fork();
                 let ctx = ActionContext::new(p.clone(), ws.clone()).with_source("scenario");
@@ -1673,6 +1679,19 @@ struct QualityIn {
     kind: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Queries one scenario may run (each runs twice: live and on the fork).
+const MAX_SCENARIO_QUERIES: usize = 20;
+
+/// Run CPU-bound engine work (a closure, a shape evaluation) without
+/// stalling the async runtime: on a multi-thread runtime the worker hands its
+/// other tasks to another thread while `f` runs.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
 }
 
 /// Read-only graph actions; these also run inside what-if scenarios on a fork

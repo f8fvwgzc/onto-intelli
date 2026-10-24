@@ -202,7 +202,7 @@ function PackDrawer({ id, info }: { id: string; info?: PackInfo }) {
       ) : null}
 
       {lint ? (
-        <Section title="Lint, layered on this schema">
+        <Section title="Lint, the pack's own findings">
           <p className="tnum text-[13px] text-ink-2">
             {plural(lint.error, "error")}, {plural(lint.warning, "warning")}, {plural(lint.info, "note")}
           </p>

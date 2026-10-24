@@ -200,3 +200,56 @@ fn profile_precedence_is_cli_then_env_then_config() {
         assert_eq!(resolve_profile(None, "catalog"), "catalog");
     }
 }
+
+#[tokio::test]
+async fn what_if_queries_stay_inside_the_profile() {
+    let i = demo().await;
+    let mcp = McpServer::new(i.clone(), agent(), false).with_profile("evaluation").unwrap();
+    // induce_shape is withheld, so what_if may not run its action either.
+    let refused = call(
+        &mcp,
+        "what_if",
+        json!({ "mutations": [], "queries": [{ "action": "shapes.induce", "input": { "kind": "issue" } }] }),
+    )
+    .await;
+    let msg = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("induce_shape") && msg.contains("evaluation"), "{refused}");
+    // An action no tool exposes is refused under a focused profile.
+    let none =
+        call(&mcp, "what_if", json!({ "mutations": [], "queries": [{ "action": "reason.binding", "input": {} }] }))
+            .await;
+    assert!(none["error"]["message"].as_str().unwrap_or_default().contains("no MCP tool"), "{none}");
+    // A query of an offered tool runs.
+    let fine = call(
+        &mcp,
+        "what_if",
+        json!({ "mutations": [], "queries": [{ "action": "reason.verify", "input": { "claims": [] } }] }),
+    )
+    .await;
+    assert!(fine["error"].is_null() && fine["result"]["isError"] != true, "{fine}");
+    // The full profile narrows nothing.
+    let full = McpServer::new(i, agent(), false);
+    let any = call(
+        &full,
+        "what_if",
+        json!({ "mutations": [], "queries": [{ "action": "shapes.induce", "input": { "kind": "issue" } }] }),
+    )
+    .await;
+    assert!(any["error"].is_null(), "{any}");
+}
+
+#[tokio::test]
+async fn initialize_counts_add_up_to_every_tool() {
+    let i = demo().await;
+    let mcp = McpServer::new(i, agent(), false).with_profile("governance").unwrap();
+    let init = mcp.handle(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })).await.unwrap();
+    let text = init["result"]["instructions"].as_str().unwrap().to_string();
+    let all = tool_actions();
+    let offered = listed(&mcp).await.len();
+    let withheld = all.iter().filter(|t| !profile_offers("governance", t.0)).count();
+    let hidden = all.iter().filter(|t| profile_offers("governance", t.0) && t.2).count();
+    assert!(hidden > 0, "governance offers write tools");
+    assert_eq!(offered + withheld + hidden, all.len());
+    assert!(text.contains(&format!("{offered} of {} tools offered", all.len())), "{text}");
+    assert!(text.contains(&format!("{hidden} write tools hidden by allow_writes = false")), "{text}");
+}
