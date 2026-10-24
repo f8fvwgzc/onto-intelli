@@ -697,8 +697,12 @@ impl Schema {
                         rule.name
                     )));
                 }
-                crate::reason::compile_rule(self, &vocab, rule)
-                    .map_err(|e| Error::Config(format!("rule {}: {e}", rule.name)))?;
+                // A term the reasoner cannot spell (a head relation named like a
+                // keyword) is not a schema error: the reasoner refuses the rule
+                // and reports it, as it does for a chain rule's `infer`.
+                if let Err(crate::reason::CompileError::Invalid(e)) = crate::reason::compile_rule(self, &vocab, rule) {
+                    return Err(Error::Config(format!("rule {}: {e}", rule.name)));
+                }
                 continue;
             }
             if rule.chain.is_empty() {

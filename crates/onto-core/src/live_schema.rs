@@ -736,7 +736,15 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
                 }
             }
             let (old_path, new_path) = (format!("prop.{from}"), format!("prop.{to}"));
-            for sh in s.shapes.values_mut().filter(|sh| sh.target.as_ref().is_some_and(|t| kinds.contains(t))) {
+            // When no other type or interface still declares the old name, every
+            // reader of it meant this property and follows the rename.
+            let still_declared = s.object_types.values().any(|t| t.properties.contains_key(from))
+                || s.interfaces.values().any(|i| i.properties.contains_key(from));
+            for r in &mut s.rules {
+                rename_prop_atoms(r, &kinds, still_declared, &old_path, &new_path);
+            }
+            let ours = |sh: &Shape| !still_declared || sh.target.as_ref().is_some_and(|t| kinds.contains(t));
+            for sh in s.shapes.values_mut().filter(|sh| ours(sh)) {
                 for p in sh.properties.iter_mut().filter(|p| p.path == old_path) {
                     p.path = new_path.clone();
                 }
@@ -856,6 +864,28 @@ fn glossary_map(s: &mut Schema, section: GlossarySection) -> &mut BTreeMap<Strin
     }
 }
 
+/// Rename `prop.<from>` atoms of a Horn rule's body to `new_pred` where they
+/// read a property of one of `kinds`: the subject is typed as one of them in
+/// the body (`[?v, "a", kind]`) or is an id of one of them. With
+/// `still_declared` false no other type declares the old name, so every
+/// `old_pred` atom is renamed. Heads cannot hold property atoms.
+fn rename_prop_atoms(r: &mut Rule, kinds: &[String], still_declared: bool, old_pred: &str, new_pred: &str) {
+    let typed: BTreeSet<String> = r
+        .when
+        .iter()
+        .filter(|a| a.len() == 3 && a[1].as_str() == Some("a"))
+        .filter(|a| a[2].as_str().is_some_and(|k| kinds.iter().any(|x| x == k)))
+        .filter_map(|a| a[0].as_str().map(str::to_string))
+        .collect();
+    for atom in r.when.iter_mut().filter(|a| a.len() == 3 && a[1].as_str() == Some(old_pred)) {
+        let subject = atom[0].as_str().unwrap_or_default();
+        let of_kind = subject.split_once(':').is_some_and(|(k, _)| kinds.iter().any(|x| x == k));
+        if !still_declared || typed.contains(subject) || of_kind {
+            atom[1] = Value::String(new_pred.to_string());
+        }
+    }
+}
+
 /// Point every reference to kind `from` at `to`.
 fn rewrite_kind(s: &mut Schema, from: &str, to: &str) {
     let swap = |v: &mut String| {
@@ -899,10 +929,32 @@ fn rewrite_kind(s: &mut Schema, from: &str, to: &str) {
             *v = Value::String(to.to_string());
         }
     };
+    // Entities of the renamed kind move from `from:<key>` to `to:<key>`, so
+    // rules and shapes that name one by id follow it.
+    let prefix = format!("{from}:");
+    let swap_id = |v: &mut String| {
+        if let Some(key) = v.strip_prefix(&prefix) {
+            *v = format!("{to}:{key}");
+        }
+    };
+    let swap_id_value = |v: &mut Value| {
+        if let Value::String(id) = v {
+            swap_id(id);
+        }
+    };
     for r in &mut s.rules {
         for atom in r.when.iter_mut().chain(std::iter::once(&mut r.then)) {
-            if atom.len() == 3 && atom[1].as_str() == Some("a") {
+            if atom.len() != 3 {
+                continue;
+            }
+            let pred = atom[1].as_str().unwrap_or_default();
+            let literal_object = pred == "a" || pred == "state" || pred.starts_with("prop.");
+            if pred == "a" {
                 swap_value(&mut atom[2]);
+            }
+            swap_id_value(&mut atom[0]);
+            if !literal_object {
+                swap_id_value(&mut atom[2]);
             }
         }
     }
@@ -910,9 +962,15 @@ fn rewrite_kind(s: &mut Schema, from: &str, to: &str) {
         if let Some(t) = &mut sh.target {
             swap(t);
         }
+        sh.target_ids.iter_mut().for_each(swap_id);
         for p in &mut sh.properties {
             if let Some(c) = &mut p.class {
                 swap(c);
+            }
+            if matches!(ShapePath::parse(&p.path), ShapePath::Relations(_))
+                && let Some(v) = &mut p.has_value
+            {
+                swap_id_value(v);
             }
         }
     }
@@ -1870,6 +1928,19 @@ pub(crate) fn plan(base: &Schema, base_version: u64, g: &Graph, set: &SchemaChan
                             "{n} entities move their {object_type}.{from} values to {to}; callers must use the new name"
                         ),
                     );
+                }
+                // Rules whose subject the rename could not tie to the renamed
+                // type keep reading the old name (another type declares it).
+                let old_pred = format!("prop.{from}");
+                for r in new
+                    .rules
+                    .iter()
+                    .filter(|r| r.when.iter().any(|a| a.get(1).and_then(Value::as_str) == Some(&old_pred)))
+                {
+                    warnings.push(format!(
+                        "rule {} still reads {old_pred}, which {object_type} entities no longer carry; edit it if it meant {object_type}.{from}",
+                        r.name
+                    ));
                 }
             }
             SchemaChange::RenameLinkType { from, to } => {

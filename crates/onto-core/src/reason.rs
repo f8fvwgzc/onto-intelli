@@ -95,7 +95,7 @@ const BINDING_MEANS: &str = "A digest binds a certificate to bytes, not to a sta
 
 /// Refusals listed (all of them are counted).
 const MAX_REFUSALS_LISTED: usize = 20;
-/// Distinct bindings a query collects before sorting and cutting to its limit.
+/// Matches a query scans before it stops; an answer cut there says so.
 const QUERY_SCAN_CAP: usize = 100_000;
 /// Closures kept per ontology.
 const CACHE_SIZE: usize = 4;
@@ -291,17 +291,64 @@ fn shown(t: &str) -> String {
 
 // ── rule compilation ─────────────────────────────────────────────────────
 
+/// Why a rule or an atom did not compile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompileError {
+    /// The rule is wrong: schema compile rejects it.
+    Invalid(String),
+    /// The rule is well formed but names a term that cannot be spelled (a
+    /// reserved keyword, an unsafe character). Schema compile accepts it; the
+    /// reasoner refuses it and reports it under `refused`.
+    Refused(String),
+}
+
+impl CompileError {
+    fn context(self, at: impl fmt::Display) -> Self {
+        match self {
+            CompileError::Invalid(m) => CompileError::Invalid(format!("{at}: {m}")),
+            CompileError::Refused(m) => CompileError::Refused(format!("{at}: {m}")),
+        }
+    }
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompileError::Invalid(m) | CompileError::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for CompileError {
+    fn from(m: String) -> Self {
+        CompileError::Invalid(m)
+    }
+}
+
+impl From<&str> for CompileError {
+    fn from(m: &str) -> Self {
+        CompileError::Invalid(m.to_string())
+    }
+}
+
+type Compiled<T> = std::result::Result<T, CompileError>;
+
+/// A spelling failure is a refusal, not a schema error.
+fn spelled(r: std::result::Result<String, String>) -> Compiled<String> {
+    r.map_err(CompileError::Refused)
+}
+
 fn is_var(t: &str) -> bool {
     t.strip_prefix('?').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
-fn var_of(v: &Value) -> std::result::Result<Option<String>, String> {
+fn var_of(v: &Value) -> Compiled<Option<String>> {
     match v.as_str() {
         Some(s) if s.starts_with('?') => {
             if is_var(s) {
                 Ok(Some(s.to_string()))
             } else {
-                Err(format!("bad variable {s:?} (use ?name with letters, digits and _)"))
+                Err(format!("bad variable {s:?} (use ?name with letters, digits and _)").into())
             }
         }
         _ => Ok(None),
@@ -309,30 +356,25 @@ fn var_of(v: &Value) -> std::result::Result<Option<String>, String> {
 }
 
 /// A subject or a relation's object: a variable or an entity id.
-fn node_term(v: &Value, what: &str) -> std::result::Result<String, String> {
+fn node_term(v: &Value, what: &str) -> Compiled<String> {
     if let Some(var) = var_of(v)? {
         return Ok(var);
     }
     match v.as_str() {
-        Some(id) if id.contains(':') => spell_entity(id),
-        _ => Err(format!("{what} must be a ?variable or an entity id (kind:key), got {v}")),
+        Some(id) if id.contains(':') => spelled(spell_entity(id)),
+        _ => Err(format!("{what} must be a ?variable or an entity id (kind:key), got {v}").into()),
     }
 }
 
 /// Compile one `[subject, predicate, object]` atom of a rule, a rule head
 /// (`head`) or a query into spelled terms. Inverse relation names and `^rel`
 /// become the canonical relation with subject and object swapped.
-pub fn compile_atom(
-    schema: &Schema,
-    vocab: &Vocabulary,
-    atom: &[Value],
-    head: bool,
-) -> std::result::Result<[String; 3], String> {
+pub fn compile_atom(schema: &Schema, vocab: &Vocabulary, atom: &[Value], head: bool) -> Compiled<[String; 3]> {
     if atom.len() != 3 {
-        return Err(format!("an atom has three parts [subject, predicate, object], got {}", atom.len()));
+        return Err(format!("an atom has three parts [subject, predicate, object], got {}", atom.len()).into());
     }
     let Some(pred) = atom[1].as_str() else {
-        return Err(format!("predicate must be a string, got {}", atom[1]));
+        return Err(format!("predicate must be a string, got {}", atom[1]).into());
     };
     let subject = node_term(&atom[0], "subject")?;
     if pred.starts_with('?') {
@@ -347,16 +389,16 @@ pub fn compile_atom(
             return Ok([subject, "a".into(), var]);
         }
         let Some(class) = atom[2].as_str() else {
-            return Err(format!("the object of a must be a class name, got {}", atom[2]));
+            return Err(format!("the object of a must be a class name, got {}", atom[2]).into());
         };
         if head {
             if !valid_name(class) {
-                return Err(format!("derived class name '{class}' must match [a-z][a-z0-9_]*"));
+                return Err(format!("derived class name '{class}' must match [a-z][a-z0-9_]*").into());
             }
         } else if !schema.is_type_or_interface(class) && !vocab.classes.contains(class) {
-            return Err(format!("unknown class {class} (not a kind, an interface or a class a rule derives)"));
+            return Err(format!("unknown class {class} (not a kind, an interface or a class a rule derives)").into());
         }
-        return Ok([subject, "a".into(), spell_class(class)?]);
+        return Ok([subject, "a".into(), spelled(spell_class(class))?]);
     }
     if pred == "state" || pred.starts_with("prop.") {
         if head {
@@ -369,15 +411,15 @@ pub fn compile_atom(
             let known = schema.object_types.values().any(|t| t.properties.contains_key(name))
                 || schema.interfaces.values().any(|i| i.properties.contains_key(name));
             if !known {
-                return Err(format!("unknown property {name}"));
+                return Err(format!("unknown property {name}").into());
             }
-            spell_prop(name)?
+            spelled(spell_prop(name))?
         };
         let o = match var_of(&atom[2])? {
             Some(var) => var,
             None => match &atom[2] {
                 v @ (Value::String(_) | Value::Number(_) | Value::Bool(_)) => spell_literal(v),
-                v => return Err(format!("the value of {pred} must be a ?variable or a scalar, got {v}")),
+                v => return Err(format!("the value of {pred} must be a ?variable or a scalar, got {v}").into()),
             },
         };
         return Ok([subject, p, o]);
@@ -390,21 +432,24 @@ pub fn compile_atom(
             if vocab.relations.contains(name) {
                 (name.to_string(), name != pred)
             } else {
-                return Err(format!("unknown relation {pred}"));
+                return Err(format!("unknown relation {pred}").into());
             }
         }
     };
     if head && !schema.link_types.contains_key(&base) && !valid_name(&base) {
-        return Err(format!("derived relation name '{base}' must match [a-z][a-z0-9_]*"));
+        return Err(format!("derived relation name '{base}' must match [a-z][a-z0-9_]*").into());
     }
-    let base = spell_relation(&base)?;
+    let base = spelled(spell_relation(&base))?;
     Ok(if swap { [object, base, subject] } else { [subject, base, object] })
 }
 
 /// Compile a schema rule (either form) to its rule line `schema/<name>`.
-pub fn compile_rule(schema: &Schema, vocab: &Vocabulary, rule: &Rule) -> std::result::Result<RuleLine, String> {
+/// [`CompileError::Invalid`] is a schema error; [`CompileError::Refused`]
+/// means the rule is well formed but the reasoner cannot spell one of its
+/// terms (for example a head relation named like a keyword).
+pub fn compile_rule(schema: &Schema, vocab: &Vocabulary, rule: &Rule) -> Compiled<RuleLine> {
     if let Some(why) = unsafe_text(&rule.name) {
-        return Err(format!("rule name {why}"));
+        return Err(CompileError::Refused(format!("rule name {why}")));
     }
     let name = format!("{SUPPLIED_PREFIX}{}", rule.name);
     if rule.is_horn() {
@@ -416,12 +461,12 @@ pub fn compile_rule(schema: &Schema, vocab: &Vocabulary, rule: &Rule) -> std::re
         }
         let mut body = Vec::with_capacity(rule.when.len());
         for (i, atom) in rule.when.iter().enumerate() {
-            body.push(compile_atom(schema, vocab, atom, false).map_err(|e| format!("when[{i}]: {e}"))?);
+            body.push(compile_atom(schema, vocab, atom, false).map_err(|e| e.context(format_args!("when[{i}]")))?);
         }
-        let head = compile_atom(schema, vocab, &rule.then, true).map_err(|e| format!("then: {e}"))?;
+        let head = compile_atom(schema, vocab, &rule.then, true).map_err(|e| e.context("then"))?;
         let bound: BTreeSet<&str> = body.iter().flatten().map(String::as_str).filter(|t| is_var(t)).collect();
         if let Some(v) = head.iter().find(|t| is_var(t) && !bound.contains(t.as_str())) {
-            return Err(format!("head variable {v} does not occur in when"));
+            return Err(format!("head variable {v} does not occur in when").into());
         }
         return Ok(RuleLine { name, head, body });
     }
@@ -436,19 +481,23 @@ pub fn compile_rule(schema: &Schema, vocab: &Vocabulary, rule: &Rule) -> std::re
             None => {
                 let name = step.strip_prefix('^').unwrap_or(step);
                 if !vocab.relations.contains(name) {
-                    return Err(format!("unknown relation {step}"));
+                    return Err(format!("unknown relation {step}").into());
                 }
                 (name.to_string(), if name == step { Dir::Out } else { Dir::In })
             }
         };
-        let base = spell_relation(&base)?;
+        let base = spelled(spell_relation(&base))?;
         body.push(if dir == Dir::In { [var(i + 1), base, var(i)] } else { [var(i), base, var(i + 1)] });
     }
     let n = rule.chain.len();
     let head = match schema.resolve_rel(&rule.infer) {
-        Some((base, Dir::In)) => [var(n), spell_relation(&base)?, var(0)],
-        Some((base, _)) => [var(0), spell_relation(&base)?, var(n)],
-        None => [var(0), spell_relation(rule.infer.trim_start_matches('^'))?, var(n)],
+        Some((base, Dir::In)) => [var(n), spelled(spell_relation(&base))?, var(0)],
+        Some((base, _)) => [var(0), spelled(spell_relation(&base))?, var(n)],
+        // A derived relation: `^foo` derives foo from the end back to the start.
+        None => match rule.infer.strip_prefix('^') {
+            Some(base) => [var(n), spelled(spell_relation(base))?, var(0)],
+            None => [var(0), spelled(spell_relation(&rule.infer))?, var(n)],
+        },
     };
     Ok(RuleLine { name, head, body })
 }
@@ -1268,8 +1317,46 @@ impl Closure {
     }
 
     /// Basic graph pattern matching over the closure: every binding of the
-    /// atoms' variables (without `?`), sorted, at most `limit`.
+    /// atoms' variables (without `?`), sorted, at most `limit`. A query whose
+    /// matches exceed the scan cap returns the smallest bindings among those
+    /// scanned; [`Closure::query_answer`] reports that cut.
     pub fn query(&self, atoms: &[AtomPattern], limit: usize) -> Vec<Binding> {
+        self.scan(atoms, limit).0
+    }
+
+    /// [`Closure::query`] with the closure's flags, refusing atoms that read
+    /// facts the closure does not hold: `state` and `prop.<name>` facts are
+    /// collected only when some rule reads them, so such an atom would answer
+    /// "nothing matches" for values the store has.
+    pub fn query_answer(&self, atoms: &[AtomPattern], limit: usize) -> Result<QueryAnswer> {
+        let need = needs(&self.rules);
+        for (i, a) in atoms.iter().enumerate() {
+            let held = match a.p.as_str() {
+                "state" => need.state,
+                p => p.strip_prefix("prop.").is_none_or(|name| need.props.contains(name)),
+            };
+            if !held {
+                return Err(Error::invalid(format!(
+                    "atom {i}: the closure holds no {} facts because no rule reads them; read property values from the store",
+                    a.p
+                )));
+            }
+        }
+        let (bindings, cut) = self.scan(atoms, limit);
+        let mut truncated = self.stats.truncated.clone();
+        if cut {
+            let note =
+                format!("query stopped after {QUERY_SCAN_CAP} matches; bindings are the smallest of those scanned");
+            truncated = Some(match truncated {
+                Some(t) => format!("{t}; {note}"),
+                None => note,
+            });
+        }
+        Ok(QueryAnswer { bindings, fixpoint_reached: self.stats.fixpoint_reached, truncated })
+    }
+
+    /// The `limit` smallest bindings, and whether the scan hit its cap.
+    fn scan(&self, atoms: &[AtomPattern], limit: usize) -> (Vec<Binding>, bool) {
         let mut vars = Vec::new();
         let mut body = Vec::with_capacity(atoms.len());
         for a in atoms {
@@ -1278,28 +1365,39 @@ impl Closure {
             match compile_terms(&triple, &mut vars, &mut lookup) {
                 Some(t) => body.push(t),
                 // A constant the closure never mentions matches nothing.
-                None => return Vec::new(),
+                None => return (Vec::new(), false),
             }
         }
         if body.is_empty() || limit == 0 {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let order = plan_order(&body, None, vars.len());
         let all = self.ix.facts.len() as u32;
         let join = Join { ix: &self.ix, atoms: &body, order: &order, first: (0, all), rest: (0, all) };
+        // Keep only the `limit` smallest, so the answer does not depend on
+        // the join order.
         let mut found: BTreeSet<Binding> = BTreeSet::new();
+        let (mut scanned, mut cut) = (0usize, false);
         let mut binds = vec![None; vars.len()];
         let mut matched = vec![0u32; body.len()];
         join.run(0, &mut binds, &mut matched, &mut |b, _| {
+            if scanned == QUERY_SCAN_CAP {
+                cut = true;
+                return false;
+            }
+            scanned += 1;
             let binding: Binding = vars
                 .iter()
                 .zip(b)
                 .filter_map(|(v, t)| Some((v[1..].to_string(), self.terms.terms[(*t)? as usize].clone())))
                 .collect();
             found.insert(binding);
-            found.len() < QUERY_SCAN_CAP
+            if found.len() > limit {
+                found.pop_last();
+            }
+            true
         });
-        found.into_iter().take(limit).collect()
+        (found.into_iter().collect(), cut)
     }
 
     /// The certificate of this closure. Refused when any term or rule was
@@ -1513,13 +1611,7 @@ impl Ontology {
         limit: usize,
     ) -> Result<QueryAnswer> {
         let patterns = parse_atoms(&self.schema(), atoms)?;
-        let c = self.reason(p, opts)?;
-        let s = c.stats();
-        Ok(QueryAnswer {
-            bindings: c.query(&patterns, limit),
-            fixpoint_reached: s.fixpoint_reached,
-            truncated: s.truncated,
-        })
+        self.reason(p, opts)?.query_answer(&patterns, limit)
     }
 
     pub fn reason_stats(&self, p: &Principal, opts: &ReasonOptions) -> Result<ReasonStats> {
@@ -1754,5 +1846,138 @@ mod tests {
         assert_eq!(c.stats().instances, Some(2));
         let plain = closure(&s, &g, &ReasonOptions::default(), &all);
         assert!(plain.instances_of(&ad).is_empty());
+    }
+
+    #[test]
+    fn query_answers_are_the_sorted_first_bindings() {
+        let s = schema();
+        let atoms = parse_atoms(
+            &s,
+            &[vec![json!("?y"), json!("a"), json!("node")], vec![json!("?x"), json!("a"), json!("node")]],
+        )
+        .unwrap();
+        let graph = |n: usize| {
+            let mut g = Graph::default();
+            for i in 0..n {
+                g.put_entity(entity(&format!("node:{i:03}"), "acme"));
+            }
+            g
+        };
+        // 200 * 200 matches: under the scan cap, so the answer is exact.
+        let c = closure(&s, &graph(200), &ReasonOptions::default(), &all);
+        let a = c.query_answer(&atoms, 300).unwrap();
+        assert_eq!(a.truncated, None);
+        assert_eq!(a.bindings.len(), 300);
+        assert_eq!(a.bindings[250]["x"], "<node:001>");
+        assert_eq!(a.bindings[250]["y"], "<node:050>");
+        assert!(a.bindings.windows(2).all(|w| w[0] < w[1]));
+        // 400 * 400 matches pass the cap: the answer says it was cut.
+        let c = closure(&s, &graph(400), &ReasonOptions::default(), &all);
+        let a = c.query_answer(&atoms, 300).unwrap();
+        assert!(a.fixpoint_reached);
+        assert!(a.truncated.as_deref().is_some_and(|t| t.contains("query stopped after 100000")), "{:?}", a.truncated);
+        assert_eq!(a.bindings.len(), 300);
+    }
+
+    #[test]
+    fn queries_refuse_property_facts_no_rule_reads() {
+        let s = Schema::from_toml(
+            r#"
+            [object_types.node.properties.tier]
+            type = "string"
+            [object_types.node.properties.size]
+            type = "string"
+            [[rules]]
+            name = "big"
+            when = [["?n", "prop.size", "big"]]
+            then = ["?n", "a", "big_node"]
+            "#,
+        )
+        .unwrap();
+        let mut e = entity("node:a", "acme");
+        e.state = Some("open".into());
+        e.props.insert("tier".into(), json!("gold"));
+        e.props.insert("size".into(), json!("big"));
+        let mut g = Graph::default();
+        g.put_entity(e);
+        let c = closure(&s, &g, &ReasonOptions::default(), &all);
+        for atom in
+            [vec![json!("?n"), json!("state"), json!("open")], vec![json!("?n"), json!("prop.tier"), json!("gold")]]
+        {
+            let p = parse_atoms(&s, &[atom]).unwrap();
+            let err = c.query_answer(&p, 10).unwrap_err().to_string();
+            assert!(err.contains("no rule reads them"), "{err}");
+        }
+        let read = parse_atoms(&s, &[vec![json!("?n"), json!("prop.size"), json!("big")]]).unwrap();
+        assert_eq!(c.query_answer(&read, 10).unwrap().bindings.len(), 1);
+    }
+
+    #[test]
+    fn chain_infer_with_caret_swaps_the_head() {
+        let s = Schema::from_toml(
+            r#"
+            [object_types.node]
+            [link_types.r]
+            [link_types.q]
+            [[rules]]
+            name = "d"
+            chain = ["r"]
+            infer = "foo"
+            [[rules]]
+            name = "e"
+            chain = ["r"]
+            infer = "^foo"
+            [[rules]]
+            name = "f"
+            chain = ["r"]
+            infer = "^q"
+            "#,
+        )
+        .unwrap();
+        let (lines, refused) = rule_table(&s);
+        assert!(refused.is_empty(), "{refused:?}");
+        let tsv: Vec<String> = lines.iter().filter(|l| !l.is_builtin()).map(RuleLine::tsv).collect();
+        assert_eq!(
+            tsv,
+            vec![
+                "schema/d\t?x0\tfoo\t?x1\t?x0\tr\t?x1",
+                "schema/e\t?x1\tfoo\t?x0\t?x0\tr\t?x1",
+                "schema/f\t?x1\tq\t?x0\t?x0\tr\t?x1",
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_heads_compile_and_are_refused_by_the_reasoner() {
+        let s = Schema::from_toml(
+            r#"
+            [object_types.node]
+            [link_types.r]
+            [[rules]]
+            name = "h"
+            when = [["?x", "r", "?y"]]
+            then = ["?x", "implements", "?y"]
+            [[rules]]
+            name = "c"
+            chain = ["r"]
+            infer = "implements"
+            "#,
+        )
+        .expect("a keyword head is the reasoner's refusal, not a schema error");
+        let (lines, refused) = rule_table(&s);
+        assert_eq!(lines.len(), builtin_rules().len());
+        let reasons: Vec<&str> = refused.iter().map(|r| r.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "rule h: then: relation name 'implements' is a reserved keyword",
+                "rule c: relation name 'implements' is a reserved keyword",
+            ]
+        );
+        // A malformed rule is still a schema error.
+        let err = Schema::from_toml("[[rules]]\nname = 'b'\nwhen = [['?x', 'a', 'nope']]\nthen = ['?x', 'a', 'y']")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rule b: when[0]: unknown class nope"), "{err}");
     }
 }

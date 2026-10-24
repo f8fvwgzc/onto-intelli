@@ -532,6 +532,96 @@ fn renames_reach_horn_rules_and_shapes() {
 }
 
 #[test]
+fn property_renames_reach_horn_rules() {
+    let (o, ctx) = world();
+    let grade = json!({ "type": "string" });
+    let add = set(json!({ "changes": [
+        { "op": "put_object_type", "name": "vendor", "def": { "properties": { "grade": grade } } },
+        { "op": "put_object_type", "name": "partner", "def": { "properties": { "grade": grade } } },
+        { "op": "put_rule", "def": { "name": "gold",
+            "when": [["?v", "a", "vendor"], ["?v", "prop.grade", "gold"]], "then": ["?v", "a", "gold_vendor"] } },
+        { "op": "put_rule", "def": { "name": "graded",
+            "when": [["?x", "prop.grade", "gold"]], "then": ["?x", "a", "graded"] } }
+    ] }));
+    o.schema_apply(&ctx, add).unwrap();
+    o.apply(&ctx, vec![Mutation::Upsert(EntityInput::new("vendor", "v1", "Vendor One").prop("grade", "gold"))])
+        .unwrap();
+    let gold = f("<vendor:v1>", "a", "#gold_vendor");
+    assert!(o.reason(&admin(), &acme()).unwrap().contains(&gold).is_some());
+
+    // partner still declares grade: the rule typed as vendor follows the
+    // rename, the untyped one stays and the plan warns about it.
+    let rename = set(json!({ "changes": [
+        { "op": "rename_property", "object_type": "vendor", "from": "grade", "to": "level" }
+    ] }));
+    let plan = o.schema_plan(&admin(), &rename).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+    assert!(plan.warnings.iter().any(|w| w.starts_with("rule graded still reads prop.grade")), "{:?}", plan.warnings);
+    o.schema_apply(&ctx, rename).unwrap();
+    let s = o.schema();
+    let rule = |name: &str| s.rules.iter().find(|r| r.name == name).unwrap().when.clone();
+    assert_eq!(rule("gold")[1], vec![json!("?v"), json!("prop.level"), json!("gold")]);
+    assert_eq!(rule("graded")[0], vec![json!("?x"), json!("prop.grade"), json!("gold")]);
+    assert_eq!(derived_by(&o.reason(&admin(), &acme()).unwrap(), &gold), "schema/gold");
+
+    // No other declaration remains: every reader of the old name follows.
+    let rename = set(json!({ "changes": [
+        { "op": "rename_property", "object_type": "partner", "from": "grade", "to": "rank" }
+    ] }));
+    let plan = o.schema_plan(&admin(), &rename).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+    o.schema_apply(&ctx, rename).unwrap();
+    let s = o.schema();
+    let graded = &s.rules.iter().find(|r| r.name == "graded").unwrap().when;
+    assert_eq!(graded[0], vec![json!("?x"), json!("prop.rank"), json!("gold")]);
+}
+
+#[test]
+fn kind_renames_move_entity_ids_in_rules_and_shapes() {
+    let (o, ctx) = world();
+    let add = set(json!({ "changes": [
+        { "op": "put_rule", "def": { "name": "watched",
+            "when": [["?i", "a", "issue"], ["?i", "affects", "service:api"]], "then": ["?i", "a", "watched"] } },
+        { "op": "put_shape", "name": "api", "def": { "target_ids": ["service:api"],
+            "properties": [{ "path": "title", "min_count": 1 }] } }
+    ] }));
+    o.schema_apply(&ctx, add).unwrap();
+    let watched = f("<issue:1>", "a", "#watched");
+    assert_eq!(derived_by(&o.reason(&admin(), &acme()).unwrap(), &watched), "schema/watched");
+    let rename = set(json!({ "changes": [{ "op": "rename_object_type", "from": "service", "to": "component" }] }));
+    let plan = o.schema_plan(&admin(), &rename).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+    o.schema_apply(&ctx, rename).unwrap();
+    let s = o.schema();
+    let r = s.rules.iter().find(|r| r.name == "watched").unwrap();
+    assert_eq!(r.when[1], vec![json!("?i"), json!("affects"), json!("component:api")]);
+    assert_eq!(s.shapes["api"].target_ids, vec!["component:api".to_string()]);
+    assert_eq!(derived_by(&o.reason(&admin(), &acme()).unwrap(), &watched), "schema/watched");
+}
+
+#[test]
+fn queries_refuse_state_and_property_atoms_no_rule_reads() {
+    let o = Ontology::in_memory(Schema::enterprise());
+    let ctx = ActionContext::new(admin(), "acme");
+    o.apply(
+        &ctx,
+        vec![Mutation::Upsert(EntityInput::new("issue", "1", "Timeout").state("triaged").prop("priority", "high"))],
+    )
+    .unwrap();
+    for atom in [json!(["?i", "state", "triaged"]), json!(["?i", "prop.priority", "high"])] {
+        let atoms: Vec<Vec<Value>> = vec![serde_json::from_value(atom).unwrap()];
+        let err = o.reason_query(&admin(), &acme(), &atoms, 10).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("no rule reads them"), "{err}");
+    }
+    // With a rule that reads them (the world schema), the same atoms answer.
+    let (o, _) = world();
+    let atoms = vec![vec![json!("?i"), json!("state"), json!("triaged")]];
+    let a = o.reason_query(&admin(), &acme(), &atoms, 10).unwrap();
+    assert!(a.bindings.iter().any(|b| b["i"] == "<issue:1>"), "{a:?}");
+}
+
+#[test]
 fn horn_rules_are_validated_when_put_live() {
     let (o, ctx) = world();
     let plan_of =
