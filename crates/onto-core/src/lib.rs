@@ -23,6 +23,7 @@ pub mod engine;
 pub mod error;
 pub mod execution;
 pub mod experts;
+pub mod explain;
 pub mod explorer;
 pub mod export;
 pub mod graph;
@@ -53,6 +54,7 @@ pub use engine::{
     SearchHit, SearchMode, SyncReport,
 };
 pub use error::{Error, Result};
+pub use explain::{Claim, ClaimVerdict, Justifications, SliceReport, VerifyReport};
 pub use live_schema::{
     Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
     SchemaVersion, SchemaVersionInfo,
