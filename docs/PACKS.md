@@ -47,8 +47,10 @@ saas           1.0.0    SaaS: product, customers, subscriptions and support 66 c
     software · 10 object types, 16 link types, 6 rules, 5 shapes, 4 metrics, 3 actions, 41 sample entities · borrows from organization and offer vocabulary inspired by schema.org (Organization, Offer, SoftwareApplication), support ticket terms inspired by ITIL 4 incident and service request management, feature flag terms inspired by the OpenFeature specification, survey categories borrowed from the Net Promoter Score method (promoter 9-10, passive 7-8, detractor 0-6)
 ```
 
-`onto pack show <id>` lists everything a pack defines, with the lint findings
-of the schema it would produce:
+`onto pack show <id>` lists everything a pack defines, with the pack's own
+lint findings: those of the pack on the packages it requires that those
+packages do not already have (for manufacturing, the recursive multi-level
+BOM rule):
 
 ```text
 $ onto pack show manufacturing
@@ -66,7 +68,7 @@ Rules (supplied: assumptions, not facts)
   critical_quality_exposure    ?p has_critical_ncr ?n <= ?n a nonconformance, ?n prop.severity critical, ?n raised_against ?lot, ?lot lot_of_part ?p (horn)
 …
 sample: production_order:po-1004 is planned but not yet scheduled on a line or work center: the one deliberate violation (shape production_order_shape, min_count 1 on scheduled_on). Everything else in the sample conforms.
-Lint (layered on the current schema): 0 errors, 7 warnings, 16 info · a measurement
+Lint (the pack's own findings): 0 errors, 0 warnings, 1 info · a measurement
 …
 ```
 
@@ -81,7 +83,7 @@ non-breaking on schema v1 · 0 entities · 0 links in scope
   · add object type bill_of_material (0 entities, 0 links)
 …
   risk low
-  consequences: +4 derived, -0 removed · conservative
+  consequences: +4 asserted, -0 removed · conservative
       asserted 4
       + #production_line implements #plant_floor_asset
       + #work_center implements #plant_floor_asset
@@ -99,7 +101,7 @@ change. An agent always proposes. Installing again changes nothing:
 $ onto pack install manufacturing
 installed manufacturing 1.0.0 already: nothing to change
 $ onto pack install telecom --propose --message "network operations want alarms in the ontology"
-proposed telecom 1.0.0 66 schema changes · proposal prop_1a16ddbfa940000033484 (review with `onto schema proposal prop_1a16ddbfa940000033484`)
+proposed telecom 1.0.0 66 schema changes · proposal prop_1a16e22845c0000031474 (review with `onto schema proposal prop_1a16e22845c0000031474`)
 ```
 
 A pack is also a built-in schema package, so a configuration can load it at
@@ -116,11 +118,10 @@ The same operations are the actions `pack.list`, `pack.show`, `pack.plan` and
 `list_packs`, `show_pack`, `plan_pack` and `install_pack` (a proposal), and the
 **Packs** tab of the web UI's Assurance area.
 
-Samples use fixed entity ids. Two samples share one id: `person:raj-patel`
-is in both the retail and the insurance sample, so loading both samples into
-different workspaces of one database fails on the second (the schema change
-is rolled back with it). Load them into the same workspace, or into separate
-databases.
+Samples use fixed entity ids, and no two samples share one, so every sample
+loads into a workspace of its own in one database: the outputs below come
+from installing the packs one after another, each with its sample in its own
+workspace (`-w pk-<pack>`).
 
 ## The packs
 
@@ -648,14 +649,14 @@ Derived classes: `claim_on_lapsed_policy`, `duplicate_item_claim`, `excluded_per
 | `refer_claim_to_investigation` | medium | any writer | Refer an open claim to the special investigations unit. |
 | `settle_claim` | high | claims_handler, admin | Pay an approved claim and release its reserve. |
 
-**The deliberate violation.** claim:clm-20260006 was taken by phone without a loss date: the one deliberate violation (shape claim_complete, constraint claim_complete/loss_date, min_count 1 on prop.loss_date). Everything else in the sample conforms. Installed with its sample into a workspace of its own, on a database without the retail sample (see the note on shared sample ids above):
+**The deliberate violation.** claim:clm-20260006 was taken by phone without a loss date: the one deliberate violation (shape claim_complete, constraint claim_complete/loss_date, min_count 1 on prop.loss_date). Everything else in the sample conforms. Installed with its sample into a workspace of its own:
 
 ```text
 $ onto -w pk-insurance pack install insurance --sample
-installed insurance 1.0.0 66 schema changes · schema v2
+installed insurance 1.0.0 66 schema changes · schema v9
   sample: 37 entities, 84 links
 $ onto -w pk-insurance reason run --samples 0
-17 facts derived from 148 asserted (16 rules · 3 rounds · fixpoint reached)
+17 facts derived from 176 asserted (52 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-insurance shapes validate
 violates 17 focus nodes · 1 violations, 0 warnings, 0 info
@@ -730,10 +731,10 @@ Derived classes: `condition_related_outage`, `grid_asset_at_risk`, `outage_affec
 
 ```text
 $ onto -w pk-energy pack install energy --sample
-installed energy 1.0.0 69 schema changes · schema v9
+installed energy 1.0.0 69 schema changes · schema v10
   sample: 32 entities, 50 links
 $ onto -w pk-energy reason run --samples 0
-58 facts derived from 169 asserted (52 rules · 3 rounds · fixpoint reached)
+58 facts derived from 171 asserted (58 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-energy shapes validate
 violates 19 focus nodes · 1 violations, 0 warnings, 0 info
@@ -807,10 +808,10 @@ Derived classes: `sim_swap_risk`, `sla_breach_risk`. Derived relations: `alarm_a
 
 ```text
 $ onto -w pk-telecom pack install telecom --sample
-installed telecom 1.0.0 66 schema changes · schema v10
+installed telecom 1.0.0 66 schema changes · schema v11
   sample: 32 entities, 49 links
 $ onto -w pk-telecom reason run --samples 0
-39 facts derived from 173 asserted (58 rules · 4 rounds · fixpoint reached)
+39 facts derived from 175 asserted (64 rules · 4 rounds · fixpoint reached)
 …
 $ onto -w pk-telecom shapes validate
 violates 16 focus nodes · 1 violations, 0 warnings, 0 info
@@ -882,10 +883,10 @@ Derived classes: `churn_risk_account`, `detractor_account`, `payment_risk_accoun
 
 ```text
 $ onto -w pk-saas pack install saas --sample
-installed saas 1.0.0 66 schema changes · schema v11
+installed saas 1.0.0 66 schema changes · schema v12
   sample: 41 entities, 62 links
 $ onto -w pk-saas reason run --samples 0
-26 facts derived from 195 asserted (64 rules · 3 rounds · fixpoint reached)
+26 facts derived from 197 asserted (70 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-saas shapes validate
 violates 19 focus nodes · 1 violations, 0 warnings, 0 info
@@ -900,4 +901,3 @@ violates 19 focus nodes · 1 violations, 0 warnings, 0 info
 - support ticket terms inspired by ITIL 4 incident and service request management
 - feature flag terms inspired by the OpenFeature specification
 - survey categories borrowed from the Net Promoter Score method (promoter 9-10, passive 7-8, detractor 0-6)
-
