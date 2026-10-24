@@ -1307,6 +1307,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onto-cert"
+version = "0.2.0"
+dependencies = [
+ "fastrand",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "onto-control"
 version = "0.2.0"
 dependencies = [
