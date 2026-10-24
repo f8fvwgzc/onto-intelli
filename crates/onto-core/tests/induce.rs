@@ -651,3 +651,124 @@ fn postgres_ingest_survives_a_reopen() {
         o.events(&admin(), &EventFilter { action: Some("ingest.sheet".into()), ..Default::default() }).unwrap();
     assert_eq!(events.len(), 1);
 }
+
+#[test]
+fn ingest_never_writes_over_another_workspace() {
+    let (o, ctx) = world();
+    let csv = "order_id,total\no1,10\no2,12\n";
+    let ind = o.induce_sheet(&admin(), csv, &opts("orders.csv")).unwrap();
+    apply(&o, &ctx, &ind);
+    assert_eq!(o.ingest_sheet(&ctx, csv, &ind.mapping, false).unwrap().upserts, 2);
+    // The same mapping into globex, whose sheet reuses the key o1.
+    let globex = ActionContext::new(admin(), "globex");
+    let other = "order_id,total\no1,999\no9,5\n";
+    let dry = o.ingest_sheet(&globex, other, &ind.mapping, true).unwrap();
+    assert_eq!((dry.upserts, dry.findings.len()), (1, 1), "{:?}", dry.findings);
+    let out = o.ingest_sheet(&globex, other, &ind.mapping, false).unwrap();
+    assert_eq!(out.upserts, 1);
+    assert_eq!(out.findings.len(), 1, "{:?}", out.findings);
+    let f = &out.findings[0];
+    assert_eq!((f.issue, f.row, f.value.as_deref()), (FindingKind::OtherWorkspace, 1, Some("o1")));
+    assert!(!f.message.contains("acme"), "the other workspace is not named: {}", f.message);
+    let o1 = o.get(&admin(), "order:o1").unwrap();
+    assert_eq!((o1.workspace.as_str(), &o1.props["total"]), ("acme", &json!(10)));
+    assert_eq!(o.get(&admin(), "order:o9").unwrap().workspace, "globex");
+}
+
+#[test]
+fn without_a_workspace_targets_are_counted_per_workspace() {
+    let (o, ctx) = world();
+    // g1 is a globex customer: the link is induced for globex only, and the
+    // shape does not require it, since the ingest workspace is unknown.
+    let csv = "order_id,customer_id\no1,g1\no2,g1\n";
+    let file = InduceOptions { file: Some("orders.csv".into()), ..Default::default() };
+    let ind = o.induce_sheet(&admin(), csv, &file).unwrap();
+    assert_eq!(ind.links.len(), 1, "{:?}", ind.links);
+    assert_eq!(ind.links[0].workspace.as_deref(), Some("globex"));
+    assert_eq!((ind.links[0].matched, ind.links[0].filled), (2, 2));
+    let link_shape = ind.shape.properties.iter().find(|p| p.path == "customer").unwrap();
+    assert_eq!((link_shape.min_count, link_shape.max_count), (None, Some(1)));
+    assert!(
+        ind.warnings.iter().any(|w| w.contains("no workspace was given") && w.contains("globex")),
+        "{:?}",
+        ind.warnings
+    );
+    apply(&o, &ctx, &ind);
+    // Ingested into acme, no link is written, and the shape still holds.
+    let out = o.ingest_sheet(&ctx, csv, &ind.mapping, false).unwrap();
+    assert_eq!((out.upserts, out.links), (2, 0));
+    assert!(out.findings.iter().all(|f| f.issue == FindingKind::MissingTarget), "{:?}", out.findings);
+    assert_eq!(conforms(&o, &ind), Vec::<String>::new());
+    // Ingested into globex, every row is linked.
+    let globex = ActionContext::new(admin(), "globex");
+    let out = o.ingest_sheet(&globex, "order_id,customer_id\no3,g1\no4,g1\n", &ind.mapping, false).unwrap();
+    assert_eq!((out.upserts, out.links), (2, 2), "{:?}", out.findings);
+    assert_eq!(conforms(&o, &ind), Vec::<String>::new());
+
+    // Keys spread over workspaces: no ingest into one workspace links them all.
+    let spread = "sale_id,customer_id\ns1,c1\ns2,g1\n";
+    let ind =
+        o.induce_sheet(&admin(), spread, &InduceOptions { kind: Some("sale".into()), ..Default::default() }).unwrap();
+    assert!(ind.links.is_empty(), "{:?}", ind.links);
+    assert!(ind.warnings.iter().any(|w| w.contains("several workspaces")), "{:?}", ind.warnings);
+    // With the workspace given, the shape requires a link every row has.
+    let ind = o.induce_sheet(&admin(), "sale_id,customer_id\ns1,c1\ns2,c2\n", &opts("sales.csv")).unwrap();
+    assert_eq!(ind.links.len(), 1, "{:?}", ind.links);
+    let link_shape = ind.shape.properties.iter().find(|p| p.path == ind.links[0].rel).unwrap();
+    assert_eq!(link_shape.min_count, Some(1));
+    assert_eq!(ind.links[0].workspace.as_deref(), Some("acme"));
+}
+
+#[test]
+fn numbers_are_read_exactly_or_not_at_all() {
+    let (o, ctx) = world();
+    // Negative fractions are floats.
+    let ind = o.induce_sheet(&admin(), "id,delta\na,-0.5\nb,1.5\nc,-2.25\n", &InduceOptions::default()).unwrap();
+    assert_eq!(column(&ind, "delta").ty, PropType::Float, "{}", column(&ind, "delta").evidence);
+    // Integers beyond 64 bits are identifiers, kept as written.
+    let csv = "id,iccid\na,89440012345678901234\nb,89440012345678901299\n";
+    let ind = o.induce_sheet(&admin(), csv, &opts("sims.csv")).unwrap();
+    let c = column(&ind, "iccid");
+    assert_eq!(c.ty, PropType::String, "{}", c.evidence);
+    assert!(c.evidence.contains("beyond 64 bits"), "{}", c.evidence);
+    apply(&o, &ctx, &ind);
+    let out = o.ingest_sheet(&ctx, csv, &ind.mapping, false).unwrap();
+    assert!(out.findings.is_empty(), "{:?}", out.findings);
+    let a = o.get(&admin(), "sim:a").unwrap();
+    let b = o.get(&admin(), "sim:b").unwrap();
+    assert_eq!(a.title, "89440012345678901234");
+    assert_ne!(a.title, b.title);
+    // Into a float property, a number that would be rounded is refused.
+    let lt = "[object_types.reading]\nlabel = \"Reading\"\n\n[object_types.reading.properties.v]\ntype = \"float\"\n";
+    let mut s = schema();
+    s.extend_toml(lt).unwrap();
+    let o2 = Ontology::in_memory(s);
+    let m = SheetMapping {
+        kind: "reading".into(),
+        key: Some("id".into()),
+        properties: BTreeMap::from([("v".to_string(), "v".to_string())]),
+        ..Default::default()
+    };
+    let out = o2.ingest_sheet(&ctx, "id,v\nr1,-0.5\nr2,89440012345678901234\n", &m, false).unwrap();
+    assert_eq!(out.upserts, 2);
+    assert_eq!(out.findings.len(), 1, "{:?}", out.findings);
+    assert_eq!((out.findings[0].issue, out.findings[0].row), (FindingKind::BadValue, 2));
+    assert_eq!(o2.get(&admin(), "reading:r1").unwrap().props["v"], json!(-0.5));
+    assert!(!o2.get(&admin(), "reading:r2").unwrap().props.contains_key("v"));
+}
+
+#[test]
+fn kinds_in_use_count_only_where_the_principal_reads() {
+    let (o, _) = world();
+    o.apply(
+        &ActionContext::new(admin(), "globex"),
+        vec![Mutation::Upsert(EntityInput::new("secretproject", "x", "Secret"))],
+    )
+    .unwrap();
+    let named = InduceOptions { kind: Some("secretproject".into()), ..Default::default() };
+    let viewer = o.induce_sheet(&Principal::viewer("vic", "acme"), "a\n1\n", &named).unwrap();
+    assert_eq!(viewer.kind, "secretproject", "{:?}", viewer.warnings);
+    assert!(viewer.warnings.iter().all(|w| !w.contains("exists already")), "{:?}", viewer.warnings);
+    // Someone who reads globex sees the kind in use.
+    assert_eq!(o.induce_sheet(&admin(), "a\n1\n", &named).unwrap().kind, "secretproject_2");
+}

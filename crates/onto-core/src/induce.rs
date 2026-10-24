@@ -282,19 +282,23 @@ pub fn parse_csv(text: &str) -> Result<Sheet> {
 
 // ── lexical forms ────────────────────────────────────────────────────────
 
-/// `0` or a digit run without leading zeros, optionally negative.
+/// `0` or a digit run without leading zeros, optionally negative (`-0`
+/// included: it is the integer part of `-0.5`).
 fn lex_digits(s: &str) -> bool {
     let d = s.strip_prefix('-').unwrap_or(s);
-    !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) && (d == "0" || !d.starts_with('0')) && s != "-0"
+    !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) && (d == "0" || !d.starts_with('0'))
 }
 
-/// An integer in canonical form (`42`, `-7`; not `007` or `+1`).
+/// An integer in canonical form (`42`, `-7`; not `007`, `+1` or `-0`) that
+/// fits 64 bits.
 pub fn lex_int(s: &str) -> Option<i64> {
-    if lex_digits(s) { s.parse().ok() } else { None }
+    if lex_digits(s) && s != "-0" { s.parse().ok() } else { None }
 }
 
-/// A decimal number (`1.5`, `-2`, `3e8`; not `.5`, `1.`, `NaN` or `1,5`).
-pub fn lex_float(s: &str) -> Option<f64> {
+/// `s` written as a decimal number (`1.5`, `-0.5`, `-2`, `3e8`; not `.5`,
+/// `1.`, `NaN` or `1,5`), and its nearest finite `f64`, which may have lost
+/// digits.
+fn number_form(s: &str) -> Option<f64> {
     let (mantissa, exp) = match s.find(['e', 'E']) {
         Some(i) => (&s[..i], Some(&s[i + 1..])),
         None => (s, None),
@@ -313,6 +317,28 @@ pub fn lex_float(s: &str) -> Option<f64> {
         return None;
     }
     s.parse::<f64>().ok().filter(|f| f.is_finite())
+}
+
+/// The significant digits of a decimal (`-0.0250e3` → `25`; zero → ``).
+fn significant(mantissa: &str) -> String {
+    let d: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    d.trim_start_matches('0').trim_end_matches('0').to_string()
+}
+
+/// Does `f` hold every significant digit `s` writes? (`0.1` and `1.50` do;
+/// `89440012345678901234` does not: an `f64` keeps about 16 digits.)
+fn exact(s: &str, f: f64) -> bool {
+    let written = significant(s.split(['e', 'E']).next().unwrap_or(s));
+    // The shortest decimal that reads back as `f`.
+    let held = format!("{:e}", f.abs());
+    written == significant(held.split('e').next().unwrap_or(&held))
+}
+
+/// A decimal number (`1.5`, `-0.5`, `-2`, `3e8`; not `.5`, `1.`, `NaN` or
+/// `1,5`) whose every significant digit a 64-bit float holds: a number
+/// that would be rounded (a 20-digit account number) is not read as one.
+pub fn lex_float(s: &str) -> Option<f64> {
+    number_form(s).filter(|f| exact(s, *f))
 }
 
 /// `true`/`false`/`yes`/`no`, in any case.
@@ -372,10 +398,18 @@ pub fn lex_timestamp(s: &str) -> bool {
 /// is not a bool.
 pub fn read_value(def: &PropertyDef, cell: &str) -> std::result::Result<Value, String> {
     let v = match def.ty {
-        PropType::Int => lex_int(cell).map(Value::from).ok_or("not an integer")?,
-        PropType::Float => {
-            lex_float(cell).and_then(serde_json::Number::from_f64).map(Value::Number).ok_or("not a number")?
-        }
+        PropType::Int => match lex_int(cell) {
+            Some(i) => Value::from(i),
+            None if lex_digits(cell) && cell != "-0" => return Err("an integer beyond 64 bits".into()),
+            None => return Err("not an integer".into()),
+        },
+        PropType::Float => match number_form(cell) {
+            None => return Err("not a number".into()),
+            Some(f) if !exact(cell, f) => {
+                return Err("more digits than a 64-bit float holds: it would be rounded".into());
+            }
+            Some(f) => serde_json::Number::from_f64(f).map(Value::Number).ok_or("not a number")?,
+        },
         PropType::Bool => lex_bool(cell).map(Value::Bool).ok_or("not true, false, yes or no")?,
         PropType::Timestamp => {
             if !lex_timestamp(cell) {
@@ -407,7 +441,10 @@ pub struct InduceOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// Only objects of this workspace count as link targets (the engine
-    /// wrapper also hides what the principal may not read).
+    /// wrapper also hides what the principal may not read). Pass the
+    /// workspace the rows will be ingested into: without one, targets are
+    /// counted per workspace, a link is induced only when one workspace
+    /// holds them, and the shape does not require it (`min_count`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
 }
@@ -474,6 +511,10 @@ pub struct InducedLink {
     /// Links to the sheet's own rows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub self_link: bool,
+    /// The workspace whose objects were counted as targets (not for a self
+    /// link): an ingest writes links only to objects of its own workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Filled cells whose value is the key of a `target_kind` object.
     pub matched: usize,
     /// Filled cells.
@@ -568,6 +609,23 @@ fn stats(sheet: &Sheet, col: usize) -> Stats {
         (PropType::Int, format!("all {filled} filled values are integers"))
     } else if all(&|c| lex_float(c).is_some()) {
         (PropType::Float, format!("all {filled} filled values are numbers, not all integers"))
+    } else if all(&|c| number_form(c).is_some()) {
+        // Numbers, but some would lose digits: identifiers (ICCIDs, account
+        // numbers) kept exactly as written.
+        let lossy: Vec<&str> = cells.iter().copied().filter(|c| lex_float(c).is_none()).collect();
+        let why = if lossy.iter().all(|c| lex_digits(c)) {
+            "integers beyond 64 bits, which a float would round"
+        } else {
+            "more digits than a 64-bit float holds"
+        };
+        (
+            PropType::String,
+            format!(
+                "strings: all {filled} filled values are numbers, but {} are {why} ({}): kept as written",
+                lossy.len(),
+                sample(&lossy)
+            ),
+        )
     } else if all(&|c| lex_bool(c).is_some()) {
         (PropType::Bool, format!("all {filled} filled values are true, false, yes or no"))
     } else if all(&lex_timestamp) {
@@ -706,8 +764,11 @@ pub fn induce_parsed(
             }
         },
     };
+    // Kinds in use count only where the principal can read: an object it
+    // cannot see must not show through the name (the plan reports any
+    // collision there when the change set is applied).
     let kind_taken =
-        |k: &str| schema.is_type_or_interface(k) || vocab.classes.contains(k) || g.of_kind(k).next().is_some();
+        |k: &str| schema.is_type_or_interface(k) || vocab.classes.contains(k) || g.of_kind(k).any(can_read);
     let kind = free_name(&base, kind_taken);
     let kind_evidence = if kind == base {
         format!("{kind}: {kind_why}")
@@ -726,25 +787,29 @@ pub fn induce_parsed(
             && matches!(stats[c].ty, PropType::Int | PropType::String | PropType::Enum)
             && !TITLE_WORDS.contains(&snake(&sheet.header[c]).as_str())
     };
-    // Which graph objects the cells name: key → kinds, over every visible
-    // object of a declared kind whose key appears in a candidate column.
+    // Which graph objects the cells name: key → (kind, workspace), over every
+    // visible object of a declared kind whose key appears in a candidate
+    // column. Links are only written within one workspace, so targets are
+    // counted per workspace.
     let cell_values: HashSet<&str> = (0..sheet.header.len())
         .filter(|c| link_candidate(*c))
         .flat_map(|c| stats[c].distinct.iter().map(String::as_str))
         .collect();
-    let mut kinds_by_key: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut kinds_by_key: HashMap<&str, BTreeSet<(&str, &str)>> = HashMap::new();
     for e in g.entities() {
         if let Some(key) = cell_values.get(e.key())
             && schema.object_types.contains_key(&e.kind)
             && visible(e)
         {
-            kinds_by_key.entry(*key).or_default().insert(e.kind.as_str());
+            kinds_by_key.entry(*key).or_default().insert((e.kind.as_str(), e.workspace.as_str()));
         }
     }
 
-    // External link candidates: >= 90% of filled cells are keys of one kind.
+    // External link candidates: >= 90% of filled cells are keys of one kind
+    // in one workspace.
     struct Ext {
         target: String,
+        workspace: String,
         matched: usize,
         unmatched: Vec<String>,
         why: String,
@@ -754,39 +819,57 @@ pub fn induce_parsed(
         if !link_candidate(c) {
             continue;
         }
-        let (stem, suffixed) = ref_stem(&sheet.header[c]);
+        let h = &sheet.header[c];
+        let (stem, suffixed) = ref_stem(h);
         let hinted_kind = |k: &str| stem == k || schema.canonical_kind(&stem).as_deref() == Some(k);
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let share = |m: usize| m as f64 >= LINK_MIN_SHARE * st.filled as f64;
+        let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
         for r in 0..n {
             if let Some(v) = sheet.cell(r, c)
                 && let Some(ks) = kinds_by_key.get(v)
             {
-                for k in ks {
-                    *counts.entry(*k).or_default() += 1;
+                for kw in ks {
+                    *counts.entry(*kw).or_default() += 1;
+                }
+                for k in ks.iter().map(|(k, _)| *k).collect::<BTreeSet<_>>() {
+                    *by_kind.entry(k).or_default() += 1;
                 }
             }
         }
-        let qualified: Vec<(&str, usize)> =
-            counts.into_iter().filter(|(_, m)| *m as f64 >= LINK_MIN_SHARE * st.filled as f64).collect();
+        let qualified: Vec<((&str, &str), usize)> = counts.into_iter().filter(|(_, m)| share(*m)).collect();
         let pick = match qualified.as_slice() {
-            [] => None,
+            [] => {
+                // Keys of one kind, but spread over workspaces: no ingest
+                // into one workspace could write the links.
+                let spread: Vec<&str> = by_kind.iter().filter(|(_, m)| share(**m)).map(|(k, _)| *k).collect();
+                if !spread.is_empty() {
+                    warnings.push(format!(
+                        "{h}: the values are keys of {} objects spread over several workspaces, and a link stays \
+                         within one: no link induced; pass workspace to count one workspace's objects",
+                        spread.join(", ")
+                    ));
+                }
+                None
+            }
             [one] => Some(*one),
             many => {
-                let hinted: Vec<&(&str, usize)> = many.iter().filter(|(k, _)| hinted_kind(k)).collect();
+                let hinted: Vec<&((&str, &str), usize)> = many.iter().filter(|((k, _), _)| hinted_kind(k)).collect();
                 if let [one] = hinted.as_slice() {
                     Some(**one)
                 } else {
-                    let names: Vec<&str> = many.iter().map(|(k, _)| *k).collect();
-                    warnings.push(format!(
-                        "{}: the values are keys of objects of several kinds ({}): no link induced",
-                        sheet.header[c],
-                        names.join(", ")
-                    ));
+                    let names: BTreeSet<&str> = many.iter().map(|((k, _), _)| *k).collect();
+                    let why = if names.len() == 1 {
+                        "the same keys in several workspaces; pass workspace to choose one".to_string()
+                    } else {
+                        format!("several kinds ({})", names.into_iter().collect::<Vec<_>>().join(", "))
+                    };
+                    warnings.push(format!("{h}: the values are keys of objects of {why}: no link induced"));
                     None
                 }
             }
         };
-        let Some((target, matched)) = pick else { continue };
+        let Some(((target, target_ws), matched)) = pick else { continue };
         if st.numeric && !suffixed && !hinted_kind(target) {
             warnings.push(format!(
                 "{}: {matched} of {} integer values are keys of {target} objects, but the column name does not \
@@ -797,18 +880,20 @@ pub fn induce_parsed(
         }
         let unmatched: Vec<String> = (0..n)
             .filter_map(|r| sheet.cell(r, c))
-            .filter(|v| !kinds_by_key.get(v).is_some_and(|ks| ks.contains(target)))
+            .filter(|v| !kinds_by_key.get(v).is_some_and(|ks| ks.contains(&(target, target_ws))))
             .map(str::to_string)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let pct = 100.0 * matched as f64 / st.filled as f64;
         let why = format!(
-            "{matched} of {} filled values are keys of existing {target} objects ({pct:.0}%, at least {:.0}%)",
+            "{matched} of {} filled values are keys of existing {target} objects in workspace {target_ws} \
+             ({pct:.0}%, at least {:.0}%)",
             st.filled,
             LINK_MIN_SHARE * 100.0
         );
-        external.insert(c, Ext { target: target.to_string(), matched, unmatched, why });
+        external
+            .insert(c, Ext { target: target.to_string(), workspace: target_ws.to_string(), matched, unmatched, why });
     }
 
     // Key.
@@ -1018,6 +1103,7 @@ pub fn induce_parsed(
                     target_kind: target.clone(),
                     new_link_type: false,
                     self_link: false,
+                    workspace: Some(ext.workspace.clone()),
                     matched: ext.matched,
                     filled: st.filled,
                     evidence: format!(
@@ -1060,6 +1146,7 @@ pub fn induce_parsed(
                     target_kind: target.clone(),
                     new_link_type: true,
                     self_link: false,
+                    workspace: Some(ext.workspace.clone()),
                     matched: ext.matched,
                     filled: st.filled,
                     evidence: format!(
@@ -1068,6 +1155,14 @@ pub fn induce_parsed(
                     ),
                 }
             };
+            if opts.workspace.is_none() {
+                warnings.push(format!(
+                    "{h}: no workspace was given, so the {target} targets were counted in workspace {}: only an \
+                     ingest into {} writes {} links, and the shape does not require them; pass workspace to induce \
+                     for the workspace you ingest into",
+                    ext.workspace, ext.workspace, link.rel
+                ));
+            }
             if !ext.unmatched.is_empty() {
                 let shown: Vec<&str> = ext.unmatched.iter().map(String::as_str).collect();
                 warnings.push(format!(
@@ -1120,6 +1215,7 @@ pub fn induce_parsed(
                 target_kind: kind.clone(),
                 new_link_type: true,
                 self_link: true,
+                workspace: None,
                 matched: st.filled - own,
                 filled: st.filled,
                 evidence: format!("{h}: {why}; a new link type {name} ({kind} → {kind}, {how}), inverse {inverse}"),
@@ -1277,8 +1373,9 @@ pub fn induce_parsed(
     for l in &links {
         let id = format!("{shape_name}/{}", l.rel);
         // Only links whose target exists are written, so min_count holds
-        // only when every row names an existing target.
-        let full = l.matched == n;
+        // only when every row names an existing target, in the workspace
+        // the rows are ingested into: without a workspace, that is unknown.
+        let full = l.matched == n && (l.self_link || opts.workspace.is_some());
         let mut parts = vec![format!("class {}: every link written goes to a {} object", l.target_kind, l.target_kind)];
         let lt_one = new_link_types.iter().any(|(name, _)| *name == l.rel)
             || schema.link_type(&l.rel).is_some_and(|lt| lt.cardinality == Cardinality::One);
@@ -1355,6 +1452,8 @@ pub enum FindingKind {
     BadValue,
     /// The state is not one the kind allows: the state is left out.
     BadState,
+    /// The row's id belongs to an object of another workspace: the row is left out.
+    OtherWorkspace,
     /// A required property is missing or unreadable on a new object: the row is left out.
     MissingRequired,
     /// No object has the key the link cell names: the link is left out.
@@ -1424,19 +1523,22 @@ fn shown(v: &str) -> String {
     if v.chars().count() > 200 { format!("{}…", v.chars().take(200).collect::<String>()) } else { v.to_string() }
 }
 
-/// The mutations that write a sheet's rows: one upsert per row, then one
-/// link per link cell (so a row may name a row further down). `can_read`
-/// decides which existing objects count as link targets and as already
-/// present (required properties are only demanded of new objects).
+/// The mutations that write a sheet's rows into `workspace`: one upsert
+/// per row, then one link per link cell (so a row may name a row further
+/// down). `can_read` decides which existing objects count as link targets
+/// and as already present (required properties are only demanded of new
+/// objects). A row whose id belongs to an object of another workspace is
+/// left out rather than written over.
 pub fn rows_to_mutations(
     schema: &Schema,
     g: &Graph,
     mapping: &SheetMapping,
     csv: &str,
+    workspace: &str,
     can_read: &dyn Fn(&Entity) -> bool,
 ) -> Result<(Vec<Mutation>, Vec<Finding>)> {
     let sheet = parse_csv(csv)?;
-    sheet_mutations(schema, g, mapping, &sheet, can_read)
+    sheet_mutations(schema, g, mapping, &sheet, workspace, can_read)
 }
 
 /// [`rows_to_mutations`] over a parsed sheet.
@@ -1445,6 +1547,7 @@ pub fn sheet_mutations(
     g: &Graph,
     mapping: &SheetMapping,
     sheet: &Sheet,
+    workspace: &str,
     can_read: &dyn Fn(&Entity) -> bool,
 ) -> Result<(Vec<Mutation>, Vec<Finding>)> {
     let r = resolve(schema, sheet, mapping)?;
@@ -1485,6 +1588,19 @@ pub fn sheet_mutations(
                 Some(&key),
                 FindingKind::BadKey,
                 format!("key cannot be part of an id ({e}): row left out"),
+            ));
+            ids.push(None);
+            continue;
+        }
+        // Ids are global: the object may live (unseen) in another workspace,
+        // and an upsert there would write over it. The workspace is not
+        // named, since the principal may not read it.
+        if g.get(&id).is_some_and(|e| e.workspace != workspace) {
+            findings.push(find(
+                r.key,
+                Some(&key),
+                FindingKind::OtherWorkspace,
+                format!("{id} is an object of another workspace, not {workspace}: row left out"),
             ));
             ids.push(None);
             continue;
@@ -1543,6 +1659,7 @@ pub fn sheet_mutations(
         upserts.push(Mutation::Upsert(EntityInput {
             kind: kind.clone(),
             key: Some(key),
+            workspace: Some(workspace.to_string()),
             title: r.title.and_then(|c| sheet.cell(row, c)).map(str::to_string),
             state,
             props,
@@ -1605,7 +1722,8 @@ pub struct SheetIngest {
 
 impl Ontology {
     /// Induce the ontology a sheet describes, over what `p` can read
-    /// (and, when `opts.workspace` is set, only that workspace's objects).
+    /// (and, when `opts.workspace` is set, only that workspace's objects:
+    /// set it to the workspace [`Ontology::ingest_sheet`] will write).
     pub fn induce_sheet(&self, p: &Principal, csv: &str, opts: &InduceOptions) -> Result<Induced> {
         let sheet = parse_csv(csv)?;
         let g = self.reader(p)?;
@@ -1615,7 +1733,8 @@ impl Ontology {
 
     /// Write a sheet's rows into `ctx.workspace` with `mapping`, in one
     /// atomic apply (with an `ingest.sheet` audit event). Link targets must
-    /// be objects of that workspace the principal can read. A dry run
+    /// be objects of that workspace the principal can read; a row whose id
+    /// is taken in another workspace is left out (finding `other_workspace`). A dry run
     /// validates the mutations without writing anything.
     pub fn ingest_sheet(
         &self,
@@ -1656,14 +1775,14 @@ impl Ontology {
             let g = self.reader(p)?;
             let schema = self.schema();
             let can = |e: &Entity| e.workspace == ws && policy::visible(p, e, &g);
-            let (muts, findings) = sheet_mutations(&schema, &g, mapping, &sheet, &can)?;
+            let (muts, findings) = sheet_mutations(&schema, &g, mapping, &sheet, ws, &can)?;
             let n = counts(&muts);
             self.stage_only(&g, &schema, ctx, muts)?;
             return Ok(report(n, findings, None));
         }
         let (res, (n, findings)) = self.transact(ctx, |o, g| {
             let can = |e: &Entity| e.workspace == ws && policy::visible(p, e, g);
-            let (muts, findings) = sheet_mutations(&o.schema(), g, mapping, &sheet, &can)?;
+            let (muts, findings) = sheet_mutations(&o.schema(), g, mapping, &sheet, ws, &can)?;
             let (upserts, links) = counts(&muts);
             let ev = o.event(
                 ctx,
@@ -1732,14 +1851,28 @@ mod tests {
     fn lexical_forms() {
         assert_eq!(lex_int("42"), Some(42));
         assert_eq!(lex_int("-7"), Some(-7));
-        for bad in ["007", "+1", "1.0", "", "-", "1e3", "99999999999999999999"] {
+        for bad in ["007", "+1", "1.0", "", "-", "-0", "1e3", "99999999999999999999"] {
             assert_eq!(lex_int(bad), None, "{bad}");
         }
         assert_eq!(lex_float("1.5"), Some(1.5));
         assert_eq!(lex_float("-2"), Some(-2.0));
         assert_eq!(lex_float("3e8"), Some(3e8));
-        for bad in [".5", "1.", "NaN", "inf", "1,5", "01.5", "1e"] {
+        // Negative numbers between -1 and 0 have the integer part -0.
+        assert_eq!(lex_float("-0.5"), Some(-0.5));
+        assert_eq!(lex_float("-0.25e1"), Some(-2.5));
+        assert_eq!(lex_float("0.0"), Some(0.0));
+        // Digits a float holds exactly: trailing zeros and short decimals.
+        assert_eq!(lex_float("1.50"), Some(1.5));
+        assert_eq!(lex_float("0.1"), Some(0.1));
+        assert_eq!(lex_float("0.30000000000000004"), Some(0.30000000000000004));
+        assert_eq!(lex_float("100000000000000000000"), Some(1e20));
+        for bad in [".5", "1.", "NaN", "inf", "1,5", "01.5", "1e", "-00.5", "-"] {
             assert_eq!(lex_float(bad), None, "{bad}");
+        }
+        // Numbers a float would round are not read as floats.
+        for lossy in ["89440012345678901234", "9223372036854775808", "3.14159265358979323846", "1e-400"] {
+            assert!(number_form(lossy).is_some(), "{lossy}");
+            assert_eq!(lex_float(lossy), None, "{lossy}");
         }
         assert_eq!(lex_bool("YES"), Some(true));
         assert_eq!(lex_bool("False"), Some(false));
@@ -1758,6 +1891,9 @@ mod tests {
         assert_eq!(read_value(&def(PropType::Int), "12"), Ok(Value::from(12)));
         assert!(read_value(&def(PropType::Int), "12.5").is_err());
         assert!(read_value(&def(PropType::Float), "abc").is_err());
+        assert_eq!(read_value(&def(PropType::Float), "-0.5"), Ok(json!(-0.5)));
+        assert!(read_value(&def(PropType::Float), "89440012345678901234").unwrap_err().contains("rounded"));
+        assert!(read_value(&def(PropType::Int), "89440012345678901234").unwrap_err().contains("64 bits"));
         assert_eq!(read_value(&def(PropType::Bool), "no"), Ok(Value::Bool(false)));
         let e = PropertyDef { ty: PropType::Enum, values: vec!["a".into()], ..Default::default() };
         assert!(read_value(&e, "b").unwrap_err().contains("one of a"));
