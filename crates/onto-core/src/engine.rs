@@ -261,6 +261,8 @@ struct Inner {
     seq: AtomicU64,
     opts: OntologyOptions,
     listeners: RwLock<Vec<Listener>>,
+    /// The last few reasoner closures (see [`crate::reason`]).
+    reason_cache: crate::reason::ClosureCache,
 }
 
 /// Cheap to clone; all clones share the same graph.
@@ -306,6 +308,7 @@ impl Ontology {
                 seq: AtomicU64::new(snap.seq),
                 opts,
                 listeners: RwLock::new(Vec::new()),
+                reason_cache: Default::default(),
             }),
         };
         onto.bootstrap_schema(config_schema)?;
@@ -502,6 +505,7 @@ impl Ontology {
                 seq: AtomicU64::new(0),
                 opts: self.inner.opts.clone(),
                 listeners: RwLock::new(Vec::new()),
+                reason_cache: Default::default(),
             }),
         }
     }
@@ -525,6 +529,10 @@ impl Ontology {
             }
         }
         cur.to_string()
+    }
+
+    pub(crate) fn reason_cache(&self) -> &crate::reason::ClosureCache {
+        &self.inner.reason_cache
     }
 
     pub(crate) fn inner_graph_read(&self) -> RwLockReadGuard<'_, Graph> {

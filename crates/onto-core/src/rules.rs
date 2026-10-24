@@ -3,7 +3,10 @@
 //! `chain = ["assigned_to", "member_of"]`, `infer = "handled_by_team"` means
 //! `issue -assigned_to-> person -member_of-> team` ⇒ `issue -handled_by_team-> team`.
 //! Inferred links are computed on demand and never stored, so they are always
-//! consistent with the current graph.
+//! consistent with the current graph. This is the per-entity walk used by
+//! `ask` and context building; the whole-graph reasoner with certificates
+//! (which also evaluates Horn-form rules and transitive link types) is
+//! [`crate::reason`].
 
 use std::collections::HashSet;
 
@@ -29,7 +32,8 @@ const MAX_FRONTIER: usize = 256;
 pub fn infer(schema: &Schema, g: &Graph, start: &str, can_read: &dyn Fn(&Entity) -> bool) -> Vec<Inferred> {
     let mut out = Vec::new();
     let mut emitted: HashSet<(String, String)> = HashSet::new();
-    for rule in &schema.rules {
+    // Horn-form rules (`when`/`then`) are evaluated by the reasoner only.
+    for rule in schema.rules.iter().filter(|r| !r.chain.is_empty()) {
         let mut frontier: Vec<(String, Vec<Hop>)> = vec![(start.to_string(), Vec::new())];
         for step in &rule.chain {
             let (base, dir) = schema.resolve_rel_lenient(step);

@@ -1,5 +1,6 @@
-//! Dynamic ontology schema: object types, link types, inference rules and
-//! analysis settings, loaded from TOML at runtime and merged in layers.
+//! Dynamic ontology schema: object types, link types, inference rules,
+//! shapes and analysis settings, loaded from TOML at runtime and merged in
+//! layers.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -11,6 +12,7 @@ use serde_json::{Map, Value};
 use crate::action_types::ActionType;
 use crate::metrics::{DerivedDef, MetricDef};
 use crate::quality::Constraints;
+use crate::shape_model::Shape;
 use crate::{Error, Result};
 
 /// The built-in Enterprise Execution ontology.
@@ -79,7 +81,7 @@ pub struct PropertyDef {
 }
 
 /// Compiled `pattern`s, shared by every schema.
-fn pattern_regex(p: &str) -> std::result::Result<std::sync::Arc<regex_lite::Regex>, String> {
+pub(crate) fn pattern_regex(p: &str) -> std::result::Result<std::sync::Arc<regex_lite::Regex>, String> {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
     static CACHE: LazyLock<Mutex<HashMap<String, Arc<regex_lite::Regex>>>> = LazyLock::new(Default::default);
@@ -355,6 +357,9 @@ pub struct LinkType {
     pub dependency: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub symmetric: bool,
+    /// `a -r-> b -r-> c` implies `a -r-> c` (evaluated by the reasoner, never stored).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transitive: bool,
     /// Provenance edge (derived_from, generated_by).
     #[serde(default, skip_serializing_if = "is_false")]
     pub provenance: bool,
@@ -378,6 +383,7 @@ impl Default for LinkType {
             cardinality: Cardinality::Many,
             dependency: false,
             symmetric: false,
+            transitive: false,
             provenance: false,
             weight: default_weight(),
             backing: None,
@@ -385,13 +391,58 @@ impl Default for LinkType {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A supplied inference rule, in one of two forms.
+///
+/// Chain form: `chain = ["assigned_to", "member_of"]`, `infer = "handled_by_team"`
+/// derives `x handled_by_team z` from `x assigned_to y` and `y member_of z`.
+///
+/// Horn form: `when` is a list of atoms `[subject, predicate, object]` and
+/// `then` one atom; `?name` is a variable. Predicates are `a` (is a kind,
+/// interface or derived class), `state`, `prop.<name>`, a relation, or a
+/// relation another rule derives. `then` derives a class (`a`) or a relation,
+/// never a property value. Rules are assumptions the schema supplies: what they
+/// derive is labelled with the rule and never written to the graph.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub infer: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when: Vec<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub then: Vec<Value>,
+}
+
+impl Rule {
+    /// Written in the Horn form (`when`/`then`) rather than as a chain.
+    pub fn is_horn(&self) -> bool {
+        !self.when.is_empty() || !self.then.is_empty()
+    }
+
+    /// The relation (chain form) or `a <class>` / relation (Horn form) the rule derives.
+    pub fn head_predicate(&self) -> Option<&str> {
+        if self.is_horn() { self.then.get(1).and_then(Value::as_str) } else { Some(self.infer.as_str()) }
+    }
+
+    /// `handled_by_team = assigned_to > member_of`, or
+    /// `?s a high_risk <= ?s a supplier, ?s located_in ?c` for the Horn form.
+    pub fn describe(&self) -> String {
+        if !self.is_horn() {
+            return format!("{} = {}", self.infer, self.chain.join(" > "));
+        }
+        let atom = |a: &[Value]| -> String {
+            a.iter()
+                .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let body: Vec<String> = self.when.iter().map(|a| atom(a)).collect();
+        format!("{} <= {}", atom(&self.then), body.join(", "))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -441,6 +492,9 @@ pub struct Schema {
     pub glossary: Glossary,
     pub metrics: BTreeMap<String, MetricDef>,
     pub action_types: BTreeMap<String, ActionType>,
+    /// Conditions on the objects of a target, by name (see [`Shape`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, Shape>,
     /// inverse name -> canonical relation
     #[serde(skip)]
     inverses: BTreeMap<String, String>,
@@ -465,6 +519,13 @@ struct SchemaFile {
     metrics: BTreeMap<String, MetricDef>,
     #[serde(default)]
     action_types: BTreeMap<String, ActionType>,
+    #[serde(default)]
+    shapes: BTreeMap<String, Shape>,
+    /// Package metadata (`[pack]`). It describes the file, never the schema,
+    /// so it does not change the schema's name or version.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pack: Option<toml::Value>,
 }
 
 impl Schema {
@@ -513,7 +574,9 @@ impl Schema {
     }
 
     /// Layer another schema file on top: types and relations are added or
-    /// replaced by name, rules are appended, `[analysis]` replaces when present.
+    /// replaced by name, rules are appended (or replaced by name), shapes are
+    /// replaced by name, `[analysis]` replaces when present. A `[pack]` table
+    /// is package metadata and leaves the schema untouched.
     pub fn extend_toml(&mut self, text: &str) -> Result<()> {
         let file: SchemaFile = toml::from_str(text)?;
         if let Some(name) = file.name {
@@ -546,6 +609,7 @@ impl Schema {
         }
         self.metrics.extend(file.metrics);
         self.action_types.extend(file.action_types);
+        self.shapes.extend(file.shapes);
         self.compile()
     }
 
@@ -580,6 +644,9 @@ impl Schema {
         for (name, a) in self.action_types.iter_mut() {
             a.name = name.clone();
         }
+        for (name, shape) in self.shapes.iter_mut() {
+            shape.normalize(name);
+        }
         for name in self.interfaces.keys() {
             if self.object_types.contains_key(name) {
                 return Err(Error::Config(format!("interface {name} collides with an object type")));
@@ -598,6 +665,13 @@ impl Schema {
                     return Err(Error::Config(format!("link type {name} references unknown type {kind}")));
                 }
             }
+            if lt.transitive && !lt.from.is_empty() && !lt.to.is_empty() && !self.kinds_overlap(&lt.from, &lt.to) {
+                return Err(Error::Config(format!(
+                    "link type {name} is transitive but its targets [{}] can never be its sources [{}]",
+                    lt.to.join(", "),
+                    lt.from.join(", ")
+                )));
+            }
             if let Some(inv) = &lt.inverse {
                 if self.link_types.contains_key(inv) {
                     return Err(Error::Config(format!("inverse {inv} of {name} collides with a link type")));
@@ -614,15 +688,37 @@ impl Schema {
                 return Err(Error::Config(format!("type {name} extends unknown type {parent}")));
             }
         }
+        let vocab = crate::reason::vocabulary(self);
         for rule in &self.rules {
+            if rule.is_horn() {
+                if !rule.chain.is_empty() || !rule.infer.is_empty() {
+                    return Err(Error::Config(format!(
+                        "rule {}: give either chain/infer or when/then, not both",
+                        rule.name
+                    )));
+                }
+                crate::reason::compile_rule(self, &vocab, rule)
+                    .map_err(|e| Error::Config(format!("rule {}: {e}", rule.name)))?;
+                continue;
+            }
             if rule.chain.is_empty() {
                 return Err(Error::Config(format!("rule {} has an empty chain", rule.name)));
             }
+            if rule.infer.is_empty() {
+                return Err(Error::Config(format!("rule {}: a chain needs infer (the derived relation)", rule.name)));
+            }
             for step in &rule.chain {
-                if self.resolve_rel(step).is_none() {
+                // A step may name a relation another rule derives.
+                let derived = vocab.relations.contains(step.strip_prefix('^').unwrap_or(step));
+                if self.resolve_rel(step).is_none() && !derived {
                     return Err(Error::Config(format!("rule {} uses unknown relation {step}", rule.name)));
                 }
             }
+        }
+        for (name, shape) in &self.shapes {
+            shape
+                .validate(self, &vocab.classes, &vocab.relations)
+                .map_err(|e| Error::Config(format!("shape {name}: {e}")))?;
         }
         self.check_interfaces()?;
         for (word, kind) in &self.glossary.kinds {
@@ -726,6 +822,18 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    /// Can some object be both of a kind in `a` and of a kind in `b`?
+    fn kinds_overlap(&self, a: &[String], b: &[String]) -> bool {
+        a.iter().any(|x| {
+            b.iter().any(|y| {
+                x == y
+                    || self.kind_is(x, y)
+                    || self.kind_is(y, x)
+                    || self.object_types.keys().any(|k| self.kind_is(k, x) && self.kind_is(k, y))
+            })
+        })
     }
 
     pub fn is_interface(&self, name: &str) -> bool {
@@ -1023,7 +1131,11 @@ impl Schema {
         out.push_str(&rels.join(", "));
         if !self.rules.is_empty() {
             out.push_str("\nDerived: ");
-            let rules: Vec<String> = self.rules.iter().map(|r| format!("{}={}", r.infer, r.chain.join(">"))).collect();
+            let rules: Vec<String> = self
+                .rules
+                .iter()
+                .map(|r| if r.is_horn() { r.describe() } else { format!("{}={}", r.infer, r.chain.join(">")) })
+                .collect();
             out.push_str(&rules.join(", "));
         }
         out
@@ -1057,6 +1169,12 @@ impl Schema {
             if lt.dependency {
                 let _ = write!(out, "   [dependency]");
             }
+            if lt.transitive {
+                let _ = write!(out, "   [transitive]");
+            }
+            if lt.symmetric {
+                let _ = write!(out, "   [symmetric]");
+            }
             if let Some(b) = &lt.backing {
                 let _ = write!(out, "   backed by {}:{}", b.source, b.table);
             }
@@ -1065,7 +1183,7 @@ impl Schema {
         if !self.rules.is_empty() {
             let _ = writeln!(out, "\nRules:");
             for r in &self.rules {
-                let _ = writeln!(out, "  {} = {}", r.infer, r.chain.join(" > "));
+                let _ = writeln!(out, "  {}", r.describe());
             }
         }
         if !self.interfaces.is_empty() {
@@ -1079,6 +1197,13 @@ impl Schema {
             for a in self.action_types.values() {
                 let params: Vec<String> = a.parameters.keys().cloned().collect();
                 let _ = writeln!(out, "  {:<15} ({}) risk {:?}", a.name, params.join(", "), a.risk);
+            }
+        }
+        if !self.shapes.is_empty() {
+            let _ = writeln!(out, "\nShapes:");
+            for (name, sh) in &self.shapes {
+                let target = sh.target.as_deref().unwrap_or("(ids or relation)");
+                let _ = writeln!(out, "  {name:<24} {target}, {} property shapes", sh.properties.len());
             }
         }
         if !self.metrics.is_empty() {
@@ -1261,5 +1386,126 @@ mod tests {
     fn rejects_bad_rules() {
         let err = Schema::from_toml("[[rules]]\nname='x'\nchain=['nope']\ninfer='y'").unwrap_err();
         assert!(err.to_string().contains("unknown relation"));
+    }
+
+    fn with_rule(rule: &str) -> Result<Schema> {
+        let mut s = Schema::enterprise();
+        s.extend_toml(&format!("[[rules]]\n{rule}"))?;
+        Ok(s)
+    }
+
+    #[test]
+    fn horn_rules_validate() {
+        let s = with_rule(
+            r#"name = "urgent"
+            description = "Triaged high-priority issues are urgent."
+            when = [["?i", "a", "issue"], ["?i", "state", "triaged"], ["?i", "prop.priority", "high"], ["?i", "owned_by", "?t"]]
+            then = ["?i", "a", "urgent_issue"]"#,
+        )
+        .unwrap();
+        let r = s.rules.iter().find(|r| r.name == "urgent").unwrap();
+        assert!(r.is_horn());
+        assert!(r.describe().starts_with("?i a urgent_issue <= ?i a issue"), "{}", r.describe());
+        // A later rule may use the derived class and the chain rules' relations.
+        let mut s2 = s.clone();
+        s2.extend_toml(
+            "[[rules]]\nname = 'on_call'\nwhen = [['?i', 'a', 'urgent_issue'], ['?i', 'handled_by_team', '?t']]\nthen = ['?t', 'a', 'on_call_team']\n",
+        )
+        .unwrap();
+        // Chain steps may name a derived relation.
+        s2.extend_toml("[[rules]]\nname = 'team_scope'\nchain = ['handled_by_team', 'owns']\ninfer = 'team_scope'\n")
+            .unwrap();
+        // JSON round trip keeps the Horn form and leaves chain rules as they were.
+        let doc = serde_json::to_value(&s2).unwrap();
+        let chain = doc["rules"].as_array().unwrap().iter().find(|r| r["name"] == "responsible_team").unwrap();
+        assert!(chain.get("when").is_none() && chain["chain"].is_array());
+        Schema::from_json(doc).unwrap();
+
+        let err = |rule: &str| with_rule(rule).unwrap_err().to_string();
+        let e = err("name = 'r'\nwhen = [['?x', 'located_in', '?c']]\nthen = ['?x', 'a', 'risky']");
+        assert!(e.contains("rule r:") && e.contains("unknown relation located_in"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'a', 'issue']]\nthen = ['?x', 'handled_by_team', '?y']");
+        assert!(e.contains("head variable ?y does not occur in when"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'a', 'issue']]\nthen = ['?x', 'state', 'urgent']");
+        assert!(e.contains("rules derive types and relations, not property values"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'a', 'spaceship']]\nthen = ['?x', 'a', 'risky']");
+        assert!(e.contains("unknown class spaceship"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'prop.warp', 9]]\nthen = ['?x', 'a', 'risky']");
+        assert!(e.contains("unknown property warp"), "{e}");
+        let e =
+            err("name = 'r'\nchain = ['owns']\ninfer = 'x'\nwhen = [['?x', 'a', 'issue']]\nthen = ['?x', 'a', 'y']");
+        assert!(e.contains("not both"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'a', 'issue']]\nthen = ['?x', 'a', 'Bad Class']");
+        assert!(e.contains("must match"), "{e}");
+        let e = err("name = 'r'\nwhen = [['?x', 'a']]\nthen = ['?x', 'a', 'y']");
+        assert!(e.contains("three parts"), "{e}");
+        let e = err("name = 'r'\nchain = ['owns']");
+        assert!(e.contains("needs infer"), "{e}");
+    }
+
+    #[test]
+    fn transitive_link_types_must_chain() {
+        let s = Schema::from_toml(
+            "[object_types.a]\n[object_types.b]\nextends = 'a'\n[link_types.r]\nfrom = ['a']\nto = ['b']\ntransitive = true\n",
+        )
+        .unwrap();
+        assert!(s.link_types["r"].transitive);
+        assert!(s.describe().contains("[transitive]"));
+        let err = Schema::from_toml(
+            "[object_types.a]\n[object_types.b]\n[link_types.r]\nfrom = ['a']\nto = ['b']\ntransitive = true\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is transitive"), "{err}");
+        // Not transitive: not serialized, so existing documents keep their bytes.
+        let doc = serde_json::to_value(Schema::enterprise()).unwrap();
+        assert!(doc["link_types"]["owns"].get("transitive").is_none());
+        assert!(doc.get("shapes").is_none());
+    }
+
+    #[test]
+    fn pack_tables_leave_name_and_version_alone() {
+        let mut s = Schema::enterprise();
+        let (name, version) = (s.name.clone(), s.version);
+        s.extend_toml(
+            "[pack]\nid = 'supply'\ntitle = 'Supply chain'\nversion = '1.2.0'\nname = 'other'\n[object_types.supplier]\n",
+        )
+        .unwrap();
+        assert_eq!((s.name.as_str(), s.version), (name.as_str(), version));
+        assert!(s.object_types.contains_key("supplier"));
+    }
+
+    #[test]
+    fn shapes_merge_and_validate() {
+        let mut s = Schema::enterprise();
+        s.extend_toml(
+            r#"
+            [shapes.issue_shape]
+            target = "issue"
+            message = "Issues need an owner project."
+            properties = [
+                { path = "belongs_to", min_count = 1, class = "project" },
+                { path = "prop.priority", in = ["low", "high"], id = "prio" },
+                { path = "assigned_to.member_of", max_count = 3, severity = "warning" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let sh = &s.shapes["issue_shape"];
+        assert_eq!(sh.properties[0].id, "issue_shape/0");
+        assert_eq!(sh.properties[1].id, "prio");
+        assert_eq!(sh.properties[2].severity, Some(crate::shape_model::ShapeSeverity::Warning));
+        // A later layer replaces a shape by name.
+        s.extend_toml("[shapes.issue_shape]\ntarget = 'task'\n").unwrap();
+        assert!(s.shapes["issue_shape"].properties.is_empty());
+        let back = Schema::from_json(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.shapes, s.shapes);
+
+        let bad = |text: &str| Schema::enterprise().extend_toml(text).unwrap_err().to_string();
+        assert!(bad("[shapes.x]\ntarget = 'spaceship'\n").contains("shape x: unknown target spaceship"));
+        assert!(bad("[shapes.x]\ntarget_subjects_of = 'nope'\n").contains("unknown relation nope"));
+        assert!(bad("[shapes.x]\nproperties = [{ path = 'owns.nope' }]\n").contains("unknown relation nope"));
+        assert!(bad("[shapes.x]\nproperties = [{ path = 'prop.nope' }]\n").contains("unknown property nope"));
+        assert!(bad("[shapes.x]\nproperties = [{ path = 'owns', node = 'y' }]\n").contains("unknown shape y"));
+        assert!(bad("[shapes.x]\nproperties = [{ path = 'title', pattern = '(' }]\n").contains("invalid pattern"));
     }
 }

@@ -1,5 +1,5 @@
 //! Live schema: object types, properties, link types, interfaces, action
-//! types, rules, metrics and glossary terms changed as data at runtime.
+//! types, rules, shapes, metrics and glossary terms changed as data at runtime.
 //!
 //! A [`SchemaChangeSet`] is validated (the resulting schema must compile),
 //! previewed with an impact report over the live graph ([`SchemaPlan`]:
@@ -22,6 +22,7 @@ use crate::metrics::MetricDef;
 use crate::model::{Entity, EntityInput, EntityRef, Id, LinkInput, Mutation};
 use crate::policy::{Access, Principal, Role};
 use crate::schema::{Analysis, Cardinality, InterfaceType, LinkType, ObjectType, PropType, PropertyDef, Rule, Schema};
+use crate::shape_model::{Shape, ShapePath};
 use crate::store::Store;
 use crate::time::{fmt_ts, now_ms};
 use crate::{Error, Ontology, Result};
@@ -176,6 +177,13 @@ pub enum SchemaChange {
     DeleteRule {
         name: String,
     },
+    PutShape {
+        name: String,
+        def: Shape,
+    },
+    DeleteShape {
+        name: String,
+    },
     PutMetric {
         name: String,
         def: MetricDef,
@@ -299,7 +307,7 @@ pub enum DiffKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiffEntry {
     /// `object_types`, `link_types`, `interfaces`, `action_types`, `metrics`,
-    /// `rules`, `glossary.kinds|relations|dimensions` or `analysis`.
+    /// `rules`, `shapes`, `glossary.kinds|relations|dimensions` or `analysis`.
     pub section: String,
     pub name: String,
     pub change: DiffKind,
@@ -502,6 +510,8 @@ pub struct SchemaStatus {
     pub interfaces: usize,
     pub action_types: usize,
     pub rules: usize,
+    #[serde(default)]
+    pub shapes: usize,
     pub metrics: usize,
     pub governance: Governance,
     /// Why changed schema files were not imported on open.
@@ -529,6 +539,8 @@ impl SchemaChange {
             SchemaChange::DeleteActionType { .. } => "delete_action_type",
             SchemaChange::PutRule { .. } => "put_rule",
             SchemaChange::DeleteRule { .. } => "delete_rule",
+            SchemaChange::PutShape { .. } => "put_shape",
+            SchemaChange::DeleteShape { .. } => "delete_shape",
             SchemaChange::PutMetric { .. } => "put_metric",
             SchemaChange::DeleteMetric { .. } => "delete_metric",
             SchemaChange::PutGlossaryTerm { .. } => "put_glossary_term",
@@ -549,6 +561,8 @@ impl SchemaChange {
             | SchemaChange::PutActionType { name, .. }
             | SchemaChange::DeleteActionType { name }
             | SchemaChange::DeleteRule { name }
+            | SchemaChange::PutShape { name, .. }
+            | SchemaChange::DeleteShape { name }
             | SchemaChange::PutMetric { name, .. }
             | SchemaChange::DeleteMetric { name } => name.clone(),
             SchemaChange::RenameObjectType { from, to } | SchemaChange::RenameLinkType { from, to } => {
@@ -721,6 +735,15 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
                     renamed(&mut m.property);
                 }
             }
+            let (old_path, new_path) = (format!("prop.{from}"), format!("prop.{to}"));
+            for sh in s.shapes.values_mut().filter(|sh| sh.target.as_ref().is_some_and(|t| kinds.contains(t))) {
+                for p in sh.properties.iter_mut().filter(|p| p.path == old_path) {
+                    p.path = new_path.clone();
+                }
+                for i in sh.ignored_properties.iter_mut().filter(|i| *i == from) {
+                    *i = to.clone();
+                }
+            }
         }
         SchemaChange::PutLinkType { name, def, .. } => {
             if !s.link_types.contains_key(name) {
@@ -786,6 +809,15 @@ fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String
             if s.rules.len() == before {
                 return Err(format!("unknown rule {name}"));
             }
+        }
+        SchemaChange::PutShape { name, def } => {
+            if !s.shapes.contains_key(name) {
+                check_new_name("shape", name)?;
+            }
+            s.shapes.insert(name.clone(), def.clone());
+        }
+        SchemaChange::DeleteShape { name } => {
+            s.shapes.remove(name).ok_or_else(|| format!("unknown shape {name}"))?;
         }
         SchemaChange::PutMetric { name, def } => {
             if !s.metrics.contains_key(name) {
@@ -861,6 +893,29 @@ fn rewrite_kind(s: &mut Schema, from: &str, to: &str) {
             swap(k);
         }
     }
+    // Horn rules name kinds as the object of `a`.
+    let swap_value = |v: &mut Value| {
+        if v.as_str() == Some(from) {
+            *v = Value::String(to.to_string());
+        }
+    };
+    for r in &mut s.rules {
+        for atom in r.when.iter_mut().chain(std::iter::once(&mut r.then)) {
+            if atom.len() == 3 && atom[1].as_str() == Some("a") {
+                swap_value(&mut atom[2]);
+            }
+        }
+    }
+    for sh in s.shapes.values_mut() {
+        if let Some(t) = &mut sh.target {
+            swap(t);
+        }
+        for p in &mut sh.properties {
+            if let Some(c) = &mut p.class {
+                swap(c);
+            }
+        }
+    }
 }
 
 /// Point every reference to relation `from` at `to` (also `^from` and the
@@ -888,6 +943,19 @@ fn rewrite_rel(s: &mut Schema, from: &str, to: &str) {
     };
     for r in &mut s.rules {
         r.chain.iter_mut().for_each(step);
+        for atom in r.when.iter_mut().chain(std::iter::once(&mut r.then)) {
+            if let Some(Value::String(pred)) = atom.get_mut(1) {
+                step(pred);
+            }
+        }
+    }
+    for sh in s.shapes.values_mut() {
+        sh.target_subjects_of.iter_mut().chain(sh.target_objects_of.iter_mut()).for_each(step);
+        for p in &mut sh.properties {
+            if matches!(ShapePath::parse(&p.path), ShapePath::Relations(_)) {
+                path(&mut p.path);
+            }
+        }
     }
     for i in s.interfaces.values_mut() {
         i.links.iter_mut().for_each(step);
@@ -960,6 +1028,7 @@ fn sections(s: &Schema) -> Vec<(&'static str, BTreeMap<String, Value>)> {
         ("action_types", entries(&s.action_types)),
         ("metrics", entries(&s.metrics)),
         ("rules", s.rules.iter().map(|r| (r.name.clone(), serde_json::to_value(r).unwrap_or(Value::Null))).collect()),
+        ("shapes", entries(&s.shapes)),
         ("glossary.kinds", strings(&s.glossary.kinds)),
         ("glossary.relations", strings(&s.glossary.relations)),
         ("glossary.dimensions", strings(&s.glossary.dimensions)),
@@ -1063,6 +1132,8 @@ pub fn changes_between(a: &Schema, b: &Schema) -> Vec<SchemaChange> {
             "action_types" => SchemaChange::PutActionType { def: b.action_types[&name].clone(), name },
             "metrics" if removed => SchemaChange::DeleteMetric { name },
             "metrics" => SchemaChange::PutMetric { def: b.metrics[&name].clone(), name },
+            "shapes" if removed => SchemaChange::DeleteShape { name },
+            "shapes" => SchemaChange::PutShape { def: b.shapes[&name].clone(), name },
             "rules" if removed => SchemaChange::DeleteRule { name },
             "rules" => match b.rules.iter().find(|r| r.name == name) {
                 Some(r) => SchemaChange::PutRule { def: r.clone() },
@@ -2020,12 +2091,22 @@ fn summarize(base: &Schema, c: &SchemaChange) -> String {
         }
         SchemaChange::PutLinkType { name, def, .. } => {
             let side = |v: &[String]| if v.is_empty() { "*".to_string() } else { v.join("|") };
-            format!(
+            let mut out = format!(
                 "{} link type {} -{name}-> {}",
                 verb(base.link_types.contains_key(name)),
                 side(&def.from),
                 side(&def.to)
-            )
+            );
+            let before = base.link_types.get(name);
+            let flag = |on: bool, was: Option<bool>, word: &str| match (on, was) {
+                (true, Some(true)) | (true, None) => format!(" ({word})"),
+                (true, Some(false)) => format!(" (now {word})"),
+                (false, Some(true)) => format!(" (no longer {word})"),
+                _ => String::new(),
+            };
+            out.push_str(&flag(def.transitive, before.map(|b| b.transitive), "transitive"));
+            out.push_str(&flag(def.symmetric, before.map(|b| b.symmetric), "symmetric"));
+            out
         }
         SchemaChange::DeleteLinkType { name, .. } => format!("delete link type {name}"),
         SchemaChange::RenameLinkType { from, to } => format!("rename link type {from} to {to}"),
@@ -2037,14 +2118,24 @@ fn summarize(base: &Schema, c: &SchemaChange) -> String {
             format!("{} action type {name}", verb(base.action_types.contains_key(name)))
         }
         SchemaChange::DeleteActionType { name } => format!("delete action type {name}"),
-        SchemaChange::PutRule { def } => format!(
-            "{} rule {} ({} = {})",
-            verb(base.rules.iter().any(|r| r.name == def.name)),
-            def.name,
-            def.infer,
-            def.chain.join(" > ")
-        ),
+        SchemaChange::PutRule { def } => {
+            format!("{} rule {} ({})", verb(base.rules.iter().any(|r| r.name == def.name)), def.name, def.describe())
+        }
         SchemaChange::DeleteRule { name } => format!("delete rule {name}"),
+        SchemaChange::PutShape { name, def } => {
+            let target = match (&def.target, &def.target_subjects_of, &def.target_objects_of) {
+                (Some(t), _, _) => format!("on {t}"),
+                (_, Some(r), _) => format!("on subjects of {r}"),
+                (_, _, Some(r)) => format!("on objects of {r}"),
+                _ => format!("on {} listed ids", def.target_ids.len()),
+            };
+            format!(
+                "{} shape {name} ({target}, {} property shapes)",
+                verb(base.shapes.contains_key(name)),
+                def.properties.len()
+            )
+        }
+        SchemaChange::DeleteShape { name } => format!("delete shape {name}"),
         SchemaChange::PutMetric { name, .. } => format!("{} metric {name}", verb(base.metrics.contains_key(name))),
         SchemaChange::DeleteMetric { name } => format!("delete metric {name}"),
         SchemaChange::PutGlossaryTerm { section, word, target } => {
@@ -2283,6 +2374,7 @@ impl Ontology {
             interfaces: s.interfaces.len(),
             action_types: s.action_types.len(),
             rules: s.rules.len(),
+            shapes: s.shapes.len(),
             metrics: s.metrics.len(),
             governance: self.options().governance.clone(),
             import_error: self.schema_import_error(),
@@ -2547,6 +2639,7 @@ impl Ontology {
                 SchemaChange::DeleteActionType { name } => current.action_types.contains_key(name),
                 SchemaChange::DeleteMetric { name } => current.metrics.contains_key(name),
                 SchemaChange::DeleteRule { name } => current.rules.iter().any(|r| &r.name == name),
+                SchemaChange::DeleteShape { name } => current.shapes.contains_key(name),
                 _ => true,
             };
             if still {
