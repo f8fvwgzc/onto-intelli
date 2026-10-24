@@ -18,7 +18,7 @@ fn coffee_is_entailed() {
     let r = check(&f);
     assert_eq!(r.verdict(), Some(Verdict::Entailed), "{}", r.to_json());
     let a = r.accepted().unwrap();
-    assert_eq!((a.asserted, a.derivations, a.builtin_cited, a.supplied_cited), (3, 3, 2, 0));
+    assert_eq!((a.asserted(), a.derivations(), a.builtin_cited(), a.supplied_cited()), (3, 3, 2, 0));
     // The three conclusions of the example.
     for fact in ["<cup:my>\ta\t#coffee", "<cup:my>\ta\t#drink", "#espresso\textends\t#drink"] {
         assert!(f.derivations.lines().any(|l| l.split('\t').skip(1).take(3).collect::<Vec<_>>().join("\t") == fact));
@@ -30,7 +30,7 @@ fn coffee_forged_to_beer_is_rejected_at_its_line() {
     let r = check(&fixture("coffee-forged"));
     let x = r.rejected().unwrap_or_else(|| panic!("{}", r.to_json()));
     assert_eq!(x.first_rejected, Some(3));
-    assert!(matches!(x.reason, Reason::ConclusionMismatch | Reason::PremiseMismatch), "{:?}", x.reason);
+    assert_eq!(x.reason, Reason::ConclusionMismatch);
     assert_eq!(x.rule.as_deref(), Some("builtin/type_extends"));
     assert_eq!(x.conclusion.as_deref(), Some("<cup:my> a #beer"));
     assert_eq!(r.exit_code(), 1);
@@ -239,7 +239,7 @@ fn random_closures_check_and_one_byte_forgeries_do_not() {
             r.to_json(),
             files.derivations
         );
-        assert_eq!(r.accepted().unwrap().derivations, lines.len());
+        assert_eq!(r.accepted().unwrap().derivations(), lines.len());
         if lines.is_empty() {
             continue;
         }

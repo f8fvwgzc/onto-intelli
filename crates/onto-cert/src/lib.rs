@@ -192,20 +192,58 @@ struct Checked;
 ///     checked: unreachable!(),
 /// };
 /// ```
+///
+/// Every field is private and read through a getter, so a value that
+/// [`check`] returned cannot be edited into a stronger verdict or bound to
+/// another certificate's rules:
+///
+/// ```compile_fail
+/// fn upgrade(mut a: onto_cert::Accepted) -> onto_cert::Accepted {
+///     a.verdict = onto_cert::Verdict::Entailed;
+///     a
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Accepted {
-    pub verdict: Verdict,
-    /// Lines in `asserted.tsv`.
-    pub asserted: usize,
-    /// Lines in `derivations.tsv`.
-    pub derivations: usize,
-    /// Distinct built-in rules cited by some derivation.
-    pub builtin_cited: usize,
-    /// Distinct supplied rules cited by some derivation.
-    pub supplied_cited: usize,
-    /// SHA-256 of the `rules.tsv` bytes, lowercase hex.
-    pub rules_sha256: String,
+    verdict: Verdict,
+    asserted: usize,
+    derivations: usize,
+    builtin_cited: usize,
+    supplied_cited: usize,
+    rules_sha256: String,
     checked: Checked,
+}
+
+impl Accepted {
+    /// The checker's verdict.
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Lines in `asserted.tsv`.
+    pub fn asserted(&self) -> usize {
+        self.asserted
+    }
+
+    /// Lines in `derivations.tsv`.
+    pub fn derivations(&self) -> usize {
+        self.derivations
+    }
+
+    /// Distinct built-in rules cited by some derivation.
+    pub fn builtin_cited(&self) -> usize {
+        self.builtin_cited
+    }
+
+    /// Distinct supplied rules cited by some derivation.
+    pub fn supplied_cited(&self) -> usize {
+        self.supplied_cited
+    }
+
+    /// SHA-256 of the `rules.tsv` bytes, lowercase hex.
+    pub fn rules_sha256(&self) -> &str {
+        &self.rules_sha256
+    }
 }
 
 /// A rejected certificate: the first failure found, in check order.
@@ -254,6 +292,13 @@ pub enum Outcome {
 
 /// The result of [`check`]. It is written to JSON with [`Report::to_json`]
 /// and has no way to be read back, nor to be built outside this crate.
+///
+/// The design asks for `Report` to be `Serialize` (never `Deserialize`).
+/// This crate's dependency rule allows std, `sha2` and `serde_json` only, and
+/// `serde_json` does not re-export the `serde::Serialize` trait, so `Report`
+/// implements no serde trait. Callers serialize through [`Report::to_json`]:
+/// to embed a report in a `#[derive(Serialize)]` response, store the
+/// [`serde_json::Value`] it returns.
 ///
 /// ```compile_fail
 /// let m = onto_cert::Malformed { file: "rules.tsv", line: 0, reason: String::new() };
@@ -755,23 +800,45 @@ builtin/type_extends\t<cup:my>\ta\t#drink\t<cup:my>\ta\t#coffee\t#coffee\textend
         assert_eq!(check(&f).verdict(), Some(Verdict::Entailed));
     }
 
-    /// The checker must stay independent of the engine: no onto-* crate under [dependencies].
+    /// The checker must stay independent of the engine: no onto-* crate and no
+    /// path dependency in any dependency table (normal, dev, build or
+    /// target-specific), and only sha2 and serde_json under `[dependencies]`.
     #[test]
     fn no_engine_dependency() {
         let manifest = include_str!("../Cargo.toml");
+        let workspace = include_str!("../../../Cargo.toml");
+        let workspace = &workspace[workspace.find("[workspace.dependencies]").expect("workspace dependency table")..];
         let mut section = "";
         let mut deps = 0;
         for line in manifest.lines().map(str::trim) {
             if line.starts_with('[') {
                 section = line;
+            }
+            let dep_table = section.ends_with("dependencies]") || section.contains("dependencies.");
+            if !dep_table || line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if section == "[dependencies]" && !line.is_empty() && !line.starts_with('#') {
+            let lower = line.to_ascii_lowercase();
+            let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !lower.contains("onto-") && !lower.contains("onto_") && !compact.contains("path="),
+                "onto-cert must not depend on the engine: {section} {line}"
+            );
+            if section == "[dependencies]" && line != section {
                 deps += 1;
-                assert!(!line.starts_with("onto"), "onto-cert must not depend on {line}");
+            }
+            // A `name.workspace = true` entry inherits its source from the
+            // workspace table, so that definition must not be a path either.
+            if compact.contains("workspace=true") {
+                let name = compact.split(['.', '=']).next().unwrap_or_default();
+                let def = workspace
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.split(['.', '=', ' ']).next() == Some(name))
+                    .unwrap_or_else(|| panic!("{name} is not in [workspace.dependencies]"));
+                assert!(!def.replace(' ', "").contains("path="), "{name} is a path dependency: {def}");
             }
         }
         assert_eq!(deps, 2, "only sha2 and serde_json");
-        assert!(!manifest.contains("[dependencies.onto"));
     }
 }

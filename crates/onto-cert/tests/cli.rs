@@ -39,7 +39,7 @@ fn forged_coffee_exits_1_naming_line_and_rule() {
     assert_eq!(r["ok"], false);
     assert_eq!(r["first_rejected"], 3);
     assert_eq!(r["rule"], "builtin/type_extends");
-    assert!(matches!(r["reason"].as_str(), Some("conclusion_mismatch" | "premise_mismatch")), "{r}");
+    assert_eq!(r["reason"], "conclusion_mismatch", "{r}");
     assert_eq!(r["conclusion"], "<cup:my> a #beer");
     assert_eq!(r["premises"].as_array().map(Vec::len), Some(2));
 }
