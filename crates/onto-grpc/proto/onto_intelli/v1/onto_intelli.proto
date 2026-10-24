@@ -311,6 +311,7 @@ message ActionRequest {
   string workspace = 3;
   bool confirm = 4;               // required for high-risk or irreversible actions
   bool dry_run = 5;
+  bool consequences = 6;          // Plan: also report the derived facts the edits change
 }
 
 message UndoRequest {
@@ -791,4 +792,163 @@ service ObservabilityService {
   rpc ListSessions(google.protobuf.Struct) returns (google.protobuf.Struct); // trace.sessions
   rpc GetSession(EntityRef) returns (google.protobuf.Struct);                 // trace.session
   rpc Score(google.protobuf.Struct) returns (google.protobuf.Struct);        // trace.score
+}
+
+// ── Assurance: reasoning, certificates, shapes, lint, locks, packs ───────
+// One RPC per assurance action (`onto actions`); request field names are the
+// actions' JSON keys and responses are their JSON. Derived facts are the
+// engine's opinion: only the `check` of Certify and the CheckCertificate
+// response carry a verdict, and it comes from the independent onto-cert
+// checker. Empty strings and zero numbers mean "not given" (defaults apply).
+
+message ReasonRunRequest {
+  string workspace = 1;           // only this workspace's entities (schema facts always)
+  uint64 max_derived = 2;         // stop after this many derived facts (default 1000000)
+  uint32 samples = 3;             // sample derivations listed (default 20)
+}
+
+message ReasonQueryRequest {
+  google.protobuf.ListValue pattern = 1;  // [[s, p, o], ...] with ?variables
+  string workspace = 2;
+  uint32 limit = 3;               // default 50
+}
+
+message ReasonFactRequest {
+  google.protobuf.Value fact = 1; // [s, p, o] or {subject, relation, object}
+  string workspace = 2;
+  uint32 max = 3;                 // Explain: justifications listed (default 10)
+  string semiring = 4;            // Provenance: why (default) | trust | count
+}
+
+message ReasonScopeRequest {
+  string workspace = 1;
+}
+
+message CertificateFiles {
+  string rules_tsv = 1;
+  string asserted_tsv = 2;
+  string derivations_tsv = 3;
+  string manifest_json = 4;       // empty: no manifest, the digest check is skipped
+}
+
+message BindingRequest {
+  string asserted_tsv = 1;
+  string manifest_json = 2;
+}
+
+message VerifyRequest {
+  repeated google.protobuf.Struct claims = 1;  // {subject, relation, object, rule?, premises?}
+  string workspace = 2;
+}
+
+message SliceRequest {
+  repeated string entities = 1;
+  repeated google.protobuf.Struct goals = 2;   // claims the slice must preserve
+  string workspace = 3;
+  uint32 limit = 4;               // lost facts listed (default 100)
+}
+
+message ShapesValidateRequest {
+  repeated string shapes = 1;     // empty: every shape
+  string workspace = 2;
+  bool inferred = 3;              // also read derived classes and relations
+  uint32 limit = 4;               // results listed (default 1000; all are counted)
+}
+
+message ShapesInduceRequest {
+  string kind = 1;
+  string workspace = 2;
+  string name = 3;                // default <kind>_shape
+}
+
+message ShapesCheckRequest {
+  google.protobuf.Struct shapes = 1;   // {name: Shape}
+}
+
+message LintRequest {
+  repeated string checks = 1;     // empty: every check
+  bool include_dismissed = 2;
+}
+
+message LintFeedbackRequest {
+  string id = 1;                  // finding id (12 hex digits)
+  string decision = 2;            // accept | dismiss
+  string note = 3;
+  string workspace = 4;
+}
+
+message LockRequest {
+  string section = 1;             // object_types | link_types | interfaces | rules | metrics | action_types | shapes | properties
+  string name = 2;                // properties: kind.prop
+  string reason = 3;
+}
+
+message AlignRequest {
+  string pack = 1;                // a pack id, or
+  string toml = 2;                // a schema TOML document
+  double threshold = 3;           // minimum candidate score (default 0.5)
+}
+
+message AlignCertifyRequest {
+  string pack = 1;
+  string toml = 2;
+  repeated google.protobuf.Struct mappings = 3;  // {source, target, predicate}
+}
+
+message PackRef {
+  string id = 1;
+}
+
+message PackInstallRequest {
+  string id = 1;
+  string mode = 2;                // apply (default) | propose; agents always propose
+  bool sample = 3;                // load the pack's sample data (its schema must be in force)
+  string workspace = 4;
+  string message = 5;
+}
+
+message SheetRequest {
+  string csv = 1;                 // the CSV text (header row first)
+  string kind = 2;
+  string key = 3;
+  string workspace = 4;
+  string file = 5;                // file name, used for the kind name
+}
+
+message SheetIngestRequest {
+  string csv = 1;
+  google.protobuf.Struct mapping = 2;  // empty: induced from the sheet
+  string kind = 3;
+  string key = 4;
+  string workspace = 5;
+  bool dry_run = 6;
+  string file = 7;
+}
+
+service AssuranceService {
+  rpc Run(ReasonRunRequest) returns (google.protobuf.Struct);                 // reason.run
+  rpc Query(ReasonQueryRequest) returns (google.protobuf.Struct);             // reason.query
+  rpc Explain(ReasonFactRequest) returns (google.protobuf.Struct);            // reason.explain
+  rpc Provenance(ReasonFactRequest) returns (google.protobuf.Struct);         // reason.provenance
+  rpc Certify(ReasonScopeRequest) returns (google.protobuf.Struct);           // reason.certify
+  rpc CheckCertificate(CertificateFiles) returns (google.protobuf.Struct);    // reason.check_certificate
+  rpc Binding(BindingRequest) returns (google.protobuf.Struct);               // reason.binding
+  rpc Verify(VerifyRequest) returns (google.protobuf.Struct);                 // reason.verify
+  rpc SliceCheck(SliceRequest) returns (google.protobuf.Struct);              // reason.slice_check
+  rpc ValidateShapes(ShapesValidateRequest) returns (google.protobuf.Struct); // shapes.validate
+  rpc InduceShape(ShapesInduceRequest) returns (google.protobuf.Struct);      // shapes.induce
+  rpc CheckShapes(ShapesCheckRequest) returns (google.protobuf.Struct);       // shapes.check
+  rpc Lint(LintRequest) returns (google.protobuf.Struct);                     // schema.lint
+  rpc LintFeedback(LintFeedbackRequest) returns (google.protobuf.Struct);     // schema.lint_feedback
+  rpc Locks(google.protobuf.Empty) returns (google.protobuf.Struct);          // schema.locks
+  rpc Lock(LockRequest) returns (google.protobuf.Struct);                     // schema.lock
+  rpc Unlock(LockRequest) returns (google.protobuf.Struct);                   // schema.unlock
+  rpc Align(AlignRequest) returns (google.protobuf.Struct);                   // schema.align
+  rpc AlignCertify(AlignCertifyRequest) returns (google.protobuf.Struct);     // schema.align_certify
+  rpc ListPacks(google.protobuf.Empty) returns (google.protobuf.Struct);      // pack.list
+  rpc ShowPack(PackRef) returns (google.protobuf.Struct);                     // pack.show
+  rpc PlanPack(PackRef) returns (google.protobuf.Struct);                     // pack.plan
+  rpc InstallPack(PackInstallRequest) returns (google.protobuf.Struct);       // pack.install
+  rpc InduceSheet(SheetRequest) returns (google.protobuf.Struct);             // model.induce
+  rpc IngestSheet(SheetIngestRequest) returns (google.protobuf.Struct);       // ingest.sheet
 }

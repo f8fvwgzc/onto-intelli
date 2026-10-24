@@ -137,6 +137,10 @@ response = { text = "{{answer}}", facts = "{{facts}}", mode = "{{mode}}" }
 
 [mcp]
 allow_writes = false          # `onto mcp`: expose apply_action/undo_action to agents
+# Tool profile: full (every tool) | catalog | authoring | reasoning | governance | retrieval | evaluation.
+# ask, search, get_entity and get_schema are in every profile. ONTO_MCP_PROFILE overrides this,
+# and `onto mcp --profile <name>` overrides both; an unknown name refuses to start.
+profile = "full"
 # MCP clients act as an agent: they read, propose schema changes, never apply or approve them.
 principal = { id = "mcp-agent", roles = ["agent"], workspaces = ["*"] }
 

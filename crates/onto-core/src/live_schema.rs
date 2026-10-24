@@ -461,6 +461,90 @@ pub struct SchemaPlan {
     /// Deletes paired with similar new definitions: probably renames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub likely_renames: Vec<LikelyRename>,
+    /// Shape results that appear and disappear under the planned schema
+    /// (see [`PlanShapes`]); absent from plans stored before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shapes: Option<PlanShapes>,
+}
+
+/// What a plan's shape delta means.
+pub const PLAN_SHAPES_MEANS: &str = "Shape results under the planned schema that the current schema does not \
+     produce (new_results) and the reverse (resolved), over the graph as it stands now and as the planner may see \
+     it, asserted facts only (inferred = false); migrations are not applied. A shape report is a measurement, not a \
+     proof; with complete false some results were cut and the counts are lower bounds.";
+
+/// Results a plan's shape delta lists per side.
+const PLAN_SHAPE_SAMPLES: usize = 20;
+
+/// Results one side of a plan's shape delta may hold before it is cut.
+const PLAN_SHAPE_LIMIT: usize = 100_000;
+
+/// The shape results a schema change makes appear and disappear.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanShapes {
+    /// The verdict under the current schema (absent when skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<crate::shapes::ShapeVerdict>,
+    /// The verdict under the planned schema (absent when skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<crate::shapes::ShapeVerdict>,
+    /// Results the planned schema produces that the current one does not.
+    pub new_results: usize,
+    /// Results of the current schema the planned one no longer produces.
+    pub resolved: usize,
+    pub samples: PlanShapeSamples,
+    /// False when either report was cut (the counts are then lower bounds).
+    pub complete: bool,
+    /// Why the delta was not computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    pub means: String,
+}
+
+/// The first results on each side of a plan's shape delta.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanShapeSamples {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_results: Vec<crate::shapes::ShapeResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved: Vec<crate::shapes::ShapeResult>,
+}
+
+impl PlanShapes {
+    /// A block that says why it holds nothing.
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self { skipped: Some(reason.into()), means: PLAN_SHAPES_MEANS.into(), ..Default::default() }
+    }
+}
+
+/// The shape delta of replacing `base` with `new` over `g` as `can_read`
+/// sees it (skipped above the size cap of [`schema_consequences`]).
+pub fn plan_shapes(base: &Schema, new: &Schema, g: &Graph, can_read: &dyn Fn(&Entity) -> bool) -> PlanShapes {
+    if base.shapes.is_empty() && new.shapes.is_empty() {
+        return PlanShapes::skipped("neither schema defines shapes");
+    }
+    let floor = asserted_floor(g, can_read);
+    if floor > MAX_CONSEQUENCE_FACTS {
+        return PlanShapes::skipped(too_large(floor));
+    }
+    let q = crate::shapes::ShapesQuery { limit: PLAN_SHAPE_LIMIT, ..Default::default() };
+    let before = crate::shapes::validate(base, g, None, &q, can_read);
+    let after = crate::shapes::validate(new, g, None, &q, can_read);
+    let d = crate::shapes::delta(&before, &after);
+    PlanShapes {
+        before: Some(d.before),
+        after: Some(d.after),
+        new_results: d.new_results.len(),
+        resolved: d.resolved.len(),
+        samples: PlanShapeSamples {
+            new_results: d.new_results.into_iter().take(PLAN_SHAPE_SAMPLES).collect(),
+            resolved: d.resolved.into_iter().take(PLAN_SHAPE_SAMPLES).collect(),
+        },
+        complete: d.complete,
+        skipped: None,
+        means: PLAN_SHAPES_MEANS.into(),
+    }
 }
 
 impl SchemaPlan {
@@ -479,6 +563,10 @@ impl SchemaPlan {
             return;
         }
         self.consequences = Some(Consequences::skipped(STORED_CONSEQUENCES, SCHEMA_CONSEQUENCES_MEANS));
+        // Shape results name the focus entities the planner may see.
+        if self.shapes.is_some() {
+            self.shapes = Some(PlanShapes::skipped(STORED_SHAPES));
+        }
         (self.risk, self.risk_reasons) = assess_risk(self, set);
     }
 
@@ -487,6 +575,7 @@ impl SchemaPlan {
     /// consequences and lock violations, and the risk they imply.
     pub(crate) fn with_reader_view(&mut self, fresh: &SchemaPlan, set: &SchemaChangeSet) {
         self.consequences = fresh.consequences.clone();
+        self.shapes = fresh.shapes.clone();
         self.locked_violations = fresh.locked_violations.clone();
         (self.risk, self.risk_reasons) = assess_risk(self, set);
     }
@@ -576,6 +665,10 @@ pub const SCHEMA_CONSEQUENCES_MEANS: &str = "Facts the reasoner derives (or the 
      engine's opinion, not a checker's verdict. `conservative` means no added fact is stated purely in the current \
      vocabulary; it is shown only when both runs reached a fixpoint. Asserted state and property facts are left out: \
      the graph is the same, and only what the rules read differs.";
+
+/// The shape delta of a stored plan: computed per reader, like its consequences.
+pub const STORED_SHAPES: &str = "shape results are computed for each reader, as that reader may see the graph: \
+     plan the change set (or read the proposal) to see them";
 
 /// Why a stored proposal's plan holds no consequences.
 pub const STORED_CONSEQUENCES: &str = "consequences are computed for each reader, as that reader may see the graph, \
@@ -3234,6 +3327,10 @@ impl Ontology {
         planned.plan.consequences = Some(match &planned.schema {
             Some(new) => schema_consequences(&active.schema, new, &g, &can),
             None => Consequences::skipped("the change set does not compile", SCHEMA_CONSEQUENCES_MEANS),
+        });
+        planned.plan.shapes = Some(match &planned.schema {
+            Some(new) => plan_shapes(&active.schema, new, &g, &can),
+            None => PlanShapes::skipped("the change set does not compile"),
         });
         let may_override = locks::can_manage(p) && proposer.is_none_or(proposer_may_override);
         assess(&mut planned.plan, &active.schema, set, &held, may_override);

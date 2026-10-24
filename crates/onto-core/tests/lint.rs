@@ -46,6 +46,12 @@ fn builtin_packages_have_no_errors() {
             combos.push(vec![name]);
         }
     }
+    // Industry packs layer on enterprise.
+    for (name, _) in PACKAGES {
+        if !combos.iter().any(|c| c.contains(name)) {
+            combos.push(vec!["enterprise", name]);
+        }
+    }
     assert!(PACKAGES.iter().all(|(n, _)| combos.iter().any(|c| c.contains(n))), "every package is covered");
     for names in combos {
         let s = layered(&names);
