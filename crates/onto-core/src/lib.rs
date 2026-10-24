@@ -38,8 +38,10 @@ pub mod profile;
 pub mod proposals;
 pub mod quality;
 pub mod query;
+pub mod reason;
 pub mod rules;
 pub mod schema;
+pub mod shape_model;
 pub mod similarity;
 pub mod store;
 pub mod text;
@@ -58,7 +60,12 @@ pub use live_schema::{
 pub use model::*;
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
+pub use reason::{
+    Attested, BindingReport, BindingVerdict, Certificate, Closure, ClosureDiff, Derivation, Fact, QueryAnswer,
+    ReasonOptions, ReasonStats, Status as FactStatus,
+};
 pub use schema::{Dir, Schema};
+pub use shape_model::{PropertyShape, Shape, ShapeSeverity};
 /// The sqlx 0.9 API the PostgreSQL store is built on, as `sqlx::…` paths.
 /// An application's `sqlx::PgPool` is the same type as `sqlx::PgPool` here:
 /// hand it to `store::PgShared::from_pool`.

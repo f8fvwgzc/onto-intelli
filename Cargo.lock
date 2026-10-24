@@ -1335,6 +1335,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx-core",
  "sqlx-postgres",
  "thiserror",
