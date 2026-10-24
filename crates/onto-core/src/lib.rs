@@ -28,6 +28,7 @@ pub mod explain;
 pub mod explorer;
 pub mod export;
 pub mod graph;
+pub mod induce;
 pub mod learn;
 pub mod lint;
 pub mod live_schema;
@@ -61,6 +62,7 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use explain::{Claim, ClaimVerdict, Justifications, SliceReport, VerifyReport};
+pub use induce::{InduceOptions, Induced, SheetIngest, SheetMapping};
 pub use lint::{LintDecision, LintFeedback, LintQuery, LintReport};
 pub use live_schema::{
     Consequences, Conservativity, Governance, LikelyRename, Migration, Risk, SchemaApplied, SchemaChange,
