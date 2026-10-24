@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod model;
 pub mod modeling;
 pub mod objects;
+pub mod packs;
 pub mod policy;
 pub mod profile;
 pub mod proposals;
@@ -58,6 +59,7 @@ pub use live_schema::{
     SchemaVersion, SchemaVersionInfo,
 };
 pub use model::*;
+pub use packs::{InstallMode, PackDetail, PackInfo, PackInstallOptions, PackInstalled, PackMeta};
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use reason::{

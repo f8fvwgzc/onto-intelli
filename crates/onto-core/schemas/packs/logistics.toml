@@ -1,0 +1,490 @@
+# Industry pack: logistics and transportation, layered on builtin:enterprise.
+#
+# Carriers and their fleets; hubs, lanes and consignees; shipments, their legs
+# and the handling units packed into them; delivery exceptions, freight
+# invoices and customs declarations. Drivers and hub teams are the enterprise
+# `person` and `team`.
+#
+# Enable it with `[ontology] extend = ["builtin:logistics"]`, or install it
+# live as a governed schema change (pack.plan / pack.install).
+
+[pack]
+id = "logistics"
+title = "Logistics and transportation"
+industry = "logistics"
+version = "1.0.0"
+description = "Freight and parcel movements: carriers and their vehicles, hubs, lanes and consignees, shipments split into transport legs, nested handling units, delivery exceptions, freight invoices and customs declarations. Vocabulary inspired by GS1 logistics keys (SSCC, GLN), UN/LOCODE and the WCO Harmonized System; it borrows their words and claims no compliance with any of them. Its rules (carriers used via legs, delayed shipments, hub congestion risk, customs holds, hazmat vehicles) are supplied assumptions, so certificates that cite them are entailed only under those rules."
+requires = ["enterprise"]
+standards = [
+    "GS1 logistics keys: SSCC for handling units, GLN for locations",
+    "UN/LOCODE (UNECE): hub location codes",
+    "WCO Harmonized System: commodity codes on customs declarations",
+]
+sample_note = "Handling unit pal-2 carries an 11-digit SSCC (an SSCC has 18 digits), so handling_unit_shape reports exactly one violation (prop.sscc, pattern). Everything else in the sample conforms."
+
+# ── Parties and places ───────────────────────────────────────────────────────
+
+[object_types.carrier]
+label = "Carrier"
+category = "actor"
+icon = "truck"
+color = "#1e40af"
+description = "A company that moves freight: a trucking firm, shipping line, airline, railway or parcel network."
+states = ["onboarding", "active", "suspended"]
+alert_states = ["suspended"]
+properties.scac_code = { type = "string", pattern = "^[A-Z]{2,4}$", description = "Standard Carrier Alpha Code." }
+properties.transport_mode = { type = "enum", values = ["road", "rail", "ocean", "air", "parcel"] }
+properties.on_time_rate = { type = "float", description = "Share of legs delivered on time, between 0 and 1." }
+constraints.unique = ["scac_code"]
+
+[object_types.logistics_hub]
+label = "Logistics hub"
+category = "container"
+icon = "warehouse"
+color = "#1d4ed8"
+description = "A place freight passes through: a warehouse, distribution center, cross-dock, port, airport or rail terminal."
+states = ["operational", "congested", "closed"]
+terminal_states = ["closed"]
+alert_states = ["congested"]
+properties.hub_type = { type = "enum", values = ["warehouse", "distribution_center", "cross_dock", "port", "airport", "rail_terminal"] }
+properties.unlocode = { type = "string", pattern = "^[A-Z]{2}[A-Z2-9]{3}$", description = "UN/LOCODE of the location (NLRTM)." }
+properties.dock_doors = { type = "int" }
+
+[object_types.consignee]
+label = "Consignee"
+category = "actor"
+icon = "map-pin"
+color = "#0f766e"
+description = "The party a shipment is delivered to."
+properties.delivery_window = { type = "string", description = "Accepted delivery hours, for example 06:00-14:00." }
+properties.dock_appointment_required = { type = "bool" }
+
+[object_types.transport_lane]
+label = "Transport lane"
+icon = "route"
+color = "#2563eb"
+description = "A recurring origin-destination pair between two hubs, with its standard transit time."
+properties.distance_km = { type = "float" }
+properties.standard_transit_days = { type = "float" }
+
+[object_types.fleet_vehicle]
+label = "Fleet vehicle"
+icon = "bus"
+color = "#0284c7"
+description = "A vehicle, vessel, aircraft or railcar a carrier moves freight with."
+states = ["available", "in_service", "maintenance", "retired"]
+terminal_states = ["retired"]
+properties.registration = { type = "string", searchable = true }
+properties.vehicle_type = { type = "enum", values = ["van", "rigid_truck", "tractor_unit", "trailer", "vessel", "aircraft", "railcar"] }
+properties.capacity_kg = { type = "float" }
+
+# ── Movements ────────────────────────────────────────────────────────────────
+
+[object_types.shipment]
+label = "Shipment"
+icon = "package"
+color = "#3b82f6"
+implements = ["trackable_movement"]
+description = "Goods moving from a hub to a consignee or another hub under one tracking number."
+states = ["booked", "picked_up", "in_transit", "at_hub", "out_for_delivery", "delivered", "exception", "returned", "cancelled"]
+terminal_states = ["delivered", "returned", "cancelled"]
+alert_states = ["exception"]
+properties.tracking_number = { type = "string", required = true, searchable = true }
+properties.weight_kg = { type = "float" }
+properties.service_level = { type = "enum", values = ["standard", "express", "same_day", "freight"] }
+properties.hazmat = { type = "bool", description = "Contains dangerous goods." }
+properties.promised_delivery = { type = "timestamp" }
+
+[object_types.transport_leg]
+label = "Transport leg"
+icon = "milestone"
+color = "#0ea5e9"
+implements = ["trackable_movement"]
+description = "One movement of a shipment between two hubs, on one vehicle."
+states = ["planned", "departed", "arrived", "delayed", "cancelled"]
+terminal_states = ["arrived", "cancelled"]
+alert_states = ["delayed"]
+properties.leg_sequence = { type = "int" }
+properties.departure_time = { type = "timestamp" }
+properties.arrival_time = { type = "timestamp" }
+
+[object_types.handling_unit]
+label = "Handling unit"
+icon = "box"
+color = "#60a5fa"
+description = "A parcel, pallet, tote or container, identified by its SSCC; units nest inside each other."
+properties.sscc = { type = "string", description = "18-digit Serial Shipping Container Code." }
+properties.unit_type = { type = "enum", values = ["parcel", "pallet", "tote", "container_20ft", "container_40ft"] }
+properties.gross_weight_kg = { type = "float" }
+
+# ── Exceptions and paperwork ─────────────────────────────────────────────────
+
+[object_types.delivery_exception]
+label = "Delivery exception"
+icon = "triangle-alert"
+color = "#dc2626"
+description = "Something went wrong with a shipment or a leg: damage, loss, delay, refusal, a customs hold."
+states = ["open", "investigating", "resolved"]
+terminal_states = ["resolved"]
+alert_states = ["open", "investigating"]
+properties.exception_type = { type = "enum", values = ["damaged", "lost", "delayed", "refused", "address_issue", "customs_hold"] }
+properties.reported_at = { type = "timestamp" }
+
+[object_types.freight_invoice]
+label = "Freight invoice"
+category = "artifact"
+icon = "receipt"
+color = "#7c3aed"
+description = "A carrier's bill for moving shipments."
+states = ["received", "disputed", "approved", "paid"]
+terminal_states = ["paid"]
+alert_states = ["disputed"]
+properties.invoice_number = { type = "string" }
+properties.invoice_amount = { type = "float" }
+properties.invoice_currency = { type = "enum", values = ["usd", "eur", "gbp", "cny", "jpy"] }
+
+[object_types.customs_declaration]
+label = "Customs declaration"
+category = "artifact"
+icon = "stamp"
+color = "#a16207"
+description = "The declaration that clears a shipment's goods through customs."
+states = ["drafted", "submitted", "held", "cleared"]
+terminal_states = ["cleared"]
+alert_states = ["held"]
+properties.declaration_number = { type = "string" }
+properties.hs_code = { type = "string", pattern = "^[0-9]{6,10}$", description = "Harmonized System commodity code, 6 to 10 digits." }
+properties.declared_value = { type = "float" }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.trackable_movement]
+description = "Shipments and transport legs: movements with an estimated arrival, carried by a carrier."
+properties.eta = { type = "timestamp" }
+links = ["carried_by"]
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.carried_by]
+description = "The carrier responsible for the movement."
+from = ["trackable_movement"]
+to = ["carrier"]
+inverse = "carries"
+cardinality = "one"
+weight = 0.9
+
+[link_types.ships_from]
+description = "The hub the shipment starts from."
+from = ["shipment"]
+to = ["logistics_hub"]
+inverse = "outbound_shipments"
+cardinality = "one"
+weight = 0.8
+
+[link_types.ships_to]
+description = "The consignee or hub the shipment is delivered to."
+from = ["shipment"]
+to = ["logistics_hub", "consignee"]
+inverse = "inbound_shipments"
+cardinality = "one"
+weight = 0.8
+
+[link_types.moves_on_lane]
+description = "The standard lane the shipment travels."
+from = ["shipment"]
+to = ["transport_lane"]
+inverse = "lane_shipments"
+cardinality = "one"
+weight = 0.6
+
+[link_types.leg_of]
+description = "The shipment this leg moves."
+from = ["transport_leg"]
+to = ["shipment"]
+inverse = "legs"
+cardinality = "one"
+weight = 0.9
+
+[link_types.departs_from_hub]
+description = "The hub the leg leaves from."
+from = ["transport_leg"]
+to = ["logistics_hub"]
+inverse = "departures"
+cardinality = "one"
+weight = 0.7
+
+[link_types.arrives_at_hub]
+description = "The hub the leg arrives at."
+from = ["transport_leg"]
+to = ["logistics_hub"]
+inverse = "arrivals"
+cardinality = "one"
+weight = 0.7
+
+[link_types.after_leg]
+description = "The leg can start only after the object leg arrives (a dependency, transitive)."
+from = ["transport_leg"]
+to = ["transport_leg"]
+inverse = "before_leg"
+dependency = true
+transitive = true
+weight = 0.7
+
+[link_types.on_vehicle]
+description = "The vehicle that performs the leg."
+from = ["transport_leg"]
+to = ["fleet_vehicle"]
+inverse = "vehicle_legs"
+cardinality = "one"
+weight = 0.6
+
+[link_types.driven_by]
+description = "The driver of the leg."
+from = ["transport_leg"]
+to = ["person"]
+inverse = "drives_leg"
+cardinality = "one"
+weight = 0.5
+
+[link_types.vehicle_operated_by]
+description = "The carrier that operates the vehicle."
+from = ["fleet_vehicle"]
+to = ["carrier"]
+inverse = "fleet"
+cardinality = "one"
+weight = 0.6
+
+[link_types.packed_in]
+description = "The unit is packed inside a bigger unit or loaded on a shipment (nesting; transitive)."
+from = ["handling_unit"]
+to = ["handling_unit", "shipment"]
+inverse = "packed_units"
+transitive = true
+weight = 0.7
+
+[link_types.lane_origin]
+description = "The hub the lane starts at."
+from = ["transport_lane"]
+to = ["logistics_hub"]
+inverse = "lanes_out"
+cardinality = "one"
+weight = 0.6
+
+[link_types.lane_destination]
+description = "The hub the lane ends at."
+from = ["transport_lane"]
+to = ["logistics_hub"]
+inverse = "lanes_in"
+cardinality = "one"
+weight = 0.6
+
+[link_types.hub_operated_by]
+description = "The team running the hub."
+from = ["logistics_hub"]
+to = ["team"]
+inverse = "operates_hub"
+cardinality = "one"
+weight = 0.7
+
+[link_types.exception_on]
+description = "The shipment or leg the exception concerns."
+from = ["delivery_exception"]
+to = ["shipment", "transport_leg"]
+inverse = "exceptions"
+weight = 1.0
+
+[link_types.invoices_shipment]
+description = "A shipment billed on the freight invoice."
+from = ["freight_invoice"]
+to = ["shipment"]
+inverse = "freight_invoices"
+weight = 0.6
+
+[link_types.invoiced_by]
+description = "The carrier that issued the freight invoice."
+from = ["freight_invoice"]
+to = ["carrier"]
+inverse = "carrier_invoices"
+cardinality = "one"
+weight = 0.6
+
+[link_types.declares]
+description = "The shipment whose goods the customs declaration covers."
+from = ["customs_declaration"]
+to = ["shipment"]
+inverse = "customs_declarations"
+cardinality = "one"
+weight = 0.8
+
+# ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
+
+[[rules]]
+name = "carrier_via_legs"
+description = "A shipment is moved by every carrier that carries one of its legs."
+chain = ["legs", "carried_by"]
+infer = "moved_by_carrier"
+
+[[rules]]
+name = "leg_dispatch_team"
+description = "A leg is dispatched by the team that runs the hub it departs from."
+chain = ["departs_from_hub", "hub_operated_by"]
+infer = "dispatched_by_team"
+
+[[rules]]
+name = "delayed_shipment"
+description = "A shipment with a delayed leg is a delayed shipment."
+when = [["?s", "a", "shipment"], ["?l", "leg_of", "?s"], ["?l", "state", "delayed"]]
+then = ["?s", "a", "delayed_shipment"]
+
+[[rules]]
+name = "hub_congestion_risk"
+description = "A shipment in transit whose next planned leg arrives at a congested hub is at risk of delay."
+when = [["?s", "state", "in_transit"], ["?l", "leg_of", "?s"], ["?l", "state", "planned"], ["?l", "arrives_at_hub", "?h"], ["?h", "state", "congested"]]
+then = ["?s", "a", "congestion_risk_shipment"]
+
+[[rules]]
+name = "customs_hold"
+description = "A shipment whose customs declaration is held is held by customs."
+when = [["?d", "a", "customs_declaration"], ["?d", "state", "held"], ["?d", "declares", "?s"]]
+then = ["?s", "held_by_customs", "?d"]
+
+[[rules]]
+name = "hazmat_vehicle"
+description = "A vehicle that performs a leg of a dangerous-goods shipment needs hazmat certification."
+when = [["?l", "on_vehicle", "?v"], ["?l", "leg_of", "?s"], ["?s", "prop.hazmat", true]]
+then = ["?v", "a", "hazmat_vehicle"]
+
+# ── Shapes (conditions the data should meet; a report is a measurement) ─────
+
+[shapes.shipment_shape]
+description = "A shipment has a tracking number, an origin, a destination, at most one carrier and a non-negative weight."
+target = "shipment"
+properties = [
+    { path = "prop.tracking_number", min_count = 1, max_count = 1 },
+    { path = "ships_from", min_count = 1, max_count = 1 },
+    { path = "ships_to", min_count = 1, max_count = 1 },
+    { path = "carried_by", max_count = 1, class = "carrier" },
+    { path = "prop.weight_kg", min_value = 0 },
+]
+
+[shapes.transport_leg_shape]
+description = "A leg moves exactly one shipment from one hub to another."
+target = "transport_leg"
+properties = [
+    { path = "leg_of", min_count = 1, max_count = 1, class = "shipment" },
+    { path = "departs_from_hub", min_count = 1, max_count = 1 },
+    { path = "arrives_at_hub", min_count = 1, max_count = 1 },
+]
+
+[shapes.handling_unit_shape]
+description = "A handling unit carries an 18-digit SSCC and is packed in something."
+target = "handling_unit"
+properties = [
+    { path = "prop.sscc", min_count = 1, max_count = 1, pattern = "^[0-9]{18}$", message = "An SSCC has exactly 18 digits." },
+    { path = "packed_in", min_count = 1 },
+]
+
+[shapes.customs_declaration_shape]
+description = "A customs declaration covers exactly one shipment and carries an HS code."
+target = "customs_declaration"
+properties = [
+    { path = "declares", min_count = 1, max_count = 1, class = "shipment" },
+    { path = "prop.hs_code", min_count = 1, pattern = "^[0-9]{6,10}$" },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_shipments]
+description = "Shipments not yet delivered, returned or cancelled."
+kind = "shipment"
+measure = "count"
+filter = { open = true }
+dimensions = { state = "state", carrier = "carried_by", service_level = "service_level", origin = "ships_from", lane = "moves_on_lane" }
+certified = true
+
+[metrics.open_shipment_weight]
+description = "Kilograms on open shipments."
+kind = "shipment"
+measure = "sum"
+property = "weight_kg"
+filter = { open = true }
+dimensions = { carrier = "carried_by", origin = "ships_from" }
+
+[metrics.exception_resolution_time]
+description = "Days from a delivery exception being opened to being resolved."
+kind = "delivery_exception"
+measure = "lead_time"
+window_days = 90
+
+# ── Action types (governed edits) ────────────────────────────────────────────
+
+[action_types.report_delivery_exception]
+description = "Open a delivery exception on a shipment and flag the shipment."
+phrases = ["report exception", "flag shipment"]
+risk = "low"
+roles = ["member", "admin", "agent"]
+parameters.shipment = { type = "entity", kinds = ["shipment"], required = true }
+parameters.title = { type = "string", required = true }
+parameters.exception_type = { type = "enum", values = ["damaged", "lost", "delayed", "refused", "address_issue", "customs_hold"], required = true }
+
+[[action_types.report_delivery_exception.preconditions]]
+check = "open"
+param = "shipment"
+message = "The shipment is already delivered, returned or cancelled."
+
+[[action_types.report_delivery_exception.effects]]
+create = { kind = "delivery_exception", title = "{title}", state = "open", props = { exception_type = "{exception_type}" }, links = [ { rel = "exception_on", to = "{shipment}" } ] }
+
+[[action_types.report_delivery_exception.effects]]
+patch = { id = "{shipment}", state = "exception" }
+
+[[action_types.report_delivery_exception.effects]]
+event = { action = "shipment.exception", target = "{shipment}", payload = { exception = "{created}", type = "{exception_type}" } }
+
+[action_types.confirm_delivery]
+description = "Confirm that a shipment was delivered."
+phrases = ["deliver", "confirm delivery", "mark delivered"]
+risk = "low"
+parameters.shipment = { type = "entity", kinds = ["shipment"], required = true }
+
+[[action_types.confirm_delivery.preconditions]]
+check = "state_in"
+param = "shipment"
+values = ["in_transit", "at_hub", "out_for_delivery"]
+message = "Only shipments on the way can be confirmed as delivered."
+
+[[action_types.confirm_delivery.effects]]
+patch = { id = "{shipment}", state = "delivered" }
+
+[[action_types.confirm_delivery.effects]]
+event = { action = "shipment.delivered", target = "{shipment}" }
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+haulier = "carrier"
+trucking_company = "carrier"
+shipping_line = "carrier"
+distribution_center = "logistics_hub"
+cross_dock = "logistics_hub"
+depot = "logistics_hub"
+freight_terminal = "logistics_hub"
+receiver = "consignee"
+lane = "transport_lane"
+truck = "fleet_vehicle"
+trailer = "fleet_vehicle"
+vessel = "fleet_vehicle"
+consignment = "shipment"
+parcel = "shipment"
+freight = "shipment"
+leg = "transport_leg"
+pallet = "handling_unit"
+sscc = "handling_unit"
+delivery_issue = "delivery_exception"
+customs_entry = "customs_declaration"
+
+[glossary.relations]
+carrier = "carried_by"
+origin = "ships_from"
+destination = "ships_to"
+driver = "driven_by"

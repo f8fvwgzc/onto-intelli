@@ -30,11 +30,16 @@ pub const DATA_CATALOG_SCHEMA: &str = include_str!("../schemas/data-catalog.toml
 pub const CODE_SCHEMA: &str = include_str!("../schemas/code.toml");
 
 /// Built-in schema packages, layered with `extend = ["builtin:<name>"]`.
+/// The industry packs of [`crate::packs::REGISTRY`] are layers on enterprise.
 pub const PACKAGES: &[(&str, &str)] = &[
     ("enterprise", ENTERPRISE_SCHEMA),
     ("nexc-execution", NEXC_EXECUTION_SCHEMA),
     ("data-catalog", DATA_CATALOG_SCHEMA),
     ("code", CODE_SCHEMA),
+    ("manufacturing", crate::packs::MANUFACTURING_SCHEMA),
+    ("supply-chain", crate::packs::SUPPLY_CHAIN_SCHEMA),
+    ("retail", crate::packs::RETAIL_SCHEMA),
+    ("logistics", crate::packs::LOGISTICS_SCHEMA),
 ];
 
 /// The TOML of a built-in package.
@@ -521,11 +526,12 @@ struct SchemaFile {
     action_types: BTreeMap<String, ActionType>,
     #[serde(default)]
     shapes: BTreeMap<String, Shape>,
-    /// Package metadata (`[pack]`). It describes the file, never the schema,
-    /// so it does not change the schema's name or version.
+    /// Package metadata (`[pack]`, see [`crate::packs::PackMeta`]). It
+    /// describes the file, never the schema, so it does not change the
+    /// schema's name or version.
     #[serde(default)]
     #[allow(dead_code)]
-    pack: Option<toml::Value>,
+    pack: Option<crate::packs::PackMeta>,
 }
 
 impl Schema {
