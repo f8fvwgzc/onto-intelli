@@ -16,6 +16,7 @@
 //! ingestion wrap [`Ontology::apply`] in a queue (see the `onto-intelli` crate).
 
 pub mod action_types;
+pub mod align;
 pub mod authority;
 pub mod catalog;
 pub mod deps;
@@ -53,6 +54,7 @@ pub mod text;
 pub mod time;
 pub mod trace;
 
+pub use align::{AlignOptions, AlignReport, AlignSource, CertifyReport, Mapping, MatchPredicate};
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
     SearchHit, SearchMode, SyncReport,
