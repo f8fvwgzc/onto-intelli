@@ -823,7 +823,10 @@ impl McpServer {
                     all.iter().filter(|t| self.offered(t.0, t.4)).count(),
                     all.len(),
                     if hidden > 0 {
-                        format!(", {hidden} write tools hidden by allow_writes = false")
+                        format!(
+                            ", {hidden} write tool{} hidden by allow_writes = false",
+                            if hidden == 1 { "" } else { "s" }
+                        )
                     } else {
                         String::new()
                     },

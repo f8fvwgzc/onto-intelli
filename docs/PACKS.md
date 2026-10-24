@@ -203,7 +203,7 @@ $ onto reason run
 62 facts derived from 345 asserted (16 rules · 3 rounds · fixpoint reached)
 …
 $ onto shapes validate
-violates 15 focus nodes · 1 violations, 0 warnings, 0 info
+violates 15 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation production_order_shape   min_count    production_order:po-1004 scheduled_on       Schedule the order on a line or work center.
 …
@@ -279,7 +279,7 @@ $ onto -w pk-supply-chain reason run --samples 0
 20 facts derived from 121 asserted (22 rules · 6 rounds · fixpoint reached)
 …
 $ onto -w pk-supply-chain shapes validate
-violates 17 focus nodes · 1 violations, 0 warnings, 0 info
+violates 17 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation supplier_shape           min_count    supplier:northwind-distribution operates_site      Record at least one site so the supplier's sourcing region can be assessed.
 …
@@ -354,7 +354,7 @@ $ onto -w pk-retail reason run --samples 0
 23 facts derived from 136 asserted (28 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-retail shapes validate
-violates 18 focus nodes · 1 violations, 0 warnings, 0 info
+violates 18 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation stock_position_shape     min_value    stock_position:0217-cold-brew prop.on_hand       On-hand stock cannot be negative: look for double-posted adjustments. (value -3)
 …
@@ -429,7 +429,7 @@ $ onto -w pk-logistics reason run --samples 0
 19 facts derived from 124 asserted (34 rules · 2 rounds · fixpoint reached)
 …
 $ onto -w pk-logistics shapes validate
-violates 12 focus nodes · 1 violations, 0 warnings, 0 info
+violates 12 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation handling_unit_shape      pattern      handling_unit:pal-2      prop.sscc          An SSCC has exactly 18 digits. (value 38712345000)
 …
@@ -507,7 +507,7 @@ $ onto -w pk-healthcare reason run --samples 0
 32 facts derived from 150 asserted (40 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-healthcare shapes validate
-violates 17 focus nodes · 1 violations, 0 warnings, 0 info
+violates 17 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation medication_order_complete min_count    medication_order:mo-1003 prescribed_by      Orders must be signed by a clinician.
 …
@@ -585,7 +585,7 @@ $ onto -w pk-finance reason run --samples 0
 26 facts derived from 167 asserted (46 rules · 4 rounds · fixpoint reached)
 …
 $ onto -w pk-finance shapes validate
-violates 19 focus nodes · 1 violations, 0 warnings, 0 info
+violates 19 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation legal_entity_identified  pattern      legal_entity:northwind-holdings prop.lei           An LEI is 18 alphanumerics followed by 2 check digits. (value 213800ABCDEF1234567)
 …
@@ -659,7 +659,7 @@ $ onto -w pk-insurance reason run --samples 0
 17 facts derived from 176 asserted (52 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-insurance shapes validate
-violates 17 focus nodes · 1 violations, 0 warnings, 0 info
+violates 17 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation claim_complete           min_count    claim:clm-20260006       prop.loss_date     Record the date of loss: cover depends on it.
 …
@@ -737,7 +737,7 @@ $ onto -w pk-energy reason run --samples 0
 58 facts derived from 171 asserted (58 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-energy shapes validate
-violates 19 focus nodes · 1 violations, 0 warnings, 0 info
+violates 19 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation smart_meter_installed    min_count    smart_meter:m-stock-0001 meter_at           A meter must be installed at one service point.
 …
@@ -814,7 +814,7 @@ $ onto -w pk-telecom reason run --samples 0
 39 facts derived from 175 asserted (64 rules · 4 rounds · fixpoint reached)
 …
 $ onto -w pk-telecom shapes validate
-violates 16 focus nodes · 1 violations, 0 warnings, 0 info
+violates 16 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation transport_endpoints      min_count    transport_link:mw-hop-77 terminates_on      A transport link must terminate on two network elements.
 …
@@ -889,7 +889,7 @@ $ onto -w pk-saas reason run --samples 0
 26 facts derived from 197 asserted (70 rules · 3 rounds · fixpoint reached)
 …
 $ onto -w pk-saas shapes validate
-violates 19 focus nodes · 1 violations, 0 warnings, 0 info
+violates 19 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation nps_scale                max_value    nps_response:nps-0007    prop.nps_score     NPS scores run from 0 to 10. (value 11)
 …

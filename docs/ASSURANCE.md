@@ -739,7 +739,7 @@ violation:
 
 ```text
 $ onto shapes validate
-violates 15 focus nodes · 1 violations, 0 warnings, 0 info
+violates 15 focus nodes · 1 violation, 0 warnings, 0 info
   severity  shape                    component    focus                    path               message
   violation production_order_shape   min_count    production_order:po-1004 scheduled_on       Schedule the order on a line or work center.
 means: A shape report is a measurement of the graph as this principal can read it (with inferred, of the reasoner's closure too), not a proof. …
@@ -874,13 +874,13 @@ dismissed 3697ee08a206 recursive_rule rule:bom_explosion_multilevel · by local
 $ onto lint --check recursive_rule --check keyword_collision
 warning 54ee4638bd54 keyword_collision link_type:implemented_by
         …
-0 errors, 1 warnings, 0 info · 1 suppressed (dismissed) · 2 checks ran
+0 errors, 1 warning, 0 info · 1 suppressed (dismissed) · 2 checks ran
 $ onto lint --check recursive_rule --all
 info    3697ee08a206 recursive_rule rule:bom_explosion_multilevel [dismissed]
         rule bom_explosion_multilevel derives relation uses_component, which its own body uses again through rules bom_explosion_multilevel -> bom_explosion_multilevel
         fix: nothing, if the recursion is intended (the reasoner runs it to a fixpoint); otherwise break the cycle between these rules
         note: multi-level BOM explosion is meant to recurse
-0 errors, 0 warnings, 1 info · 0 suppressed (dismissed) · 1 checks ran
+0 errors, 0 warnings, 1 info · 0 suppressed (dismissed) · 1 check ran
 ```
 
 `onto lint` exits 1 when it shows an `error` finding.

@@ -986,10 +986,10 @@ fn print_shape_report(st: &Style, r: &Value) {
     println!(
         "{word} {}",
         st.dim(&format!(
-            "{} focus nodes · {} violations, {} warnings, {} info{}{}",
-            r["focus_nodes"],
-            c["violation"],
-            c["warning"],
+            "{} · {}, {}, {} info{}{}",
+            n_of(r["focus_nodes"].as_u64().unwrap_or(0), "focus node"),
+            n_of(c["violation"].as_u64().unwrap_or(0), "violation"),
+            n_of(c["warning"].as_u64().unwrap_or(0), "warning"),
             c["info"],
             if r["inferred"] == true { " · with inferred facts" } else { "" },
             if r["fixpoint_reached"] == false { " (closure is a lower bound)" } else { "" }
@@ -1111,12 +1111,12 @@ pub(crate) async fn lint(cli: &Cli, st: &Style, a: &LintArgs) -> Result<()> {
         println!(
             "{}",
             st.dim(&format!(
-                "{} errors, {} warnings, {} info · {} suppressed (dismissed) · {} checks ran",
-                c["error"],
-                c["warning"],
+                "{}, {}, {} info · {} suppressed (dismissed) · {} ran",
+                n_of(c["error"].as_u64().unwrap_or(0), "error"),
+                n_of(c["warning"].as_u64().unwrap_or(0), "warning"),
                 c["info"],
                 r["suppressed"].as_u64().unwrap_or(0),
-                len_of(&r["checks_run"])
+                n_of(len_of(&r["checks_run"]) as u64, "check")
             ))
         );
         for n in r["not_run"].as_array().into_iter().flatten().chain(r["partial"].as_array().into_iter().flatten()) {
@@ -1366,10 +1366,10 @@ fn print_pack(st: &Style, r: &Value) {
     if lint.is_object() {
         let c = if lint["counts"].is_object() { &lint["counts"] } else { lint };
         println!(
-            "\n{} {} errors, {} warnings, {} info {}",
+            "\n{} {}, {}, {} info {}",
             st.bold("Lint (the pack's own findings):"),
-            c["error"],
-            c["warning"],
+            n_of(c["error"].as_u64().unwrap_or(0), "error"),
+            n_of(c["warning"].as_u64().unwrap_or(0), "warning"),
             c["info"],
             st.dim("· a measurement")
         );

@@ -825,6 +825,24 @@ fn a_glossary_match_names_both_definitions() {
 }
 
 #[test]
+fn name_evidence_always_names_both_definitions() {
+    let o = manufacturing();
+    let admin = Principal::admin("ada");
+    for source in [AlignSource::Pack("supply-chain".into()), AlignSource::Toml(HELPDESK.into())] {
+        let r = o.schema_align(&admin, &source, &AlignOptions::default()).unwrap();
+        for m in r.kinds.iter().chain(&r.links) {
+            let name = &m.evidence[0];
+            assert!(
+                name.contains(&format!("'{}'", m.source)) && name.contains(&format!("'{}'", m.target)),
+                "{} -> {}: {name}",
+                m.source,
+                m.target
+            );
+        }
+    }
+}
+
+#[test]
 fn one_shared_endpoint_does_not_outweigh_the_names() {
     let o = manufacturing();
     let admin = Principal::admin("ada");

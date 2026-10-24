@@ -627,6 +627,11 @@ fn name_signal(a: &[Name], b: &[Name]) -> NameHit {
             let v = name_sim(x, y);
             if v > best.value {
                 best = hit(x, y, v, false);
+                // A fuzzy hit through a glossary word still names the two
+                // definitions; the words that were compared go in `via`.
+                if x.synonym || y.synonym {
+                    best = NameHit { a: own(a, x), b: own(b, y), via: format!("'{}' ~ '{}'", x.raw, y.raw), ..best };
+                }
             }
         }
     }
@@ -1082,6 +1087,11 @@ fn name_sentence(hit: &NameHit) -> String {
         format!("name: '{}' and '{}' are the same word through the glossary word '{}' (1.00)", hit.a, hit.b, hit.via)
     } else if !hit.same_word && hit.value >= 1.0 {
         format!("name: '{}' vs '{}' share every word but are not the same word (similarity 1.00)", hit.a, hit.b)
+    } else if !hit.via.is_empty() {
+        format!(
+            "name: '{}' vs '{}' compared through the glossary as {} (similarity {:.2})",
+            hit.a, hit.b, hit.via, hit.value
+        )
     } else {
         format!("name: '{}' vs '{}' (similarity {:.2})", hit.a, hit.b, hit.value)
     }
