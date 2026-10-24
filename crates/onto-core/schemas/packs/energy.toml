@@ -483,22 +483,22 @@ chain = ["in_territory", "sub_territory_of"]
 infer = "within_territory"
 
 [[rules]]
-name = "outage_crew"
+name = "responsible_crew"
 description = "The crew maintaining the asset where an outage started is responsible for it."
 chain = ["originated_at", "maintained_by_crew"]
 infer = "responsible_crew"
 
 [[rules]]
 name = "interrupted_service"
-description = "A service point supplied through the asset where an outage started is interrupted by that outage."
+description = "A service point supplied through the asset where an outage started is interrupted by that outage. The relation is a record of the event and stays after restoration."
 when = [["?sp", "a", "service_point"], ["?sp", "downstream_of", "?asset"], ["?o", "originated_at", "?asset"]]
 then = ["?sp", "interrupted_by", "?o"]
 
 [[rules]]
-name = "life_support_outage"
-description = "An outage that interrupts a life-support premise is a life-support outage (priority restoration)."
+name = "outage_affecting_life_support"
+description = "An outage that interrupts or interrupted a life-support premise. The class is a record, not a priority flag: it stays after restoration, so read the outage's state to see whether it is still open."
 when = [["?sp", "interrupted_by", "?o"], ["?sp", "prop.life_support", true]]
-then = ["?o", "a", "life_support_outage"]
+then = ["?o", "a", "outage_affecting_life_support"]
 
 [[rules]]
 name = "grid_asset_at_risk"

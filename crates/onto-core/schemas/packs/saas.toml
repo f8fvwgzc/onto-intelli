@@ -127,10 +127,10 @@ extends = "issue"
 label = "Support ticket"
 icon = "headset"
 color = "#ea580c"
-description = "A customer's request for help. A subtype of issue, so it can be assigned and blocked like any issue."
-states = ["new", "open", "pending_customer", "on_hold", "solved", "closed"]
-terminal_states = ["solved", "closed"]
-alert_states = ["new", "open", "on_hold"]
+description = "A customer's request for help. A subtype of issue, so it can be assigned, blocked and resolved like any issue (it keeps issue's triaged, blocked and resolved states, which enterprise's assign, block and resolve actions set)."
+states = ["new", "open", "triaged", "pending_customer", "on_hold", "blocked", "resolved", "closed"]
+terminal_states = ["resolved", "closed"]
+alert_states = ["new", "open", "on_hold", "blocked"]
 properties.ticket_severity = { type = "enum", values = ["sev1", "sev2", "sev3", "sev4"] }
 properties.channel = { type = "enum", values = ["email", "chat", "phone", "portal", "in_app"] }
 properties.first_response_due = { type = "timestamp" }
@@ -385,7 +385,7 @@ dimensions = { plan = "on_plan", account = "subscription_of", product = "on_plan
 certified = true
 
 [metrics.open_support_tickets]
-description = "Support tickets not yet solved or closed."
+description = "Support tickets not yet resolved or closed."
 kind = "support_ticket"
 measure = "count"
 filter = { open = true }
@@ -393,7 +393,7 @@ dimensions = { severity = "ticket_severity", account = "ticket_from", feature = 
 certified = true
 
 [metrics.support_resolution_time]
-description = "Days from a support ticket being opened to being solved or closed."
+description = "Days from a support ticket being opened to being resolved or closed."
 kind = "support_ticket"
 measure = "lead_time"
 window_days = 90

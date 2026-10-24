@@ -249,6 +249,12 @@ fn packs_have_the_content_the_guide_asks_for() {
             for st in t.terminal_states.iter().chain(&t.alert_states) {
                 assert!(t.states.contains(st), "{}: {name} lists {st} outside its states", p.id);
             }
+            if s.kind_is(name, "issue") && !t.states.is_empty() {
+                // Enterprise's assign, block and resolve set these states.
+                for st in ["open", "triaged", "blocked", "resolved"] {
+                    assert!(t.states.iter().any(|x| x == st), "{}: issue subtype {name} drops {st}", p.id);
+                }
+            }
         }
         let mut transitive = 0;
         for name in &links {
@@ -312,19 +318,55 @@ then = ["?x", "a", "read_thing"]
         "read_thing",
     ]);
     assert_eq!(got, want);
+    assert!(names.values().all(|places| places.len() == 1), "{names:?}");
+    assert!(names_defined_twice(&names).is_empty());
     let ent = defined_names(ENTERPRISE_SCHEMA, "enterprise");
-    assert_eq!(ent["owned_by"], "link_types.owns.inverse", "an inverse name is a definition");
+    assert_eq!(ent["owned_by"], ["link_types.owns.inverse"], "an inverse name is a definition");
     assert!(ent.contains_key("handled_by_team") && ent.contains_key("ticket"), "derived names and glossary words");
 }
 
-/// Every name a pack file defines, with where it is defined. Rule heads that
-/// name a relation or class enterprise already has are reuse, not a
+#[test]
+fn name_check_sees_a_name_defined_twice_in_one_pack() {
+    let names = defined_names(
+        r#"
+[object_types.feeder_line]
+[link_types.feeds]
+inverse = "fed_by"
+[glossary.relations]
+fed_by = "feeds"
+crew = "feeds"
+[[rules]]
+name = "crew"
+when = [["?x", "feeds", "?y"]]
+then = ["?x", "a", "fed_thing"]
+[[rules]]
+name = "fed_twice"
+chain = ["feeds", "feeds"]
+infer = "feeds"
+[[rules]]
+name = "fed_thrice"
+chain = ["feeds", "feeds", "feeds"]
+infer = "feeds"
+"#,
+        "fixture",
+    );
+    let twice = names_defined_twice(&names);
+    let got: BTreeSet<&str> = twice.iter().map(|(n, _)| n.as_str()).collect();
+    // An inverse that is also a glossary word, and a rule named like a
+    // glossary word, are refused; several rules deriving the declared
+    // relation `feeds` are reuse.
+    assert_eq!(got, BTreeSet::from(["crew", "fed_by"]), "{twice:?}");
+    assert_eq!(names["feeds"].len(), 3, "every place is recorded: {:?}", names["feeds"]);
+}
+
+/// Every name a pack file defines, with every place it is defined. Rule heads
+/// that name a relation or class enterprise already has are reuse, not a
 /// definition, and are left out by the caller.
-fn defined_names(text: &str, what: &str) -> BTreeMap<String, String> {
+fn defined_names(text: &str, what: &str) -> BTreeMap<String, Vec<String>> {
     let t = toml_of(text, what);
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut put = |name: &str, place: String| {
-        out.entry(name.to_string()).or_insert(place);
+        out.entry(name.to_string()).or_default().push(place);
     };
     for section in ["object_types", "interfaces", "metrics", "action_types", "shapes"] {
         for k in section_keys(&t, section) {
@@ -363,6 +405,26 @@ fn defined_names(text: &str, what: &str) -> BTreeMap<String, String> {
     out
 }
 
+fn is_rule_head(place: &str) -> bool {
+    place.starts_with("derived by rule ")
+}
+
+/// Names one file defines in more than one place. Rule heads are uses of a
+/// relation or class, so several rules may derive the same one, and a rule
+/// may derive a relation the file declares; but a glossary word must not
+/// also be a derived relation or class (the word would resolve elsewhere).
+fn names_defined_twice(names: &BTreeMap<String, Vec<String>>) -> Vec<(String, Vec<String>)> {
+    names
+        .iter()
+        .filter(|(_, places)| {
+            let defs = places.iter().filter(|p| !is_rule_head(p)).count();
+            let glossary = places.iter().any(|p| p.starts_with("glossary."));
+            defs > 1 || (glossary && places.len() > 1)
+        })
+        .map(|(n, places)| (n.clone(), places.clone()))
+        .collect()
+}
+
 /// Other packs in `schemas/packs` (packs-a and packs-b, once merged).
 fn other_pack_files() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas/packs");
@@ -392,8 +454,13 @@ fn pack_names_are_unique_across_enterprise_and_every_pack() {
     let mut owner: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut clashes = Vec::new();
     for (id, text) in &all {
-        for (name, place) in defined_names(text, id) {
-            let reuse = place.starts_with("derived by")
+        let names = defined_names(text, id);
+        for (name, places) in names_defined_twice(&names) {
+            clashes.push(format!("{id}: {name} is defined twice in the pack ({})", places.join(", ")));
+        }
+        for (name, places) in names {
+            let place = places.join(", ");
+            let reuse = places.iter().all(|p| is_rule_head(p))
                 && (base.resolve_rel(&name).is_some()
                     || base_vocab.relations.contains(&name)
                     || base_vocab.classes.contains(&name)
@@ -402,7 +469,7 @@ fn pack_names_are_unique_across_enterprise_and_every_pack() {
                 continue;
             }
             if let Some(at) = ent.get(&name) {
-                clashes.push(format!("{id}: {name} ({place}) collides with enterprise ({at})"));
+                clashes.push(format!("{id}: {name} ({place}) collides with enterprise ({})", at.join(", ")));
             }
             if let Some((other, at)) = owner.get(&name) {
                 clashes.push(format!("{id}: {name} ({place}) collides with pack {other} ({at})"));
@@ -469,14 +536,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("energy", "<service_point:sp-1001>", "interrupted_by", "<grid_outage:out-2026-0412>"),
     ("energy", "<service_point:sp-1004>", "interrupted_by", "<grid_outage:out-2026-0413>"),
     ("energy", "<service_point:sp-1003>", "interrupted_by", "<grid_outage:out-2026-0420>"),
-    ("energy", "<grid_outage:out-2026-0412>", "a", "#life_support_outage"),
+    ("energy", "<grid_outage:out-2026-0412>", "a", "#outage_affecting_life_support"),
     ("energy", "<transformer:t-1201>", "a", "#grid_asset_at_risk"),
     ("energy", "<grid_outage:out-2026-0412>", "a", "#condition_related_outage"),
     ("telecom", "<network_alarm:alm-90002>", "alarm_impacts", "<network_service:mobile-data-metro>"),
     ("telecom", "<network_alarm:alm-90001>", "alarm_impacts", "<network_service:vpn-harbor-logistics>"),
     ("telecom", "<network_alarm:alm-90001>", "alarm_impacts", "<network_service:mobile-data-metro>"),
     ("telecom", "<network_alarm:alm-90001>", "alarm_affects_account", "<subscriber_account:acct-700100>"),
-    ("telecom", "<network_service:vpn-harbor-logistics>", "a", "#impacted_service"),
+    // A service that runs only on a radio cell: its baseband unit and the
+    // aggregation hierarchy above it reach it.
+    ("telecom", "<network_service:voice-riverside>", "realized_by", "<network_element:bbu-4471>"),
+    ("telecom", "<network_alarm:alm-90002>", "alarm_impacts", "<network_service:voice-riverside>"),
+    ("telecom", "<network_alarm:alm-90001>", "alarm_impacts", "<network_service:voice-riverside>"),
     ("telecom", "<network_service:vpn-harbor-logistics>", "a", "#sla_breach_risk"),
     ("telecom", "<subscriber_account:acct-5550188>", "a", "#sim_swap_risk"),
     ("saas", "<customer_account:northwind>", "entitled_to", "<product_feature:sso>"),
@@ -491,9 +562,11 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
 /// Facts the rules must NOT derive from the sample (each rule's conditions matter).
 const NOT_EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("energy", "<service_point:sp-1004>", "interrupted_by", "<grid_outage:out-2026-0412>"),
-    ("energy", "<grid_outage:out-2026-0413>", "a", "#life_support_outage"),
+    ("energy", "<grid_outage:out-2026-0413>", "a", "#outage_affecting_life_support"),
     ("energy", "<feeder:hb-14>", "a", "#grid_asset_at_risk"),
     ("telecom", "<network_service:mobile-data-metro>", "a", "#sla_breach_risk"),
+    ("telecom", "<network_service:voice-riverside>", "a", "#sla_breach_risk"),
+    ("telecom", "<network_service:voice-riverside>", "realized_by", "<network_element:bbu-4472>"),
     ("telecom", "<subscriber_account:acct-5550101>", "a", "#sim_swap_risk"),
     ("saas", "<customer_account:fabrikam>", "a", "#churn_risk_account"),
     ("saas", "<customer_account:northwind>", "a", "#detractor_account"),
@@ -869,6 +942,40 @@ fn pack_action_types_apply_on_the_sample() {
         )
         .unwrap();
     assert_eq!(r.status, "rejected", "retiring an asset is for admins");
+}
+
+#[test]
+fn enterprise_work_item_actions_apply_to_pack_issue_subtypes() {
+    // (pack, ticket, assignee, blocker)
+    let cases = [
+        ("telecom", "trouble_ticket:tt-3301", "person:noc-engineer-ravi", "trouble_ticket:tt-3302"),
+        ("saas", "support_ticket:st-501", "person:csm-tomas", "issue:flowdesk-4410"),
+    ];
+    for (id, ticket, assignee, blocker) in cases {
+        let p = PACKS.iter().find(|p| p.id == id).unwrap();
+        let o = world(p);
+        let state = |o: &Ontology| o.get(&admin(), ticket).unwrap().state;
+        assert_eq!(state(&o).as_deref(), Some("open"), "{id}: {ticket} starts open");
+        let run = |action: &str, input: Value| {
+            let r = o
+                .apply_action(&ctx(), action, &params(input), ApplyOptions { confirm: true, ..Default::default() })
+                .unwrap_or_else(|e| panic!("{id}.{action} on {ticket}: {e}"));
+            assert_eq!(r.status, "applied", "{id}.{action} on {ticket}: {:?} {:?}", r.reason, r.plan.checks);
+        };
+        run("assign", json!({"item": ticket, "assignee": assignee}));
+        assert_eq!(state(&o).as_deref(), Some("triaged"), "{id}: assign triages {ticket}");
+        let assigned = o.read(|g, _| {
+            g.neighbors(ticket, "assigned_to", Dir::Out).into_iter().map(String::from).collect::<Vec<_>>()
+        });
+        assert_eq!(assigned, [assignee.to_string()], "{id}: assign replaces the assignee");
+        run("block", json!({"item": ticket, "blocker": blocker}));
+        assert_eq!(state(&o).as_deref(), Some("blocked"), "{id}: block sets {ticket} blocked");
+        let blockers = o
+            .read(|g, _| g.neighbors(ticket, "blocked_by", Dir::Out).into_iter().map(String::from).collect::<Vec<_>>());
+        assert_eq!(blockers, [blocker.to_string()], "{id}: block links the blocker");
+        run("resolve", json!({"issue": ticket}));
+        assert_eq!(state(&o).as_deref(), Some("resolved"), "{id}: resolve resolves {ticket}");
+    }
 }
 
 #[test]

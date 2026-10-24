@@ -3,12 +3,14 @@
 # (resources), the customer-facing services they realize, subscriber
 # accounts and SIM cards, alarms, trouble tickets and maintenance windows.
 # The aggregation hierarchy (`uplinks_to`) is transitive, so an alarm on a
-# core router reaches every service realized below it.
+# core router reaches every service realized below it, including services
+# that run only on the radio cells of a baseband unit below it.
 #
 # Layered on builtin:enterprise (extend = ["builtin:telecom"]). Teams (the
 # network operations centre), people and projects come from enterprise;
 # trouble_ticket is a subtype of enterprise's issue, so tickets are work items
-# that can be assigned and blocked like any issue. The vocabulary borrows from
+# that can be assigned and blocked like any issue (its states keep issue's
+# `triaged` and `blocked`, which enterprise's assign and block actions set). The vocabulary borrows from
 # public telecom frameworks; it does not claim compliance with any of them.
 #
 # Ids: network_site:{site code}, network_element:{hostname},
@@ -139,9 +141,9 @@ label = "Trouble ticket"
 icon = "life-buoy"
 color = "#ea580c"
 description = "A customer-reported or network-detected problem with a service. A subtype of issue, so it can be assigned and blocked."
-states = ["open", "acknowledged", "in_progress", "pending_customer", "resolved", "closed"]
+states = ["open", "triaged", "acknowledged", "in_progress", "blocked", "pending_customer", "resolved", "closed"]
 terminal_states = ["resolved", "closed"]
-alert_states = ["open", "in_progress"]
+alert_states = ["open", "in_progress", "blocked"]
 properties.reported_channel = { type = "enum", values = ["call_center", "app", "web", "retail_store", "noc"] }
 properties.customer_impact = { type = "enum", values = ["none", "degraded", "outage"] }
 
@@ -452,7 +454,7 @@ event = { action = "service.suspended", target = "{service}", payload = { reason
 
 [[rules]]
 name = "alarm_service_impact"
-description = "An alarm on a resource impacts the services that resource realizes."
+description = "An alarm on a resource impacts the services that resource realizes. alarm_impacts is a record and stays after the alarm clears; the risk classification checks the alarm's state."
 chain = ["alarm_on", "realizes"]
 infer = "alarm_impacts"
 
@@ -463,21 +465,21 @@ when = [["?s", "realized_by", "?e"], ["?e", "uplinks_to", "?up"], ["?a", "alarm_
 then = ["?a", "alarm_impacts", "?s"]
 
 [[rules]]
+name = "cell_realization"
+description = "A service that runs on a radio cell also runs on the baseband unit serving that cell, so alarms on the unit and everything above it reach the service."
+when = [["?s", "realized_by", "?c"], ["?c", "cell_of", "?e"]]
+then = ["?s", "realized_by", "?e"]
+
+[[rules]]
 name = "affected_subscribers"
 description = "An alarm that impacts a service affects the accounts subscribed to it."
 chain = ["alarm_impacts", "subscribers"]
 infer = "alarm_affects_account"
 
 [[rules]]
-name = "impacted_service"
-description = "A service impacted by a raised critical alarm is an impacted service."
-when = [["?a", "alarm_impacts", "?s"], ["?a", "prop.perceived_severity", "critical"], ["?a", "state", "raised"]]
-then = ["?s", "a", "impacted_service"]
-
-[[rules]]
 name = "sla_breach_risk"
-description = "An impacted platinum service is at risk of breaching its SLA."
-when = [["?s", "a", "impacted_service"], ["?s", "prop.sla_tier", "platinum"]]
+description = "A platinum service impacted by a raised (not yet acknowledged or cleared) critical alarm is at risk of breaching its SLA."
+when = [["?a", "alarm_impacts", "?s"], ["?a", "prop.perceived_severity", "critical"], ["?a", "state", "raised"], ["?s", "prop.sla_tier", "platinum"]]
 then = ["?s", "a", "sla_breach_risk"]
 
 [[rules]]
