@@ -18,7 +18,9 @@
 //!   `semapv:CompositeMatching`.
 //! * **Ties are never resolved silently.** Matching is greedy and one-to-one
 //!   over the pairs sorted by score; a pair with a competitor within
-//!   `tie_epsilon` is `borderline` and names the competitors in `tied_with`.
+//!   `tie_epsilon` is `borderline` and names the competitors in `tied_with`
+//!   (a pair whose other side an earlier, clearly better pair already took
+//!   is not a competitor: greedy matching could never choose it).
 //!   So is a pair that rests on a similar spelling alone: `accepted` needs
 //!   structure, or names that are the same word (own names or a glossary).
 //! * **Certification can only refute.** [`certify`] compares the ancestor
@@ -202,6 +204,12 @@ pub struct Signals {
     /// A glossary synonym equates the two names.
     #[serde(default, skip_serializing_if = "is_false")]
     pub glossary: bool,
+    /// The names compared are the same word (equal stemmed keys, own names
+    /// or through a glossary). Words in another order, or a similarity
+    /// that rounds to 1.0, are not. Decides whether a row scored on names
+    /// alone may be accepted; not serialized (the evidence says it).
+    #[serde(skip)]
+    pub same_word: bool,
     /// Property-name Jaccard, weighted 80/20 with the share of shared names
     /// whose types agree (object types).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +582,8 @@ fn name_sim(a: &Name, b: &Name) -> f64 {
 struct NameHit {
     value: f64,
     glossary: bool,
+    /// Equal stemmed keys: the two names are the same word.
+    same_word: bool,
     a: String,
     b: String,
 }
@@ -582,13 +592,14 @@ struct NameHit {
 /// synonym on either side that is the same word as a name on the other
 /// (1.0, marked `glossary`); then the best fuzzy similarity.
 fn name_signal(a: &[Name], b: &[Name]) -> NameHit {
+    let same = |x: &Name, y: &Name| !x.key.is_empty() && x.key == y.key;
     let hit = |x: &Name, y: &Name, value: f64, glossary: bool| NameHit {
         value,
         glossary,
+        same_word: same(x, y),
         a: x.raw.clone(),
         b: y.raw.clone(),
     };
-    let same = |x: &Name, y: &Name| !x.key.is_empty() && x.key == y.key;
     for x in a.iter().filter(|x| !x.synonym) {
         if let Some(y) = b.iter().find(|y| !y.synonym && same(x, y)) {
             return hit(x, y, 1.0, false);
@@ -836,6 +847,7 @@ fn score_kind(s: &KindFeat, t: &KindFeat) -> KindDetail {
     d.signals = Signals {
         name: name_value,
         glossary: name.glossary,
+        same_word: name.same_word,
         properties,
         property_jaccard,
         links,
@@ -883,9 +895,9 @@ fn score_link(s: &LinkFeat, t: &LinkFeat, map: &dyn Fn(&str) -> Option<String>, 
     let mut name = name_signal(&s.names, &t.names);
     // Inverse names count only when they are the same word: fuzzy scores of
     // short `x_by` / `x_of` names are mostly the shared suffix.
-    if name.value < 1.0 && !s.inverse.is_empty() && !t.inverse.is_empty() {
+    if !name.same_word && !s.inverse.is_empty() && !t.inverse.is_empty() {
         let inv = name_signal(&s.inverse, &t.inverse);
-        if inv.value >= 1.0 {
+        if inv.same_word {
             name = inv;
         }
     }
@@ -898,7 +910,13 @@ fn score_link(s: &LinkFeat, t: &LinkFeat, map: &dyn Fn(&str) -> Option<String>, 
     let name_value = if name.glossary { 1.0 } else { name.value };
     let (score, coverage) = fuse(&[(W_LINK_NAME, Some(name_value)), (W_LINK_ENDPOINTS, endpoints)]);
     LinkDetail {
-        signals: Signals { name: name_value, glossary: name.glossary, endpoints, ..Default::default() },
+        signals: Signals {
+            name: name_value,
+            glossary: name.glossary,
+            same_word: name.same_word,
+            endpoints,
+            ..Default::default()
+        },
         name,
         ends,
         score,
@@ -954,26 +972,41 @@ struct Chosen {
     alternatives: Vec<Scored>,
 }
 
+/// Greedy one-to-one matching over the pairs sorted by score. A chosen
+/// pair's tie competitors are the pairs sharing one of its sides with a
+/// score within `eps`, except those whose other side an earlier pair has
+/// already taken by more than `eps`: greedy matching could never pick them,
+/// so they are not competing.
 fn assign(sc: &Scores, n_s: usize, n_t: usize, eps: f64, alternatives: usize) -> Vec<Chosen> {
-    let (mut s_used, mut t_used) = (vec![false; n_s], vec![false; n_t]);
+    // The score of the pair that took each side.
+    let (mut s_taken, mut t_taken): (Vec<Option<f64>>, Vec<Option<f64>>) = (vec![None; n_s], vec![None; n_t]);
     let mut by_s: Vec<Vec<usize>> = vec![Vec::new(); n_s];
     let mut by_t: Vec<Vec<usize>> = vec![Vec::new(); n_t];
     for (i, p) in sc.pairs.iter().enumerate() {
         by_s[p.s].push(i);
         by_t[p.t].push(i);
     }
+    let taken_by_better = |taken: Option<f64>, score: f64| taken.is_some_and(|q| q - score > eps);
     let mut out = Vec::new();
     for (i, p) in sc.pairs.iter().enumerate() {
-        if s_used[p.s] || t_used[p.t] {
+        if s_taken[p.s].is_some() || t_taken[p.t].is_some() {
             continue;
         }
-        s_used[p.s] = true;
-        t_used[p.t] = true;
+        s_taken[p.s] = Some(p.score);
+        t_taken[p.t] = Some(p.score);
+        let close = |j: &usize| *j != i && (sc.pairs[*j].score - p.score).abs() <= eps;
         let mut tied: Vec<usize> = by_s[p.s]
             .iter()
-            .chain(&by_t[p.t])
             .copied()
-            .filter(|&j| j != i && (sc.pairs[j].score - p.score).abs() <= eps)
+            .filter(close)
+            .filter(|&j| !taken_by_better(t_taken[sc.pairs[j].t], sc.pairs[j].score))
+            .chain(
+                by_t[p.t]
+                    .iter()
+                    .copied()
+                    .filter(close)
+                    .filter(|&j| !taken_by_better(s_taken[sc.pairs[j].s], sc.pairs[j].score)),
+            )
             .collect();
         tied.sort();
         tied.dedup();
@@ -997,8 +1030,12 @@ fn structural(sig: &Signals) -> bool {
     [sig.properties, sig.links, sig.parents, sig.states, sig.endpoints].iter().any(Option::is_some)
 }
 
+/// Scored on names alone and the names are not the same word. Decided by
+/// key equality, not by `name == 1.0`: words in another order
+/// (`account_user` / `user_account`) have token Jaccard 1.0 but are not
+/// the same word, and a near-1.0 Jaro-Winkler can round up.
 fn fuzzy_name_only(sig: &Signals) -> bool {
-    !structural(sig) && sig.name < 1.0
+    !structural(sig) && !sig.same_word
 }
 
 /// `semapv:LexicalMatching` when only the name was compared, else
@@ -1024,6 +1061,8 @@ fn status_sentence(score: f64, tied: &[Candidate], eps: f64, sig: &Signals) -> S
 fn name_sentence(hit: &NameHit) -> String {
     if hit.glossary {
         format!("name: '{}' and '{}' are the same word through a glossary (1.00)", hit.a, hit.b)
+    } else if !hit.same_word && hit.value >= 1.0 {
+        format!("name: '{}' vs '{}' share every word but are not the same word (similarity 1.00)", hit.a, hit.b)
     } else {
         format!("name: '{}' vs '{}' (similarity {:.2})", hit.a, hit.b, hit.value)
     }
@@ -1387,6 +1426,7 @@ fn round_signals(s: Signals) -> Signals {
     Signals {
         name: round3(s.name),
         glossary: s.glossary,
+        same_word: s.same_word,
         properties: r(s.properties),
         property_jaccard: r(s.property_jaccard),
         links: r(s.links),
@@ -1394,6 +1434,17 @@ fn round_signals(s: Signals) -> Signals {
         states: r(s.states),
         endpoints: r(s.endpoints),
     }
+}
+
+/// The glossary key [`Schema::canonical_kind`] looks a word up by (trimmed,
+/// lowercased, spaces and hyphens as `_`), so a proposed term is found.
+fn kind_glossary_word(word: &str) -> String {
+    word.trim().to_lowercase().replace([' ', '-'], "_")
+}
+
+/// The glossary key [`Schema::canonical_rel`] looks a word up by.
+fn rel_glossary_word(word: &str) -> String {
+    word.trim().to_lowercase()
 }
 
 /// Glossary terms for accepted exact and close matches whose names differ:
@@ -1413,7 +1464,11 @@ fn glossary_changes(
     let mut changes = Vec::new();
     let mut warnings = Vec::new();
     for m in kinds.iter().filter(usable) {
-        let word = m.source.to_lowercase();
+        let word = kind_glossary_word(&m.source);
+        if word == m.target {
+            // `work-order` -> `work_order`: the target already finds it.
+            continue;
+        }
         if target.is_type_or_interface(&word) {
             warnings.push(format!(
                 "{word} is already a kind of {}: a glossary term {word} -> {} would be shadowed, not proposed",
@@ -1435,7 +1490,10 @@ fn glossary_changes(
         }
     }
     for m in links.iter().filter(usable) {
-        let word = m.source.to_lowercase();
+        let word = rel_glossary_word(&m.source);
+        if word == m.target {
+            continue;
+        }
         if target.resolve_rel(&word).is_some() {
             warnings.push(format!(
                 "{word} is already a relation of {}: a glossary term {word} -> {} would be shadowed, not proposed",
@@ -1815,9 +1873,12 @@ fn sssom_term(id: &str) -> String {
 /// Read the mapping rows of an SSSOM TSV (metadata lines start with `#`).
 /// The header must name `subject_id`, `predicate_id` and `object_id`; a row
 /// missing one of them, or with a predicate that is not a SKOS mapping
-/// predicate, is refused with its line number rather than skipped.
+/// predicate, is refused with its line number rather than skipped. So is a
+/// negated row (a non-empty `predicate_modifier`, i.e. `Not`): a [`Mapping`]
+/// is a positive claim, and reading "a is not b" as "a is b" would be a
+/// silent wrong answer.
 pub fn parse_sssom(text: &str) -> Result<Vec<Mapping>> {
-    let mut header: Option<(usize, usize, usize)> = None;
+    let mut header: Option<(usize, usize, usize, Option<usize>)> = None;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
@@ -1826,10 +1887,10 @@ pub fn parse_sssom(text: &str) -> Result<Vec<Mapping>> {
             continue;
         }
         let cells: Vec<&str> = line.split('\t').collect();
-        let Some((s, p, o)) = header else {
+        let Some((s, p, o, modifier)) = header else {
             let col = |name: &str| cells.iter().position(|c| c.trim() == name);
             match (col("subject_id"), col("predicate_id"), col("object_id")) {
-                (Some(s), Some(p), Some(o)) => header = Some((s, p, o)),
+                (Some(s), Some(p), Some(o)) => header = Some((s, p, o, col("predicate_modifier"))),
                 _ => {
                     return Err(Error::invalid(format!(
                         "sssom line {n}: the header must name subject_id, predicate_id and object_id"
@@ -1846,6 +1907,11 @@ pub fn parse_sssom(text: &str) -> Result<Vec<Mapping>> {
                 .ok_or_else(|| Error::invalid(format!("sssom line {n}: missing {what}")))
         };
         let (subject, predicate, object) = (get(s, "subject_id")?, get(p, "predicate_id")?, get(o, "object_id")?);
+        if let Some(m) = modifier.and_then(|m| cells.get(m)).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            return Err(Error::invalid(format!(
+                "sssom line {n}: negated mappings (predicate_modifier {m}) are not supported"
+            )));
+        }
         let Some(predicate) = MatchPredicate::parse(predicate) else {
             return Err(Error::invalid(format!(
                 "sssom line {n}: predicate {predicate} is not a SKOS mapping predicate \

@@ -670,3 +670,99 @@ fn options_deserialize_with_defaults_and_scope_the_source() {
     assert_eq!(json["means"], align::MEANS);
     assert!(json["kinds"][0]["signals"].get("endpoints").is_none(), "{}", json["kinds"][0]);
 }
+
+#[test]
+fn negated_sssom_rows_are_refused_not_read_as_claims() {
+    let tsv = "subject_id\tpredicate_id\tpredicate_modifier\tobject_id\n\
+               src:class/p\tskos:exactMatch\t\ttgt:class/q\n\
+               src:class/a\tskos:exactMatch\tNot\ttgt:class/b\n";
+    let err = align::parse_sssom(tsv).unwrap_err();
+    assert!(
+        matches!(&err, Error::Invalid(m) if m.contains("line 3") && m.contains("negated") && m.contains("Not")),
+        "{err:?}"
+    );
+    // An empty modifier column is a positive claim.
+    let ok = "subject_id\tpredicate_id\tpredicate_modifier\tobject_id\nsrc:class/p\tskos:exactMatch\t\ttgt:class/q\n";
+    assert_eq!(align::parse_sssom(ok).unwrap(), vec![mapping("p", "q", MatchPredicate::ExactMatch)]);
+}
+
+#[test]
+fn reordered_words_alone_are_not_the_same_word() {
+    let source = Schema::from_toml("name = \"a\"\n[object_types.account_user]\n").unwrap();
+    let target = Schema::from_toml("name = \"b\"\n[object_types.user_account]\n").unwrap();
+    let r = align::align(&source, &target, &AlignOptions::default());
+    let m = row(&r.kinds, "account_user");
+    assert_eq!(m.target, "user_account", "{m:#?}");
+    assert_eq!((m.predicate, m.status), (MatchPredicate::CloseMatch, MatchStatus::Borderline), "{m:#?}");
+    assert!(m.evidence[0].contains("not the same word"), "{:?}", m.evidence);
+    assert!(m.evidence.last().unwrap().contains("similar name alone"), "{:?}", m.evidence);
+    assert!(r.change_set.changes.is_empty(), "{:?}", r.change_set);
+}
+
+#[test]
+fn proposed_glossary_words_are_normalized_like_lookups() {
+    let source = Schema::from_toml(
+        "name = \"a\"\n[object_types.work-order]\nstates = [\"open\", \"done\"]\n\
+         properties.due = { type = \"timestamp\" }\nproperties.cost = { type = \"float\" }\n",
+    )
+    .unwrap();
+    let mut target = Schema::from_toml(
+        "name = \"b\"\n[object_types.job]\nlabel = \"Work order\"\nstates = [\"open\", \"done\"]\n\
+         properties.due = { type = \"timestamp\" }\nproperties.cost = { type = \"float\" }\n",
+    )
+    .unwrap();
+    let r = align::align(&source, &target, &AlignOptions::default());
+    let m = row(&r.kinds, "work-order");
+    assert_eq!((m.target.as_str(), m.status), ("job", MatchStatus::Accepted), "{m:#?}");
+    let terms: Vec<(String, String)> = r
+        .change_set
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::PutGlossaryTerm { section: GlossarySection::Kinds, word, target } => {
+                Some((word.clone(), target.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terms, vec![("work_order".to_string(), "job".to_string())], "{:?}", r.change_set);
+    for (word, kind) in terms {
+        target.glossary.kinds.insert(word, kind);
+    }
+    for word in ["work-order", "work order", "work_order", "Work Order"] {
+        assert_eq!(target.canonical_kind(word).as_deref(), Some("job"), "{word}");
+    }
+}
+
+#[test]
+fn a_target_taken_by_a_better_match_is_not_a_tie() {
+    let source = Schema::from_toml(
+        "name = \"a\"\n\
+         [object_types.crew]\nstates = [\"on\", \"off\"]\n\
+         properties.shift = { type = \"string\" }\nproperties.size = { type = \"int\" }\n\
+         [object_types.squad]\nstates = [\"on\", \"off\"]\n\
+         properties.shift = { type = \"string\" }\nproperties.size = { type = \"int\" }\n\
+         properties.extra = { type = \"string\" }\n\
+         [glossary.kinds]\ncrew = \"squad\"\n",
+    )
+    .unwrap();
+    let target = Schema::from_toml(
+        "name = \"b\"\n\
+         [object_types.crew]\nstates = [\"on\", \"off\"]\n\
+         properties.shift = { type = \"string\" }\nproperties.size = { type = \"int\" }\n\
+         [object_types.troop]\nstates = [\"on\", \"off\"]\n\
+         properties.shift = { type = \"string\" }\nproperties.size = { type = \"int\" }\n\
+         [glossary.kinds]\nsquad = \"troop\"\n",
+    )
+    .unwrap();
+    let r = align::align(&source, &target, &AlignOptions::default());
+    let crew = row(&r.kinds, "crew");
+    assert_eq!((crew.target.as_str(), crew.status), ("crew", MatchStatus::Accepted), "{crew:#?}");
+    let squad = row(&r.kinds, "squad");
+    assert_eq!(squad.target, "troop", "{squad:#?}");
+    // squad -> crew scores the same as squad -> troop, but crew was already
+    // taken by crew -> crew at a clearly higher score: not a competitor.
+    assert!(squad.tied_with.is_empty(), "{squad:#?}");
+    assert_eq!(squad.status, MatchStatus::Accepted, "{squad:#?}");
+    assert!(squad.alternatives.iter().any(|c| c.target == "crew"), "{squad:#?}");
+}
