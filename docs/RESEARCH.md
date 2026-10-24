@@ -22,6 +22,39 @@ Sources: [Palantir Ontology overview](https://palantir.com/docs/foundry/ontology
 [Databricks Unity Catalog semantics](https://docs.databricks.com/aws/en/uc-semantics),
 [Glean Enterprise Graph](https://www.glean.com/product/enterprise-graph).
 
+## open-ontologies: the assurance layer
+
+The assurance layer ([ASSURANCE.md](ASSURANCE.md)) takes its philosophy from
+[open-ontologies](https://github.com/fabio-rovai/open-ontologies) by Fabio
+Rovai / Tesseract Semantics (MIT licence): *Open Ontologies: Tool-Augmented
+Ontology Engineering with Stable Matching Alignment* (Rovai, 2026,
+[arXiv:2605.09184](https://arxiv.org/abs/2605.09184)). open-ontologies works
+on OWL and RDF; onto-intelli reimplements the ideas for its typed property
+graph and shares no code with it.
+
+| Idea in open-ontologies | onto-intelli feature |
+|---|---|
+| An inference is not an assertion; every inference carries a derivation certificate | `reason.*`: derived facts live in a closure, never in the graph; `reason.certify` writes `oi-cert/1` certificates |
+| An independent checker re-derives each line and refuses forged ones | `crates/onto-cert`: depends on std, sha2 and serde_json only; `onto cert check` and `onto-cert check` run offline |
+| Rules you wrote earn a different verdict word than the built-in semantics | `entailed` versus `entailed_under_supplied_rules` |
+| Checker words belong to the checker | the engine says `derived`; only an onto-cert report carries a verdict |
+| What the tool proves, measures or only suggests | the proved / measured / opinion table and every report's `means` field |
+| Plan before apply, with semantic consequences and conservativity | `consequences`, `risk`, `locked_violations`, `likely_renames` and `shapes` in every schema plan; schema locks |
+| SHACL validation as a three-valued measurement | `shapes.validate`: `conforms`, `violates`, `undetermined`; `shapes.check`, `shapes.induce` |
+| Ontology lint with reviewer feedback | `schema.lint`, `schema.lint_feedback` |
+| Alignment as an opinion, with SSSOM output and certification of mappings | `schema.align` (SSSOM TSV), `schema.align_certify` |
+| A retrieval slice preserves a conclusion or it does not; coverage is a proxy | `reason.slice_check`; preservation of derived facts in the packed LLM context |
+| Justifications, provenance semirings and claim verification | `reason.explain`, `reason.provenance`, `reason.verify` |
+| One sheet in, one ontology out | `model.induce`, `ingest.sheet` |
+| Domain packs | ten industry packs ([PACKS.md](PACKS.md)) |
+| Tool profiles for agents | `onto mcp --profile` |
+
+What differs: open-ontologies checks its certificates against proofs written
+in Lean; onto-cert is a tested Rust checker without a machine-checked proof.
+The rule language here is Horn rules over the property graph (kind
+inheritance, interfaces, transitive and symmetric link types, chain and
+when/then rules), not OWL.
+
 ## Papers (arXiv, cs, ontology — newest 50)
 
 Papers that shaped features (most of the 50 are domain ontologies in medicine,
