@@ -509,14 +509,20 @@ fn samples_make_every_supplied_rule_fire() {
             let n = stats.by_rule.get(rule).copied().unwrap_or(0);
             assert!(n > 0, "{id}: rule {rule} derives nothing from the sample ({:?})", stats.by_rule);
         }
-        // The built-in semantics a pack declares (its transitive relations,
-        // its interfaces) are exercised by its sample too.
-        let mut builtins = vec!["builtin/transitive"];
-        if table_len(&layer(id), "interfaces") > 0 {
-            builtins.push("builtin/type_implements");
+        // The built-in semantics a pack declares are exercised by its sample
+        // too: every transitive relation is chained at least once, and the
+        // interfaces (if any) are implemented.
+        let raw = layer(id);
+        let link_types = raw.get("link_types").and_then(|v| v.as_table()).cloned().unwrap_or_default();
+        for (rel, def) in &link_types {
+            if def.get("transitive").and_then(|v| v.as_bool()) == Some(true) {
+                let chained = c.derived().iter().any(|d| d.rule == "builtin/transitive" && d.conclusion.p == *rel);
+                assert!(chained, "{id}: the sample never chains the transitive relation {rel}");
+            }
         }
-        for builtin in builtins {
-            assert!(stats.by_rule.get(builtin).copied().unwrap_or(0) > 0, "{id}: {builtin} never fires");
+        if table_len(&raw, "interfaces") > 0 {
+            let n = stats.by_rule.get("builtin/type_implements").copied().unwrap_or(0);
+            assert!(n > 0, "{id}: builtin/type_implements never fires");
         }
         // The run yields a certificate citing the pack's rules as supplied.
         let cert = o.reason_certificate(&admin(), &ReasonOptions::default()).unwrap();
@@ -533,6 +539,8 @@ const ENTAILED: &[(&str, [&str; 3])] = &[
     ("healthcare", ["<patient:mrn-100233>", "treated_by_clinician", "<clinician:dr-lindqvist>"]),
     ("healthcare", ["<patient:mrn-100231>", "receives_medication", "<medication:amoxicillin-500>"]),
     ("healthcare", ["<medication:amoxicillin-500>", "in_drug_class", "<drug_class:j01c>"]),
+    // Up the ATC hierarchy: J01CA within J01C within J01.
+    ("healthcare", ["<medication:amoxicillin-500>", "in_drug_class", "<drug_class:j01>"]),
     ("healthcare", ["<medication_order:mo-1002>", "a", "#contraindicated_order"]),
     ("healthcare", ["<patient:mrn-100231>", "a", "#critical_result_patient"]),
     ("healthcare", ["<clinician:dr-okafor>", "notify_critical_result", "<patient:mrn-100231>"]),
@@ -542,6 +550,8 @@ const ENTAILED: &[(&str, [&str; 3])] = &[
     ("finance", ["<private_individual:maria-lopez>", "pays_party", "<private_individual:emil-brandt>"]),
     ("finance", ["<legal_entity:northwind-holdings>", "pays_party", "<legal_entity:kestrel-trading>"]),
     ("finance", ["<private_individual:viktor-hale>", "resident_in", "<jurisdiction:xa>"]),
+    // Kestrel Trading FZE resides in a free zone inside the northern province.
+    ("finance", ["<legal_entity:kestrel-trading>", "resident_in", "<jurisdiction:xa>"]),
     ("finance", ["<private_individual:viktor-hale>", "a", "#sanctioned_party"]),
     ("finance", ["<legal_entity:kestrel-trading>", "a", "#sanctioned_party"]),
     ("finance", ["<legal_entity:kestrel-logistics>", "a", "#sanctioned_party"]),
@@ -699,10 +709,11 @@ fn retail_promotions_cover_skus_directly_and_down_the_category_hierarchy() {
         };
         assert_eq!(covers("cracker-clearance", "oat-crackers").as_deref(), Some("schema/promotion_covers_sku"));
         assert_eq!(covers("snack-week", "trail-mix-500").as_deref(), Some("schema/promotion_covers_category"));
-        // grocery is the parent of snacks and beverages.
+        // grocery is the parent of snacks and beverages, and snacks of snack bars.
         for sku in ["trail-mix-500", "granola-bar-6", "sparkling-water-12", "cold-brew-4"] {
             assert_eq!(covers("pantry-days", sku).as_deref(), Some("schema/promotion_covers_subcategories"), "{sku}");
         }
+        assert_eq!(covers("snack-week", "granola-bar-6").as_deref(), Some("schema/promotion_covers_subcategories"));
         assert_eq!(covers("snack-week", "cold-brew-4"), None, "a category covers only its own subtree");
         // snack-week promotes the snacks category only; the stockout is still found.
         let stockout = Fact::new("<stock_position:0142-trail-mix>", "a", "#promoted_stockout");

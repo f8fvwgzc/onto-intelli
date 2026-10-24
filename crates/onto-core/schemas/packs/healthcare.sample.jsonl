@@ -7,7 +7,8 @@
 {"kind":"clinician","key":"dr-okafor","title":"Dr Chidi Okafor","props":{"specialty":"cardiology","license_number":"GMC-7012345","email":"c.okafor@st-anne.example"},"links":[{"rel":"member_of","to":"team:cardiology-care"},{"rel":"practices_at","to":"care_facility:st-anne"}]}
 {"kind":"clinician","key":"dr-lindqvist","title":"Dr Sara Lindqvist","props":{"specialty":"general_practice","license_number":"GMC-7098765"}}
 {"kind":"clinician","key":"nurse-haddad","title":"Nadia Haddad RN","props":{"specialty":"nursing","license_number":"NMC-21H4567"},"links":[{"rel":"member_of","to":"team:cardiology-care"},{"rel":"practices_at","to":"care_facility:st-anne"}]}
-{"kind":"drug_class","key":"j01c","title":"Beta-lactam antibacterials, penicillins","props":{"atc_prefix":"J01C"}}
+{"kind":"drug_class","key":"j01","title":"Antibacterials for systemic use","props":{"atc_prefix":"J01"}}
+{"kind":"drug_class","key":"j01c","title":"Beta-lactam antibacterials, penicillins","props":{"atc_prefix":"J01C"},"links":[{"rel":"drug_class_within","to":"drug_class:j01"}]}
 {"kind":"drug_class","key":"j01ca","title":"Penicillins with extended spectrum","props":{"atc_prefix":"J01CA"},"links":[{"rel":"drug_class_within","to":"drug_class:j01c"}]}
 {"kind":"drug_class","key":"b01a","title":"Antithrombotic agents","props":{"atc_prefix":"B01A"}}
 {"kind":"drug_class","key":"c07a","title":"Beta blocking agents","props":{"atc_prefix":"C07A"}}
