@@ -1,0 +1,511 @@
+# saas: a software-as-a-service business as ontology data. Products, their
+# features and pricing plans, customer accounts and their users,
+# subscriptions and invoices, support tickets, NPS responses and feature
+# requests. Feature dependencies (`requires_feature`) and the account
+# hierarchy (`rolls_up_to`) are transitive.
+#
+# Layered on builtin:enterprise (extend = ["builtin:saas"]). People (customer
+# success managers), teams, projects and issues come from enterprise;
+# support_ticket is a subtype of enterprise's issue, and escalations link a
+# ticket to the engineering issue it became. The vocabulary borrows from
+# public conventions; it does not claim compliance with any of them.
+#
+# Ids: software_product:{slug}, product_feature:{flag key},
+# pricing_plan:{plan code}, customer_account:{account id},
+# product_user:{user id}, subscription:{subscription id},
+# subscription_invoice:{invoice number}, support_ticket:{ticket id},
+# nps_response:{response id}, feature_request:{request id}.
+
+[pack]
+id = "saas"
+title = "SaaS: product, customers, subscriptions and support"
+industry = "software"
+version = "1.0.0"
+description = "Products, features and pricing plans, customer accounts and users, subscriptions and invoices, support tickets, NPS responses and feature requests. Vocabulary inspired by schema.org, ITIL 4, OpenFeature and the Net Promoter Score method; it borrows their words and claims no compliance with any of them. Its rules (feature entitlements, the customer success manager of a ticket, payment-risk, detractor and churn-risk accounts, plans that include requested features) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "organization and offer vocabulary inspired by schema.org (Organization, Offer, SoftwareApplication)",
+    "support ticket terms inspired by ITIL 4 incident and service request management",
+    "feature flag terms inspired by the OpenFeature specification",
+    "survey categories borrowed from the Net Promoter Score method (promoter 9-10, passive 7-8, detractor 0-6)",
+]
+sample_note = "nps_response:nps-0007 records a score of 11 from a broken survey widget: the one deliberate violation (shape nps_scale, max_value 10 on prop.nps_score). Everything else in the sample conforms."
+
+# ── Product ──────────────────────────────────────────────────────────────────
+
+[object_types.software_product]
+label = "Software product"
+category = "container"
+icon = "box"
+color = "#2563eb"
+description = "A product the company sells as a service."
+states = ["beta", "generally_available", "deprecated", "sunset"]
+terminal_states = ["sunset"]
+properties.pricing_model = { type = "enum", values = ["per_seat", "usage_based", "tiered", "flat"] }
+properties.homepage = { type = "string" }
+
+[object_types.product_feature]
+label = "Product feature"
+icon = "sparkles"
+color = "#3b82f6"
+description = "A capability of a product, usually behind a feature flag."
+states = ["in_development", "released", "deprecated", "removed"]
+terminal_states = ["removed"]
+properties.flag_key = { type = "string", description = "Feature flag key that gates it." }
+properties.maturity = { type = "enum", values = ["alpha", "beta", "ga"] }
+
+[object_types.pricing_plan]
+label = "Pricing plan"
+icon = "tag"
+color = "#60a5fa"
+description = "A tier of a product with a price and the features it includes."
+states = ["active", "grandfathered", "retired"]
+terminal_states = ["retired"]
+properties.plan_tier = { type = "enum", values = ["free", "starter", "pro", "business", "enterprise"] }
+properties.list_price = { type = "float", description = "Monthly list price per seat." }
+properties.billing_period = { type = "enum", values = ["monthly", "annual"] }
+properties.seat_limit = { type = "int" }
+
+# ── Customers ────────────────────────────────────────────────────────────────
+
+[object_types.customer_account]
+label = "Customer account"
+category = "actor"
+icon = "building-2"
+color = "#059669"
+description = "An organization that buys the product. Subsidiaries roll up to their parent account."
+states = ["trialing", "active", "at_risk", "churned"]
+terminal_states = ["churned"]
+alert_states = ["at_risk"]
+properties.segment = { type = "enum", values = ["smb", "mid_market", "enterprise"] }
+properties.arr = { type = "float", description = "Annual recurring revenue." }
+properties.health_score = { type = "int", description = "Customer health score, 0-100." }
+
+[object_types.product_user]
+label = "Product user"
+category = "actor"
+icon = "user"
+color = "#10b981"
+description = "A person at a customer account who signs in to the product (not a member of this workspace)."
+states = ["invited", "active", "deactivated"]
+terminal_states = ["deactivated"]
+properties.user_role = { type = "enum", values = ["owner", "admin", "member", "guest"] }
+properties.last_active_at = { type = "timestamp" }
+
+# ── Revenue ──────────────────────────────────────────────────────────────────
+
+[object_types.subscription]
+label = "Subscription"
+icon = "repeat"
+color = "#7c3aed"
+description = "An account's paid (or trial) use of a plan for a number of seats."
+states = ["trialing", "active", "past_due", "cancelled", "expired"]
+terminal_states = ["cancelled", "expired"]
+alert_states = ["past_due"]
+properties.seats = { type = "int" }
+properties.mrr = { type = "float", description = "Monthly recurring revenue." }
+properties.renewal_date = { type = "timestamp" }
+properties.auto_renew = { type = "bool" }
+properties.billing_period = { type = "enum", values = ["monthly", "annual"] }
+
+[object_types.subscription_invoice]
+label = "Subscription invoice"
+icon = "receipt"
+color = "#8b5cf6"
+description = "A bill for one period of a subscription."
+states = ["draft", "open", "paid", "void", "uncollectible"]
+terminal_states = ["paid", "void", "uncollectible"]
+alert_states = ["uncollectible"]
+properties.amount = { type = "float" }
+properties.currency = { type = "string", description = "ISO 4217 code, e.g. EUR." }
+properties.due_date = { type = "timestamp" }
+
+# ── Support and feedback ─────────────────────────────────────────────────────
+
+[object_types.support_ticket]
+extends = "issue"
+label = "Support ticket"
+icon = "headset"
+color = "#ea580c"
+description = "A customer's request for help. A subtype of issue, so it can be assigned, blocked and resolved like any issue (it keeps issue's triaged, blocked and resolved states, which enterprise's assign, block and resolve actions set)."
+states = ["new", "open", "triaged", "pending_customer", "on_hold", "blocked", "resolved", "closed"]
+terminal_states = ["resolved", "closed"]
+alert_states = ["new", "open", "on_hold", "blocked"]
+properties.ticket_severity = { type = "enum", values = ["sev1", "sev2", "sev3", "sev4"] }
+properties.channel = { type = "enum", values = ["email", "chat", "phone", "portal", "in_app"] }
+properties.first_response_due = { type = "timestamp" }
+
+[object_types.nps_response]
+label = "NPS response"
+category = "knowledge"
+icon = "message-square-heart"
+color = "#f97316"
+description = "One answer to the Net Promoter Score survey."
+properties.nps_score = { type = "int", description = "0-10: how likely the user is to recommend the product." }
+properties.nps_category = { type = "enum", values = ["promoter", "passive", "detractor"] }
+properties.comment = { type = "text", searchable = true }
+properties.responded_at = { type = "timestamp" }
+
+[object_types.feature_request]
+label = "Feature request"
+category = "knowledge"
+icon = "lightbulb"
+color = "#eab308"
+description = "Something customers ask the product to do."
+states = ["submitted", "under_review", "planned", "shipped", "declined"]
+terminal_states = ["shipped", "declined"]
+properties.votes = { type = "int" }
+properties.request_text = { type = "text", searchable = true }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.feature_of]
+label = "Feature of"
+description = "The product a feature belongs to."
+from = ["product_feature"]
+to = ["software_product"]
+inverse = "features"
+cardinality = "one"
+weight = 0.8
+
+[link_types.plan_of]
+label = "Plan of"
+description = "The product a pricing plan sells."
+from = ["pricing_plan"]
+to = ["software_product"]
+inverse = "plans"
+cardinality = "one"
+weight = 0.7
+
+[link_types.includes_feature]
+label = "Includes feature"
+description = "Features a plan unlocks."
+from = ["pricing_plan"]
+to = ["product_feature"]
+inverse = "included_in_plans"
+weight = 0.8
+
+[link_types.requires_feature]
+label = "Requires feature"
+description = "The subject feature only works when the object feature is on."
+from = ["product_feature"]
+to = ["product_feature"]
+inverse = "required_by_feature"
+transitive = true
+dependency = true
+weight = 0.7
+
+[link_types.subscription_of]
+label = "Subscription of"
+description = "The account that holds the subscription."
+from = ["subscription"]
+to = ["customer_account"]
+inverse = "account_subscriptions"
+cardinality = "one"
+weight = 1.0
+
+[link_types.on_plan]
+label = "On plan"
+description = "The pricing plan a subscription is on."
+from = ["subscription"]
+to = ["pricing_plan"]
+inverse = "plan_subscriptions"
+cardinality = "one"
+weight = 0.9
+
+[link_types.billed_for]
+label = "Billed for"
+description = "The subscription an invoice bills."
+from = ["subscription_invoice"]
+to = ["subscription"]
+inverse = "invoices"
+cardinality = "one"
+weight = 0.8
+
+[link_types.user_of]
+label = "User of"
+description = "The account a product user belongs to."
+from = ["product_user"]
+to = ["customer_account"]
+inverse = "account_users"
+cardinality = "one"
+weight = 0.8
+
+[link_types.rolls_up_to]
+label = "Rolls up to"
+description = "Account hierarchy: a subsidiary or division rolls up to its parent account."
+from = ["customer_account"]
+to = ["customer_account"]
+inverse = "rolled_up_from"
+transitive = true
+weight = 0.6
+
+[link_types.managed_by_csm]
+label = "Managed by CSM"
+description = "The customer success manager responsible for the account."
+from = ["customer_account"]
+to = ["person"]
+inverse = "csm_accounts"
+cardinality = "one"
+weight = 0.8
+
+[link_types.ticket_from]
+label = "Ticket from"
+description = "The customer account a support ticket comes from."
+from = ["support_ticket"]
+to = ["customer_account"]
+inverse = "customer_tickets"
+cardinality = "one"
+weight = 0.9
+
+[link_types.raised_by_user]
+label = "Raised by user"
+description = "The product user who asked for help."
+from = ["support_ticket"]
+to = ["product_user"]
+inverse = "user_tickets"
+cardinality = "one"
+weight = 0.6
+
+[link_types.concerns_feature]
+label = "Concerns feature"
+description = "The feature a ticket or a request is about."
+from = ["support_ticket", "feature_request"]
+to = ["product_feature"]
+inverse = "feature_feedback"
+weight = 0.7
+
+[link_types.escalated_as]
+label = "Escalated as"
+description = "The engineering issue a support ticket was escalated to."
+from = ["support_ticket"]
+to = ["issue"]
+inverse = "escalations"
+weight = 0.9
+
+[link_types.requested_by_account]
+label = "Requested by account"
+description = "Accounts that asked for a feature."
+from = ["feature_request"]
+to = ["customer_account"]
+inverse = "account_requests"
+weight = 0.6
+
+[link_types.nps_from]
+label = "NPS from"
+description = "The product user who answered the survey."
+from = ["nps_response"]
+to = ["product_user"]
+inverse = "nps_responses"
+cardinality = "one"
+weight = 0.5
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+saas_product = "software_product"
+feature_flag = "product_feature"
+capability = "product_feature"
+pricing_tier = "pricing_plan"
+plan_tier = "pricing_plan"
+edition = "pricing_plan"
+logo = "customer_account"
+tenant = "customer_account"
+end_user = "product_user"
+seat_holder = "product_user"
+recurring_subscription = "subscription"
+license_subscription = "subscription"
+subscription_bill = "subscription_invoice"
+support_case = "support_ticket"
+helpdesk_ticket = "support_ticket"
+nps = "nps_response"
+survey_response = "nps_response"
+idea = "feature_request"
+enhancement_request = "feature_request"
+
+[glossary.relations]
+csm = "managed_by_csm"
+parent_account = "rolls_up_to"
+current_plan = "on_plan"
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.subscription_terms]
+description = "A subscription belongs to one account, is on one plan and has at least one seat."
+target = "subscription"
+properties = [
+    { path = "subscription_of", min_count = 1, max_count = 1, class = "customer_account" },
+    { path = "on_plan", min_count = 1, max_count = 1, class = "pricing_plan" },
+    { path = "prop.seats", min_count = 1, datatype = "int", min_value = 1.0 },
+    { path = "prop.mrr", min_value = 0.0 },
+]
+
+[shapes.invoice_terms]
+description = "An invoice bills one subscription, has a non-negative amount and an ISO 4217 currency."
+target = "subscription_invoice"
+properties = [
+    { path = "billed_for", min_count = 1, max_count = 1, class = "subscription" },
+    { path = "prop.amount", min_count = 1, min_value = 0.0 },
+    { path = "prop.currency", min_count = 1, pattern = "^[A-Z]{3}$" },
+]
+
+[shapes.nps_scale]
+description = "An NPS answer comes from one user and scores 0 to 10."
+target = "nps_response"
+properties = [
+    { path = "nps_from", min_count = 1, max_count = 1, class = "product_user" },
+    { path = "prop.nps_score", min_count = 1, datatype = "int", min_value = 0.0, max_value = 10.0, message = "NPS scores run from 0 to 10." },
+    { path = "prop.nps_category", min_count = 1 },
+]
+
+[shapes.ticket_triage]
+description = "A support ticket names the account it comes from and its severity."
+target = "support_ticket"
+properties = [
+    { path = "ticket_from", min_count = 1, max_count = 1, class = "customer_account" },
+    { path = "prop.ticket_severity", min_count = 1 },
+]
+
+[shapes.product_user_account]
+description = "Every product user belongs to exactly one customer account."
+target = "product_user"
+properties = [
+    { path = "user_of", min_count = 1, max_count = 1, class = "customer_account" },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.monthly_recurring_revenue]
+description = "Monthly recurring revenue of active and past-due subscriptions."
+kind = "subscription"
+measure = "sum"
+property = "mrr"
+filter = { state = ["active", "past_due"] }
+dimensions = { plan = "on_plan", account = "subscription_of", product = "on_plan.plan_of", state = "state" }
+certified = true
+
+[metrics.open_support_tickets]
+description = "Support tickets not yet resolved or closed."
+kind = "support_ticket"
+measure = "count"
+filter = { open = true }
+dimensions = { severity = "ticket_severity", account = "ticket_from", feature = "concerns_feature", assignee = "assigned_to" }
+certified = true
+
+[metrics.support_resolution_time]
+description = "Days from a support ticket being opened to being resolved or closed."
+kind = "support_ticket"
+measure = "lead_time"
+window_days = 90
+
+[metrics.seats_under_contract]
+description = "Seats on active subscriptions."
+kind = "subscription"
+measure = "sum"
+property = "seats"
+filter = { state = "active" }
+dimensions = { plan = "on_plan" }
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.change_subscription_plan]
+description = "Move a subscription to another pricing plan (upgrade or downgrade)."
+phrases = ["upgrade", "downgrade", "change plan", "move to plan"]
+risk = "medium"
+parameters.subscription = { type = "entity", kinds = ["subscription"], required = true }
+parameters.plan = { type = "entity", kinds = ["pricing_plan"], required = true, cue = ["to", "onto"] }
+
+[[action_types.change_subscription_plan.preconditions]]
+check = "state_in"
+param = "subscription"
+values = ["trialing", "active"]
+message = "Only a trialing or active subscription can change plan."
+
+[[action_types.change_subscription_plan.preconditions]]
+check = "no_link"
+param = "subscription"
+rel = "on_plan"
+to = "{plan}"
+message = "The subscription is already on that plan."
+
+[[action_types.change_subscription_plan.effects]]
+link = { from = "{subscription}", rel = "on_plan", to = "{plan}" }
+replace = true
+
+[[action_types.change_subscription_plan.effects]]
+event = { action = "subscription.plan_changed", target = "{subscription}", payload = { plan = "{plan}" } }
+
+[action_types.cancel_subscription]
+description = "Cancel a subscription and stop it from renewing."
+phrases = ["cancel", "terminate"]
+risk = "high"
+parameters.subscription = { type = "entity", kinds = ["subscription"], required = true }
+parameters.reason = { type = "text" }
+
+[[action_types.cancel_subscription.preconditions]]
+check = "open"
+param = "subscription"
+message = "The subscription is already cancelled or expired."
+
+[[action_types.cancel_subscription.effects]]
+patch = { id = "{subscription}", state = "cancelled", props = { auto_renew = false } }
+
+[[action_types.cancel_subscription.effects]]
+event = { action = "subscription.cancelled", target = "{subscription}", payload = { reason = "{reason}" } }
+
+[action_types.escalate_support_ticket]
+description = "Escalate a support ticket to engineering as a new issue in a project."
+phrases = ["escalate"]
+risk = "low"
+parameters.ticket = { type = "entity", kinds = ["support_ticket"], required = true }
+parameters.project = { type = "entity", kinds = ["project"], required = true, cue = ["to", "in", "into"] }
+parameters.title = { type = "string", required = true }
+
+[[action_types.escalate_support_ticket.preconditions]]
+check = "open"
+param = "ticket"
+message = "Only an open ticket can be escalated."
+
+[[action_types.escalate_support_ticket.effects]]
+create = { kind = "issue", title = "{title}", state = "open", props = { priority = "high" }, links = [ { rel = "belongs_to", to = "{project}" }, { rel = "escalations", to = "{ticket}" } ] }
+
+[[action_types.escalate_support_ticket.effects]]
+event = { action = "ticket.escalated", target = "{ticket}", payload = { issue = "{created}" } }
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+[[rules]]
+name = "feature_entitlement"
+description = "An account is entitled to the features its subscriptions' plans include."
+chain = ["account_subscriptions", "on_plan", "includes_feature"]
+infer = "entitled_to"
+
+[[rules]]
+name = "ticket_csm"
+description = "A support ticket goes to the customer success manager of the account it comes from."
+chain = ["ticket_from", "managed_by_csm"]
+infer = "csm_for_ticket"
+
+[[rules]]
+name = "payment_risk"
+description = "An account with an uncollectible invoice on one of its subscriptions is a payment risk."
+when = [["?i", "billed_for", "?s"], ["?i", "state", "uncollectible"], ["?s", "subscription_of", "?a"]]
+then = ["?a", "a", "payment_risk_account"]
+
+[[rules]]
+name = "detractor_account"
+description = "An account with a user who answered the NPS survey as a detractor is a detractor account."
+when = [["?r", "nps_from", "?u"], ["?r", "prop.nps_category", "detractor"], ["?u", "user_of", "?a"]]
+then = ["?a", "a", "detractor_account"]
+
+[[rules]]
+name = "churn_risk"
+description = "An account that is both a payment risk and a detractor is a churn risk."
+when = [["?a", "a", "payment_risk_account"], ["?a", "a", "detractor_account"]]
+then = ["?a", "a", "churn_risk_account"]
+
+[[rules]]
+name = "candidate_plan"
+description = "An active plan that includes a feature an account requested is a candidate plan for it. Rules have no negation, so this does not check whether the account already has the feature."
+when = [["?r", "requested_by_account", "?a"], ["?r", "concerns_feature", "?f"], ["?p", "includes_feature", "?f"], ["?p", "state", "active"]]
+then = ["?a", "candidate_plan", "?p"]

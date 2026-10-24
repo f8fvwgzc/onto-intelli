@@ -1,0 +1,22 @@
+{
+  "format": "oi-cert/1",
+  "derived": {
+    "asserted_sha256": "48caba7dbd910c63456bf23d2e51772d213338e6fc98a9ee52fad20fbcb0730b",
+    "rules_sha256": "d17a617c3294f69c0bfd7d2bba31c309e52026c6ca1208f2caf0ead5494f5ac0",
+    "derivations_sha256": "4b08caad629a8c792799385a22ec5df54877016975e6d739b624f7958efa2920",
+    "asserted": 4,
+    "rules": 5,
+    "derivations": 3
+  },
+  "attested": {
+    "engine": "onto-intelli 0.2.0",
+    "created_at": "2026-10-24T12:00:00Z",
+    "workspace": "acme",
+    "schema_version": 4,
+    "graph_revision": 77,
+    "principal": "ada",
+    "fixpoint_reached": true,
+    "rounds": 3
+  },
+  "means": "derived fields are recomputed by the checker; attested fields are claims of the engine that wrote this certificate"
+}

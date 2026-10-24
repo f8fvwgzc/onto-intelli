@@ -34,6 +34,8 @@ const KeysPage = lazy(() => import("./pages/console/KeysPage"));
 const LlmPage = lazy(() => import("./pages/console/LlmPage"));
 const MembersPage = lazy(() => import("./pages/console/MembersPage"));
 const SettingsPage = lazy(() => import("./pages/console/SettingsPage"));
+// The assurance area (packs, reasoning, shapes, lint) loads on first visit.
+const AssurePage = lazy(() => import("./pages/assure/AssurePage"));
 
 absorbLocation();
 const embedded = window.parent !== window;
@@ -124,12 +126,22 @@ function OntologyPage({ page }: { page: string }) {
     <ExplorePage />
   ) : page === "build" ? (
     <BuildPage />
+  ) : page === "assure" ? (
+    <Suspense
+      fallback={
+        <div className="p-5">
+          <Spinner />
+        </div>
+      }
+    >
+      <AssurePage />
+    </Suspense>
   ) : (
     <MapPage />
   );
 }
 
-const ONTOLOGY = new Set(["map", "explore", "entities", "schema", "build", "proposals"]);
+const ONTOLOGY = new Set(["map", "explore", "entities", "schema", "build", "proposals", "assure"]);
 const NEEDS_PROJECT = new Set(["overview", "traces", "sessions", "usage", "connect", "keys", "llm", "settings", ...ONTOLOGY]);
 
 /** The console: sign-in until `/v1/console/me` answers, then the shell with the project pages. */

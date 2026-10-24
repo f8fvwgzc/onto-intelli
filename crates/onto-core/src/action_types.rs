@@ -6,7 +6,9 @@
 //! graph and derives an inverse for every effect, so each action knows whether
 //! it is reversible before it runs. High-risk or irreversible actions require
 //! explicit confirmation. Applying writes the edits, an audit event and an
-//! undo receipt in one transaction.
+//! undo receipt in one transaction. On request a plan also reports its
+//! consequences: the derived facts that appear and disappear when its edits
+//! are staged on a fork (see [`Ontology::plan_action_consequences`]).
 
 use std::collections::BTreeMap;
 
@@ -15,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::engine::{ActionContext, Extra};
 use crate::graph::Graph;
+use crate::live_schema::{ACTION_CONSEQUENCES_MEANS, Consequences, data_consequences};
 use crate::model::*;
 use crate::policy::{self, Principal, Role};
 use crate::schema::{Dir, Schema};
@@ -335,6 +338,10 @@ pub struct ActionPlan {
     pub reversible: bool,
     pub needs_confirmation: bool,
     pub warnings: Vec<String>,
+    /// What the edits do to entailment, when asked for with
+    /// [`Ontology::plan_action_consequences`]; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequences: Option<Consequences>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -938,7 +945,48 @@ impl Ontology {
             risk,
             reversible,
             warnings,
+            consequences: None,
         })
+    }
+
+    /// [`plan_action`](Self::plan_action) plus its consequences: the plan's
+    /// mutations are staged on a [`fork`](Self::fork), and the closure of the
+    /// live graph is compared with the closure of the fork, both as the
+    /// planner may see them. Opt-in, because it copies the graph and runs the
+    /// reasoner twice; nothing is written. An invalid plan, or mutations that
+    /// do not stage, give a skipped block that says why.
+    pub fn plan_action_consequences(
+        &self,
+        ctx: &ActionContext,
+        name: &str,
+        params: &Map<String, Value>,
+    ) -> Result<ActionPlan> {
+        let mut plan = self.plan_action(ctx, name, params)?;
+        plan.consequences = Some(self.action_consequences(ctx, &plan)?);
+        Ok(plan)
+    }
+
+    fn action_consequences(&self, ctx: &ActionContext, plan: &ActionPlan) -> Result<Consequences> {
+        if !plan.valid {
+            return Ok(Consequences::skipped(
+                "the plan is not valid, so nothing would change",
+                ACTION_CONSEQUENCES_MEANS,
+            ));
+        }
+        let p = &ctx.principal;
+        let fork = self.fork();
+        if let Err(e) = fork.apply(ctx, plan.mutations.clone()) {
+            return Ok(Consequences::skipped(
+                format!("the mutations do not stage on a fork: {e}"),
+                ACTION_CONSEQUENCES_MEANS,
+            ));
+        }
+        let schema = self.schema();
+        let before = self.reader(p)?;
+        let after = fork.reader(p)?;
+        let can_before = |e: &Entity| policy::visible(p, e, &before);
+        let can_after = |e: &Entity| policy::visible(p, e, &after);
+        Ok(data_consequences(&schema, &before, &after, &can_before, &can_after))
     }
 
     /// Plan, then apply when valid and (if required) confirmed.

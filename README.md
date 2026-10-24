@@ -22,6 +22,76 @@ llm · intent blockers · 1894 tokens · 3.5 ms
 The first answer never touches an LLM. The second sends the model ~1.9k tokens of ranked,
 permission-filtered facts instead of the database.
 
+## Plan a change, see every consequence, hand the reviewer a proof
+
+A schema change can touch no entity and no link and still change what the
+ontology says. Making `depends_on` transitive is one such change. On the demo
+workspace (with the manufacturing pack installed) the plan shows its blast
+radius, zero, and its consequences: the facts it adds (the new schema fact
+itself, asserted, and three derived facts, each with the rule and premises
+behind it), all stated in names you already use, so the change is not
+conservative:
+
+```text
+$ onto schema plan transitive.toml
+non-breaking on schema v2 · 0 entities · 0 links in scope
+  · change link type project|task|service|issue|milestone|package -depends_on-> project|task|service|issue|milestone|repository|environment|package (now transitive) (0 entities, 0 links)
+  risk medium: not conservative: 4 added facts are stated purely in the current vocabulary, e.g. <project:alpha> depends_on <service:auth-service>
+  consequences: +4 added (1 asserted, 3 derived), -0 removed · not conservative (4 new over existing names)
+      asserted 1 · builtin/transitive 3
+      + <project:alpha> depends_on <service:auth-service>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:auth-service>
+      + <project:alpha> depends_on <service:postgres>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:postgres>
+      + <task:34> depends_on <task:31>  by builtin/transitive from depends_on a transitive, <task:34> depends_on <task:32>, <task:32> depends_on <task:31>
+      + depends_on a transitive
+  shapes: 0 new results, 0 resolved · violates → violates
+```
+
+Derived facts are never written to the graph. They carry a certificate: four
+plain files in which every derived fact is one line citing a rule and earlier
+lines. `onto-cert`, a checker that shares no code with the engine, re-derives
+each line by pattern alone. The verdict says whether the conclusions rest on
+the schema's built-in semantics only (`entailed`) or also on supplied rules,
+such as an industry pack's (`entailed_under_supplied_rules`):
+
+```text
+$ onto reason certify --out cert
+entailed_under_supplied_rules 345 asserted · 62 derivations · rules cited: 2 built-in, 10 supplied · onto-cert 0.2.0
+means: every derived fact follows from asserted.tsv under the cited rules, re-derived line by line by pattern without search; the supplied (non-built-in) rules are assumptions the certificate carries, not facts it establishes; this does not show that asserted.tsv is the graph the engine read
+wrote cert (check again with `onto cert check cert` or `onto-cert check cert`)
+```
+
+Change one conclusion in `derivations.tsv` (line 15: issue 421 handled by
+Platform instead of Payments), even with the manifest digest recomputed to
+match, and the checker refuses it by line and rule (exit 1):
+
+```text
+$ onto cert check forged
+{
+  "asserted": 345,
+  "conclusion": "<issue:421> handled_by_team <team:platform>",
+  "derivations": 62,
+  "first_rejected": 15,
+  "ok": false,
+  "premises": [
+    "<issue:421> assigned_to <person:kenji>",
+    "<person:kenji> member_of <team:payments>"
+  ],
+  "reason": "conclusion_mismatch",
+  "rule": "schema/responsible_team"
+}
+```
+
+Shapes measure the data (`conforms`, `violates` or `undetermined`, never
+"valid"), lint reviews the schema, alignment scores another schema against
+yours and exports SSSOM, and a CSV sheet becomes an object type, links and a
+shape with the evidence for each line. Each report says whether it is a proof,
+a measurement or an opinion. Ten industry packs (manufacturing, supply chain,
+retail, logistics, healthcare, finance, insurance, energy, telecom, SaaS)
+install as governed schema changes. See [docs/ASSURANCE.md](docs/ASSURANCE.md)
+and [docs/PACKS.md](docs/PACKS.md); the ideas come from
+[open-ontologies](https://github.com/fabio-rovai/open-ontologies) by Fabio
+Rovai / Tesseract Semantics, reimplemented here for a typed property graph.
+
 ---
 
 ## Why it is fast and cheap
@@ -93,7 +163,14 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | Capability | Try it |
 |---|---|
 | **Ontology builder** — connect a database and draft object types backed by its tables (typed properties, keys, titles, states), link types from foreign keys and join tables, and action types; refine it with the LLM, apply or propose it, sync rows into objects and browse them in the Object Explorer ([docs/ONTOLOGY_BUILDER.md](docs/ONTOLOGY_BUILDER.md)) | `onto model draft shop` · `onto model apply shop` · `onto explore order --filter state=paid` |
-| **Live schema as data** — create, change and delete object types, properties, link types, interfaces, action types, rules and metrics at runtime; every change set is validated, previewed (entities/links affected, breaking or not), migrated explicitly when it breaks data in use, versioned with diffs and point-in-time reads, audited and reversible ([docs/SCHEMA.md](docs/SCHEMA.md)) | `onto schema plan change.toml` · `onto schema apply change.toml` · `onto schema history` · `onto schema revert 2` |
+| **Live schema as data** — create, change and delete object types, properties, link types, interfaces, action types, rules, metrics and shapes at runtime; every change set is validated, previewed (entities/links affected, breaking or not), migrated explicitly when it breaks data in use, versioned with diffs and point-in-time reads, audited and reversible ([docs/SCHEMA.md](docs/SCHEMA.md)) | `onto schema plan change.toml` · `onto schema apply change.toml` · `onto schema history` · `onto schema revert 2` |
+| **Reasoner with certificates** — derived facts kept apart from stored ones, each with its rule and premises; a certificate per run that the independent checker `onto-cert` accepts or refuses line by line, offline; justifications, provenance, claim verification and slice preservation ([docs/ASSURANCE.md](docs/ASSURANCE.md)) | `onto reason run` · `onto reason certify --out cert` · `onto cert check cert` · `onto reason explain issue:421 escalate_to person:sarah` |
+| **Semantic schema plans** — every plan also lists the derived facts a change adds and removes, whether it is conservative, a risk word with reasons, lock violations, deletes that look like renames and the shape results it changes | `onto schema plan change.toml` · `onto lock object_types issue --reason "…"` · `onto do assign item=issue:433 assignee=person:maria --consequences` |
+| **Shapes** (SHACL-style) — `conforms`, `violates` or `undetermined`, never a silent pass; a structural check for authors and agents; shapes induced from data with the counts behind each constraint | `onto shapes validate` · `onto shapes check shapes.toml` · `onto shapes induce part` |
+| **Schema lint** — 19 checks with fixes and stable finding ids; dismiss or accept with a note, never hidden silently | `onto lint` · `onto lint --dismiss <id> --note "…"` |
+| **Industry packs** — manufacturing, supply chain, retail, logistics, healthcare, finance, insurance, energy, telecom and SaaS, each with rules, shapes, metrics, action types and a sample, installed as a governed schema change ([docs/PACKS.md](docs/PACKS.md)) | `onto pack list` · `onto pack plan retail` · `onto pack install manufacturing --sample` |
+| **Schema alignment** — scored matches between a pack or a TOML schema and yours, SSSOM export, certification of claimed mappings against both hierarchies | `onto align --pack supply-chain --sssom out.tsv` · `onto align other.toml --certify mappings.json` |
+| **One sheet in, one ontology out** — a CSV becomes an object type, link types and a shape, with an evidence sentence per line; ingest with a lexical guard that never coerces | `onto induce vendors.csv --change-set c.json` · `onto induce vendors.csv --ingest` · `onto induce other.csv --ingest --mapping m.json` |
 | **PostgreSQL store** (16+, with pgvector) — the durable store: versioned migrations embedded in the binary, one schema per tenant, JSONB documents, an append-only event log and history, vectors in an HNSW index. Any number of processes (replicas embedding the library, several servers) share it consistently: optimistic commits on a commit log, in-memory graph indexes refreshed through LISTEN/NOTIFY, optional read-your-writes ([docs/STORAGE.md](docs/STORAGE.md)) | `make db-up` · `onto --database-url postgres://… status` |
 | **nexc-execution vocabulary** — `extend = ["builtin:nexc-execution"]`: graphs, node types (executor, default role, stage, produces_artifact, allow_code_exec) and relation types (blocking) as validated, versioned data, read and written in nexc's shape ([docs/NEXC_EXECUTION.md](docs/NEXC_EXECUTION.md)) | `onto call execution.init_graph '{"graph":"g1"}'` |
 | **Web UI** at `/ui` — workspace map (filter, search, expand, path, impact, history slider), Object Explorer, ontology Builder, schema editor with impact preview and apply/propose, proposals inbox, entity browser with history; iframe-embeddable with browser sessions, works on phones ([docs/UI.md](docs/UI.md)) | `onto serve --dev` then open http://127.0.0.1:50051/ui/ |
@@ -111,7 +188,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Expert finding** with reasons | `onto experts postgres` · `onto ask "Who knows about PostgreSQL?"` |
 | **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
 | **Graph profile** grounds prompts in patterns that exist; **drift suggestions** for data the schema doesn't cover | `onto schema profile` · `onto schema suggest` |
-| **MCP server** for agents (same permissions, writes only via action types) | `onto mcp` |
+| **MCP server** for agents (same permissions, writes only via action types), with tool profiles per job | `onto mcp` · `onto mcp --profile reasoning` |
 | **Evaluation** with competency questions and evidence | `onto eval` (22/22 on the demo, 86% answered without the LLM) |
 | **Export** — Turtle (OWL + PROV-O provenance) and Mermaid | `onto export --format mermaid --start project:alpha` |
 
@@ -155,9 +232,20 @@ What Genie does not offer:
 Tools: `ask`, `search`, `get_entity`, `neighbors`, `find_data`, `join_path`, `trusted_metric`,
 `authority`, `learned_facts`, `find_entities`, `explain_blockers`, `impact`, `dependencies`,
 `critical_path`, `metric`, `history`, `changes`, `experts`, `data_quality`, `what_if`,
-`list_actions`, `plan_action`, `draft_ontology`, `refine_ontology`, `advise_ontology`,
-`propose_ontology`, `object_types`, `explore_objects` (+ `apply_action`, `undo_action`,
-`crawl` when `[mcp] allow_writes = true`). `propose_ontology` only ever files a proposal.
+`list_actions`, `plan_action`, `get_schema`, `plan_schema_change`, `propose_schema_change`,
+`list_proposals`, `get_proposal`, `draft_ontology`, `refine_ontology`, `advise_ontology`,
+`propose_ontology`, `object_types`, `explore_objects`, `query_inferred`, `explain_fact`,
+`verify_claims`, `check_slice`, `certify_reasoning`, `validate_shapes`, `induce_shape`,
+`check_shapes`, `lint_schema`, `list_packs`, `show_pack`, `plan_pack`, `install_pack`,
+`align_schema`, `induce_sheet` (+ `apply_action`, `undo_action`, `crawl` when
+`[mcp] allow_writes = true`). `propose_ontology`, `propose_schema_change` and
+`install_pack` only ever file a proposal.
+
+A profile narrows the list to one job: `full` (default), `catalog`, `authoring`,
+`reasoning`, `governance`, `retrieval` or `evaluation`, each with `ask`, `search`,
+`get_entity` and `get_schema`. Set it with `onto mcp --profile <name>`,
+`ONTO_MCP_PROFILE` or `[mcp] profile`, in that order of precedence; an unknown name
+refuses to start. The profile tables are in [docs/ASSURANCE.md](docs/ASSURANCE.md#mcp-tools-and-profiles).
 
 ## Build an ontology from your database
 
@@ -213,6 +301,12 @@ onto deps project:alpha --plan  # execution order + critical path
 onto ask "Which table holds revenue?"  # the demo warehouse catalog; see docs/CATALOG.md
 onto rank table:warehouse.sales.orders # OntoRank and why
 onto chat                       # multi-turn, remembers what "it" refers to
+onto pack install manufacturing --sample  # an industry pack and its sample data
+onto reason run                 # derived facts per rule, and what the reasoner did not evaluate
+onto reason certify --out cert  # a certificate, checked by onto-cert
+onto cert check cert            # check it again offline: exit 0 accepted, 1 rejected, 2 malformed
+onto shapes validate            # conforms, violates or undetermined
+onto lint                       # schema findings with fixes
 export ONTO_TOKEN=$(openssl rand -hex 24)
 onto serve                      # gRPC + HTTP on 127.0.0.1:50051 (token auth)
 onto serve --dev                # local development: no auth, loopback only
@@ -256,6 +350,8 @@ block and server-side refusal fallback (`fallbacks: "default"`, disable with
   history, changes, quality, duplicates/merge, scenarios, experts, profile, export, eval),
   `MemoryService`, `EventService` (incl. client-streaming `Ingest`), `AdminService`;
 * `SchemaService`: the live schema and proposals ([docs/SCHEMA.md](docs/SCHEMA.md));
+* `AssuranceService`: the reasoner and certificates, shapes, lint, locks, alignment,
+  packs and sheet induction ([docs/ASSURANCE.md](docs/ASSURANCE.md));
 * `OntologyBuilderService` and `ObjectService`: the ontology builder and the Object Explorer
   ([docs/ONTOLOGY_BUILDER.md](docs/ONTOLOGY_BUILDER.md));
 * gRPC reflection and `grpc.health.v1`;
@@ -441,7 +537,7 @@ C: [`examples/ffi/demo.c`](examples/ffi/demo.c).
 Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers, `[connectors]`
 background crawls, `[llm]`, `[context]`
 token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic intents,
-`[grpc]` listener and routes, `[auth]`, `[console]` the control plane, `[traces]` what is
+`[grpc]` listener and routes, `[mcp]` agent principal, writes and tool profile, `[auth]`, `[console]` the control plane, `[traces]` what is
 recorded and for how long. Lookup order: `--config`, `$ONTO_CONFIG`,
 `./onto-intelli.toml`, `~/.config/onto-intelli/config.toml`.
 
@@ -482,15 +578,18 @@ crates/onto-intelli   orchestrator: intent, resolution, context graph, memory, L
 crates/onto-grpc      gRPC/HTTP server: built-in proto, dynamic proto routes, reflection, health, SSE, console API, MCP over HTTP
 crates/onto-control   control plane: organizations, members, projects, API keys, OIDC sign-in, BYO LLM vault, usage
 crates/onto-cli       the `onto` binary
+crates/onto-cert      the independent certificate checker (`onto-cert`; std, sha2 and serde_json only)
 crates/onto-ffi       C ABI (cdylib + staticlib) and header
 examples/             FFI demos, JSONL ingest sample, schema extension
 packaging/            install script, Homebrew formula; Dockerfile and CI at the root
 docs/ARCHITECTURE.md  design notes
+docs/ASSURANCE.md     reasoner and certificates, semantic plans, shapes, lint, alignment, sheet induction
+docs/PACKS.md         the ten industry packs
 docs/CATALOG.md       connectors, OntoRank, learned facts
 docs/ONTOLOGY_BUILDER.md  object, link and action types from a database; row sync; Object Explorer
 docs/CONTROL_PLANE.md the console: sign-in, projects, API keys, BYO LLM, traces, SDKs, repository connector
 docs/UI.md            the web UI and console pages
-docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean and arXiv
+docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean, open-ontologies and arXiv
 sdk/typescript        TypeScript SDK (zero dependencies)
 sdk/python            Python SDK (standard library only)
 ui/                   the web UI (React); built into crates/onto-grpc/ui-dist

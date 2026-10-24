@@ -1,0 +1,513 @@
+# energy: an electric utility's grid as ontology data. Service territories,
+# substations, feeders, transformers, switching devices, generation units,
+# service points and smart meters, the electrical topology between them
+# (`downstream_of`, transitive), outages and the crews that restore them,
+# condition assessments and switching orders.
+#
+# Layered on builtin:enterprise (extend = ["builtin:energy"]). People, teams
+# (field crews), projects and knowledge come from enterprise and are reused,
+# never redefined. The vocabulary borrows from public utility standards; it
+# does not claim compliance with any of them.
+#
+# Ids: service_territory:{code}, substation:{code}, feeder:{circuit id},
+# transformer:{asset tag}, switching_device:{asset tag},
+# generation_unit:{code}, service_point:{premise id}, smart_meter:{serial},
+# grid_outage:{event id}, condition_assessment:{id}, switching_order:{id}.
+
+[pack]
+id = "energy"
+title = "Energy and utilities"
+industry = "energy"
+version = "1.0.0"
+description = "Electric utility grid assets, electrical topology, outages, crews and condition assessments. Vocabulary inspired by the IEC CIM (61968/61970), ISO 55000 and IEEE 1366; it borrows their words and claims no compliance with any of them. Its rules (which service points an outage interrupts, outages that reach life-support customers, critical assets in very poor condition) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "vocabulary inspired by the IEC 61968/61970 Common Information Model (CIM)",
+    "asset-condition terms inspired by ISO 55000 asset management",
+    "interruption terms inspired by IEEE 1366 distribution reliability indices",
+]
+sample_note = "smart_meter:m-stock-0001 is a meter still in stock with no service point: the one deliberate violation (shape smart_meter_installed, min_count 1 on meter_at). Everything else in the sample conforms."
+
+# ── Territory ────────────────────────────────────────────────────────────────
+
+[object_types.service_territory]
+label = "Service territory"
+category = "container"
+icon = "map"
+color = "#1d4ed8"
+description = "An area the utility serves: a region, an operating district or a zone. Territories nest with sub_territory_of."
+properties.territory_level = { type = "enum", values = ["region", "district", "zone"] }
+properties.regulator = { type = "string", description = "Body that regulates service in this territory." }
+
+# ── Grid assets ──────────────────────────────────────────────────────────────
+
+[object_types.substation]
+implements = ["grid_asset"]
+label = "Substation"
+icon = "factory"
+color = "#b45309"
+description = "Facility that transforms voltage and switches circuits between transmission and distribution."
+states = ["energized", "de_energized", "maintenance", "decommissioned"]
+terminal_states = ["decommissioned"]
+alert_states = ["de_energized"]
+properties.substation_type = { type = "enum", values = ["transmission", "distribution", "switching", "converter"] }
+properties.high_voltage_kv = { type = "float", description = "Highest nominal voltage in kV." }
+
+[object_types.feeder]
+implements = ["grid_asset"]
+label = "Feeder"
+icon = "cable"
+color = "#d97706"
+description = "Distribution circuit leaving a substation and serving transformers and service points."
+states = ["energized", "de_energized", "overloaded", "maintenance"]
+alert_states = ["de_energized", "overloaded"]
+properties.nominal_voltage_kv = { type = "float" }
+properties.circuit_length_km = { type = "float" }
+properties.phase_config = { type = "enum", values = ["single_phase", "two_phase", "three_phase"] }
+
+[object_types.transformer]
+implements = ["grid_asset"]
+label = "Transformer"
+icon = "zap"
+color = "#f59e0b"
+description = "Distribution or power transformer stepping voltage down towards service points."
+states = ["in_service", "out_of_service", "failed", "retired"]
+terminal_states = ["retired"]
+alert_states = ["failed"]
+properties.rating_mva = { type = "float", description = "Nameplate rating in MVA." }
+properties.cooling = { type = "enum", values = ["onan", "onaf", "ofaf", "dry"] }
+
+[object_types.switching_device]
+implements = ["grid_asset"]
+label = "Switching device"
+icon = "toggle-right"
+color = "#ca8a04"
+description = "Breaker, recloser, sectionalizer, fuse or switch that opens and closes a circuit."
+states = ["closed", "open", "locked_out", "retired"]
+terminal_states = ["retired"]
+alert_states = ["locked_out"]
+properties.device_type = { type = "enum", values = ["breaker", "recloser", "sectionalizer", "fuse", "switch"] }
+properties.normally_open = { type = "bool", description = "A tie point that is open in normal operation." }
+
+[object_types.generation_unit]
+implements = ["grid_asset"]
+label = "Generation unit"
+icon = "sun"
+color = "#16a34a"
+description = "A generator or a distributed energy resource (solar, wind, storage) connected to the grid."
+states = ["online", "offline", "curtailed", "tripped", "retired"]
+terminal_states = ["retired"]
+alert_states = ["tripped"]
+properties.fuel_type = { type = "enum", values = ["solar", "wind", "hydro", "gas", "coal", "nuclear", "battery", "biomass"] }
+properties.capacity_mw = { type = "float", description = "Nameplate capacity in MW." }
+properties.dispatchable = { type = "bool" }
+
+[object_types.smart_meter]
+implements = ["grid_asset"]
+label = "Smart meter"
+icon = "gauge"
+color = "#0891b2"
+description = "Advanced metering infrastructure (AMI) meter. Meters send a last-gasp message when they lose power."
+states = ["active", "inactive", "tampered", "removed"]
+terminal_states = ["removed"]
+alert_states = ["tampered"]
+properties.meter_class = { type = "enum", values = ["residential", "commercial", "industrial"] }
+properties.firmware = { type = "string" }
+
+# ── Customers' connection to the grid ────────────────────────────────────────
+
+[object_types.service_point]
+label = "Service point"
+icon = "home"
+color = "#0e7490"
+description = "The point where the grid delivers energy to a premise. Customer data stays in the billing system; only the connection lives here."
+states = ["connected", "disconnected"]
+alert_states = ["disconnected"]
+properties.premise_type = { type = "enum", values = ["residential", "commercial", "industrial", "municipal"] }
+properties.life_support = { type = "bool", description = "A resident depends on powered medical equipment (priority restoration)." }
+
+# ── Operations ───────────────────────────────────────────────────────────────
+
+[object_types.grid_outage]
+label = "Grid outage"
+icon = "zap-off"
+color = "#dc2626"
+description = "A sustained interruption of supply, from first report to restoration. Planned outages carry planned = true."
+states = ["reported", "confirmed", "crew_dispatched", "restored", "closed"]
+terminal_states = ["restored", "closed"]
+alert_states = ["reported", "confirmed", "crew_dispatched"]
+properties.cause = { type = "enum", values = ["weather", "equipment_failure", "vegetation", "animal", "planned", "third_party", "unknown"] }
+properties.customers_affected = { type = "int" }
+properties.planned = { type = "bool" }
+properties.started_at = { type = "timestamp" }
+properties.restored_at = { type = "timestamp" }
+
+[object_types.condition_assessment]
+label = "Condition assessment"
+category = "knowledge"
+icon = "clipboard-check"
+color = "#7c3aed"
+description = "An inspection or test of one asset and the condition it found."
+states = ["scheduled", "completed", "overdue"]
+terminal_states = ["completed"]
+alert_states = ["overdue"]
+properties.condition = { type = "enum", values = ["good", "fair", "poor", "very_poor"] }
+properties.method = { type = "enum", values = ["visual", "thermographic", "dissolved_gas", "drone", "lidar"] }
+properties.inspected_at = { type = "timestamp" }
+properties.findings = { type = "text", searchable = true }
+
+[object_types.switching_order]
+label = "Switching order"
+icon = "list-ordered"
+color = "#9333ea"
+description = "An approved sequence of switching steps that isolates equipment safely, usually for a planned outage."
+states = ["draft", "approved", "executing", "completed", "cancelled"]
+terminal_states = ["completed", "cancelled"]
+properties.planned_start = { type = "timestamp" }
+properties.safety_clearance = { type = "bool", description = "A clearance (permit to work) is issued for the isolated section." }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.grid_asset]
+description = "Physical equipment of the grid: it has an asset tag, a criticality and a maintaining crew."
+properties.asset_tag = { type = "string" }
+properties.install_year = { type = "int" }
+properties.criticality = { type = "enum", values = ["low", "medium", "high", "critical"] }
+links = ["maintained_by_crew"]
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.sub_territory_of]
+label = "Sub-territory of"
+description = "The subject territory lies inside the object territory."
+from = ["service_territory"]
+to = ["service_territory"]
+inverse = "has_sub_territory"
+transitive = true
+weight = 0.6
+
+[link_types.in_territory]
+label = "In territory"
+description = "The subject is located in the object territory."
+from = ["substation", "service_point", "generation_unit"]
+to = ["service_territory"]
+inverse = "territory_contains"
+cardinality = "one"
+weight = 0.5
+
+[link_types.downstream_of]
+label = "Downstream of"
+description = "Electrical topology: the subject is supplied through the object in normal configuration."
+from = ["service_point", "transformer", "switching_device", "feeder"]
+to = ["transformer", "switching_device", "feeder", "substation"]
+inverse = "upstream_of"
+transitive = true
+dependency = true
+weight = 1.0
+
+[link_types.tied_with]
+label = "Tied with"
+description = "Two feeders share a normally open tie point and can back each other up."
+from = ["feeder"]
+to = ["feeder"]
+symmetric = true
+weight = 0.4
+
+[link_types.interconnected_at]
+label = "Interconnected at"
+description = "The point where a generation unit connects to the grid."
+from = ["generation_unit"]
+to = ["substation", "feeder"]
+inverse = "interconnections"
+cardinality = "one"
+weight = 0.7
+
+[link_types.meter_at]
+label = "Meter at"
+description = "The service point a meter measures."
+from = ["smart_meter"]
+to = ["service_point"]
+inverse = "has_meter"
+cardinality = "one"
+weight = 0.8
+
+[link_types.originated_at]
+label = "Originated at"
+description = "The asset where an outage started (the faulted or isolated equipment)."
+from = ["grid_outage"]
+to = ["grid_asset"]
+inverse = "outage_history"
+cardinality = "one"
+weight = 1.0
+
+[link_types.reported_via]
+label = "Reported via"
+description = "Meters whose last-gasp messages reported the outage."
+from = ["grid_outage"]
+to = ["smart_meter"]
+inverse = "last_gasp_reports"
+weight = 0.5
+
+[link_types.crew_assigned]
+label = "Crew assigned"
+description = "Field crew dispatched to restore the outage."
+from = ["grid_outage"]
+to = ["team"]
+inverse = "crew_outages"
+weight = 0.9
+
+[link_types.maintained_by_crew]
+label = "Maintained by crew"
+description = "The crew responsible for maintaining the asset."
+from = ["grid_asset"]
+to = ["team"]
+inverse = "crew_maintains"
+cardinality = "one"
+weight = 0.8
+
+[link_types.condition_of]
+label = "Condition of"
+description = "The asset a condition assessment examined."
+from = ["condition_assessment"]
+to = ["grid_asset"]
+inverse = "condition_assessments"
+cardinality = "one"
+weight = 0.8
+
+[link_types.surveyed_by]
+label = "Surveyed by"
+description = "Who carried out the assessment: an inspector, a crew or an analytics agent."
+from = ["condition_assessment"]
+to = ["person", "team", "agent"]
+inverse = "surveys"
+weight = 0.5
+
+[link_types.isolates]
+label = "Isolates"
+description = "Equipment a switching order de-energizes."
+from = ["switching_order"]
+to = ["switching_device", "feeder", "transformer"]
+inverse = "isolated_by"
+weight = 0.8
+
+[link_types.for_outage]
+label = "For outage"
+description = "The planned outage a switching order carries out."
+from = ["switching_order"]
+to = ["grid_outage"]
+inverse = "switching_plan"
+cardinality = "one"
+weight = 0.7
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+blackout = "grid_outage"
+power_cut = "grid_outage"
+interruption = "grid_outage"
+circuit = "feeder"
+recloser = "switching_device"
+breaker = "switching_device"
+sectionalizer = "switching_device"
+generator = "generation_unit"
+der = "generation_unit"
+solar_farm = "generation_unit"
+wind_farm = "generation_unit"
+meter = "smart_meter"
+ami_meter = "smart_meter"
+premise = "service_point"
+service_location = "service_point"
+service_area = "service_territory"
+operating_district = "service_territory"
+asset_inspection = "condition_assessment"
+condition_survey = "condition_assessment"
+switching_program = "switching_order"
+xfmr = "transformer"
+
+[glossary.relations]
+fed_by = "downstream_of"
+feeds_into = "upstream_of"
+outage_crew = "crew_assigned"
+parent_territory = "sub_territory_of"
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.smart_meter_installed]
+description = "Every meter measures exactly one service point."
+target = "smart_meter"
+message = "A meter must be installed at one service point."
+properties = [
+    { path = "meter_at", min_count = 1, max_count = 1, class = "service_point" },
+]
+
+[shapes.outage_record]
+description = "An outage names its origin and cause and counts the customers it affects."
+target = "grid_outage"
+properties = [
+    { path = "originated_at", min_count = 1, max_count = 1, class = "grid_asset" },
+    { path = "prop.cause", min_count = 1 },
+    { path = "prop.customers_affected", datatype = "int", min_value = 0.0 },
+]
+
+[shapes.service_point_connected]
+description = "Every service point is connected to the grid and lies in one territory."
+target = "service_point"
+properties = [
+    { path = "downstream_of", min_count = 1 },
+    { path = "in_territory", min_count = 1, max_count = 1, class = "service_territory" },
+]
+
+[shapes.assessment_complete]
+description = "A condition assessment names the asset, the condition found and when."
+target = "condition_assessment"
+properties = [
+    { path = "condition_of", min_count = 1, max_count = 1, class = "grid_asset" },
+    { path = "prop.condition", min_count = 1 },
+    { path = "prop.inspected_at", min_count = 1 },
+]
+
+[shapes.transformer_rating]
+description = "A transformer has a plausible nameplate rating and an upstream supply."
+target = "transformer"
+properties = [
+    { path = "prop.rating_mva", min_count = 1, min_value = 0.01, max_value = 2000.0 },
+    { path = "downstream_of", min_count = 1 },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_grid_outages]
+description = "Outages not yet restored or closed."
+kind = "grid_outage"
+measure = "count"
+filter = { open = true }
+dimensions = { cause = "cause", state = "state", crew = "crew_assigned", origin = "originated_at" }
+certified = true
+
+[metrics.customers_interrupted]
+description = "Customers affected by outages that are still open."
+kind = "grid_outage"
+measure = "sum"
+property = "customers_affected"
+filter = { open = true }
+dimensions = { cause = "cause", crew = "crew_assigned" }
+
+[metrics.generation_capacity_mw]
+description = "Nameplate generation capacity in MW."
+kind = "generation_unit"
+measure = "sum"
+property = "capacity_mw"
+dimensions = { fuel = "fuel_type", state = "state", territory = "in_territory" }
+
+[metrics.outage_restoration_days]
+description = "Days from an outage being recorded to being restored or closed."
+kind = "grid_outage"
+measure = "lead_time"
+window_days = 365
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.dispatch_outage_crew]
+description = "Dispatch a field crew to an open outage."
+phrases = ["dispatch", "send crew", "roll a truck"]
+risk = "low"
+parameters.outage = { type = "entity", kinds = ["grid_outage"], required = true, description = "The outage to restore" }
+parameters.crew = { type = "entity", kinds = ["team"], required = true, cue = ["to", "with"] }
+
+[[action_types.dispatch_outage_crew.preconditions]]
+check = "open"
+param = "outage"
+message = "The outage is already restored or closed."
+
+[[action_types.dispatch_outage_crew.preconditions]]
+check = "no_link"
+param = "outage"
+rel = "crew_assigned"
+to = "{crew}"
+message = "That crew is already assigned."
+
+[[action_types.dispatch_outage_crew.effects]]
+link = { from = "{outage}", rel = "crew_assigned", to = "{crew}" }
+
+[[action_types.dispatch_outage_crew.effects]]
+patch = { id = "{outage}", state = "crew_dispatched" }
+when = { check = "state_in", param = "outage", values = ["reported", "confirmed"] }
+
+[[action_types.dispatch_outage_crew.effects]]
+event = { action = "outage.crew_dispatched", target = "{outage}", payload = { crew = "{crew}" } }
+
+[action_types.restore_outage]
+description = "Record that supply is restored for an outage."
+phrases = ["restore", "re-energize"]
+risk = "medium"
+parameters.outage = { type = "entity", kinds = ["grid_outage"], required = true }
+parameters.note = { type = "text" }
+
+[[action_types.restore_outage.preconditions]]
+check = "open"
+param = "outage"
+message = "The outage is already restored or closed."
+
+[[action_types.restore_outage.effects]]
+patch = { id = "{outage}", state = "restored", props = { restored_at = "{now}" } }
+
+[[action_types.restore_outage.effects]]
+event = { action = "outage.restored", target = "{outage}", payload = { note = "{note}" } }
+
+[action_types.retire_transformer]
+description = "Retire a transformer from service (asset register change)."
+phrases = ["retire", "decommission"]
+roles = ["admin"]
+risk = "high"
+parameters.transformer = { type = "entity", kinds = ["transformer"], required = true }
+parameters.reason = { type = "text", required = true }
+
+[[action_types.retire_transformer.preconditions]]
+check = "state_not_in"
+param = "transformer"
+values = ["retired"]
+message = "The transformer is already retired."
+
+[[action_types.retire_transformer.effects]]
+patch = { id = "{transformer}", state = "retired" }
+
+[[action_types.retire_transformer.effects]]
+event = { action = "asset.retired", target = "{transformer}", payload = { reason = "{reason}" } }
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+[[rules]]
+name = "territory_rollup"
+description = "What lies in a territory lies within every territory that contains it."
+chain = ["in_territory", "sub_territory_of"]
+infer = "within_territory"
+
+[[rules]]
+name = "responsible_crew"
+description = "The crew maintaining the asset where an outage started is responsible for it."
+chain = ["originated_at", "maintained_by_crew"]
+infer = "responsible_crew"
+
+[[rules]]
+name = "interrupted_service"
+description = "A service point supplied through the asset where an outage started is interrupted by that outage. The relation is a record of the event and stays after restoration."
+when = [["?sp", "a", "service_point"], ["?sp", "downstream_of", "?asset"], ["?o", "originated_at", "?asset"]]
+then = ["?sp", "interrupted_by", "?o"]
+
+[[rules]]
+name = "outage_affecting_life_support"
+description = "An outage that interrupts or interrupted a life-support premise. The class is a record, not a priority flag: it stays after restoration, so read the outage's state to see whether it is still open."
+when = [["?sp", "interrupted_by", "?o"], ["?sp", "prop.life_support", true]]
+then = ["?o", "a", "outage_affecting_life_support"]
+
+[[rules]]
+name = "grid_asset_at_risk"
+description = "A critical asset whose condition was assessed as very poor is at risk."
+when = [["?c", "condition_of", "?a"], ["?c", "prop.condition", "very_poor"], ["?a", "prop.criticality", "critical"]]
+then = ["?a", "a", "grid_asset_at_risk"]
+
+[[rules]]
+name = "condition_related_outage"
+description = "An outage that started at an asset assessed as very poor is condition related."
+when = [["?o", "originated_at", "?a"], ["?c", "condition_of", "?a"], ["?c", "prop.condition", "very_poor"]]
+then = ["?o", "a", "condition_related_outage"]

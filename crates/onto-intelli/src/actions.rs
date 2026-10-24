@@ -16,6 +16,7 @@ use onto_core::{
 };
 use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, SchemaChangeSet, SearchMode};
 
+use crate::assurance;
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RecallOptions, RememberInput};
@@ -105,7 +106,11 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("conversation.get", false, "Fetch a conversation with its turns. Input: {id}."),
     a("action.list", false, "Action types (governed edits) defined in the schema."),
     a("action.describe", false, "One action type: parameters, checks, effects, risk. Input: {name}."),
-    a("action.plan", false, "Validate an action and preview its edits and reversibility. Input: {action, params}."),
+    a(
+        "action.plan",
+        false,
+        "Validate an action and preview its edits and reversibility; consequences=true adds the derived facts it changes. Input: {action, params, consequences?}.",
+    ),
     a(
         "action.apply",
         true,
@@ -249,6 +254,119 @@ pub const ACTIONS: &[ActionInfo] = &[
         "objects.explore",
         false,
         "Object Explorer: objects of one type filtered, searched, sorted and paged, with facet counts, numeric statistics, link and action columns. Input: {kind, filters?: [{prop, op, value}], search?, sort?, limit?, offset?, facets?, stats?, workspace?}.",
+    ),
+    a(
+        "reason.run",
+        false,
+        "Run the reasoner over what the caller may read: counts per rule, sample derivations, the constructs it did not evaluate (a clean run is not a consistency result). Derived facts are never written. Input: {workspace?, max_derived?, samples?}.",
+    ),
+    a(
+        "reason.query",
+        false,
+        "Match triple patterns over asserted and derived facts. Input: {pattern: [[s, p, o], ...] (at most 8 atoms), workspace?, limit? (at most 1000)}.",
+    ),
+    a(
+        "reason.explain",
+        false,
+        "Minimal sets of asserted facts a fact is derived from, each re-derived independently. Input: {fact: [s, p, o] | {subject, relation, object}, workspace?, max?}.",
+    ),
+    a(
+        "reason.provenance",
+        false,
+        "A fact's support in a semiring: why (witness sets), trust (confidence) or count (derivation trees). Input: {fact, semiring?: why|trust|count, workspace?}.",
+    ),
+    a(
+        "reason.certify",
+        false,
+        "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the independent onto-cert checker's report on it, with the closure's fixpoint_reached (false: the derivations are a lower bound). Input: {workspace?}.",
+    ),
+    a(
+        "reason.check_certificate",
+        false,
+        "Check certificate files with the independent onto-cert checker (no graph access). Input: {rules_tsv, asserted_tsv, derivations_tsv, manifest_json?}.",
+    ),
+    a(
+        "reason.binding",
+        false,
+        "Is a certificate's asserted.tsv what the store yields now for the caller? Input: {asserted_tsv, manifest_json?}.",
+    ),
+    a(
+        "reason.verify",
+        false,
+        "Verdicts on claims (asserted, derived, not_entailed, contradicted, outside_vocabulary) with the derivation behind each. Input: {claims: [{subject, relation, object, rule?, premises?}], workspace?}.",
+    ),
+    a(
+        "reason.slice_check",
+        false,
+        "Does a slice of entities keep what the whole visible graph derives (or the given goals)? Input: {entities: [...], goals?: [...], workspace?}.",
+    ),
+    a(
+        "shapes.validate",
+        false,
+        "Validate the schema's shapes over the graph: conforms, violates or undetermined, with every result. Input: {shapes?: [name], workspace?, inferred?, limit?}.",
+    ),
+    a(
+        "shapes.induce",
+        false,
+        "A shape for one object type read from its data, with the evidence and a put_shape change set. Input: {kind, workspace?, name?}.",
+    ),
+    a(
+        "shapes.check",
+        false,
+        "Structural dry run of shape definitions against the schema (names, keys, patterns, bounds). Input: {shapes: {name: Shape}}.",
+    ),
+    a(
+        "schema.lint",
+        false,
+        "Schema lint findings with fixes; dismissed ones are counted. Input: {checks?: [..], include_dismissed?}.",
+    ),
+    a(
+        "schema.lint_feedback",
+        true,
+        "Accept or dismiss a lint finding (write access; the latest decision wins). Input: {id, decision: accept|dismiss, note?, workspace?}.",
+    ),
+    a("schema.locks", false, "Locked schema definitions."),
+    a(
+        "schema.lock",
+        true,
+        "Lock a schema definition against delete, rename and breaking change (admins only, never agents). Input: {section, name, reason}.",
+    ),
+    a("schema.unlock", true, "Release a schema lock (admins only). Input: {section, name}."),
+    a(
+        "schema.align",
+        false,
+        "Align a pack or a TOML schema onto the schema in force: scored matches (opinions), SSSOM and a glossary change set. Input: {pack? | toml?, threshold?}.",
+    ),
+    a(
+        "schema.align_certify",
+        false,
+        "Certify claimed mappings against both hierarchies: upheld, upheld with gaps, downgraded or uncertified. Input: {pack? | toml?, mappings: [{source, target, predicate}]}.",
+    ),
+    a("pack.list", false, "Industry packs with counts and whether each is installed."),
+    a(
+        "pack.show",
+        false,
+        "One pack's types, rules, shapes, metrics and actions, with the lint findings it would add to the current schema. Input: {id}.",
+    ),
+    a(
+        "pack.plan",
+        false,
+        "The schema plan of installing a pack (consequences, risk, locks, shape delta). Input: {id}.",
+    ),
+    a(
+        "pack.install",
+        true,
+        "Install a pack (apply roles; agents always propose) and optionally load its sample data. Input: {id, mode?: apply|propose, sample?, workspace?, message?}.",
+    ),
+    a(
+        "model.induce",
+        false,
+        "One sheet in, one ontology out: an object type, links and a shape induced from CSV text (nothing written). Input: {csv, kind?, key?, workspace?, file?}.",
+    ),
+    a(
+        "ingest.sheet",
+        true,
+        "Write a sheet's rows as objects with a mapping; when absent, the rows go into the existing object type the sheet names (kind, else induced), column by column, and a type the schema lacks must be applied from model.induce first. dry_run validates only. Input: {csv, mapping?, kind?, key?, workspace?, dry_run?}.",
     ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
@@ -457,21 +575,21 @@ struct IngestIn {
     source: Option<String>,
 }
 
-fn parse<T: serde::de::DeserializeOwned>(action: &str, input: Value) -> Result<T> {
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(action: &str, input: Value) -> Result<T> {
     let input = if input.is_null() { json!({}) } else { input };
     serde_json::from_value(input).map_err(|e| Error::invalid(format!("{action}: {e}")))
 }
 
-fn to_json<T: Serialize>(v: &T) -> Result<Value> {
+pub(crate) fn to_json<T: Serialize>(v: &T) -> Result<Value> {
     Ok(serde_json::to_value(v)?)
 }
 
 impl Intelli {
-    fn ws_or_default(&self, ws: Option<String>) -> String {
+    pub(crate) fn ws_or_default(&self, ws: Option<String>) -> String {
         ws.filter(|w| !w.is_empty()).unwrap_or_else(|| self.default_workspace().to_string())
     }
 
-    fn ctx(&self, p: &Principal, ws: Option<String>) -> ActionContext {
+    pub(crate) fn ctx(&self, p: &Principal, ws: Option<String>) -> ActionContext {
         let source = match &p.via {
             Some(service) => format!("api via {service}"),
             None => "api".to_string(),
@@ -590,8 +708,11 @@ impl Intelli {
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
-        if GRAPH_READS.contains(&action) {
-            return graph_call(onto, p, self.default_workspace(), action, input);
+        if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
+            return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
+        }
+        if assurance::CALLS.contains(&action) {
+            return blocking(|| self.assurance_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
@@ -607,7 +728,11 @@ impl Intelli {
             }
             "action.plan" => {
                 let i: ActionIn = parse(action, input)?;
-                to_json(&onto.plan_action(&self.ctx(p, i.workspace), &i.action, &i.params)?)
+                let ctx = self.ctx(p, i.workspace);
+                if i.consequences {
+                    return to_json(&onto.plan_action_consequences(&ctx, &i.action, &i.params)?);
+                }
+                to_json(&onto.plan_action(&ctx, &i.action, &i.params)?)
             }
             "action.apply" => {
                 let i: ActionIn = parse(action, input)?;
@@ -663,6 +788,12 @@ impl Intelli {
             }
             "scenario.run" => {
                 let i: ScenarioIn = parse(action, input)?;
+                if i.queries.len() > MAX_SCENARIO_QUERIES {
+                    return Err(Error::invalid(format!(
+                        "a scenario runs at most {MAX_SCENARIO_QUERIES} queries (this one has {})",
+                        i.queries.len()
+                    )));
+                }
                 let ws = self.ws_or_default(i.workspace);
                 let fork = onto.fork();
                 let ctx = ActionContext::new(p.clone(), ws.clone()).with_source("scenario");
@@ -1416,6 +1547,9 @@ struct ActionIn {
     confirm: bool,
     #[serde(default)]
     dry_run: bool,
+    /// `action.plan`: also report the derived facts the edits change.
+    #[serde(default)]
+    consequences: bool,
 }
 
 #[derive(Deserialize)]
@@ -1547,7 +1681,21 @@ struct QualityIn {
     limit: Option<usize>,
 }
 
-/// Read-only graph actions; these also run inside what-if scenarios on a fork.
+/// Queries one scenario may run (each runs twice: live and on the fork).
+const MAX_SCENARIO_QUERIES: usize = 20;
+
+/// Run CPU-bound engine work (a closure, a shape evaluation) without
+/// stalling the async runtime: on a multi-thread runtime the worker hands its
+/// other tasks to another thread while `f` runs.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// Read-only graph actions; these also run inside what-if scenarios on a fork
+/// (with [`assurance::GRAPH_READS`]).
 pub const GRAPH_READS: &[&str] = &[
     "entity.get",
     "entity.find",
@@ -1679,6 +1827,7 @@ pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str
             let spec: onto_core::explorer::ExploreSpec = parse(action, input)?;
             to_json(&onto.explore(p, &spec)?)
         }
+        a if assurance::GRAPH_READS.contains(&a) => assurance::graph_read(onto, p, a, input),
         other => Err(Error::invalid(format!("{other} is not a read-only graph action"))),
     }
 }

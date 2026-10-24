@@ -1,0 +1,4 @@
+#incident	implements	#trackable
+<incident:7>	a	#incident
+<person:ada>	works_with	<person:kenji>
+works_with	a	symmetric

@@ -6,8 +6,15 @@ use std::path::PathBuf;
 
 use prost::Message;
 
+/// The package directory, read when the script runs: a build script binary
+/// may be shared by checkouts of the same package (one target directory for
+/// several worktrees), so a path compiled into it could name another checkout.
+fn manifest_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
+    let root = manifest_dir()?.join("proto");
     let file = "onto_intelli/v1/onto_intelli.proto";
     println!("cargo:rerun-if-changed={}", root.join(file).display());
 
@@ -24,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// so the binary serves it with no files on disk. A checkout without a built
 /// UI still compiles; `/ui` then explains how to build it.
 fn embed_ui(out: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui-dist");
+    let dist = manifest_dir()?.join("ui-dist");
     println!("cargo:rerun-if-changed={}", dist.display());
     let mut files = Vec::new();
     if dist.is_dir() {

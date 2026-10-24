@@ -1307,6 +1307,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "onto-cert"
+version = "0.2.0"
+dependencies = [
+ "fastrand",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "onto-control"
 version = "0.2.0"
 dependencies = [
@@ -1335,6 +1344,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx-core",
  "sqlx-postgres",
  "thiserror",
@@ -1383,6 +1393,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
+ "onto-cert",
  "onto-core",
  "parking_lot",
  "reqwest",
@@ -1399,6 +1410,7 @@ name = "onto-intelli-cli"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "onto-cert",
  "onto-control",
  "onto-grpc",
  "onto-intelli",

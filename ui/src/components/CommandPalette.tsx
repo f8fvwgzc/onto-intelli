@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Blocks, Boxes, GitPullRequestArrow, Map as MapIcon, Search, Shapes, Table2 } from "lucide-react";
+import { Blocks, Boxes, GitPullRequestArrow, Map as MapIcon, Search, Shapes, ShieldCheck, Table2 } from "lucide-react";
 
 import { call } from "../lib/api";
 import { kindColor, kindLabel } from "../lib/format";
@@ -71,6 +71,7 @@ export function CommandPalette({ open, onClose, views: extra = [] }: { open: boo
       { key: "v:schema", label: "Schema", hint: "View", icon: <Shapes className="size-4" />, run: go(["schema"]) },
       { key: "v:build", label: "Builder", hint: "View", icon: <Blocks className="size-4" />, run: go(["build"]) },
       { key: "v:proposals", label: "Proposals", hint: "View", icon: <GitPullRequestArrow className="size-4" />, run: go(["proposals"]) },
+      { key: "v:assure", label: "Assurance", hint: "View", icon: <ShieldCheck className="size-4" />, run: go(["assure"]) },
     ].filter((v) => !q || v.label.toLowerCase().includes(q.toLowerCase()));
     const types: Item[] = q
       ? Object.keys(schema?.object_types ?? {})

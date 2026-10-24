@@ -1,0 +1,488 @@
+# telecom: a network operator's resources, services and customers as
+# ontology data. Sites, network elements, radio cells and transport links
+# (resources), the customer-facing services they realize, subscriber
+# accounts and SIM cards, alarms, trouble tickets and maintenance windows.
+# The aggregation hierarchy (`uplinks_to`) is transitive, so an alarm on a
+# core router reaches every service realized below it, including services
+# that run only on the radio cells of a baseband unit below it.
+#
+# Layered on builtin:enterprise (extend = ["builtin:telecom"]). Teams (the
+# network operations centre), people and projects come from enterprise;
+# trouble_ticket is a subtype of enterprise's issue, so tickets are work items
+# that can be assigned and blocked like any issue (its states keep issue's
+# `triaged` and `blocked`, which enterprise's assign and block actions set). The vocabulary borrows from
+# public telecom frameworks; it does not claim compliance with any of them.
+#
+# Ids: network_site:{site code}, network_element:{hostname},
+# radio_cell:{cell id}, transport_link:{circuit id},
+# network_service:{service id}, subscriber_account:{account number},
+# sim_card:{iccid}, network_alarm:{alarm id}, trouble_ticket:{ticket id},
+# maintenance_window:{change id}.
+
+[pack]
+id = "telecom"
+title = "Telecommunications"
+industry = "telecom"
+version = "1.0.0"
+description = "Network resources (sites, elements, radio cells, transport links), the services they realize, subscribers, SIM cards, alarms, trouble tickets and maintenance windows. Vocabulary inspired by the TM Forum SID, ITU-T X.733 and 3GPP radio access; it borrows their words and claims no compliance with any of them. Its rules (which services and subscribers an alarm impacts through the transitive aggregation hierarchy, SLA breach risk, SIM-swap fraud risk) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "resource and service vocabulary inspired by the TM Forum Information Framework (SID)",
+    "alarm severity terms inspired by ITU-T X.733 alarm reporting",
+    "radio access terms inspired by 3GPP (LTE and NR cells, physical cell identity)",
+]
+sample_note = "transport_link:mw-hop-77 is a microwave hop recorded with only one end: the one deliberate violation (shape transport_endpoints, min_count 2 on terminates_on). Everything else in the sample conforms."
+
+# ── Resources ────────────────────────────────────────────────────────────────
+
+[object_types.network_site]
+label = "Network site"
+category = "container"
+icon = "radio-tower"
+color = "#4338ca"
+description = "A physical location that houses network equipment: a cell tower, a rooftop, a central office or a data centre."
+states = ["planned", "active", "decommissioned"]
+terminal_states = ["decommissioned"]
+properties.site_type = { type = "enum", values = ["cell_tower", "rooftop", "central_office", "data_center", "street_cabinet"] }
+properties.latitude = { type = "float" }
+properties.longitude = { type = "float" }
+
+[object_types.network_element]
+implements = ["network_resource"]
+label = "Network element"
+icon = "server"
+color = "#6366f1"
+description = "A managed piece of network equipment: router, switch, optical line terminal, baseband unit or firewall."
+states = ["in_service", "degraded", "down", "maintenance", "retired"]
+terminal_states = ["retired"]
+alert_states = ["degraded", "down"]
+properties.element_role = { type = "enum", values = ["core_router", "edge_router", "aggregation_switch", "olt", "baseband_unit", "firewall"] }
+properties.software_version = { type = "string" }
+properties.management_ip = { type = "string" }
+
+[object_types.radio_cell]
+implements = ["network_resource"]
+label = "Radio cell"
+icon = "signal"
+color = "#8b5cf6"
+description = "A radio sector served by a baseband unit, identified by its physical cell identity (PCI)."
+states = ["on_air", "off_air", "locked"]
+alert_states = ["off_air"]
+properties.technology = { type = "enum", values = ["umts", "lte", "nr"] }
+properties.band = { type = "string", description = "Frequency band, e.g. n78 or B3." }
+properties.pci = { type = "int", description = "Physical cell identity (0-503 for LTE, 0-1007 for NR)." }
+
+[object_types.transport_link]
+implements = ["network_resource"]
+label = "Transport link"
+icon = "git-commit"
+color = "#a855f7"
+description = "A fibre, microwave, copper or satellite link between two network elements (backhaul and core transport)."
+states = ["up", "degraded", "down"]
+alert_states = ["degraded", "down"]
+properties.medium = { type = "enum", values = ["fiber", "microwave", "copper", "satellite"] }
+properties.capacity_gbps = { type = "float" }
+properties.length_km = { type = "float" }
+
+# ── Services and customers ───────────────────────────────────────────────────
+
+[object_types.network_service]
+label = "Network service"
+icon = "globe"
+color = "#0284c7"
+description = "A customer-facing service (mobile data, broadband, enterprise VPN, SIP trunk) realized by network resources."
+states = ["designed", "active", "suspended", "terminated"]
+terminal_states = ["terminated"]
+alert_states = ["suspended"]
+properties.service_type = { type = "enum", values = ["mobile_voice", "mobile_data", "broadband", "enterprise_vpn", "sip_trunk", "iptv"] }
+properties.sla_tier = { type = "enum", values = ["bronze", "silver", "gold", "platinum"] }
+
+[object_types.subscriber_account]
+label = "Subscriber account"
+category = "actor"
+icon = "contact"
+color = "#0369a1"
+description = "A billing account that subscribes to services: a consumer, a business or a wholesale partner."
+states = ["active", "suspended", "churned"]
+terminal_states = ["churned"]
+alert_states = ["suspended"]
+properties.segment = { type = "enum", values = ["consumer", "small_business", "enterprise", "wholesale"] }
+properties.arpu = { type = "float", description = "Average monthly revenue per user." }
+properties.port_out_pending = { type = "bool", description = "A request to port the number to another operator is open." }
+
+[object_types.sim_card]
+label = "SIM card"
+icon = "smartphone"
+color = "#0ea5e9"
+description = "A physical SIM or eSIM profile bound to a subscriber account, identified by its ICCID."
+states = ["provisioned", "active", "suspended", "swapped", "terminated"]
+terminal_states = ["terminated"]
+alert_states = ["swapped"]
+properties.iccid = { type = "string" }
+properties.form_factor = { type = "enum", values = ["physical", "esim"] }
+
+# ── Assurance ────────────────────────────────────────────────────────────────
+
+[object_types.network_alarm]
+label = "Network alarm"
+icon = "siren"
+color = "#dc2626"
+description = "An alarm raised by a network resource, from raise to clear."
+states = ["raised", "acknowledged", "cleared"]
+terminal_states = ["cleared"]
+alert_states = ["raised"]
+properties.perceived_severity = { type = "enum", values = ["critical", "major", "minor", "warning", "indeterminate"] }
+properties.probable_cause = { type = "string", searchable = true }
+properties.raised_at = { type = "timestamp" }
+
+[object_types.trouble_ticket]
+extends = "issue"
+label = "Trouble ticket"
+icon = "life-buoy"
+color = "#ea580c"
+description = "A customer-reported or network-detected problem with a service. A subtype of issue, so it can be assigned and blocked."
+states = ["open", "triaged", "acknowledged", "in_progress", "blocked", "pending_customer", "resolved", "closed"]
+terminal_states = ["resolved", "closed"]
+alert_states = ["open", "in_progress", "blocked"]
+properties.reported_channel = { type = "enum", values = ["call_center", "app", "web", "retail_store", "noc"] }
+properties.customer_impact = { type = "enum", values = ["none", "degraded", "outage"] }
+
+[object_types.maintenance_window]
+label = "Maintenance window"
+icon = "calendar-clock"
+color = "#64748b"
+description = "Planned work on network resources during an agreed window."
+states = ["scheduled", "in_progress", "completed", "cancelled"]
+terminal_states = ["completed", "cancelled"]
+properties.starts_at = { type = "timestamp" }
+properties.ends_at = { type = "timestamp" }
+properties.expected_impact = { type = "enum", values = ["none", "degraded", "outage"] }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.network_resource]
+description = "Anything that carries traffic and can raise alarms: network elements, radio cells and transport links."
+properties.vendor = { type = "string" }
+properties.serial_number = { type = "string" }
+properties.commissioned_at = { type = "timestamp" }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.housed_at]
+label = "Housed at"
+description = "The site where the equipment is installed."
+from = ["network_element", "radio_cell"]
+to = ["network_site"]
+inverse = "houses"
+cardinality = "one"
+weight = 0.7
+
+[link_types.cell_of]
+label = "Cell of"
+description = "The baseband unit that serves a radio cell."
+from = ["radio_cell"]
+to = ["network_element"]
+inverse = "cells"
+cardinality = "one"
+dependency = true
+weight = 0.9
+
+[link_types.uplinks_to]
+label = "Uplinks to"
+description = "Aggregation hierarchy: the subject's traffic is carried through the object."
+from = ["network_element"]
+to = ["network_element"]
+inverse = "downlinks"
+transitive = true
+dependency = true
+weight = 1.0
+
+[link_types.terminates_on]
+label = "Terminates on"
+description = "The network elements at the two ends of a transport link."
+from = ["transport_link"]
+to = ["network_element"]
+inverse = "transport_links"
+weight = 0.8
+
+[link_types.realized_by]
+label = "Realized by"
+description = "The network resources a service runs on."
+from = ["network_service"]
+to = ["network_resource"]
+inverse = "realizes"
+dependency = true
+weight = 1.0
+
+[link_types.subscribes_to]
+label = "Subscribes to"
+description = "Services an account pays for."
+from = ["subscriber_account"]
+to = ["network_service"]
+inverse = "subscribers"
+weight = 0.8
+
+[link_types.sim_of]
+label = "SIM of"
+description = "The account a SIM card is bound to."
+from = ["sim_card"]
+to = ["subscriber_account"]
+inverse = "sims"
+cardinality = "one"
+weight = 0.7
+
+[link_types.alarm_on]
+label = "Alarm on"
+description = "The resource that raised the alarm."
+from = ["network_alarm"]
+to = ["network_resource"]
+inverse = "alarms"
+cardinality = "one"
+weight = 1.0
+
+[link_types.correlates_with]
+label = "Correlates with"
+description = "Two alarms that share a root cause (alarm correlation)."
+from = ["network_alarm"]
+to = ["network_alarm"]
+symmetric = true
+weight = 0.6
+
+[link_types.ticket_for_service]
+label = "Ticket for service"
+description = "The service a trouble ticket is about."
+from = ["trouble_ticket"]
+to = ["network_service"]
+inverse = "trouble_tickets"
+weight = 0.9
+
+[link_types.raised_by_account]
+label = "Raised by account"
+description = "The subscriber account that reported the problem."
+from = ["trouble_ticket"]
+to = ["subscriber_account"]
+inverse = "account_tickets"
+cardinality = "one"
+weight = 0.6
+
+[link_types.caused_by_alarm]
+label = "Caused by alarm"
+description = "The alarm a trouble ticket was traced to."
+from = ["trouble_ticket"]
+to = ["network_alarm"]
+inverse = "alarm_tickets"
+weight = 0.8
+
+[link_types.window_covers]
+label = "Window covers"
+description = "Resources and sites the planned work touches."
+from = ["maintenance_window"]
+to = ["network_resource", "network_site"]
+inverse = "maintenance_windows"
+weight = 0.6
+
+[link_types.route_diverse_with]
+label = "Route diverse with"
+description = "Two transport links that follow physically separate routes (protection pairs)."
+from = ["transport_link"]
+to = ["transport_link"]
+symmetric = true
+weight = 0.4
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+cell_site = "network_site"
+tower = "network_site"
+central_office = "network_site"
+exchange = "network_site"
+network_node = "network_element"
+router = "network_element"
+olt = "network_element"
+baseband = "network_element"
+sector = "radio_cell"
+backhaul = "transport_link"
+fiber_link = "transport_link"
+microwave_link = "transport_link"
+subscriber = "subscriber_account"
+sim = "sim_card"
+esim = "sim_card"
+noc_alarm = "network_alarm"
+network_fault = "network_alarm"
+trouble_report = "trouble_ticket"
+change_window = "maintenance_window"
+planned_works = "maintenance_window"
+
+[glossary.relations]
+aggregates_into = "uplinks_to"
+runs_on = "realized_by"
+alarmed_resource = "alarm_on"
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.radio_cell_placement]
+description = "A radio cell is housed at one site, served by one baseband unit and has a valid PCI."
+target = "radio_cell"
+properties = [
+    { path = "housed_at", min_count = 1, max_count = 1, class = "network_site" },
+    { path = "cell_of", min_count = 1, max_count = 1, class = "network_element" },
+    { path = "prop.pci", min_count = 1, datatype = "int", min_value = 0.0, max_value = 1007.0 },
+]
+
+[shapes.service_realization]
+description = "A service runs on at least one resource and has an SLA tier."
+target = "network_service"
+properties = [
+    { path = "realized_by", min_count = 1, class = "network_resource" },
+    { path = "prop.sla_tier", min_count = 1 },
+]
+
+[shapes.sim_binding]
+description = "A SIM card is bound to exactly one account and has a well-formed ICCID."
+target = "sim_card"
+properties = [
+    { path = "sim_of", min_count = 1, max_count = 1, class = "subscriber_account" },
+    { path = "prop.iccid", min_count = 1, pattern = "^89[0-9]{16,18}$", message = "An ICCID starts with 89 and has 18 to 20 digits." },
+]
+
+[shapes.alarm_source]
+description = "An alarm names the resource that raised it and its perceived severity."
+target = "network_alarm"
+properties = [
+    { path = "alarm_on", min_count = 1, max_count = 1, class = "network_resource" },
+    { path = "prop.perceived_severity", min_count = 1 },
+]
+
+[shapes.transport_endpoints]
+description = "A transport link has exactly two ends."
+target = "transport_link"
+message = "A transport link must terminate on two network elements."
+properties = [
+    { path = "terminates_on", min_count = 2, max_count = 2, class = "network_element" },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.active_network_alarms]
+description = "Alarms not yet cleared."
+kind = "network_alarm"
+measure = "count"
+filter = { open = true }
+dimensions = { severity = "perceived_severity", state = "state", resource = "alarm_on", site = "alarm_on.housed_at" }
+certified = true
+
+[metrics.open_trouble_tickets]
+description = "Trouble tickets not yet resolved or closed."
+kind = "trouble_ticket"
+measure = "count"
+filter = { open = true }
+dimensions = { service = "ticket_for_service", priority = "priority", channel = "reported_channel", assignee = "assigned_to" }
+certified = true
+
+[metrics.subscriber_arpu]
+description = "Average monthly revenue per active subscriber account."
+kind = "subscriber_account"
+measure = "avg"
+property = "arpu"
+filter = { state = "active" }
+dimensions = { segment = "segment" }
+
+[metrics.ticket_restore_time]
+description = "Days from a trouble ticket being opened to being resolved or closed."
+kind = "trouble_ticket"
+measure = "lead_time"
+window_days = 90
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.acknowledge_alarm]
+description = "Acknowledge a raised alarm (someone in the NOC is on it)."
+phrases = ["acknowledge", "ack"]
+risk = "low"
+parameters.alarm = { type = "entity", kinds = ["network_alarm"], required = true }
+parameters.note = { type = "text" }
+
+[[action_types.acknowledge_alarm.preconditions]]
+check = "state_in"
+param = "alarm"
+values = ["raised"]
+message = "Only a raised alarm can be acknowledged."
+
+[[action_types.acknowledge_alarm.effects]]
+patch = { id = "{alarm}", state = "acknowledged" }
+
+[[action_types.acknowledge_alarm.effects]]
+event = { action = "alarm.acknowledged", target = "{alarm}", payload = { note = "{note}" } }
+
+[action_types.open_trouble_ticket]
+description = "Open a trouble ticket for a service, optionally on behalf of a subscriber account."
+phrases = ["open ticket", "raise ticket", "log a fault"]
+risk = "low"
+parameters.title = { type = "string", required = true }
+parameters.service = { type = "entity", kinds = ["network_service"], required = true, cue = ["for", "on"] }
+parameters.account = { type = "entity", kinds = ["subscriber_account"], cue = ["from", "by"] }
+parameters.priority = { type = "enum", values = ["low", "medium", "high", "critical"], default = "medium" }
+
+[[action_types.open_trouble_ticket.effects]]
+create = { kind = "trouble_ticket", title = "{title}", state = "open", props = { priority = "{priority}" }, links = [ { rel = "ticket_for_service", to = "{service}" }, { rel = "raised_by_account", to = "{account}" } ] }
+
+[[action_types.open_trouble_ticket.effects]]
+event = { action = "ticket.opened", target = "{created}", payload = { service = "{service}" } }
+
+[action_types.suspend_service]
+description = "Suspend an active customer-facing service."
+phrases = ["suspend", "bar"]
+roles = ["admin"]
+risk = "high"
+parameters.service = { type = "entity", kinds = ["network_service"], required = true }
+parameters.reason = { type = "text", required = true }
+
+[[action_types.suspend_service.preconditions]]
+check = "state_in"
+param = "service"
+values = ["active"]
+message = "Only an active service can be suspended."
+
+[[action_types.suspend_service.effects]]
+patch = { id = "{service}", state = "suspended" }
+
+[[action_types.suspend_service.effects]]
+event = { action = "service.suspended", target = "{service}", payload = { reason = "{reason}" } }
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+[[rules]]
+name = "alarm_service_impact"
+description = "An alarm on a resource impacts the services that resource realizes. alarm_impacts is a record and stays after the alarm clears; the risk classification checks the alarm's state."
+chain = ["alarm_on", "realizes"]
+infer = "alarm_impacts"
+
+[[rules]]
+name = "upstream_alarm_impact"
+description = "An alarm on an element impacts services realized by any element that uplinks to it (directly or through the hierarchy)."
+when = [["?s", "realized_by", "?e"], ["?e", "uplinks_to", "?up"], ["?a", "alarm_on", "?up"]]
+then = ["?a", "alarm_impacts", "?s"]
+
+[[rules]]
+name = "cell_realization"
+description = "A service that runs on a radio cell also runs on the baseband unit serving that cell, so alarms on the unit and everything above it reach the service."
+when = [["?s", "realized_by", "?c"], ["?c", "cell_of", "?e"]]
+then = ["?s", "realized_by", "?e"]
+
+[[rules]]
+name = "affected_subscribers"
+description = "An alarm that impacts a service affects the accounts subscribed to it."
+chain = ["alarm_impacts", "subscribers"]
+infer = "alarm_affects_account"
+
+[[rules]]
+name = "sla_breach_risk"
+description = "A platinum service impacted by a raised (not yet acknowledged or cleared) critical alarm is at risk of breaching its SLA."
+when = [["?a", "alarm_impacts", "?s"], ["?a", "prop.perceived_severity", "critical"], ["?a", "state", "raised"], ["?s", "prop.sla_tier", "platinum"]]
+then = ["?s", "a", "sla_breach_risk"]
+
+[[rules]]
+name = "sim_swap_risk"
+description = "An account whose SIM was just swapped and that has a port-out pending shows the SIM-swap fraud pattern."
+when = [["?sim", "sim_of", "?acct"], ["?sim", "state", "swapped"], ["?acct", "prop.port_out_pending", true]]
+then = ["?acct", "a", "sim_swap_risk"]

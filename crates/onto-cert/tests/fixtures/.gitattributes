@@ -1,0 +1,2 @@
+# Certificates are byte-exact (digests, TAB and LF separators): never convert line endings.
+* -text

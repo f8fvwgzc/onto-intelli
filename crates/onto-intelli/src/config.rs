@@ -453,11 +453,43 @@ pub struct McpConfig {
     /// schema changes and (with `allow_writes`) runs action types, but never
     /// applies or approves schema changes.
     pub principal: Principal,
+    /// The tool profile (`full`, `catalog`, `authoring`, `reasoning`,
+    /// `governance`, `retrieval`, `evaluation`; see
+    /// [`crate::mcp::MCP_PROFILES`]). `ONTO_MCP_PROFILE` overrides it and
+    /// `onto mcp --profile` overrides both: [`McpConfig::effective_profile`].
+    pub profile: String,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { allow_writes: false, principal: Principal::new("mcp-agent", vec![Role::Agent], vec!["*".into()]) }
+        Self {
+            allow_writes: false,
+            principal: Principal::new("mcp-agent", vec![Role::Agent], vec!["*".into()]),
+            profile: "full".into(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// The profile an MCP server runs with: `cli` (the `onto mcp --profile`
+    /// flag) when given, else `ONTO_MCP_PROFILE`, else `profile` (see
+    /// [`crate::mcp::resolve_profile`]). Pass the result to
+    /// [`crate::mcp::McpServer::with_profile`], which refuses unknown names.
+    pub fn effective_profile(&self, cli: Option<&str>) -> String {
+        crate::mcp::resolve_profile(cli, &self.profile)
+    }
+
+    /// `[mcp] profile` names a known profile (the environment and the CLI
+    /// flag are checked when an MCP server starts).
+    pub fn check(&self) -> Result<()> {
+        let profile = self.profile.trim();
+        if crate::mcp::MCP_PROFILES.contains(&profile) {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "[mcp] profile: unknown MCP profile '{profile}' (valid: {})",
+            crate::mcp::MCP_PROFILES.join(", ")
+        )))
     }
 }
 
@@ -756,6 +788,10 @@ mod tests {
         assert_eq!(cfg.auth.mode, "token", "authentication is on unless asked otherwise");
         assert_eq!(cfg.local.principal.id, "local");
         assert!(cfg.mcp.principal.is_agent());
+        assert_eq!(cfg.mcp.profile, "full");
+        assert!(cfg.mcp.check().is_ok());
+        let bad = Config::from_toml("[mcp]\nprofile = 'everything'\n").unwrap();
+        assert!(bad.mcp.check().unwrap_err().to_string().contains("catalog, authoring"));
         let legacy = Config::from_toml("[auth]\ndefault_principal = { id = 'old', roles = ['viewer'] }\n").unwrap();
         assert_eq!(legacy.auth.dev_principal.id, "old");
         assert!(!cfg.console.enabled);

@@ -1,0 +1,507 @@
+# Industry pack: manufacturing operations, layered on builtin:enterprise.
+#
+# Plants, lines and work centers; parts, bills of material and routings;
+# production orders, lots and their genealogy; inspections, nonconformances
+# and maintenance. People and teams are the enterprise `person` and `team`.
+#
+# Enable it with `[ontology] extend = ["builtin:manufacturing"]`, or install it
+# live as a governed schema change (pack.plan / pack.install).
+
+[pack]
+id = "manufacturing"
+title = "Manufacturing operations"
+industry = "manufacturing"
+version = "1.0.0"
+description = "Discrete and batch manufacturing: factories, production lines and work centers, parts with multi-level bills of material and routings, production orders with lot genealogy, quality inspections and nonconformances, and equipment maintenance. Vocabulary inspired by ISA-95 / IEC 62264, ISA-88 and ISO 9001; it borrows their words and claims no compliance with any of them. Its rules (bill-of-material explosion, suspect lots, at-risk orders) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "ISA-95 / IEC 62264 (enterprise-control system integration): equipment hierarchy and production order vocabulary",
+    "ISA-88 / IEC 61512 (batch control): lot and batch vocabulary",
+    "ISO 9001 (quality management): nonconformance vocabulary",
+]
+sample_note = "production_order:po-1004 is planned but not yet scheduled on a line or work center: the one deliberate violation (shape production_order_shape, min_count 1 on scheduled_on). Everything else in the sample conforms."
+
+# ── Plant floor ──────────────────────────────────────────────────────────────
+
+[object_types.factory]
+label = "Factory"
+category = "container"
+icon = "factory"
+color = "#b45309"
+description = "A manufacturing plant (an ISA-95 site): where lines, work centers and inventory live."
+states = ["commissioning", "operating", "idle", "closed"]
+terminal_states = ["closed"]
+properties.plant_code = { type = "string", required = true, pattern = "^[A-Z]{2}[0-9]{2,4}$", description = "Plant code, two letters and two to four digits (US01)." }
+properties.country = { type = "string" }
+properties.daily_capacity = { type = "int", description = "Units per day at full staffing." }
+constraints.unique = ["plant_code"]
+
+[object_types.production_line]
+label = "Production line"
+category = "container"
+icon = "workflow"
+color = "#d97706"
+implements = ["plant_floor_asset"]
+description = "A line or area inside a factory where an ordered sequence of work centers builds parts."
+states = ["running", "changeover", "stopped", "decommissioned"]
+terminal_states = ["decommissioned"]
+alert_states = ["stopped"]
+properties.line_type = { type = "enum", values = ["assembly", "machining", "packaging", "process"] }
+properties.takt_seconds = { type = "float", description = "Target seconds per unit." }
+constraints.required_links = ["housed_in"]
+
+[object_types.work_center]
+label = "Work center"
+icon = "cpu"
+color = "#f59e0b"
+implements = ["plant_floor_asset"]
+description = "A machine, cell or workstation where operations are performed (an ISA-95 work unit)."
+states = ["available", "running", "down", "maintenance", "retired"]
+terminal_states = ["retired"]
+alert_states = ["down"]
+properties.asset_tag = { type = "string" }
+properties.oee_target = { type = "float", description = "Target overall equipment effectiveness, between 0 and 1." }
+constraints.required_links = ["housed_in"]
+
+# ── Product definition ───────────────────────────────────────────────────────
+
+[object_types.part]
+label = "Part"
+icon = "package"
+color = "#0369a1"
+description = "A material, component, subassembly or finished good identified by its part number."
+states = ["development", "released", "obsolete"]
+terminal_states = ["obsolete"]
+properties.part_number = { type = "string", required = true, pattern = "^[A-Z0-9][A-Z0-9-]{2,31}$", searchable = true }
+properties.make_or_buy = { type = "enum", values = ["make", "buy"] }
+properties.unit_of_measure = { type = "enum", values = ["ea", "kg", "m", "l"] }
+properties.safety_critical = { type = "bool" }
+properties.standard_cost = { type = "float" }
+constraints.unique = ["part_number"]
+
+[object_types.bill_of_material]
+label = "Bill of material"
+category = "artifact"
+icon = "list-tree"
+color = "#0284c7"
+description = "One revision of the list of parts that make up a part (single level; the rules explode it)."
+states = ["draft", "released", "superseded"]
+terminal_states = ["superseded"]
+properties.revision = { type = "string" }
+properties.effective_from = { type = "timestamp" }
+
+[object_types.routing_operation]
+label = "Routing operation"
+icon = "list-ordered"
+color = "#0ea5e9"
+description = "One step of the routing that makes a part: what is done, where, and after which other steps."
+properties.sequence = { type = "int", required = true }
+properties.setup_minutes = { type = "float" }
+properties.run_minutes = { type = "float", description = "Minutes per unit." }
+
+# ── Execution ────────────────────────────────────────────────────────────────
+
+[object_types.production_order]
+label = "Production order"
+icon = "clipboard-list"
+color = "#15803d"
+description = "An order to make a quantity of one part on a line or work center (a work order or manufacturing order)."
+states = ["planned", "released", "in_progress", "on_hold", "completed", "cancelled"]
+terminal_states = ["completed", "cancelled"]
+alert_states = ["on_hold"]
+properties.quantity = { type = "int", required = true }
+properties.due = { type = "timestamp" }
+properties.order_priority = { type = "enum", values = ["low", "normal", "rush"] }
+
+[object_types.production_lot]
+label = "Production lot"
+icon = "boxes"
+color = "#16a34a"
+description = "A traceable lot or batch of one part, produced by an order or received from a supplier."
+states = ["in_production", "quarantined", "released", "scrapped", "shipped"]
+terminal_states = ["scrapped", "shipped"]
+alert_states = ["quarantined"]
+properties.lot_number = { type = "string", required = true, searchable = true }
+properties.quantity = { type = "int" }
+properties.produced_at = { type = "timestamp" }
+
+# ── Quality and maintenance ──────────────────────────────────────────────────
+
+[object_types.inspection_lot]
+label = "Inspection lot"
+category = "knowledge"
+icon = "clipboard-check"
+color = "#7c3aed"
+description = "A quality inspection of a production lot and its result."
+states = ["scheduled", "in_progress", "completed"]
+terminal_states = ["completed"]
+properties.inspection_result = { type = "enum", values = ["pass", "fail", "conditional"] }
+properties.sample_size = { type = "int" }
+properties.inspected_at = { type = "timestamp" }
+
+[object_types.nonconformance]
+label = "Nonconformance"
+icon = "triangle-alert"
+color = "#dc2626"
+description = "A recorded deviation from specification (an NCR) against a lot, a part or a work center."
+states = ["open", "under_review", "contained", "closed"]
+terminal_states = ["closed"]
+alert_states = ["open", "under_review"]
+properties.severity = { type = "enum", values = ["minor", "major", "critical"] }
+properties.disposition = { type = "enum", values = ["use_as_is", "rework", "scrap", "return_to_supplier"] }
+properties.details = { type = "text", searchable = true }
+
+[object_types.maintenance_order]
+label = "Maintenance order"
+icon = "wrench"
+color = "#64748b"
+description = "Preventive, corrective or predictive maintenance work on a work center or line."
+states = ["requested", "scheduled", "in_progress", "done", "cancelled"]
+terminal_states = ["done", "cancelled"]
+properties.maintenance_type = { type = "enum", values = ["preventive", "corrective", "predictive"] }
+properties.planned_hours = { type = "float" }
+properties.due = { type = "timestamp" }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.plant_floor_asset]
+description = "Lines and work centers: equipment on the plant floor that is housed somewhere and can stop production."
+properties.criticality = { type = "enum", values = ["low", "medium", "high"] }
+links = ["housed_in"]
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.housed_in]
+description = "The equipment sits inside this line or factory (equipment hierarchy; transitive)."
+from = ["plant_floor_asset"]
+to = ["factory", "production_line"]
+inverse = "houses_equipment"
+transitive = true
+weight = 0.9
+
+[link_types.crewed_by]
+description = "The team that staffs and runs this line or work center."
+from = ["production_line", "work_center"]
+to = ["team"]
+inverse = "crews"
+weight = 0.8
+
+[link_types.plant_manager]
+description = "The person accountable for the factory."
+from = ["factory"]
+to = ["person"]
+inverse = "manages_plant"
+cardinality = "one"
+weight = 0.7
+
+[link_types.scheduled_on]
+description = "The line or work center the production order runs on."
+from = ["production_order"]
+to = ["production_line", "work_center"]
+inverse = "order_queue"
+cardinality = "one"
+weight = 1.0
+
+[link_types.makes_part]
+description = "The part the production order makes."
+from = ["production_order"]
+to = ["part"]
+inverse = "made_by_order"
+cardinality = "one"
+weight = 0.9
+
+[link_types.bom_for]
+description = "The part this bill of material describes."
+from = ["bill_of_material"]
+to = ["part"]
+inverse = "has_bom"
+cardinality = "one"
+weight = 0.9
+
+[link_types.bom_component]
+description = "A part listed on this bill of material."
+from = ["bill_of_material"]
+to = ["part"]
+inverse = "used_in_bom"
+weight = 0.8
+
+[link_types.routing_for]
+description = "The part this routing operation helps make."
+from = ["routing_operation"]
+to = ["part"]
+inverse = "routing"
+cardinality = "one"
+weight = 0.7
+
+[link_types.performed_at]
+description = "The work center that performs this operation."
+from = ["routing_operation"]
+to = ["work_center"]
+inverse = "operations_at"
+cardinality = "one"
+weight = 0.7
+
+[link_types.after_operation]
+description = "The operation can start only after the object operation (sequence; a dependency, transitive)."
+from = ["routing_operation"]
+to = ["routing_operation"]
+inverse = "before_operation"
+dependency = true
+transitive = true
+weight = 0.8
+
+[link_types.lot_from_order]
+description = "The production order that produced this lot."
+from = ["production_lot"]
+to = ["production_order"]
+inverse = "lots_produced"
+cardinality = "one"
+weight = 0.9
+
+[link_types.lot_of_part]
+description = "The part this lot holds."
+from = ["production_lot"]
+to = ["part"]
+inverse = "part_lots"
+cardinality = "one"
+weight = 0.8
+
+[link_types.consumed_lot]
+description = "An input lot the production order consumes (lot genealogy; the order needs it to finish)."
+from = ["production_order"]
+to = ["production_lot"]
+inverse = "consumed_by_order"
+dependency = true
+weight = 0.8
+
+[link_types.inspects_lot]
+description = "The production lot this inspection examines."
+from = ["inspection_lot"]
+to = ["production_lot"]
+inverse = "inspected_in"
+cardinality = "one"
+weight = 0.8
+
+[link_types.raised_against]
+description = "What the nonconformance was found on."
+from = ["nonconformance"]
+to = ["production_lot", "part", "work_center"]
+inverse = "nonconformances"
+weight = 1.0
+
+[link_types.ncr_raised_by]
+description = "The person who raised the nonconformance."
+from = ["nonconformance"]
+to = ["person"]
+inverse = "raised_ncr"
+cardinality = "one"
+weight = 0.5
+
+[link_types.maintenance_on]
+description = "The equipment the maintenance order works on."
+from = ["maintenance_order"]
+to = ["work_center", "production_line"]
+inverse = "maintenance_orders"
+cardinality = "one"
+weight = 0.9
+
+[link_types.maintenance_assignee]
+description = "The person or team doing the maintenance work."
+from = ["maintenance_order"]
+to = ["person", "team"]
+inverse = "maintenance_work"
+cardinality = "one"
+weight = 0.8
+
+# ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
+
+[[rules]]
+name = "bom_explosion"
+description = "A part uses every component listed on its bill of material."
+chain = ["has_bom", "bom_component"]
+infer = "uses_component"
+
+[[rules]]
+name = "bom_explosion_multilevel"
+description = "A part uses the components of its components (multi-level explosion)."
+when = [["?a", "uses_component", "?b"], ["?b", "uses_component", "?c"]]
+then = ["?a", "uses_component", "?c"]
+
+[[rules]]
+name = "production_crew"
+description = "A production order is handled by the crew of the line or work center it is scheduled on."
+chain = ["scheduled_on", "crewed_by"]
+infer = "production_crew"
+
+[[rules]]
+name = "suspect_lot"
+description = "A lot made by an order that consumed a quarantined input lot is suspect until cleared."
+when = [["?lot", "lot_from_order", "?o"], ["?o", "consumed_lot", "?input"], ["?input", "state", "quarantined"]]
+then = ["?lot", "a", "suspect_lot"]
+
+[[rules]]
+name = "at_risk_production_order"
+description = "A released production order scheduled on equipment that is down is at risk."
+when = [["?o", "a", "production_order"], ["?o", "state", "released"], ["?o", "scheduled_on", "?wc"], ["?wc", "state", "down"]]
+then = ["?o", "a", "at_risk_production_order"]
+
+[[rules]]
+name = "critical_quality_exposure"
+description = "A part has a critical nonconformance when one is raised against one of its lots."
+when = [["?n", "a", "nonconformance"], ["?n", "prop.severity", "critical"], ["?n", "raised_against", "?lot"], ["?lot", "lot_of_part", "?p"]]
+then = ["?p", "has_critical_ncr", "?n"]
+
+# ── Shapes (conditions the data should meet; a report is a measurement) ─────
+
+[shapes.production_order_shape]
+description = "Every production order makes exactly one part, runs somewhere and has a positive quantity."
+target = "production_order"
+message = "Production orders need a part, a line or work center, and a quantity."
+properties = [
+    { path = "makes_part", min_count = 1, max_count = 1, class = "part" },
+    { path = "scheduled_on", min_count = 1, message = "Schedule the order on a line or work center." },
+    { path = "prop.quantity", min_count = 1, min_value = 1 },
+]
+
+[shapes.part_shape]
+description = "Every part carries a well-formed part number."
+target = "part"
+properties = [
+    { path = "prop.part_number", min_count = 1, max_count = 1, pattern = "^[A-Z0-9][A-Z0-9-]{2,31}$" },
+]
+
+[shapes.bom_shape]
+description = "A bill of material describes exactly one part and lists at least one component."
+target = "bill_of_material"
+properties = [
+    { path = "bom_for", min_count = 1, max_count = 1, class = "part" },
+    { path = "bom_component", min_count = 1, class = "part" },
+]
+
+[shapes.nonconformance_shape]
+description = "A nonconformance says what it was found on and how severe it is."
+target = "nonconformance"
+properties = [
+    { path = "raised_against", min_count = 1 },
+    { path = "prop.severity", min_count = 1, in = ["minor", "major", "critical"] },
+]
+
+[shapes.plant_floor_asset_shape]
+description = "Lines and work centers sit inside a line or a factory."
+target = "plant_floor_asset"
+properties = [
+    { path = "housed_in", min_count = 1 },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_production_orders]
+description = "Open production orders by line, part, state and priority."
+kind = "production_order"
+measure = "count"
+filter = { open = true }
+dimensions = { line = "scheduled_on", part = "makes_part", state = "state", priority = "order_priority", crew = "scheduled_on.crewed_by" }
+certified = true
+
+[metrics.scheduled_production_quantity]
+description = "Units still to make on open production orders."
+kind = "production_order"
+measure = "sum"
+property = "quantity"
+filter = { open = true }
+dimensions = { part = "makes_part", line = "scheduled_on" }
+
+[metrics.nonconformance_lead_time]
+description = "Days from a nonconformance being raised to being closed."
+kind = "nonconformance"
+measure = "lead_time"
+window_days = 180
+
+# ── Action types (governed edits) ────────────────────────────────────────────
+
+[action_types.release_production_order]
+description = "Release a planned production order to a line or work center."
+phrases = ["release", "dispatch", "schedule"]
+risk = "low"
+roles = ["member", "admin"]
+parameters.order = { type = "entity", kinds = ["production_order"], required = true, description = "The planned order" }
+parameters.line = { type = "entity", kinds = ["production_line", "work_center"], required = true, cue = ["on", "to"] }
+
+[[action_types.release_production_order.preconditions]]
+check = "state_in"
+param = "order"
+values = ["planned"]
+message = "Only planned orders can be released."
+
+[[action_types.release_production_order.effects]]
+link = { from = "{order}", rel = "scheduled_on", to = "{line}" }
+replace = true
+
+[[action_types.release_production_order.effects]]
+patch = { id = "{order}", state = "released" }
+
+[[action_types.release_production_order.effects]]
+event = { action = "production_order.released", target = "{order}", payload = { line = "{line}" } }
+
+[action_types.quarantine_lot]
+description = "Put a production lot on quality hold."
+phrases = ["quarantine", "hold"]
+risk = "medium"
+parameters.lot = { type = "entity", kinds = ["production_lot"], required = true }
+parameters.reason = { type = "text", cue = ["because", "for"] }
+
+[[action_types.quarantine_lot.preconditions]]
+check = "state_not_in"
+param = "lot"
+values = ["quarantined", "scrapped", "shipped"]
+message = "The lot is already on hold, scrapped or shipped."
+
+[[action_types.quarantine_lot.effects]]
+patch = { id = "{lot}", state = "quarantined" }
+
+[[action_types.quarantine_lot.effects]]
+event = { action = "lot.quarantined", target = "{lot}", payload = { reason = "{reason}" } }
+
+[action_types.raise_nonconformance]
+description = "Record a nonconformance against a lot, a part or a work center."
+phrases = ["raise ncr", "report nonconformance", "raise nonconformance"]
+risk = "low"
+parameters.title = { type = "string", required = true }
+parameters.against = { type = "entity", kinds = ["production_lot", "part", "work_center"], required = true, cue = ["against", "on", "for"] }
+parameters.severity = { type = "enum", values = ["minor", "major", "critical"], required = true }
+
+[[action_types.raise_nonconformance.effects]]
+create = { kind = "nonconformance", title = "{title}", state = "open", props = { severity = "{severity}" }, links = [ { rel = "raised_against", to = "{against}" } ] }
+
+[[action_types.raise_nonconformance.effects]]
+event = { action = "nonconformance.raised", target = "{created}", payload = { against = "{against}", severity = "{severity}" } }
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+plant = "factory"
+mill = "factory"
+line = "production_line"
+assembly_line = "production_line"
+machine = "work_center"
+workstation = "work_center"
+work_cell = "work_center"
+component = "part"
+part_number = "part"
+subassembly = "part"
+bom = "bill_of_material"
+operation = "routing_operation"
+work_order = "production_order"
+manufacturing_order = "production_order"
+batch = "production_lot"
+lot = "production_lot"
+quality_inspection = "inspection_lot"
+ncr = "nonconformance"
+deviation = "nonconformance"
+pm_order = "maintenance_order"
+
+[glossary.relations]
+crew = "crewed_by"
+components = "bom_component"
+inputs = "consumed_lot"
+operations = "routing"

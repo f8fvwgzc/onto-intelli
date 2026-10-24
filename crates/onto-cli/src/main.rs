@@ -1,5 +1,7 @@
 //! `onto` — the onto-intelli command line.
 
+mod assure;
+
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -133,6 +135,11 @@ enum Command {
         /// Plan only.
         #[arg(long)]
         dry_run: bool,
+        /// Plan only, with the derived facts the edits add and remove (consequences).
+        #[arg(long)]
+        consequences: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Undo an applied action by receipt id.
     Undo {
@@ -194,7 +201,12 @@ enum Command {
         no_schema: bool,
     },
     /// Serve the ontology to AI agents over MCP (stdio).
-    Mcp,
+    Mcp {
+        /// Tool profile: full (default), catalog, authoring, reasoning, governance,
+        /// retrieval or evaluation. Precedence: this flag, $ONTO_MCP_PROFILE, `[mcp] profile`.
+        #[arg(long, env = "ONTO_MCP_PROFILE")]
+        profile: Option<String>,
+    },
     /// Run competency questions (default: the built-in demo suite).
     Eval {
         #[arg(long)]
@@ -323,6 +335,55 @@ enum Command {
         #[command(subcommand)]
         sub: ConsoleCmd,
     },
+    /// Reasoning: closure, pattern queries, explanations, claim checks, certificates.
+    ///
+    /// Derived facts are the engine's opinion until a certificate passes the
+    /// independent checker (`onto reason certify --out DIR`, `onto cert check DIR`).
+    Reason {
+        #[command(subcommand)]
+        sub: assure::ReasonCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Check reasoning certificates offline with the onto-cert library (no store, no server).
+    Cert {
+        #[command(subcommand)]
+        sub: assure::CertCmd,
+    },
+    /// Shapes: validate the graph (exit 0 conforms, 1 violates, 3 undetermined,
+    /// 4 the command failed), induce a shape from data, check shape definitions.
+    Shapes {
+        #[command(subcommand)]
+        sub: assure::ShapesCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Lint the schema (a measurement); dismiss or accept findings. Exits 1 when an
+    /// error finding is shown (dismissed findings listed with --all do not count),
+    /// 4 when the command fails.
+    Lint(assure::LintArgs),
+    /// Lock a schema definition: changes that delete, rename or break it are refused (admins).
+    Lock(assure::LockArgs),
+    /// Release a schema lock (admins).
+    Unlock(assure::UnlockArgs),
+    /// Active schema locks.
+    Locks {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Industry packs: list, show, plan and install (or propose) them.
+    Pack {
+        #[command(subcommand)]
+        sub: assure::PackCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Align a pack or a schema TOML with the current schema (scores are an
+    /// opinion); write SSSOM, or certify mappings against both hierarchies.
+    Align(assure::AlignArgs),
+    /// One sheet in, one ontology out: induce an object type, links and a shape
+    /// from a CSV file (read locally), or ingest its rows with --ingest.
+    Induce(assure::InduceArgs),
     /// Compile configured proto files and print the gRPC route table.
     Protos,
     /// Graph, memory, cache and token statistics.
@@ -527,7 +588,14 @@ fn s_of(v: &Value) -> &str {
 
 /// "1 link type", "3 link types".
 fn n_of(n: u64, what: &str) -> String {
-    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+    if n == 1 {
+        return format!("{n} {what}");
+    }
+    // entity → entities, but key → keys.
+    match what.strip_suffix('y') {
+        Some(stem) if !stem.ends_with(['a', 'e', 'i', 'o', 'u']) => format!("{n} {stem}ies"),
+        _ => format!("{n} {what}s"),
+    }
 }
 
 fn print_draft(st: &Style, d: &Value) {
@@ -668,14 +736,25 @@ fn read_change_set(path: &std::path::Path) -> Result<Value> {
 fn print_plan(st: &Style, plan: &Value) {
     let valid = plan["valid"].as_bool().unwrap_or(false);
     let needs = plan["needs_migration"].as_array().cloned().unwrap_or_default();
+    // As `SchemaPlan::applicable()`: a lock violation not overridden refuses
+    // the apply whether or not any data changes.
+    let locks = plan["locked_violations"].as_array().cloned().unwrap_or_default();
+    let locked = locks.iter().any(|v| v["overridden"] != true);
+    let data = if plan["breaking"].as_bool().unwrap_or(false) {
+        st.cyan("breaking, migrated")
+    } else {
+        st.bold("non-breaking")
+    };
     let verdict = if !valid {
         st.red("invalid")
     } else if !needs.is_empty() {
         st.red("needs migration")
-    } else if plan["breaking"].as_bool().unwrap_or(false) {
-        st.cyan("breaking, migrated")
+    } else if locked {
+        st.red("locked: apply refused")
+    } else if !locks.is_empty() {
+        format!("{}, {data}", st.cyan("locked (overridden)"))
     } else {
-        st.bold("non-breaking")
+        data
     };
     println!(
         "{} {}",
@@ -712,6 +791,8 @@ fn print_plan(st: &Style, plan: &Value) {
             m["entities_updated"], m["entities_retyped"], m["entities_deleted"], m["links_deleted"], m["links_moved"]
         );
     }
+    assure::print_risk(st, plan);
+    assure::print_semantics(st, plan);
 }
 
 fn print_version_line(st: &Style, v: &Value, active: Option<u64>) {
@@ -745,7 +826,9 @@ fn print_receipt(st: &Style, r: &Value) {
         "rejected" => st.red(status),
         _ => st.cyan(status),
     };
-    println!("{} {} {}", mark, r["action"].as_str().unwrap_or(""), st.dim(r["id"].as_str().unwrap_or("")));
+    let line =
+        [mark, r["action"].as_str().unwrap_or("").to_string(), r["id"].as_str().map(|i| st.dim(i)).unwrap_or_default()];
+    println!("{}", line.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" "));
     let plan = &r["plan"];
     for line in plan["preview"].as_array().into_iter().flatten() {
         println!("  • {}", line.as_str().unwrap_or(""));
@@ -756,6 +839,7 @@ fn print_receipt(st: &Style, r: &Value) {
     for w in plan["warnings"].as_array().into_iter().flatten() {
         println!("  {} {}", st.dim("!"), w.as_str().unwrap_or(""));
     }
+    assure::print_semantics(st, plan);
     println!(
         "  {}",
         st.dim(&format!(
@@ -1030,8 +1114,24 @@ fn print_answer(st: &Style, r: &Value, show_context: bool) {
 
 // ── main ──────────────────────────────────────────────────────────────
 
+/// The exit code when `command` fails. Commands whose exit code is a verdict
+/// (shapes validate/check, lint, reason certify, cert) use a code no verdict
+/// uses, so a script can tell a failed run from a negative verdict.
+fn failure_exit_code(command: &Command) -> i32 {
+    let verdict = match command {
+        Command::Shapes { sub, .. } => {
+            matches!(sub, assure::ShapesCmd::Validate { .. } | assure::ShapesCmd::Check { .. })
+        }
+        Command::Reason { sub, .. } => matches!(sub, assure::ReasonCmd::Certify { .. }),
+        Command::Lint(_) | Command::Cert { .. } => true,
+        _ => false,
+    };
+    if verdict { assure::EXIT_FAILED } else { 1 }
+}
+
 #[tokio::main]
 async fn main() {
+    quiet_broken_pipe();
     let cli = Cli::parse();
     let level = if matches!(cli.command, Command::Serve { .. }) { "info" } else { "warn" };
     tracing_subscriber::fmt()
@@ -1039,10 +1139,30 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
     let st = Style { on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() };
+    let failed = failure_exit_code(&cli.command);
     if let Err(e) = run(cli, &st).await {
         eprintln!("{} {e}", st.red("error:"));
-        std::process::exit(1);
+        std::process::exit(failed);
     }
+}
+
+/// A reader that closes the pipe early (`onto ... | head -1`) ends the
+/// command quietly, as a SIGPIPE would, instead of a panic from `println!`.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if msg.contains("failed printing to stdout") && msg.contains("Broken pipe") {
+            // 128 + SIGPIPE, what a shell reports for a process the signal ends.
+            std::process::exit(141);
+        }
+        default(info);
+    }));
 }
 
 fn local_config(cli: &Cli) -> Result<Config> {
@@ -1591,13 +1711,31 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
-        Command::Do { action: Some(action), params, confirm, dry_run } => {
+        Command::Do { action: Some(action), params, confirm, dry_run, consequences, json: as_json } => {
             let be = backend(&cli).await?;
+            if *consequences {
+                let input = json!({
+                    "action": action, "params": parse_params(params)?, "consequences": true,
+                    "workspace": cli.workspace,
+                });
+                let plan = be.call("action.plan", input).await?;
+                if *as_json {
+                    print_json(&plan);
+                } else {
+                    print_receipt(st, &json!({ "status": "planned", "action": action, "plan": plan }));
+                }
+                return Ok(());
+            }
             let input = json!({
                 "action": action, "params": parse_params(params)?, "confirm": confirm,
                 "dry_run": dry_run, "workspace": cli.workspace,
             });
-            print_receipt(st, &be.call("action.apply", input).await?);
+            let r = be.call("action.apply", input).await?;
+            if *as_json {
+                print_json(&r)
+            } else {
+                print_receipt(st, &r)
+            }
             Ok(())
         }
         Command::Undo { receipt, force } => {
@@ -2011,9 +2149,11 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             print!("{}", r["content"].as_str().unwrap_or_default());
             Ok(())
         }
-        Command::Mcp => {
+        Command::Mcp { profile } => {
             let (intelli, cfg) = open_local(&cli).await?;
-            let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes);
+            let profile = onto_intelli::mcp::resolve_profile(profile.as_deref(), &cfg.mcp.profile);
+            let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes)
+                .with_profile(&profile)?;
             let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
             let mut out = tokio::io::stdout();
             while let Some(line) = lines.next_line().await? {
@@ -2189,6 +2329,16 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
         Command::Console { sub } => console(&cli, st, sub).await,
+        Command::Reason { sub, json: as_json } => assure::reason(&cli, st, sub, *as_json).await,
+        Command::Cert { sub } => assure::cert(sub),
+        Command::Shapes { sub, json: as_json } => assure::shapes(&cli, st, sub, *as_json).await,
+        Command::Lint(a) => assure::lint(&cli, st, a).await,
+        Command::Lock(a) => assure::lock(&cli, st, a).await,
+        Command::Unlock(a) => assure::unlock(&cli, st, a).await,
+        Command::Locks { json: as_json } => assure::locks(&cli, st, *as_json).await,
+        Command::Pack { sub, json: as_json } => assure::pack(&cli, st, sub, *as_json).await,
+        Command::Align(a) => assure::align(&cli, st, a).await,
+        Command::Induce(a) => assure::induce(&cli, st, a).await,
         Command::Protos => {
             let cfg = Config::discover(cli.config.as_deref())?;
             let table = onto_grpc::RouteTable::build(&cfg)?;
@@ -2557,5 +2707,13 @@ mod tests {
     fn command_line_definition_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn counts_take_english_plurals() {
+        assert_eq!(super::n_of(4, "entity"), "4 entities");
+        assert_eq!(super::n_of(1, "entity"), "1 entity");
+        assert_eq!(super::n_of(2, "key"), "2 keys");
+        assert_eq!(super::n_of(3, "property shape"), "3 property shapes");
     }
 }

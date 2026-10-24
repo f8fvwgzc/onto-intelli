@@ -16,6 +16,7 @@
 //! ingestion wrap [`Ontology::apply`] in a queue (see the `onto-intelli` crate).
 
 pub mod action_types;
+pub mod align;
 pub mod authority;
 pub mod catalog;
 pub mod deps;
@@ -23,42 +24,65 @@ pub mod engine;
 pub mod error;
 pub mod execution;
 pub mod experts;
+pub mod explain;
 pub mod explorer;
 pub mod export;
 pub mod graph;
+pub mod induce;
 pub mod learn;
+pub mod lint;
 pub mod live_schema;
+pub mod locks;
 pub mod map;
 pub mod metrics;
 pub mod model;
 pub mod modeling;
 pub mod objects;
+pub mod packs;
 pub mod policy;
 pub mod profile;
 pub mod proposals;
 pub mod quality;
 pub mod query;
+pub mod reason;
 pub mod rules;
 pub mod schema;
+pub mod shape_model;
+pub mod shapes;
 pub mod similarity;
 pub mod store;
 pub mod text;
 pub mod time;
 pub mod trace;
 
+pub use align::{AlignOptions, AlignReport, AlignSource, CertifyReport, Mapping, MatchPredicate};
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
     SearchHit, SearchMode, SyncReport,
 };
 pub use error::{Error, Result};
+pub use explain::{Claim, ClaimVerdict, Justifications, SliceReport, VerifyReport};
+pub use induce::{InduceOptions, Induced, SheetIngest, SheetMapping};
+pub use lint::{LintDecision, LintFeedback, LintQuery, LintReport};
 pub use live_schema::{
-    Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
-    SchemaVersion, SchemaVersionInfo,
+    Consequences, Conservativity, Governance, LikelyRename, Migration, Risk, SchemaApplied, SchemaChange,
+    SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan, SchemaVersion, SchemaVersionInfo,
 };
+pub use locks::{LockViolation, SchemaLock};
 pub use model::*;
+pub use packs::{InstallMode, PackDetail, PackInfo, PackInstallOptions, PackInstalled, PackMeta};
 pub use policy::{Access, Principal, Role};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
+pub use reason::{
+    Attested, BindingReport, BindingVerdict, Certificate, Closure, ClosureDiff, Derivation, Fact, QueryAnswer,
+    ReasonOptions, ReasonStats, Status as FactStatus,
+};
 pub use schema::{Dir, Schema};
+pub use shape_model::{PropertyShape, Shape, ShapeSeverity};
+pub use shapes::{
+    InducedShape, ShapeCheck, ShapeDelta, ShapeInduceOptions, ShapeIssue, ShapeIssueKind, ShapeReport, ShapeResult,
+    ShapeVerdict, ShapesQuery, SkippedConstraint,
+};
 /// The sqlx 0.9 API the PostgreSQL store is built on, as `sqlx::…` paths.
 /// An application's `sqlx::PgPool` is the same type as `sqlx::PgPool` here:
 /// hand it to `store::PgShared::from_pool`.

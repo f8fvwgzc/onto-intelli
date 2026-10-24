@@ -1,0 +1,2 @@
+builtin/type_implements	<incident:7>	a	#trackable	<incident:7>	a	#incident	#incident	implements	#trackable
+builtin/symmetric	<person:kenji>	works_with	<person:ada>	works_with	a	symmetric	<person:ada>	works_with	<person:kenji>

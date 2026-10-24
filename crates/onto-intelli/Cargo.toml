@@ -18,6 +18,9 @@ http-llm = ["dep:reqwest"]
 
 [dependencies]
 onto-core.workspace = true
+# The independent certificate checker (std, sha2 and serde_json only): reason.certify
+# and reason.check_certificate report its verdict, never the engine's.
+onto-cert = { path = "../onto-cert", version = "0.2.0" }
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true

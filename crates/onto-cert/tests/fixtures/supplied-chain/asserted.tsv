@@ -1,0 +1,4 @@
+<issue:1>	depends_on	<issue:2>
+<issue:2>	depends_on	<issue:3>
+<issue:3>	part_of	<release:r1>
+depends_on	a	transitive

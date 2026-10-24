@@ -1,0 +1,482 @@
+# Industry pack: supply chain and sourcing, layered on builtin:enterprise.
+#
+# Suppliers, their sites and the regions those sites sit in; purchased items
+# and sourcing categories; purchase orders, contracts and goods receipts;
+# supplier audits and supply disruptions. Buyers and category managers are the
+# enterprise `person` and `team`.
+#
+# Enable it with `[ontology] extend = ["builtin:supply-chain"]`, or install it
+# live as a governed schema change (pack.plan / pack.install).
+
+[pack]
+id = "supply-chain"
+title = "Supply chain and sourcing"
+industry = "supply_chain"
+version = "1.0.0"
+description = "Supplier networks across tiers: suppliers and their sites, sourcing regions and their trade-compliance status, purchased items and sourcing categories, purchase orders, contracts and goods receipts, supplier audits and supply disruptions. Vocabulary inspired by the SCOR model, GS1 identification keys and ISO 28000; it borrows their words and claims no compliance with any of them. Its risk rules (sanctioned sites, high-risk suppliers, upstream risk climbing the tiers, disruption exposure) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. Sample regions with a sanctioned status are fictional. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "SCOR (Supply Chain Operations Reference model): source, make and deliver vocabulary",
+    "GS1 identification keys: GLN for supplier sites",
+    "ISO 28000 (security management for the supply chain): disruption and risk vocabulary",
+]
+sample_note = "supplier:northwind-distribution has no site on record: the one deliberate violation (shape supplier_shape, min_count 1 on operates_site). Everything else in the sample conforms. Ruritania (XR) and its regions are fictional."
+
+# ── Supplier network ─────────────────────────────────────────────────────────
+
+[object_types.supplier]
+label = "Supplier"
+category = "actor"
+icon = "handshake"
+color = "#0f766e"
+implements = ["supply_risk_rated"]
+description = "A company that sells goods or services to the organization, at any tier of the supply network."
+states = ["prospect", "approved", "on_probation", "suspended", "offboarded"]
+terminal_states = ["offboarded"]
+alert_states = ["on_probation", "suspended"]
+properties.duns_number = { type = "string", pattern = "^[0-9]{9}$", description = "Nine-digit D-U-N-S number." }
+properties.supplier_tier = { type = "enum", values = ["tier1", "tier2", "tier3"] }
+properties.iso9001_certified = { type = "bool" }
+properties.annual_spend = { type = "float" }
+constraints.unique = ["duns_number"]
+
+[object_types.supplier_site]
+label = "Supplier site"
+category = "container"
+icon = "building-2"
+color = "#14b8a6"
+implements = ["supply_risk_rated"]
+description = "A physical facility of a supplier: a factory, warehouse, mine, farm or office."
+states = ["active", "disrupted", "closed"]
+terminal_states = ["closed"]
+alert_states = ["disrupted"]
+properties.site_type = { type = "enum", values = ["factory", "warehouse", "mine", "farm", "office"] }
+properties.gln = { type = "string", pattern = "^[0-9]{13}$", description = "GS1 Global Location Number." }
+constraints.required_links = ["site_in_region"]
+
+[object_types.sourcing_region]
+label = "Sourcing region"
+category = "container"
+icon = "globe"
+color = "#0891b2"
+description = "A country, subdivision or economic zone suppliers operate in, with its trade-compliance status."
+states = ["clear", "watchlist", "sanctioned"]
+alert_states = ["watchlist", "sanctioned"]
+properties.iso_code = { type = "string", pattern = "^[A-Z]{2}(-[A-Z0-9]{1,3})?$", description = "ISO 3166 style code (DE, MX-NLE)." }
+properties.region_level = { type = "enum", values = ["country", "subdivision", "economic_zone"] }
+
+# ── What is bought ───────────────────────────────────────────────────────────
+
+[object_types.purchased_item]
+label = "Purchased item"
+icon = "package-search"
+color = "#2563eb"
+description = "A material, component or service bought from suppliers, identified by its item code."
+states = ["active", "phase_out", "blocked"]
+alert_states = ["blocked"]
+properties.item_code = { type = "string", required = true, searchable = true }
+properties.lead_time_days = { type = "int" }
+properties.critical_item = { type = "bool", description = "A shortage stops production or service." }
+properties.unit_price = { type = "float" }
+
+[object_types.sourcing_category]
+label = "Sourcing category"
+category = "container"
+icon = "tags"
+color = "#4f46e5"
+description = "A group of purchased items managed with one sourcing strategy (bearings, castings, packaging)."
+properties.category_code = { type = "string" }
+properties.annual_budget = { type = "float" }
+
+# ── Buying ───────────────────────────────────────────────────────────────────
+
+[object_types.purchase_order]
+label = "Purchase order"
+icon = "file-text"
+color = "#1d4ed8"
+description = "A commitment to buy items from one supplier."
+states = ["draft", "issued", "acknowledged", "partially_received", "received", "closed", "cancelled"]
+terminal_states = ["received", "closed", "cancelled"]
+properties.po_number = { type = "string", required = true, searchable = true }
+properties.po_amount = { type = "float" }
+properties.currency = { type = "enum", values = ["usd", "eur", "gbp", "cny", "jpy", "inr", "mxn"] }
+properties.promised_date = { type = "timestamp" }
+
+[object_types.sourcing_contract]
+label = "Sourcing contract"
+category = "artifact"
+icon = "file-signature"
+color = "#7c3aed"
+description = "A frame agreement with a supplier: prices, delivery terms and validity."
+states = ["negotiating", "active", "expired", "terminated"]
+terminal_states = ["expired", "terminated"]
+properties.contract_number = { type = "string" }
+properties.valid_until = { type = "timestamp" }
+properties.incoterm = { type = "enum", values = ["exw", "fca", "fas", "fob", "cfr", "cif", "cpt", "cip", "dap", "dpu", "ddp"] }
+properties.payment_terms_days = { type = "int" }
+
+[object_types.goods_receipt]
+label = "Goods receipt"
+icon = "package-check"
+color = "#059669"
+description = "A recorded delivery of goods against a purchase order."
+states = ["posted", "inspected", "reversed"]
+terminal_states = ["reversed"]
+properties.received_quantity = { type = "int" }
+properties.received_at = { type = "timestamp" }
+properties.accepted = { type = "bool" }
+
+# ── Risk and assurance ───────────────────────────────────────────────────────
+
+[object_types.supplier_audit]
+label = "Supplier audit"
+category = "knowledge"
+icon = "clipboard-check"
+color = "#9333ea"
+description = "An assessment of a supplier or site: quality, social, environmental or security."
+states = ["planned", "completed", "overdue"]
+terminal_states = ["completed"]
+alert_states = ["overdue"]
+properties.audit_type = { type = "enum", values = ["quality", "social", "environmental", "security"] }
+properties.audit_score = { type = "int", description = "0 to 100." }
+properties.audit_result = { type = "enum", values = ["passed", "conditional", "failed"] }
+properties.audited_at = { type = "timestamp" }
+
+[object_types.supply_disruption]
+label = "Supply disruption"
+icon = "siren"
+color = "#dc2626"
+description = "An event that interrupts supply: a disaster, a strike, a port closure, a cyber attack."
+states = ["reported", "assessing", "mitigating", "resolved"]
+terminal_states = ["resolved"]
+alert_states = ["reported", "assessing", "mitigating"]
+properties.disruption_cause = { type = "enum", values = ["natural_disaster", "geopolitical", "labor", "logistics", "quality", "financial", "cyber"] }
+properties.impact_level = { type = "enum", values = ["low", "medium", "high"] }
+properties.started_at = { type = "timestamp" }
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.supply_risk_rated]
+description = "Suppliers and supplier sites: parties that carry a sourcing risk rating."
+properties.risk_rating = { type = "enum", values = ["low", "medium", "high"] }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.operates_site]
+description = "The supplier runs this site."
+from = ["supplier"]
+to = ["supplier_site"]
+inverse = "site_operator"
+weight = 0.9
+
+[link_types.site_in_region]
+description = "The region the site is located in."
+from = ["supplier_site"]
+to = ["sourcing_region"]
+inverse = "region_sites"
+cardinality = "one"
+weight = 0.7
+
+[link_types.region_within]
+description = "The region lies inside the object region (a province inside a country; transitive)."
+from = ["sourcing_region"]
+to = ["sourcing_region"]
+inverse = "region_contains"
+transitive = true
+weight = 0.5
+
+[link_types.supplies_item]
+description = "The supplier is an approved source for this item."
+from = ["supplier"]
+to = ["purchased_item"]
+inverse = "item_suppliers"
+weight = 0.9
+
+[link_types.produced_at_site]
+description = "The supplier site where the item is made or shipped from."
+from = ["purchased_item"]
+to = ["supplier_site"]
+inverse = "site_output"
+weight = 0.7
+
+[link_types.in_sourcing_category]
+description = "The sourcing category the item belongs to."
+from = ["purchased_item"]
+to = ["sourcing_category"]
+inverse = "sourcing_category_items"
+cardinality = "one"
+weight = 0.6
+
+[link_types.category_managed_by]
+description = "The team or person managing the sourcing category."
+from = ["sourcing_category"]
+to = ["team", "person"]
+inverse = "manages_category"
+cardinality = "one"
+weight = 0.7
+
+[link_types.ordered_from]
+description = "The supplier the purchase order is placed with."
+from = ["purchase_order"]
+to = ["supplier"]
+inverse = "purchase_orders"
+cardinality = "one"
+weight = 1.0
+
+[link_types.orders_item]
+description = "An item on the purchase order."
+from = ["purchase_order"]
+to = ["purchased_item"]
+inverse = "on_purchase_order"
+weight = 0.8
+
+[link_types.po_buyer]
+description = "The buyer who placed the purchase order."
+from = ["purchase_order"]
+to = ["person"]
+inverse = "buyer_for"
+cardinality = "one"
+weight = 0.6
+
+[link_types.under_contract]
+description = "The contract whose terms the purchase order uses."
+from = ["purchase_order"]
+to = ["sourcing_contract"]
+inverse = "contract_orders"
+cardinality = "one"
+weight = 0.6
+
+[link_types.contract_with]
+description = "The supplier the contract is signed with."
+from = ["sourcing_contract"]
+to = ["supplier"]
+inverse = "supplier_contracts"
+cardinality = "one"
+weight = 0.9
+
+[link_types.receipt_for]
+description = "The purchase order this goods receipt books delivery against."
+from = ["goods_receipt"]
+to = ["purchase_order"]
+inverse = "receipts"
+cardinality = "one"
+weight = 0.8
+
+[link_types.audit_of]
+description = "The supplier or site the audit assessed."
+from = ["supplier_audit"]
+to = ["supplier", "supplier_site"]
+inverse = "audits"
+cardinality = "one"
+weight = 0.7
+
+[link_types.disrupts]
+description = "The site, region or supplier a disruption hits."
+from = ["supply_disruption"]
+to = ["supplier_site", "sourcing_region", "supplier"]
+inverse = "disrupted_by"
+weight = 1.0
+
+[link_types.disruption_owner]
+description = "The team or person coordinating the response to a disruption."
+from = ["supply_disruption"]
+to = ["team", "person"]
+inverse = "owns_disruption"
+cardinality = "one"
+weight = 0.6
+
+[link_types.sources_from]
+description = "The supplier buys directly from the object supplier (one tier of the network; a dependency). Not transitive: A buying from B and B from C does not make A a buyer of C. Reach across tiers is what the upstream risk rules derive, as supplied assumptions."
+from = ["supplier"]
+to = ["supplier"]
+inverse = "sources_to"
+dependency = true
+weight = 0.8
+
+# ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
+
+[[rules]]
+name = "sanctioned_site"
+description = "A supplier site located in a sanctioned region is a sanctioned site."
+when = [["?site", "a", "supplier_site"], ["?site", "site_in_region", "?r"], ["?r", "state", "sanctioned"]]
+then = ["?site", "a", "sanctioned_site"]
+
+[[rules]]
+name = "sanctioned_site_within"
+description = "A supplier site in a region that lies inside a sanctioned region is a sanctioned site."
+when = [["?site", "site_in_region", "?r"], ["?r", "region_within", "?c"], ["?c", "state", "sanctioned"]]
+then = ["?site", "a", "sanctioned_site"]
+
+[[rules]]
+name = "high_risk_supplier"
+description = "A supplier operating a sanctioned site is high risk."
+when = [["?s", "a", "supplier"], ["?s", "operates_site", "?site"], ["?site", "a", "sanctioned_site"]]
+then = ["?s", "a", "high_risk_supplier"]
+
+[[rules]]
+name = "upstream_supply_risk"
+description = "A supplier that buys directly from a high-risk supplier inherits its risk (the first tier)."
+when = [["?s", "sources_from", "?t"], ["?t", "a", "high_risk_supplier"]]
+then = ["?s", "inherits_supply_risk_from", "?t"]
+
+[[rules]]
+name = "upstream_supply_risk_tiers"
+description = "A supplier that buys directly from a supplier that inherits a risk inherits it too, so the risk climbs the network one tier per step (tier-n reach is this assumption, not a property of sources_from)."
+chain = ["sources_from", "inherits_supply_risk_from"]
+infer = "inherits_supply_risk_from"
+
+[[rules]]
+name = "order_disruption_exposure"
+description = "A purchase order placed with a supplier whose site is hit by a high-impact disruption is at risk from it."
+when = [["?d", "a", "supply_disruption"], ["?d", "prop.impact_level", "high"], ["?d", "disrupts", "?site"], ["?s", "operates_site", "?site"], ["?po", "ordered_from", "?s"]]
+then = ["?po", "at_risk_from_disruption", "?d"]
+
+# ── Shapes (conditions the data should meet; a report is a measurement) ─────
+
+[shapes.purchase_order_shape]
+description = "A purchase order is placed with exactly one supplier, lists items and has a non-negative amount."
+target = "purchase_order"
+properties = [
+    { path = "ordered_from", min_count = 1, max_count = 1, class = "supplier" },
+    { path = "orders_item", min_count = 1, class = "purchased_item" },
+    { path = "prop.po_amount", min_value = 0 },
+]
+
+[shapes.supplier_shape]
+description = "A supplier has at least one site on record (so its region can be assessed) and a well-formed D-U-N-S number."
+target = "supplier"
+properties = [
+    { path = "operates_site", min_count = 1, message = "Record at least one site so the supplier's sourcing region can be assessed." },
+    { path = "prop.duns_number", max_count = 1, pattern = "^[0-9]{9}$" },
+]
+
+[shapes.supplier_site_shape]
+description = "A supplier site sits in exactly one sourcing region."
+target = "supplier_site"
+properties = [
+    { path = "site_in_region", min_count = 1, max_count = 1, class = "sourcing_region" },
+]
+
+[shapes.supplier_audit_shape]
+description = "An audit assesses exactly one supplier or site and scores it from 0 to 100."
+target = "supplier_audit"
+properties = [
+    { path = "audit_of", min_count = 1, max_count = 1 },
+    { path = "prop.audit_score", min_value = 0, max_value = 100 },
+]
+
+[shapes.sourcing_contract_shape]
+description = "A contract names exactly one supplier and an end of validity."
+target = "sourcing_contract"
+properties = [
+    { path = "contract_with", min_count = 1, max_count = 1, class = "supplier" },
+    { path = "prop.valid_until", min_count = 1 },
+]
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_purchase_spend]
+description = "Committed spend on open purchase orders."
+kind = "purchase_order"
+measure = "sum"
+property = "po_amount"
+filter = { open = true }
+dimensions = { supplier = "ordered_from", buyer = "po_buyer", currency = "currency", category = "orders_item.in_sourcing_category" }
+certified = true
+
+[metrics.open_purchase_orders]
+description = "Open purchase orders by state and supplier."
+kind = "purchase_order"
+measure = "count"
+filter = { open = true }
+dimensions = { state = "state", supplier = "ordered_from" }
+
+[metrics.disruption_resolution_time]
+description = "Days from a supply disruption being reported to being resolved."
+kind = "supply_disruption"
+measure = "lead_time"
+window_days = 365
+
+# ── Action types (governed edits) ────────────────────────────────────────────
+
+[action_types.suspend_supplier]
+description = "Suspend a supplier: no new purchase orders until it is reinstated."
+phrases = ["suspend", "block supplier"]
+risk = "high"
+roles = ["admin"]
+parameters.supplier = { type = "entity", kinds = ["supplier"], required = true }
+parameters.reason = { type = "text", required = true, cue = ["because", "for"] }
+
+[[action_types.suspend_supplier.preconditions]]
+check = "state_in"
+param = "supplier"
+values = ["approved", "on_probation"]
+message = "Only approved suppliers or suppliers on probation can be suspended."
+
+[[action_types.suspend_supplier.effects]]
+patch = { id = "{supplier}", state = "suspended" }
+
+[[action_types.suspend_supplier.effects]]
+event = { action = "supplier.suspended", target = "{supplier}", payload = { reason = "{reason}" } }
+
+[action_types.issue_purchase_order]
+description = "Issue a draft purchase order to its supplier."
+phrases = ["issue", "send po", "place order"]
+risk = "low"
+roles = ["member", "admin"]
+parameters.po = { type = "entity", kinds = ["purchase_order"], required = true }
+
+[[action_types.issue_purchase_order.preconditions]]
+check = "state_in"
+param = "po"
+values = ["draft"]
+message = "Only draft purchase orders can be issued."
+
+[[action_types.issue_purchase_order.preconditions]]
+check = "has_link"
+param = "po"
+rel = "ordered_from"
+message = "Pick a supplier before issuing the purchase order."
+
+[[action_types.issue_purchase_order.effects]]
+patch = { id = "{po}", state = "issued" }
+
+[[action_types.issue_purchase_order.effects]]
+event = { action = "purchase_order.issued", target = "{po}" }
+
+[action_types.record_supply_disruption]
+description = "Record a supply disruption hitting a supplier site."
+phrases = ["record disruption", "report disruption"]
+risk = "low"
+parameters.title = { type = "string", required = true }
+parameters.site = { type = "entity", kinds = ["supplier_site"], required = true, cue = ["at", "on", "hitting"] }
+parameters.cause = { type = "enum", values = ["natural_disaster", "geopolitical", "labor", "logistics", "quality", "financial", "cyber"], required = true }
+parameters.impact = { type = "enum", values = ["low", "medium", "high"], required = true }
+
+[[action_types.record_supply_disruption.effects]]
+create = { kind = "supply_disruption", title = "{title}", state = "reported", props = { disruption_cause = "{cause}", impact_level = "{impact}" }, links = [ { rel = "disrupts", to = "{site}" } ] }
+
+[[action_types.record_supply_disruption.effects]]
+event = { action = "supply_disruption.recorded", target = "{created}", payload = { site = "{site}", impact = "{impact}" } }
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+vendor = "supplier"
+subcontractor = "supplier"
+sub_supplier = "supplier"
+supplier_location = "supplier_site"
+sourcing_country = "sourcing_region"
+purchased_material = "purchased_item"
+commodity = "sourcing_category"
+po = "purchase_order"
+frame_agreement = "sourcing_contract"
+sourcing_agreement = "sourcing_contract"
+grn = "goods_receipt"
+supplier_assessment = "supplier_audit"
+disruption = "supply_disruption"
+
+[glossary.relations]
+vendor_for = "supplies_item"
+upstream = "sources_from"
+buyer = "po_buyer"

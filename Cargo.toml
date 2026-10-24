@@ -8,6 +8,7 @@ members = [
     "crates/onto-cli",
     "crates/onto-ffi",
     "crates/onto-bench",
+    "crates/onto-cert",
 ]
 default-members = ["crates/onto-cli"]
 

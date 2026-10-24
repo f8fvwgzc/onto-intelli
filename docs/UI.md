@@ -1,7 +1,7 @@
 # Web UI
 
 `onto serve` serves an operator UI at `/ui`, embedded in the binary. It has
-six views:
+seven views:
 
 | View | What you do there |
 |---|---|
@@ -11,6 +11,7 @@ six views:
 | **Schema** | Edit object types and typed properties, link types (from/to, cardinality, inverse), action types (parameters, preconditions, effects, roles, risk), rules and interfaces. Edits collect in a change set. Preview its impact and migrations, then **apply** it (apply roles) or **propose** it for review. Versions lists every schema version, with undo and restore. |
 | **Builder** | The ontology builder. Connectors with their crawl status and last report, **Crawl** for admins, and **Add connector** (name, `env:VAR` or URL, schemas, schedule, grants). Pick a source and **Draft**: options for tables, exclusions, a name prefix, row sync, actions and views. Review the object types (rename them, leave out types or properties), links, actions and skipped tables, each with its reason; a new name that an object type, interface or action type of the schema already has is flagged, unless that type is this table's earlier draft. **Refine with AI** (with optional instructions) shows each suggestion and whether it was kept; refining drafts afresh, so toggles reset. The advisor answers modeling questions. **Review plan** shows the `schema.plan` impact, then **Apply** (apply roles) or **Propose for review** (title and rationale, then the proposal opens). After applying, admins can crawl the source to sync its rows; a source with no registered connector says so instead. ([ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md)) |
 | **Proposals** | The review inbox: rationale, impact against today's data (re-planned when stale), diff, reviews. Approvers approve or reject; the proposer can withdraw. |
+| **Assurance** | Four tabs ([ASSURANCE.md](ASSURANCE.md)). **Packs**: the industry packs as cards (industry, title, version, counts, standards, installed or not); a pack opens a panel with its object types, link types, interfaces, rules (marked as supplied assumptions), shapes, metrics, action types, sample note and a lint summary (the pack's own findings). **Plan** shows the install plan, including risk with reasons, consequences (conservative or not, sample facts with rule and premises), locks, likely renames and the shape delta; **Install** (apply roles, with a "load sample data into this workspace" option) or **Propose**. **Reasoning**: asserted and derived counts, rounds, fixpoint, derived facts by rule, the constructs the run did not evaluate (shown next to the counts: a clean run is not a consistency result), sample derivations, a pattern query box, **Explain a fact** (justifications with their rules), and **Certify**: the checker's verdict word and meaning, or the rejected line and rule, the three digests, the attested fields (with the rounds and whether the fixpoint was reached; a closure that stopped at a limit is flagged as a lower bound) and downloads of the four files. **Shapes**: the verdict (conforms, violates or undetermined, never "valid"), the results table (severity, shape, component, focus, path, message), what was not evaluated, and a toggle to read inferred facts. **Lint**: findings with their fixes, a severity filter, **Accept** and **Dismiss** with a note (write access), the suppressed count and a toggle to show dismissed findings. |
 
 It works at phone width (bottom tab bar, bottom-sheet panels), honours
 `prefers-reduced-motion` and the system light/dark preference, and every
@@ -20,7 +21,7 @@ control is keyboard reachable.
 
 When the server runs the control plane (`[console] enabled`, see
 [CONTROL_PLANE.md](CONTROL_PLANE.md)), `/ui` opens as a console: people sign
-in, pick an organization and a project, and the six views above work on that
+in, pick an organization and a project, and the seven views above work on that
 project (its ref becomes the tenant). The shell adds an **organization and
 project switcher** at the top of the sidebar (in the header on phones), a
 **Project** group above the ontology views, and **Members** and the user menu
@@ -130,6 +131,7 @@ session in the fragment.
 - `#/build`
 - `#/schema/object_types/<name>`
 - `#/proposals/<id>`
+- `#/assure/packs`, `#/assure/packs/<id>`, `#/assure/reasoning`, `#/assure/shapes?inferred=1`, `#/assure/lint?severity=error&dismissed=1`
 
 **Response headers.** `/ui` sends a strict CSP (`default-src 'self'`,
 `frame-ancestors 'self'` plus the configured origins), `nosniff` and
@@ -155,6 +157,7 @@ npm run build     # type-check, then write crates/onto-grpc/ui-dist; rebuild the
 
 The stack is React 19, TanStack Query, d3-force (map layout), Tailwind 4,
 Geist and Lucide icons: about 145 KB of gzipped JavaScript for the operator
-views. The console pages load on first use (about 35 KB more); their charts
+views. The Assurance area loads on first use (its chunk is 38 KB, 11 KB
+gzipped). The console pages load on first use (about 35 KB more); their charts
 are small SVG components (`src/components/charts.tsx`) coloured from the CSS
 tokens, with no chart library.

@@ -1,0 +1,26 @@
+[package]
+name = "onto-cert"
+description = "Independent checker for onto-intelli reasoning certificates (oi-cert/1): re-derives every inferred fact by pattern alone and shares no code with the engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "onto_cert"
+path = "src/lib.rs"
+
+[[bin]]
+name = "onto-cert"
+path = "src/main.rs"
+
+# std, SHA-256 and JSON only. This crate must never depend on onto-core or any
+# other onto-* crate: a checker that shares code with the engine is not
+# independent of it (see the `no_engine_dependency` test).
+[dependencies]
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+fastrand.workspace = true

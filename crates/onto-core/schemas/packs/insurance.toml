@@ -1,0 +1,550 @@
+# Industry pack: property and casualty insurance.
+#
+# Layered on top of builtin:enterprise. Underwriters and claims adjusters are
+# enterprise `person`s, claims and underwriting units are enterprise `team`s,
+# and wordings or guidelines are enterprise `knowledge`. The pack adds policy
+# holders, policies and their coverage sections, insured items, perils (a
+# taxonomy), loss events, claims, intermediaries and reinsurance treaties.
+#
+# Policy and claim numbers are checked only for their lexical shape. Whether
+# a loss is covered is a contractual question: the rules flag claims for an
+# adjuster's attention, they do not decide them.
+
+[pack]
+id = "insurance"
+title = "Property and casualty insurance"
+industry = "insurance"
+version = "1.0.0"
+description = "Policy holders, insurance policies, coverage sections, insured items, a peril taxonomy, loss events, claims, intermediaries and reinsurance treaties. Vocabulary inspired by the ACORD data standards and the Solvency II lines of business; it borrows their words and claims no compliance with any of them. Its rules (which perils a policy's cover wording names, before exclusions, so not a coverage decision; claims caused by an excluded peril or a narrower kind of one, or made on a lapsed policy; duplicate claims on one item; loss events recoverable under a treaty) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The rules flag claims for review; they do not decide coverage. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "vocabulary inspired by the ACORD insurance data standards (party, policy, coverage, claim)",
+    "lines of business in the style of the Solvency II classification",
+    "reinsurance treaty types as used in common market practice (quota share, surplus, excess of loss, stop loss)",
+]
+sample_note = "claim:clm-20260006 was taken by phone without a loss date: the one deliberate violation (shape claim_complete, constraint claim_complete/loss_date, min_count 1 on prop.loss_date). Everything else in the sample conforms."
+
+# ── Parties ──────────────────────────────────────────────────────────────────
+
+[object_types.policy_holder]
+label = "Policy holder"
+category = "actor"
+description = "Person or business that holds one or more insurance policies."
+color = "#1e40af"
+icon = "contact"
+states = ["prospect", "active", "former"]
+terminal_states = ["former"]
+properties.customer_number = { type = "string", pattern = "^PH-[0-9]{6}$" }
+properties.holder_type = { type = "enum", values = ["individual", "business"] }
+properties.postcode = { type = "string" }
+
+[object_types.intermediary]
+label = "Intermediary"
+category = "actor"
+description = "Broker, agent or aggregator that places policies with the insurer."
+color = "#0369a1"
+icon = "handshake"
+states = ["appointed", "suspended", "terminated"]
+terminal_states = ["terminated"]
+alert_states = ["suspended"]
+properties.intermediary_type = { type = "enum", values = ["broker", "tied_agent", "aggregator", "bancassurer"] }
+properties.license_number = { type = "string" }
+properties.commission_rate = { type = "float", description = "Share of premium, in [0, 1]." }
+
+# ── Contracts ────────────────────────────────────────────────────────────────
+
+[object_types.insurance_policy]
+label = "Insurance policy"
+description = "Contract of insurance between the insurer and a policy holder for a period."
+color = "#4338ca"
+icon = "file-badge"
+states = ["quoted", "bound", "in_force", "lapsed", "cancelled", "expired"]
+terminal_states = ["lapsed", "cancelled", "expired"]
+properties.policy_number = { type = "string", pattern = "^POL-[0-9]{8}$" }
+properties.line_of_business = { type = "enum", values = ["motor", "property", "liability", "marine", "health", "travel", "cyber"] }
+properties.inception_date = { type = "timestamp" }
+properties.expiry_date = { type = "timestamp" }
+properties.annual_premium = { type = "float" }
+properties.currency = { type = "string", pattern = "^[A-Z]{3}$" }
+properties.cancellation_reason = { type = "text" }
+
+[object_types.coverage_section]
+label = "Coverage section"
+description = "Section of a policy: what is covered, up to which limit, after which deductible."
+color = "#6d28d9"
+icon = "shield-check"
+properties.coverage_type = { type = "enum", values = ["own_damage", "third_party_liability", "buildings", "contents", "business_interruption", "medical_expenses", "data_breach"] }
+properties.limit = { type = "float" }
+properties.deductible = { type = "float" }
+
+[object_types.insured_item]
+label = "Insured item"
+description = "Vehicle, building, contents, vessel or other object a policy insures."
+color = "#7e22ce"
+icon = "box"
+properties.item_type = { type = "enum", values = ["vehicle", "building", "contents", "vessel", "cargo", "equipment"] }
+properties.sum_insured = { type = "float" }
+properties.identifier = { type = "string", description = "Registration plate, VIN, address or hull number." }
+
+[object_types.reinsurance_treaty]
+label = "Reinsurance treaty"
+description = "Agreement ceding part of a portfolio's risk to reinsurers."
+color = "#9d174d"
+icon = "scale"
+states = ["negotiating", "active", "expired"]
+terminal_states = ["expired"]
+properties.treaty_type = { type = "enum", values = ["quota_share", "surplus", "excess_of_loss", "stop_loss"] }
+properties.retention = { type = "float" }
+properties.treaty_limit = { type = "float" }
+properties.ceded_share = { type = "float", description = "Share ceded under a proportional treaty, in [0, 1]." }
+
+# ── Losses ───────────────────────────────────────────────────────────────────
+
+[object_types.peril]
+label = "Peril"
+description = "Cause of loss (fire, flood, storm surge, theft, cyber attack). Perils form a taxonomy."
+color = "#b45309"
+icon = "flame"
+properties.peril_family = { type = "enum", values = ["natural_catastrophe", "fire", "water", "crime", "liability", "cyber", "accident"] }
+
+[object_types.loss_event]
+label = "Loss event"
+description = "Occurrence that causes many claims at once, such as a named storm or a regional flood."
+color = "#c2410c"
+icon = "cloud-lightning"
+states = ["monitoring", "declared", "closed"]
+terminal_states = ["closed"]
+alert_states = ["declared"]
+properties.event_code = { type = "string" }
+properties.occurred_from = { type = "timestamp" }
+properties.occurred_to = { type = "timestamp" }
+properties.region = { type = "string" }
+
+[object_types.claim]
+label = "Claim"
+description = "Request by a policy holder for payment under a policy after a loss."
+color = "#dc2626"
+icon = "file-warning"
+states = ["notified", "under_assessment", "under_investigation", "approved", "denied", "paid", "closed", "withdrawn"]
+terminal_states = ["paid", "denied", "closed", "withdrawn"]
+alert_states = ["under_investigation"]
+properties.claim_number = { type = "string", pattern = "^CLM-[0-9]{8}$" }
+properties.loss_date = { type = "timestamp" }
+properties.notified_at = { type = "timestamp" }
+properties.claimed_amount = { type = "float" }
+properties.reserve = { type = "float", description = "Case reserve: the expected cost still to pay." }
+properties.paid_amount = { type = "float" }
+properties.fraud_score = { type = "float", description = "Model score in [0, 1]." }
+properties.loss_description = { type = "text", searchable = true }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.policy_issued_to]
+description = "Policy holder the policy is issued to."
+from = ["insurance_policy"]
+to = ["policy_holder"]
+inverse = "holds_policy"
+weight = 1.0
+
+[link_types.section_of_policy]
+description = "Policy the coverage section belongs to."
+from = ["coverage_section"]
+to = ["insurance_policy"]
+inverse = "coverage_sections"
+cardinality = "one"
+weight = 0.9
+
+[link_types.covers_peril]
+description = "Peril the section covers (with every narrower peril)."
+from = ["coverage_section"]
+to = ["peril"]
+inverse = "covered_by_section"
+weight = 0.9
+
+[link_types.excludes_peril]
+description = "Peril the section's wording excludes."
+from = ["coverage_section"]
+to = ["peril"]
+inverse = "excluded_by_section"
+weight = 0.9
+
+[link_types.sub_peril_of]
+description = "The peril is a narrower kind of this peril (storm surge within flood within natural catastrophe)."
+from = ["peril"]
+to = ["peril"]
+inverse = "has_sub_peril"
+transitive = true
+weight = 0.6
+
+[link_types.insures_item]
+description = "Item the policy insures."
+from = ["insurance_policy"]
+to = ["insured_item"]
+inverse = "insured_under"
+weight = 0.8
+
+[link_types.exposed_to_peril]
+description = "Peril the item is exposed to by location or use (flood zone, coastal site)."
+from = ["insured_item"]
+to = ["peril"]
+inverse = "exposed_items"
+weight = 0.5
+
+[link_types.underwritten_by]
+description = "Underwriter (enterprise person) who accepted the risk."
+from = ["insurance_policy"]
+to = ["person"]
+inverse = "underwrites_policy"
+cardinality = "one"
+weight = 0.6
+
+[link_types.placed_through]
+description = "Intermediary that placed the policy."
+from = ["insurance_policy"]
+to = ["intermediary"]
+inverse = "placed_policies"
+cardinality = "one"
+weight = 0.6
+
+[link_types.ceded_to]
+description = "Reinsurance treaty the policy's risk is ceded to."
+from = ["insurance_policy"]
+to = ["reinsurance_treaty"]
+inverse = "cedes_policies"
+weight = 0.7
+
+[link_types.claim_under]
+description = "Policy the claim is made under."
+from = ["claim"]
+to = ["insurance_policy"]
+inverse = "claims_made"
+cardinality = "one"
+weight = 1.0
+
+[link_types.invokes_coverage]
+description = "Coverage section the claim is made against."
+from = ["claim"]
+to = ["coverage_section"]
+inverse = "invoked_by_claim"
+weight = 0.9
+
+[link_types.caused_by_peril]
+description = "Proximate cause of the loss."
+from = ["claim"]
+to = ["peril"]
+inverse = "caused_claims"
+cardinality = "one"
+weight = 0.9
+
+[link_types.arises_from_event]
+description = "Loss event the claim arises from."
+from = ["claim"]
+to = ["loss_event"]
+inverse = "event_claims"
+cardinality = "one"
+weight = 0.8
+
+[link_types.event_peril]
+description = "Peril the loss event is an occurrence of."
+from = ["loss_event"]
+to = ["peril"]
+inverse = "peril_occurrences"
+weight = 0.6
+
+[link_types.concerns_item]
+description = "Insured item that was lost or damaged."
+from = ["claim"]
+to = ["insured_item"]
+inverse = "item_claims"
+weight = 0.8
+
+[link_types.claim_filed_by]
+description = "Policy holder who filed the claim."
+from = ["claim"]
+to = ["policy_holder"]
+inverse = "filed_claims"
+cardinality = "one"
+weight = 0.8
+
+[link_types.adjusted_by]
+description = "Claims adjuster (enterprise person) handling the claim."
+from = ["claim"]
+to = ["person"]
+inverse = "adjusts_claim"
+cardinality = "one"
+weight = 0.7
+
+[link_types.linked_claim]
+description = "Claims that may concern the same loss (shared parties, items or circumstances)."
+from = ["claim"]
+to = ["claim"]
+symmetric = true
+weight = 0.5
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+policyholder = "policy_holder"
+insured = "policy_holder"
+insured_party = "policy_holder"
+insurance_broker = "intermediary"
+insurance_agent = "intermediary"
+insurance_contract = "insurance_policy"
+cover = "coverage_section"
+policy_section = "coverage_section"
+insured_object = "insured_item"
+insured_risk = "insured_item"
+cause_of_loss = "peril"
+catastrophe = "loss_event"
+cat_event = "loss_event"
+insurance_claim = "claim"
+loss_notification = "claim"
+treaty = "reinsurance_treaty"
+reinsurance = "reinsurance_treaty"
+
+[glossary.relations]
+adjuster = "adjusted_by"
+underwriter = "underwritten_by"
+claimant = "claim_filed_by"
+loss_cause = "caused_by_peril"
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+# `peril_in_cover_wording` is the perils the policy's sections name as
+# covered, before any exclusion is applied: Horn rules cannot say "covers
+# unless excluded", so this is not a coverage decision. Exclusions stay on the
+# section (`excludes_peril`) and surface on claims as `excluded_peril_claim`,
+# both for the excluded peril and for every narrower kind of it.
+
+[[rules]]
+name = "policy_cover_wording"
+description = "A policy's cover wording names every peril one of its coverage sections covers (exclusions not applied: this does not decide coverage)."
+chain = ["coverage_sections", "covers_peril"]
+infer = "peril_in_cover_wording"
+
+[[rules]]
+name = "excluded_peril_claim"
+description = "A claim whose cause is a peril excluded by the section it invokes needs a coverage review."
+when = [["?c", "invokes_coverage", "?s"], ["?c", "caused_by_peril", "?p"], ["?s", "excludes_peril", "?p"]]
+then = ["?c", "a", "excluded_peril_claim"]
+
+[[rules]]
+name = "excluded_broader_peril_claim"
+description = "A claim whose cause is a narrower kind of a peril excluded by the section it invokes needs a coverage review."
+when = [["?c", "invokes_coverage", "?s"], ["?c", "caused_by_peril", "?p"], ["?p", "sub_peril_of", "?q"], ["?s", "excludes_peril", "?q"]]
+then = ["?c", "a", "excluded_peril_claim"]
+
+[[rules]]
+name = "claim_on_lapsed_policy"
+description = "A claim made under a lapsed policy needs a coverage review."
+when = [["?c", "claim_under", "?pol"], ["?pol", "state", "lapsed"]]
+then = ["?c", "a", "claim_on_lapsed_policy"]
+
+[[rules]]
+name = "duplicate_item_claim"
+description = "Two linked claims on the same insured item may be a duplicate or an opportunistic claim."
+when = [["?c", "linked_claim", "?d"], ["?c", "concerns_item", "?i"], ["?d", "concerns_item", "?i"]]
+then = ["?c", "a", "duplicate_item_claim"]
+
+[[rules]]
+name = "treaty_recovery"
+description = "A loss event with claims under a policy ceded to a treaty is recoverable under that treaty."
+when = [["?c", "arises_from_event", "?e"], ["?c", "claim_under", "?pol"], ["?pol", "ceded_to", "?t"], ["?t", "state", "active"]]
+then = ["?e", "recoverable_under", "?t"]
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.insurance_policy_complete]
+description = "A policy has a well-formed number, a holder, at least one coverage section and a non-negative premium."
+target = "insurance_policy"
+
+[[shapes.insurance_policy_complete.properties]]
+id = "insurance_policy_complete/number"
+path = "prop.policy_number"
+min_count = 1
+max_count = 1
+pattern = "^POL-[0-9]{8}$"
+
+[[shapes.insurance_policy_complete.properties]]
+id = "insurance_policy_complete/holder"
+path = "policy_issued_to"
+min_count = 1
+class = "policy_holder"
+
+[[shapes.insurance_policy_complete.properties]]
+id = "insurance_policy_complete/sections"
+path = "coverage_sections"
+min_count = 1
+class = "coverage_section"
+
+[[shapes.insurance_policy_complete.properties]]
+id = "insurance_policy_complete/premium"
+path = "prop.annual_premium"
+min_count = 1
+datatype = "float"
+min_value = 0.0
+
+[shapes.claim_complete]
+description = "A claim has a well-formed number, a loss date and exactly one policy."
+target = "claim"
+
+[[shapes.claim_complete.properties]]
+id = "claim_complete/number"
+path = "prop.claim_number"
+min_count = 1
+pattern = "^CLM-[0-9]{8}$"
+
+[[shapes.claim_complete.properties]]
+id = "claim_complete/loss_date"
+path = "prop.loss_date"
+min_count = 1
+message = "Record the date of loss: cover depends on it."
+
+[[shapes.claim_complete.properties]]
+id = "claim_complete/policy"
+path = "claim_under"
+min_count = 1
+max_count = 1
+class = "insurance_policy"
+
+[[shapes.claim_complete.properties]]
+id = "claim_complete/cause"
+path = "caused_by_peril"
+max_count = 1
+class = "peril"
+severity = "warning"
+
+[shapes.coverage_section_terms]
+description = "A coverage section belongs to one policy and carries a non-negative limit and deductible."
+target = "coverage_section"
+
+[[shapes.coverage_section_terms.properties]]
+id = "coverage_section_terms/policy"
+path = "section_of_policy"
+min_count = 1
+max_count = 1
+
+[[shapes.coverage_section_terms.properties]]
+id = "coverage_section_terms/limit"
+path = "prop.limit"
+min_count = 1
+min_value = 0.0
+
+[[shapes.coverage_section_terms.properties]]
+id = "coverage_section_terms/deductible"
+path = "prop.deductible"
+min_value = 0.0
+
+[shapes.treaty_terms]
+description = "A treaty names its type; proportional shares stay within [0, 1]."
+target = "reinsurance_treaty"
+
+[[shapes.treaty_terms.properties]]
+id = "treaty_terms/type"
+path = "prop.treaty_type"
+min_count = 1
+
+[[shapes.treaty_terms.properties]]
+id = "treaty_terms/share"
+path = "prop.ceded_share"
+min_value = 0.0
+max_value = 1.0
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.open_claims]
+description = "Claims not yet paid, closed, denied or withdrawn, by state, cause, loss event and adjuster."
+kind = "claim"
+measure = "count"
+filter = { open = true }
+dimensions = { state = "state", loss_cause = "caused_by_peril", event = "arises_from_event", adjuster = "adjusted_by" }
+certified = true
+
+[metrics.outstanding_reserves]
+description = "Case reserves on open claims, by loss event and policy."
+kind = "claim"
+measure = "sum"
+property = "reserve"
+filter = { open = true }
+dimensions = { event = "arises_from_event", policy = "claim_under" }
+
+[metrics.written_premium]
+description = "Annual premium of policies in force, by line of business and intermediary."
+kind = "insurance_policy"
+measure = "sum"
+property = "annual_premium"
+filter = { state = ["in_force"] }
+dimensions = { line = "line_of_business", intermediary = "placed_through" }
+certified = true
+
+[metrics.claim_settlement_time]
+description = "Days from the claim record being created to it being paid, closed, denied or withdrawn (record creation time, not notified_at)."
+kind = "claim"
+measure = "lead_time"
+window_days = 365
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.refer_claim_to_investigation]
+description = "Refer an open claim to the special investigations unit."
+phrases = ["refer", "investigate claim", "send to siu"]
+risk = "medium"
+parameters.claim = { type = "entity", kinds = ["claim"], required = true }
+parameters.investigator = { type = "entity", kinds = ["person"], required = true, cue = ["to"] }
+parameters.note = { type = "text" }
+
+[[action_types.refer_claim_to_investigation.preconditions]]
+check = "state_in"
+param = "claim"
+values = ["notified", "under_assessment"]
+message = "Only a claim being notified or assessed can be referred."
+
+[[action_types.refer_claim_to_investigation.effects]]
+patch = { id = "{claim}", state = "under_investigation" }
+
+[[action_types.refer_claim_to_investigation.effects]]
+link = { from = "{claim}", rel = "adjusted_by", to = "{investigator}" }
+replace = true
+
+[[action_types.refer_claim_to_investigation.effects]]
+event = { action = "claim.referred", target = "{claim}", payload = { investigator = "{investigator}", note = "{note}" } }
+
+[action_types.settle_claim]
+description = "Pay an approved claim and release its reserve."
+phrases = ["settle", "pay claim"]
+roles = ["claims_handler", "admin"]
+risk = "high"
+parameters.claim = { type = "entity", kinds = ["claim"], required = true }
+parameters.amount = { type = "float", required = true, cue = ["for"] }
+
+[[action_types.settle_claim.preconditions]]
+check = "state_in"
+param = "claim"
+values = ["approved"]
+message = "Only an approved claim can be settled."
+
+[[action_types.settle_claim.effects]]
+patch = { id = "{claim}", state = "paid", props = { paid_amount = "{amount}", reserve = 0.0 } }
+
+[[action_types.settle_claim.effects]]
+event = { action = "claim.settled", target = "{claim}", payload = { amount = "{amount}" } }
+
+[action_types.cancel_insurance_policy]
+description = "Cancel a bound or in-force policy, recording why."
+phrases = ["cancel policy"]
+roles = ["underwriter", "admin"]
+risk = "high"
+parameters.policy = { type = "entity", kinds = ["insurance_policy"], required = true }
+parameters.reason = { type = "text", required = true, cue = ["because", "for"] }
+
+[[action_types.cancel_insurance_policy.preconditions]]
+check = "state_in"
+param = "policy"
+values = ["bound", "in_force"]
+message = "Only a bound or in-force policy can be cancelled."
+
+[[action_types.cancel_insurance_policy.effects]]
+patch = { id = "{policy}", state = "cancelled", props = { cancellation_reason = "{reason}" } }
+
+[[action_types.cancel_insurance_policy.effects]]
+event = { action = "policy.cancelled", target = "{policy}", payload = { reason = "{reason}" } }

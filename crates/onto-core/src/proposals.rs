@@ -79,7 +79,9 @@ pub struct SchemaProposal {
     pub status: ProposalStatus,
     /// Schema version the proposal was planned against.
     pub base_version: u64,
-    /// Impact report computed when filed (or revised).
+    /// Impact report computed when filed (or revised). Its consequences
+    /// are not stored (they depend on the reader): [`ProposalView`] plans
+    /// them for whoever reads an open proposal.
     pub plan: SchemaPlan,
     #[serde(default)]
     pub reviews: Vec<Review>,
@@ -146,6 +148,19 @@ pub struct ReviewOutcome {
     pub applied: Option<crate::live_schema::SchemaApplied>,
 }
 
+/// A stored proposal. A plan stored before plans carried a risk has none:
+/// its risk is assessed from the plan and change set rather than read as
+/// the `low` a missing field would default to.
+fn decode_proposal(id: &str, v: Value) -> Result<SchemaProposal> {
+    let legacy = v.get("plan").is_some_and(|plan| plan.get("risk").is_none());
+    let mut prop: SchemaProposal =
+        serde_json::from_value(v).map_err(|e| Error::Storage(format!("proposal {id}: {e}")))?;
+    if legacy {
+        (prop.plan.risk, prop.plan.risk_reasons) = crate::live_schema::assess_risk(&prop.plan, &prop.change_set);
+    }
+    Ok(prop)
+}
+
 fn proposer_of(p: &Principal) -> Proposer {
     Proposer { id: p.id.clone(), roles: p.roles.clone(), agent: p.is_agent(), entity: p.entity.clone() }
 }
@@ -154,14 +169,38 @@ impl Ontology {
     pub(crate) fn load_proposal(&self, id: &str) -> Result<SchemaProposal> {
         let v =
             self.store().kv_get(NS_PROPOSALS, id)?.ok_or_else(|| Error::not_found(format!("schema proposal {id}")))?;
-        serde_json::from_value(v).map_err(|e| Error::Storage(format!("proposal {id}: {e}")))
+        decode_proposal(id, v)
     }
 
+    /// The stored plan holds no consequences (they depend on who reads):
+    /// an open proposal gets them, and the locks and risk, planned for `p`,
+    /// in its plan or, when stale, in the preview.
     fn view(&self, prop: SchemaProposal, p: &Principal) -> Result<ProposalView> {
+        self.view_planned(prop, p, None)
+    }
+
+    /// [`Self::view`] with `planned`, the proposal's change set just planned
+    /// for `p` as its proposer would have it (used when it was planned for
+    /// the active schema version, instead of planning it again).
+    fn view_planned(
+        &self,
+        mut prop: SchemaProposal,
+        p: &Principal,
+        planned: Option<SchemaPlan>,
+    ) -> Result<ProposalView> {
         let active = self.schema_version();
         let stale = prop.base_version != active;
-        let preview = if prop.status == ProposalStatus::Open && stale {
-            Some(self.schema_plan(p, &prop.change_set)?)
+        let preview = if prop.status == ProposalStatus::Open {
+            let fresh = match planned.filter(|f| f.base_version == active) {
+                Some(f) => f,
+                None => self.schema_plan_as(p, &prop.change_set, Some(&prop.proposer))?,
+            };
+            if stale || fresh.base_version != prop.base_version {
+                Some(fresh)
+            } else {
+                prop.plan.with_reader_view(&fresh, &prop.change_set);
+                None
+            }
         } else {
             None
         };
@@ -222,18 +261,20 @@ impl Ontology {
         if input.title.trim().is_empty() {
             return Err(Error::invalid("a proposal needs a title"));
         }
-        let plan = self.schema_plan(&ctx.principal, &input.change_set)?;
+        let proposer = proposer_of(&ctx.principal);
+        let plan = self.schema_plan_as(&ctx.principal, &input.change_set, Some(&proposer))?;
         if !plan.valid {
             return Err(Error::Invalid(format!("the proposed change does not validate: {}", plan.errors.join("; "))));
         }
+        let fresh = plan.clone();
         let now = now_ms();
-        let prop = SchemaProposal {
+        let mut prop = SchemaProposal {
             id: new_id("prop"),
             title: input.title.trim().to_string(),
             rationale: input.rationale,
             base_version: plan.base_version,
             change_set: input.change_set,
-            proposer: proposer_of(&ctx.principal),
+            proposer,
             status: ProposalStatus::Open,
             plan,
             reviews: Vec::new(),
@@ -245,6 +286,7 @@ impl Ontology {
             updated_at: now,
             revision: 1,
         };
+        prop.plan.without_reader_facts(&prop.change_set);
         let payload = json!({
             "proposal": prop.id,
             "title": prop.title,
@@ -259,7 +301,7 @@ impl Ontology {
             ..Default::default()
         };
         self.apply_inner(ctx, Vec::new(), extra)?;
-        self.view(prop, &ctx.principal)
+        self.view_planned(prop, &ctx.principal, Some(fresh))
     }
 
     /// Proposals, newest first, optionally by status.
@@ -276,7 +318,7 @@ impl Ontology {
             .store()
             .kv_scan(NS_PROPOSALS, "")?
             .into_iter()
-            .filter_map(|(_, v)| serde_json::from_value::<SchemaProposal>(v).ok())
+            .filter_map(|(k, v)| decode_proposal(&k, v).ok())
             .filter(|x| status.is_none_or(|s| x.status == s))
             .collect();
         all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
@@ -483,6 +525,7 @@ impl Ontology {
             prop.change_set = input.change_set.clone();
             prop.base_version = plan.base_version;
             prop.plan = plan.clone();
+            prop.plan.without_reader_facts(&prop.change_set);
             prop.status = ProposalStatus::Open;
             prop.error = None;
             prop.revision += 1;

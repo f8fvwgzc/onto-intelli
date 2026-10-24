@@ -1,0 +1,3 @@
+<country:xx>	state	"sanctioned"
+<supplier:acme>	a	#supplier
+<supplier:acme>	located_in	<country:xx>

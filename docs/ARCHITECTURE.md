@@ -124,6 +124,61 @@ behave exactly like first-party ones.
 
 See [RESEARCH.md](RESEARCH.md) for the sources of each decision.
 
+## 9. The assurance layer: inference is not assertion
+
+The reasoner ([ASSURANCE.md](ASSURANCE.md)) derives facts from the graph and
+the schema's rules, and the design keeps three things apart.
+
+**Stored facts and derived facts.** The reasoner reads the visible graph as
+triples, computes a closure in memory and never writes it back. A derived
+fact is labelled `derived` and carries the rule and premises that produced
+it. The graph stays what people and connectors wrote; what follows from it is
+recomputed per caller (permissions apply, as for any read) and cached by graph
+revision and schema version, like the answer caches.
+
+```text
+   graph (stored) ──► asserted facts ──► reason::closure ──► derived facts (rule + premises)
+   schema ─────────► rule table ────┘          │
+                                              ├──► queries, explanations, plans, shapes (inferred)
+                                              └──► certificate files ──► onto-cert ──► verdict
+```
+
+**Built-in semantics and supplied rules.** Kind inheritance, interfaces and
+transitive and symmetric link types are a fixed table compiled into both the
+engine and the checker. Schema `[[rules]]`, an organization's or an industry
+pack's, are supplied rules: assumptions that a certificate carries, and that
+change its verdict word.
+
+**Engine and checker.** onto-core computes the closure and writes the
+certificate; it only ever says `derived`. `crates/onto-cert` checks it: a
+separate crate that depends on the standard library, `sha2` and `serde_json`
+only (a test fails if it ever depends on an `onto-` crate), reimplements the
+format from its specification, and re-derives each line by pattern, without
+search. Its report type has a private constructor and no `Deserialize`, so a
+verdict cannot be produced anywhere else, not even by parsing one. A checker
+that shared code with the engine would share its bugs.
+
+**Plans that reason.** A schema plan runs the reasoner twice over the same
+current graph, under the current and the planned schema, and reports the
+difference: the facts that appear and disappear, conservativity over the
+existing vocabulary, a risk word, lock violations and the shape delta. Blast
+radius alone misses changes like a link type made transitive, which touch no
+entity and still change what the ontology says.
+
+**Measurements are not proofs.** Shapes, lint, alignment and sheet induction
+are separate modules that measure or score; each report says which in its
+`means` field. Only a checked certificate is a proof, and only under its rule
+table.
+
+**Bounded, and honest about it.** A closure is bounded by derived facts,
+rounds and the candidate facts its rule joins try; a query by its atoms,
+bindings and join work; shape validation by path steps and path work. The
+facts are collected under the graph's read guard and the closure runs after
+it is released. A run cut by a bound says so: a closure that stopped is a
+lower bound (its certificate still checks, and says so), a cut shape run
+never `conforms`, and a plan whose closures stopped or refused terms is
+`undetermined` rather than conservative.
+
 ## Performance notes
 
 * Reads take a single `RwLock` read guard; context building does all graph work under one
