@@ -378,3 +378,44 @@ fn pack_install_sample_then_certify_then_cert_check_on_postgres() {
         assert_eq!(out.json()["verdict"], "same_graph", "{}", out.stdout);
     }
 }
+
+#[test]
+fn a_closed_pipe_ends_the_command_quietly() {
+    // `onto align --pack retail | head -1`: the reader goes away early.
+    let cfg = memory_config();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_onto"))
+        .args(["--config", cfg.to_str().unwrap(), "align", "--pack", "retail"])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run onto");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked") && !stderr.contains("Broken pipe"), "{stderr}");
+    assert!(matches!(out.status.code(), Some(0 | 141)), "{:?} {stderr}", out.status);
+}
+
+#[test]
+fn plan_consequences_say_asserted_or_derived() {
+    let cfg = memory_config();
+    let cfg = cfg.to_str().unwrap();
+    let json = onto(&["--config", cfg, "pack", "plan", "manufacturing", "--json"]);
+    if !dispatched(&json, "pack.plan") {
+        return;
+    }
+    let plan = json.json();
+    let c = &plan["consequences"];
+    let added = c["added"].as_u64().unwrap();
+    let asserted = c["by_rule"]["asserted"].as_u64().unwrap_or(0);
+    let out = onto(&["--config", cfg, "pack", "plan", "manufacturing"]);
+    let line = out.stdout.lines().find(|l| l.contains("consequences:")).unwrap_or_else(|| panic!("{}", out.stdout));
+    let expected = match (asserted, added - asserted) {
+        (0, d) => format!("+{d} derived"),
+        (a, 0) => format!("+{a} asserted"),
+        (a, d) => format!("+{added} added ({a} asserted, {d} derived)"),
+    };
+    assert!(line.contains(&expected), "{line} (expected {expected}) {c}");
+}

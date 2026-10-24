@@ -1570,3 +1570,30 @@ fn pg_install_with_sample_survives_a_reopen() {
         }
     }
 }
+
+#[test]
+fn pack_samples_share_no_entity_id() {
+    // Entity ids are global: two samples loaded into one database (each in
+    // its own workspace) must not name the same object.
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    let mut problems = Vec::new();
+    for id in ids() {
+        for e in packs::sample(id).unwrap() {
+            let eid = e.id.clone().unwrap_or_else(|| format!("{}:{}", e.kind, e.key.as_deref().unwrap_or_default()));
+            if let Some(other) = seen.insert(eid.clone(), id) {
+                problems.push(format!("{eid} is in the samples of {other} and {id}"));
+            }
+        }
+    }
+    report("sample ids shared between packs", problems);
+    // Two samples, two workspaces, one store.
+    let mut s = Schema::enterprise();
+    for id in ["retail", "insurance"] {
+        s.extend_source(&format!("builtin:{id}"), |p: &str| std::path::PathBuf::from(p)).unwrap();
+    }
+    let o = Ontology::in_memory(s);
+    for (id, ws) in [("retail", "a"), ("insurance", "b")] {
+        let ctx = ActionContext::new(admin(), ws);
+        o.apply(&ctx, packs::sample_mutations(packs::sample(id).unwrap())).unwrap_or_else(|e| panic!("{id}: {e}"));
+    }
+}

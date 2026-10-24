@@ -797,3 +797,55 @@ fn a_sheet_maps_onto_the_existing_type_it_names() {
     assert!(e.to_string().contains("weight"), "{e}");
     assert!(induce::mapping_onto(&o.schema(), &ind3, "nope").is_err());
 }
+
+/// The vendor sheet of the docs: account managers by first name, parents
+/// by vendor code.
+const VENDORS: &str = "vendor_code,name,tier,rating,active,onboarded,account_manager,parent_code\n\
+V-100,Northwind Metals,gold,4.6,yes,2024-02-11,kenji,\n\
+V-101,Contoso Plastics,silver,3.9,yes,2024-03-02,maria,\n\
+V-102,Fabrikam Castings,gold,4.8,yes,2023-11-20,kenji,\n\
+V-103,\"Tailspin Fasteners, Inc.\",bronze,3.1,no,2022-07-15,john,\n\
+V-104,Litware Bearings,silver,4.0,yes,2024-05-30,sarah,V-102\n\
+V-105,Adatum Electronics,gold,4.4,yes,2023-01-09,maria,\n\
+V-106,Proseware Coatings,bronze,2.8,no,2021-10-04,john,V-101\n\
+V-107,Wingtip Logistics,silver,3.7,yes,2024-08-18,sarah,\n\
+V-108,Coho Chemicals,bronze,3.3,yes,2022-12-01,kenji,V-101\n\
+V-109,Margie Tooling,silver,4.1,yes,2023-06-27,maria,V-102\n\
+V-110,Lucerne Alloys,gold,4.9,yes,2020-04-14,sarah,\n\
+V-111,Alpine Springs,bronze,3.0,no,2021-03-22,john,\n\
+V-112,Fourth Coffee Packaging,silver,3.6,yes,2024-09-05,kenji,V-105\n\
+V-113,Humongous Gears,gold,4.7,yes,2022-02-28,maria,\n\
+V-114,Woodgrove Seals,bronze,2.9,yes,2023-09-13,sarah,V-110\n\
+";
+
+#[test]
+fn columns_named_like_link_types_map_onto_them() {
+    let (o, ctx) = world();
+    let people = ["kenji", "maria", "john", "sarah"];
+    o.apply(&ctx, people.iter().map(|p| Mutation::Upsert(EntityInput::new("person", *p, *p))).collect()).unwrap();
+    let ind = o.induce_sheet(&admin(), VENDORS, &opts("vendors.csv")).unwrap();
+    apply(&o, &ctx, &ind);
+    let manager = &ind.mapping.links["account_manager"];
+    assert_eq!(manager.target_kind, "person");
+    let parent = &ind.mapping.links["parent_code"];
+    assert_eq!(parent.target_kind, "vendor");
+    // A new sheet whose cells name no existing object: the columns are read
+    // as values, yet they are named like vendor's link types, so they map
+    // onto those links and the missing targets are reported per row.
+    let new = "vendor_code,name,tier,rating,active,onboarded,account_manager,parent_code\n\
+               V-120,Zeta Wire,gold,4.2,yes,2025-01-07,zoe,V-999\n";
+    let again = o.induce_sheet(&admin(), new, &opts("vendors.csv")).unwrap();
+    assert_eq!(again.base_kind, "vendor");
+    let m = induce::mapping_onto(&o.schema(), &again, "vendor").unwrap();
+    assert_eq!(&m.links["account_manager"], manager);
+    assert_eq!(&m.links["parent_code"], parent);
+    let out = o.ingest_sheet(&ctx, new, &m, true).unwrap();
+    assert_eq!(out.upserts, 1);
+    let missing: Vec<&str> = out
+        .findings
+        .iter()
+        .filter(|f| f.issue == FindingKind::MissingTarget)
+        .filter_map(|f| f.column.as_deref())
+        .collect();
+    assert_eq!(missing, ["account_manager", "parent_code"], "{:?}", out.findings);
+}

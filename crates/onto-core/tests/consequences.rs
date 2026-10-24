@@ -702,3 +702,121 @@ fn unrelated_definitions_with_alike_structure_are_not_renames() {
     assert!(plan.likely_renames.is_empty(), "{:?}", plan.likely_renames);
     assert!(!plan.warnings.iter().any(|w| w.contains("looks renamed")), "{:?}", plan.warnings);
 }
+
+#[test]
+fn refused_terms_make_conservativity_undetermined() {
+    // `task:q>r` cannot be spelled: it and its links are left out of both
+    // closures, so what the rule would add through it is not seen.
+    let chain = |q: &str| {
+        let o = Ontology::in_memory(schema());
+        let ctx = ActionContext::new(admin(), "acme");
+        let q_id = format!("task:{q}");
+        o.apply(
+            &ctx,
+            vec![
+                Mutation::Upsert(EntityInput::new("task", "s", "S")),
+                Mutation::Upsert(EntityInput::new("task", q, "Q").link("depends_on", "task:s")),
+                Mutation::Upsert(EntityInput::new("task", "p", "P").link("depends_on", &q_id)),
+            ],
+        )
+        .unwrap();
+        o
+    };
+    let rule = set(json!({ "changes": [{ "op": "put_rule", "def": {
+        "name": "dep_chain", "description": "dependencies of dependencies",
+        "when": [["?x", "depends_on", "?y"], ["?y", "depends_on", "?z"]],
+        "then": ["?x", "depends_on", "?z"] } }] }));
+    let plan = chain("q>r").schema_plan(&admin(), &rule).unwrap();
+    let c = plan.consequences.as_ref().unwrap();
+    assert_eq!(c.refused, 2, "one refusal per closure: {c:?}");
+    assert_eq!(c.verdict, Conservativity::Undetermined, "{c:?}");
+    assert!(!c.conservative);
+    assert_eq!(plan.risk, Risk::Medium, "{:?}", plan.risk_reasons);
+    assert!(plan.risk_reasons.iter().any(|r| r.contains("could not be spelled")), "{:?}", plan.risk_reasons);
+    // The same graph with a spellable id shows the new fact.
+    let control = chain("q").schema_plan(&admin(), &rule).unwrap();
+    let c = control.consequences.as_ref().unwrap();
+    assert_eq!((c.refused, c.verdict), (0, Conservativity::NotConservative), "{c:?}");
+}
+
+#[test]
+fn plan_consequences_do_not_depend_on_the_closure_cache() {
+    let (o, ctx) = world();
+    let flip = transitive_depends_on(&o);
+    let cold = o.schema_plan(&admin(), &flip).unwrap();
+    o.reason(&admin(), &Default::default()).unwrap();
+    let warm = o.schema_plan(&admin(), &flip).unwrap();
+    assert_eq!(cold.consequences, warm.consequences);
+    // A write between two plans is seen by the second one (the cached
+    // closure of the older revision is not used).
+    o.apply(
+        &ctx,
+        vec![
+            Mutation::Upsert(EntityInput::new("task", "x1", "X1")),
+            Mutation::Upsert(EntityInput::new("task", "x2", "X2").link("depends_on", "task:x1")),
+            Mutation::Upsert(EntityInput::new("task", "x3", "X3").link("depends_on", "task:x2")),
+        ],
+    )
+    .unwrap();
+    let later = o.schema_plan(&admin(), &flip).unwrap();
+    let c = later.consequences.as_ref().unwrap();
+    assert!(c.samples_added.iter().any(|a| a.fact == fact("<task:x3>", "depends_on", "<task:x1>")), "{c:?}");
+}
+
+#[test]
+fn a_plan_stored_without_a_risk_is_assessed_not_read_as_low() {
+    use onto_core::store::{MemoryStore, Store};
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let o = Ontology::open(schema(), store.clone(), OntologyOptions::default()).unwrap();
+    let ctx = ActionContext::new(admin(), "acme");
+    seed(&o, &ctx);
+    let bot = ActionContext::new(agent(), "acme");
+    let input: ProposalInput = serde_json::from_value(json!({
+        "title": "drop operates", "changes": [{ "op": "delete_link_type", "name": "operates" }]
+    }))
+    .unwrap();
+    let filed = o.propose_schema(&bot, input).unwrap();
+    let id = filed.proposal.id.clone();
+    let reviewer = ActionContext::new(Principal::admin("lead"), "acme");
+    o.review_proposal(&reviewer, &id, Decision::Reject, "not now", None).unwrap();
+    // Cut the stored plan down to the keys plans had before risk existed.
+    let ns = onto_core::proposals::NS_PROPOSALS;
+    let mut v = store.kv_get(ns, &id).unwrap().unwrap();
+    let plan = v["plan"].as_object_mut().unwrap();
+    for k in ["risk", "risk_reasons", "consequences", "shapes", "locked_violations", "likely_renames"] {
+        plan.remove(k);
+    }
+    store.kv_put(ns, &id, &v, None).unwrap();
+    let read = o.get_proposal(&admin(), &id).unwrap();
+    assert_eq!(read.proposal.status, ProposalStatus::Rejected);
+    assert_eq!(read.proposal.plan.risk, Risk::Medium, "{:?}", read.proposal.plan.risk_reasons);
+    assert!(read.proposal.plan.risk_reasons.iter().any(|r| r.contains("delete_link_type operates")));
+    assert!(read.proposal.plan.risk_reasons.iter().any(|r| r.contains("holds no consequences")));
+    let listed = o.list_proposals(&admin(), None, 10).unwrap();
+    assert_eq!(listed[0].proposal.plan.risk, Risk::Medium);
+}
+
+#[test]
+fn deleting_a_link_type_forgets_its_glossary_words() {
+    let glossed = || {
+        let mut s = schema();
+        s.extend_toml("[glossary.relations]\nruns = \"operates\"\nrun_by = \"operated_by\"\n").unwrap();
+        Ontology::in_memory(s)
+    };
+    let drop = || set(json!({ "changes": [{ "op": "delete_link_type", "name": "operates" }] }));
+    let o = glossed();
+    let plan = o.schema_plan(&admin(), &drop()).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+    let ctx = ActionContext::new(admin(), "acme");
+    o.schema_apply(&ctx, drop()).unwrap();
+    let words = &o.schema().glossary.relations;
+    assert!(!words.contains_key("runs") && !words.contains_key("run_by"), "{words:?}");
+    assert_eq!(words.get("dependency").map(String::as_str), Some("depends_on"), "other words stay");
+    // Deleting a word explicitly in the same set still works.
+    let both = set(json!({ "changes": [
+        { "op": "delete_link_type", "name": "operates" },
+        { "op": "delete_glossary_term", "section": "relations", "word": "runs" }
+    ] }));
+    let plan = glossed().schema_plan(&admin(), &both).unwrap();
+    assert!(plan.valid, "{:?}", plan.errors);
+}

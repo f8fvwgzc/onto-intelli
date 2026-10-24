@@ -588,7 +588,14 @@ fn s_of(v: &Value) -> &str {
 
 /// "1 link type", "3 link types".
 fn n_of(n: u64, what: &str) -> String {
-    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+    if n == 1 {
+        return format!("{n} {what}");
+    }
+    // entity → entities, but key → keys.
+    match what.strip_suffix('y') {
+        Some(stem) if !stem.ends_with(['a', 'e', 'i', 'o', 'u']) => format!("{n} {stem}ies"),
+        _ => format!("{n} {what}s"),
+    }
 }
 
 fn print_draft(st: &Style, d: &Value) {
@@ -819,7 +826,9 @@ fn print_receipt(st: &Style, r: &Value) {
         "rejected" => st.red(status),
         _ => st.cyan(status),
     };
-    println!("{} {} {}", mark, r["action"].as_str().unwrap_or(""), st.dim(r["id"].as_str().unwrap_or("")));
+    let line =
+        [mark, r["action"].as_str().unwrap_or("").to_string(), r["id"].as_str().map(|i| st.dim(i)).unwrap_or_default()];
+    println!("{}", line.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" "));
     let plan = &r["plan"];
     for line in plan["preview"].as_array().into_iter().flatten() {
         println!("  • {}", line.as_str().unwrap_or(""));
@@ -1122,6 +1131,7 @@ fn failure_exit_code(command: &Command) -> i32 {
 
 #[tokio::main]
 async fn main() {
+    quiet_broken_pipe();
     let cli = Cli::parse();
     let level = if matches!(cli.command, Command::Serve { .. }) { "info" } else { "warn" };
     tracing_subscriber::fmt()
@@ -1134,6 +1144,25 @@ async fn main() {
         eprintln!("{} {e}", st.red("error:"));
         std::process::exit(failed);
     }
+}
+
+/// A reader that closes the pipe early (`onto ... | head -1`) ends the
+/// command quietly, as a SIGPIPE would, instead of a panic from `println!`.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if msg.contains("failed printing to stdout") && msg.contains("Broken pipe") {
+            // 128 + SIGPIPE, what a shell reports for a process the signal ends.
+            std::process::exit(141);
+        }
+        default(info);
+    }));
 }
 
 fn local_config(cli: &Cli) -> Result<Config> {
@@ -2678,5 +2707,13 @@ mod tests {
     fn command_line_definition_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn counts_take_english_plurals() {
+        assert_eq!(super::n_of(4, "entity"), "4 entities");
+        assert_eq!(super::n_of(1, "entity"), "1 entity");
+        assert_eq!(super::n_of(2, "key"), "2 keys");
+        assert_eq!(super::n_of(3, "property shape"), "3 property shapes");
     }
 }

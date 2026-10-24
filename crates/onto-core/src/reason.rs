@@ -35,6 +35,7 @@
 //! relations and keywords, `prop.<name>` for property predicates, compact JSON
 //! for literal values and `?name` for rule variables.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
@@ -73,9 +74,14 @@ pub const BUILTIN_RULES: &str = concat!(
 pub const SUPPLIED_PREFIX: &str = "schema/";
 
 /// Schema constructs the reasoner does not evaluate. A closure says nothing
-/// about whether the graph satisfies them.
+/// about whether the graph satisfies them. `property_types` covers every
+/// check of a property value (its type, enum `values`, `pattern` and
+/// `max_length`); `required_properties` and `state_values` (a state is one
+/// of its kind's `states`) are the per-entity checks of the schema itself.
 pub const NOT_EVALUATED: &[&str] = &[
     "cardinality",
+    "required_properties",
+    "state_values",
     "required_links",
     "link_endpoints",
     "property_types",
@@ -97,6 +103,13 @@ const BINDING_MEANS: &str = "A digest binds a certificate to bytes, not to a sta
 const MAX_REFUSALS_LISTED: usize = 20;
 /// Matches a query scans before it stops; an answer cut there says so.
 const QUERY_SCAN_CAP: usize = 100_000;
+/// Candidate facts a query's join may try before it stops; an answer cut
+/// there says so.
+pub const QUERY_WORK_CAP: usize = 10_000_000;
+/// Atoms a query may have.
+pub const MAX_QUERY_ATOMS: usize = 8;
+/// Candidate facts the rule joins of one run may try by default.
+pub const DEFAULT_MAX_WORK: usize = 50_000_000;
 /// Closures kept per ontology.
 const CACHE_SIZE: usize = 4;
 
@@ -804,6 +817,37 @@ impl Index {
 /// Receives each binding and the fact matched per atom; returns false to stop.
 type Emit<'e> = dyn FnMut(&[Option<u32>], &[u32]) -> bool + 'e;
 
+/// Join work left: every candidate fact a join tries counts one, so a join
+/// whose intermediate results explode stops instead of running unbounded.
+struct Budget {
+    left: Cell<usize>,
+    spent: Cell<bool>,
+}
+
+impl Budget {
+    fn new(n: usize) -> Self {
+        Self { left: Cell::new(n), spent: Cell::new(false) }
+    }
+
+    /// Take one unit; false (and spent from then on) when none is left.
+    fn take(&self) -> bool {
+        match self.left.get() {
+            0 => {
+                self.spent.set(true);
+                false
+            }
+            n => {
+                self.left.set(n - 1);
+                true
+            }
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.spent.get()
+    }
+}
+
 /// One join over `atoms` in `order`; the first atom ranges over fact indices
 /// `first`, the others over `rest`.
 struct Join<'a> {
@@ -812,6 +856,7 @@ struct Join<'a> {
     order: &'a [usize],
     first: (u32, u32),
     rest: (u32, u32),
+    budget: &'a Budget,
 }
 
 impl Join<'_> {
@@ -829,6 +874,9 @@ impl Join<'_> {
         };
         let (lo, hi) = if k == 0 { self.first } else { self.rest };
         let mut attempt = |idx: u32, binds: &mut [Option<u32>], matched: &mut [u32]| -> bool {
+            if !self.budget.take() {
+                return false;
+            }
             let f = self.ix.facts[idx as usize];
             let mut newly = [usize::MAX; 3];
             let mut ok = true;
@@ -891,6 +939,10 @@ pub struct ReasonOptions {
     pub capture_all: bool,
     /// At most this many instances are recorded with `capture_all`.
     pub max_instances: usize,
+    /// Stop after the rule joins tried this many candidate facts in all (the
+    /// closure is then a lower bound). Bounds the work of a run whose
+    /// intermediate matches far outnumber its conclusions.
+    pub max_work: usize,
 }
 
 impl Default for ReasonOptions {
@@ -901,6 +953,7 @@ impl Default for ReasonOptions {
             max_rounds: 10_000,
             capture_all: false,
             max_instances: 2_000_000,
+            max_work: DEFAULT_MAX_WORK,
         }
     }
 }
@@ -1079,8 +1132,26 @@ pub struct QueryAnswer {
     pub bindings: Vec<Binding>,
     /// False when the closure is a lower bound (more bindings may exist).
     pub fixpoint_reached: bool,
+    /// Why the answer may leave bindings out (a cut, a variable predicate,
+    /// refused terms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<String>,
+    /// Terms the closure left out because they cannot be spelled safely;
+    /// every fact naming one of them is missing from the answer.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Why a scan stopped early.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    None,
+    Matches,
+    Work,
 }
 
 struct Instance {
@@ -1111,11 +1182,38 @@ impl fmt::Debug for Closure {
 /// Run the reasoner over the entities `can_read` admits (and, with a
 /// workspace, only that workspace's).
 pub fn closure(schema: &Schema, g: &Graph, opts: &ReasonOptions, can_read: &dyn Fn(&Entity) -> bool) -> Closure {
+    prepare(schema, g, opts, can_read).run()
+}
+
+/// The rule table and asserted facts of one run, collected from the graph
+/// (a single pass) so the run itself can go on after the read guard is
+/// released.
+pub struct Prepared {
+    rules: Vec<RuleLine>,
+    facts: Vec<Fact>,
+    refusals: BTreeSet<Refusal>,
+    opts: ReasonOptions,
+}
+
+/// Collect what [`closure`] reads, without running the rules.
+pub fn prepare(schema: &Schema, g: &Graph, opts: &ReasonOptions, can_read: &dyn Fn(&Entity) -> bool) -> Prepared {
     let (rules, refused_rules) = rule_table(schema);
     let collected = collect(schema, g, opts.workspace.as_deref(), &rules, can_read);
     let mut refusals = collected.refusals;
     refusals.extend(refused_rules);
-    run(rules, collected.facts, refusals, opts)
+    Prepared { rules, facts: collected.facts, refusals, opts: opts.clone() }
+}
+
+impl Prepared {
+    /// Asserted facts collected.
+    pub fn asserted(&self) -> usize {
+        self.facts.len()
+    }
+
+    /// Run the rules to their fixpoint (or a limit).
+    pub fn run(self) -> Closure {
+        run(self.rules, self.facts, self.refusals, &self.opts)
+    }
 }
 
 fn run(rules: Vec<RuleLine>, asserted: Vec<Fact>, refusals: BTreeSet<Refusal>, opts: &ReasonOptions) -> Closure {
@@ -1143,6 +1241,7 @@ fn run(rules: Vec<RuleLine>, asserted: Vec<Fact>, refusals: BTreeSet<Refusal>, o
     let mut truncated = None;
     let mut rounds = 0;
     let mut delta = (0u32, asserted_n);
+    let budget = Budget::new(opts.max_work);
     while delta.0 < delta.1 {
         if rounds >= opts.max_rounds {
             truncated = Some(format!("stopped after max_rounds = {}", opts.max_rounds));
@@ -1150,14 +1249,27 @@ fn run(rules: Vec<RuleLine>, asserted: Vec<Fact>, refusals: BTreeSet<Refusal>, o
         }
         rounds += 1;
         let end = delta.1;
+        // One fresh fact past the room left shows the cap is reached, so a
+        // round stops there instead of building every conclusion first.
+        let room = opts.max_derived.saturating_sub(derivs.len());
         let mut fresh: Vec<(Triple, u16, Vec<u32>)> = Vec::new();
         let mut fresh_set: HashSet<Triple> = HashSet::new();
-        for (ri, rule) in crules.iter().enumerate() {
+        'rules: for (ri, rule) in crules.iter().enumerate() {
             let ri = ri as u16;
             let mut binds = vec![None; rule.vars.len()];
             let mut matched = vec![0u32; rule.body.len()];
             for plan in &rule.plans {
-                let join = Join { ix: &ix, atoms: &rule.body, order: plan, first: (delta.0, end), rest: (0, end) };
+                if fresh.len() > room || budget.spent() {
+                    break 'rules;
+                }
+                let join = Join {
+                    ix: &ix,
+                    atoms: &rule.body,
+                    order: plan,
+                    first: (delta.0, end),
+                    rest: (0, end),
+                    budget: &budget,
+                };
                 join.run(0, &mut binds, &mut matched, &mut |b, m| {
                     let c = instantiate(&rule.head, b);
                     let known = ix.set.get(&c).copied();
@@ -1175,16 +1287,19 @@ fn run(rules: Vec<RuleLine>, asserted: Vec<Fact>, refusals: BTreeSet<Refusal>, o
                     if known.is_none() && fresh_set.insert(c) {
                         fresh.push((c, ri, m.to_vec()));
                     }
-                    true
+                    fresh.len() <= room
                 });
             }
+        }
+        if budget.spent() {
+            truncated =
+                Some(format!("stopped after max_work = {} candidate facts tried by the rule joins", opts.max_work));
         }
         if fresh.is_empty() {
             break;
         }
         let text = |t: &Triple| [&terms.terms[t[0] as usize], &terms.terms[t[1] as usize], &terms.terms[t[2] as usize]];
         fresh.sort_by(|a, b| text(&a.0).cmp(&text(&b.0)));
-        let room = opts.max_derived.saturating_sub(derivs.len());
         if fresh.len() > room {
             fresh.truncate(room);
             truncated = Some(format!("stopped at max_derived = {}", opts.max_derived));
@@ -1327,9 +1442,39 @@ impl Closure {
     /// [`Closure::query`] with the closure's flags, refusing atoms that read
     /// facts the closure does not hold: `state` and `prop.<name>` facts are
     /// collected only when some rule reads them, so such an atom would answer
-    /// "nothing matches" for values the store has.
+    /// "nothing matches" for values the store has. An atom with a variable
+    /// predicate reads those facts too; it is answered, with a note naming
+    /// what the closure leaves out. Refused terms are counted and noted.
     pub fn query_answer(&self, atoms: &[AtomPattern], limit: usize) -> Result<QueryAnswer> {
+        if atoms.len() > MAX_QUERY_ATOMS {
+            return Err(Error::invalid(format!(
+                "a query has at most {MAX_QUERY_ATOMS} atoms (this one has {})",
+                atoms.len()
+            )));
+        }
         let need = needs(&self.rules);
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(i) = atoms.iter().position(|a| is_var(&a.p)) {
+            let state = if need.state { "state facts are held" } else { "state facts are not held" };
+            let props = if need.props.is_empty() {
+                "no property facts are held".to_string()
+            } else {
+                format!(
+                    "property facts are held only for {}",
+                    need.props.iter().map(|p| format!("prop.{p}")).collect::<Vec<_>>().join(", ")
+                )
+            };
+            notes.push(format!(
+                "atom {i} has a variable predicate: the closure holds state and property facts only when a rule reads \
+                 them ({state}; {props}), so bindings for the rest are left out; read property values from the store"
+            ));
+        }
+        if self.stats.refused > 0 {
+            notes.push(format!(
+                "{} term(s) could not be spelled and are left out of the closure, with every fact naming them",
+                self.stats.refused
+            ));
+        }
         for (i, a) in atoms.iter().enumerate() {
             let held = match a.p.as_str() {
                 "state" => need.state,
@@ -1343,20 +1488,28 @@ impl Closure {
             }
         }
         let (bindings, cut) = self.scan(atoms, limit);
-        let mut truncated = self.stats.truncated.clone();
-        if cut {
-            let note =
-                format!("query stopped after {QUERY_SCAN_CAP} matches; bindings are the smallest of those scanned");
-            truncated = Some(match truncated {
-                Some(t) => format!("{t}; {note}"),
-                None => note,
-            });
+        match cut {
+            Cut::None => {}
+            Cut::Matches => notes.push(format!(
+                "query stopped after {QUERY_SCAN_CAP} matches; bindings are the smallest of those scanned"
+            )),
+            Cut::Work => notes.push(format!(
+                "query stopped after its join tried {QUERY_WORK_CAP} candidate facts; bindings are the smallest of \
+                 those found (put the most selective atom first, or bind more terms)"
+            )),
         }
-        Ok(QueryAnswer { bindings, fixpoint_reached: self.stats.fixpoint_reached, truncated })
+        let truncated = self.stats.truncated.iter().cloned().chain(notes).reduce(|a, b| format!("{a}; {b}"));
+        Ok(QueryAnswer {
+            bindings,
+            fixpoint_reached: self.stats.fixpoint_reached,
+            truncated,
+            refused: self.stats.refused,
+        })
     }
 
-    /// The `limit` smallest bindings, and whether the scan hit its cap.
-    fn scan(&self, atoms: &[AtomPattern], limit: usize) -> (Vec<Binding>, bool) {
+    /// The `limit` smallest bindings, and whether (and why) the scan stopped
+    /// early.
+    fn scan(&self, atoms: &[AtomPattern], limit: usize) -> (Vec<Binding>, Cut) {
         let mut vars = Vec::new();
         let mut body = Vec::with_capacity(atoms.len());
         for a in atoms {
@@ -1365,24 +1518,25 @@ impl Closure {
             match compile_terms(&triple, &mut vars, &mut lookup) {
                 Some(t) => body.push(t),
                 // A constant the closure never mentions matches nothing.
-                None => return (Vec::new(), false),
+                None => return (Vec::new(), Cut::None),
             }
         }
         if body.is_empty() || limit == 0 {
-            return (Vec::new(), false);
+            return (Vec::new(), Cut::None);
         }
         let order = plan_order(&body, None, vars.len());
         let all = self.ix.facts.len() as u32;
-        let join = Join { ix: &self.ix, atoms: &body, order: &order, first: (0, all), rest: (0, all) };
+        let budget = Budget::new(QUERY_WORK_CAP);
+        let join = Join { ix: &self.ix, atoms: &body, order: &order, first: (0, all), rest: (0, all), budget: &budget };
         // Keep only the `limit` smallest, so the answer does not depend on
         // the join order.
         let mut found: BTreeSet<Binding> = BTreeSet::new();
-        let (mut scanned, mut cut) = (0usize, false);
+        let (mut scanned, mut cut) = (0usize, Cut::None);
         let mut binds = vec![None; vars.len()];
         let mut matched = vec![0u32; body.len()];
         join.run(0, &mut binds, &mut matched, &mut |b, _| {
             if scanned == QUERY_SCAN_CAP {
-                cut = true;
+                cut = Cut::Matches;
                 return false;
             }
             scanned += 1;
@@ -1397,6 +1551,9 @@ impl Closure {
             }
             true
         });
+        if budget.spent() {
+            cut = Cut::Work;
+        }
         (found.into_iter().collect(), cut)
     }
 
@@ -1560,9 +1717,16 @@ impl ClosureCache {
         Some(c)
     }
 
+    /// Keep `c` under `key`. Entries of an older graph revision or schema
+    /// version can no longer be asked for, so they are dropped rather than
+    /// left to hold memory until evicted; a closure older than an entry
+    /// already kept is not stored.
     fn put(&self, key: CacheKey, c: Arc<Closure>) {
         let mut e = self.entries.lock();
-        e.retain(|(k, _)| k != &key);
+        if e.iter().any(|(k, _)| k.revision > key.revision || k.schema_version > key.schema_version) {
+            return;
+        }
+        e.retain(|(k, _)| k != &key && k.revision == key.revision && k.schema_version == key.schema_version);
         e.push_back((key, c));
         while e.len() > CACHE_SIZE {
             e.pop_front();
@@ -1571,7 +1735,9 @@ impl ClosureCache {
 }
 
 impl Ontology {
-    fn reason_at(&self, p: &Principal, opts: &ReasonOptions) -> Result<(Arc<Closure>, u64, u64)> {
+    /// The closure for `p`, with the graph revision and schema version it
+    /// was computed at.
+    pub(crate) fn reason_at(&self, p: &Principal, opts: &ReasonOptions) -> Result<(Arc<Closure>, u64, u64)> {
         if let Some(ws) = &opts.workspace
             && !p.in_workspace(ws)
         {
@@ -1590,10 +1756,55 @@ impl Ontology {
         if let Some(c) = self.reason_cache().get(&key) {
             return Ok((c, revision, active.version));
         }
-        let can = |e: &Entity| policy::visible(p, e, &g);
-        let c = Arc::new(closure(&active.schema, &g, opts, &can));
+        // Collect under the read guard, run the rules without it: a long run
+        // must not hold writers (and, the lock being fair, readers) back.
+        let prepared = {
+            let can = |e: &Entity| policy::visible(p, e, &g);
+            prepare(&active.schema, &g, opts, &can)
+        };
+        drop(g);
+        let c = Arc::new(prepared.run());
         self.reason_cache().put(key, c.clone());
         Ok((c, revision, active.version))
+    }
+
+    /// The cached closure of the active schema for `p` at `revision` and
+    /// `schema_version`, if one is kept.
+    pub(crate) fn cached_closure(
+        &self,
+        p: &Principal,
+        opts: &ReasonOptions,
+        revision: u64,
+        schema_version: u64,
+    ) -> Option<Arc<Closure>> {
+        let key = CacheKey {
+            revision,
+            schema_version,
+            principal: p.scope_key(),
+            entity: p.entity.clone(),
+            opts: opts.clone(),
+        };
+        self.reason_cache().get(&key)
+    }
+
+    /// Keep a closure of the active schema for `p`, computed from facts
+    /// collected at `revision` and `schema_version`.
+    pub(crate) fn keep_closure(
+        &self,
+        p: &Principal,
+        opts: &ReasonOptions,
+        revision: u64,
+        schema_version: u64,
+        c: Arc<Closure>,
+    ) {
+        let key = CacheKey {
+            revision,
+            schema_version,
+            principal: p.scope_key(),
+            entity: p.entity.clone(),
+            opts: opts.clone(),
+        };
+        self.reason_cache().put(key, c);
     }
 
     /// The closure of what `p` may read (cached for the last few scopes).
@@ -1979,5 +2190,80 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("rule b: when[0]: unknown class nope"), "{err}");
+    }
+
+    fn chain(n: usize) -> Graph {
+        let mut g = Graph::default();
+        for i in 0..n {
+            g.put_entity(entity(&format!("node:{i:02}"), "acme"));
+        }
+        for i in 0..n - 1 {
+            g.put_link(link(&format!("node:{i:02}"), "next", &format!("node:{:02}", i + 1)));
+        }
+        g
+    }
+
+    #[test]
+    fn max_derived_stops_inside_a_round() {
+        // Round one of a 20-node chain concludes 18 facts; with room for 3
+        // the join stops at the fourth instead of building all 18.
+        let (s, g) = (schema(), chain(20));
+        let opts = ReasonOptions { max_derived: 3, capture_all: true, ..Default::default() };
+        let cut = closure(&s, &g, &opts, &all);
+        assert_eq!(cut.derived().len(), 3);
+        assert!(!cut.fixpoint_reached());
+        let st = cut.stats();
+        assert!(st.truncated.as_deref().unwrap().contains("max_derived"));
+        assert!(st.instances.unwrap() <= 4, "{st:?}");
+        // Still deterministic, and every premise is earlier.
+        assert_eq!(closure(&s, &g, &opts, &all).derived(), cut.derived());
+        for d in cut.derived() {
+            for p in &d.premises {
+                assert!(cut.asserted().contains(p) || cut.derived().iter().any(|e| &e.conclusion == p));
+            }
+        }
+    }
+
+    #[test]
+    fn join_work_bounds_a_run() {
+        let (s, g) = (schema(), chain(30));
+        let full = closure(&s, &g, &ReasonOptions::default(), &all);
+        assert!(full.fixpoint_reached());
+        let cut = closure(&s, &g, &ReasonOptions { max_work: 500, ..Default::default() }, &all);
+        assert!(!cut.fixpoint_reached());
+        assert!(cut.stats().truncated.unwrap().contains("max_work = 500"));
+        assert!(cut.derived().len() < full.derived().len());
+        assert!(cut.certificate(Attested::default()).unwrap().manifest_json.contains("\"fixpoint_reached\": false"));
+    }
+
+    #[test]
+    fn query_join_work_is_bounded() {
+        // Four unconnected class atoms joined before the selective one:
+        // n^4 candidates while only one binding matches.
+        let s = schema();
+        let mut g = chain(2);
+        for i in 0..60 {
+            g.put_entity(entity(&format!("special:{i:02}"), "acme"));
+        }
+        let c = closure(&s, &g, &ReasonOptions::default(), &all);
+        let atom = |a: &str, b: &str, c: &str| AtomPattern { s: a.into(), p: b.into(), o: c.into() };
+        let pattern = [
+            atom("?a", "a", "#node"),
+            atom("?b", "a", "#node"),
+            atom("?c", "a", "#node"),
+            atom("?d", "a", "#node"),
+            atom("?a", "next", "?d"),
+        ];
+        let answer = c.query_answer(&pattern, 1).unwrap();
+        let note = answer.truncated.unwrap_or_default();
+        assert!(note.contains(&format!("tried {QUERY_WORK_CAP} candidate facts")), "{note}");
+        // A selective atom first answers at once.
+        let quick = [pattern[4].clone(), pattern[0].clone(), pattern[3].clone()];
+        let answer = c.query_answer(&quick, 5).unwrap();
+        assert_eq!(answer.bindings.len(), 1);
+        assert!(answer.truncated.is_none(), "{answer:?}");
+        let many = vec![atom("?a", "a", "#node"); MAX_QUERY_ATOMS + 1];
+        let err = c.query_answer(&many, 1).unwrap_err().to_string();
+        assert!(err.contains(&format!("at most {MAX_QUERY_ATOMS} atoms")), "{err}");
     }
 }

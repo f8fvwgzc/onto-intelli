@@ -782,3 +782,62 @@ fn pg_live_put_shape_then_validate() {
     assert!(o.schema().shapes.contains_key("issue_shape"));
     conforms(&o.shapes_validate(&admin(), &ShapesQuery::default()).unwrap());
 }
+
+#[test]
+fn draft_paths_and_drafts_are_bounded() {
+    let (o, _) = world();
+    let long = ["assigned_to.^assigned_to"; 9].join(".");
+    let r = run(
+        &o,
+        json!({ "d": { "target": "issue", "properties": [{ "id": "d/long", "path": long, "min_count": 0 }] } }),
+    );
+    assert_eq!(r.verdict, ShapeVerdict::Undetermined, "{r:?}");
+    assert!(r.skipped.iter().any(|s| s.key == "path" && s.reason.contains("more than 16")), "{:?}", r.skipped);
+    let check = o
+        .shapes_check(&drafts(json!({ "d": { "target": "issue", "properties": [{ "path": long, "min_count": 0 }] } })));
+    assert!(check.issues.iter().any(|i| i.issue == ShapeIssueKind::TooLarge), "{check:?}");
+    // 16 steps still walk.
+    let ok = ["assigned_to.^assigned_to"; 8].join(".");
+    let r = run(&o, json!({ "d": { "target": "issue", "properties": [{ "path": ok, "min_count": 1 }] } }));
+    assert_eq!(r.verdict, ShapeVerdict::Conforms, "{r:?}");
+    // Too many drafts are refused before anything runs.
+    let many: serde_json::Map<String, Value> =
+        (0..=shapes::MAX_DRAFTS).map(|i| (format!("d{i}"), json!({ "target": "issue" }))).collect();
+    let q = ShapesQuery { drafts: drafts(Value::Object(many)), ..Default::default() };
+    let err = o.shapes_validate(&admin(), &q).unwrap_err().to_string();
+    assert!(err.contains("at most 64 draft shapes"), "{err}");
+}
+
+#[test]
+fn caller_patterns_are_bounded() {
+    let (o, _) = world();
+    // Compiles to megabytes of NFA from 30 bytes: refused, not cached.
+    let check = |pattern: String| {
+        o.shapes_check(&drafts(
+            json!({ "s": { "target": "issue", "properties": [{ "path": "title", "pattern": pattern }] } }),
+        ))
+    };
+    let huge = check("(?:[a-z0-9]{1000}){200}q".into());
+    assert!(huge.issues.iter().any(|i| i.issue == ShapeIssueKind::BadPattern), "{huge:?}");
+    let long = check("a".repeat(onto_core::schema::MAX_PATTERN_LEN + 1));
+    assert!(long.issues.iter().any(|i| i.issue == ShapeIssueKind::BadPattern && i.detail.contains("longer than")));
+    assert!(check("^[A-Z][a-z ]+$".into()).ok);
+}
+
+#[test]
+fn inferred_validation_sees_writes_after_a_cached_closure() {
+    let (o, ctx) = world();
+    let shape =
+        json!({ "on_call_email": { "target": "on_call", "properties": [{ "path": "prop.email", "min_count": 1 }] } });
+    let before = o.shapes_validate(&admin(), &query(shape.clone(), true)).unwrap();
+    assert_eq!(before.focus_nodes, 1, "{before:?}");
+    o.reason(&admin(), &ReasonOptions::default()).unwrap();
+    // Mia gets urgent work: she is on call now, without an email.
+    o.apply(
+        &ctx,
+        vec![Mutation::Upsert(EntityInput::new("issue", "3", "Slow").state("triaged").prop("priority", "high"))],
+    )
+    .unwrap();
+    let after = o.shapes_validate(&admin(), &query(shape, true)).unwrap();
+    assert_eq!(after.focus_nodes, 2, "{after:?}");
+}

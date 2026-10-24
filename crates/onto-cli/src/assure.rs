@@ -237,6 +237,11 @@ pub(crate) struct InduceArgs {
     /// With --ingest: validate the rows without writing.
     #[arg(long, requires = "ingest")]
     dry_run: bool,
+    /// With --ingest: a mapping file (JSON: {kind, key, title?, state?,
+    /// properties: {column: property}, links: {column: {rel, target_kind}}})
+    /// saying where each column goes, instead of matching columns by name.
+    #[arg(long, value_name = "FILE", requires = "ingest")]
+    mapping: Option<PathBuf>,
     /// Write the induced change set (JSON) to this file, for `onto schema plan|apply`.
     #[arg(long, value_name = "FILE", conflicts_with = "ingest")]
     change_set: Option<PathBuf>,
@@ -748,8 +753,25 @@ fn certify(st: &Style, r: &Value, out: Option<&Path>, as_json: bool) -> Result<(
     };
     let engine = &r["check"];
     let agree = engine["ok"] == local.0["ok"] && engine["verdict"] == local.0["verdict"];
+    // The checker does not read attested fields: whether the closure reached
+    // its fixpoint is the engine's claim, shown next to the verdict.
+    let attested = files
+        .manifest
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<Value>(m).ok())
+        .map(|m| m["attested"].clone())
+        .unwrap_or_default();
+    let partial = r["fixpoint_reached"] == false || attested["fixpoint_reached"] == false;
     if as_json {
-        let mut v = json!({ "check": local.0, "engine_check": engine, "checks_agree": agree });
+        let mut v = json!({
+            "check": local.0,
+            "engine_check": engine,
+            "checks_agree": agree,
+            "fixpoint_reached": !partial,
+        });
+        if let Some(t) = r["truncated"].as_str() {
+            v["truncated"] = json!(t);
+        }
         match out {
             Some(dir) => v["out"] = json!(dir.display().to_string()),
             None => v["certificate"] = r["certificate"].clone(),
@@ -785,6 +807,16 @@ fn certify(st: &Style, r: &Value, out: Option<&Path>, as_json: bool) -> Result<(
         }
         if let Some(m) = rep["means"].as_str() {
             println!("{}", st.dim(&format!("means: {m}")));
+        }
+        if partial {
+            let why = r["truncated"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("after {} rounds", attested["rounds"]));
+            println!(
+                "{} closure is a lower bound (stopped: {why}): the derivations check, but more may follow",
+                st.red("note:")
+            );
         }
         if let Some(dir) = out {
             println!("wrote {} (check again with `onto cert check {0}` or `onto-cert check {0}`)", dir.display());
@@ -1335,7 +1367,7 @@ fn print_pack(st: &Style, r: &Value) {
         let c = if lint["counts"].is_object() { &lint["counts"] } else { lint };
         println!(
             "\n{} {} errors, {} warnings, {} info {}",
-            st.bold("Lint (layered on the current schema):"),
+            st.bold("Lint (the pack's own findings):"),
             c["error"],
             c["warning"],
             c["info"],
@@ -1472,9 +1504,19 @@ pub(crate) async fn induce(cli: &Cli, st: &Style, a: &InduceArgs) -> Result<()> 
     let file = a.file.file_name().map(|f| f.to_string_lossy().to_string());
     let be = backend(cli).await?;
     if a.ingest {
+        let mapping = match &a.mapping {
+            Some(path) => {
+                let text =
+                    std::fs::read_to_string(path).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+                let v: Value = serde_json::from_str(&text)
+                    .map_err(|e| Error::invalid(format!("{}: not JSON: {e}", path.display())))?;
+                Some(v)
+            }
+            None => None,
+        };
         let input = json!({
             "csv": csv, "kind": a.kind, "key": a.key, "file": file,
-            "workspace": cli.workspace, "dry_run": a.dry_run,
+            "workspace": cli.workspace, "dry_run": a.dry_run, "mapping": mapping,
         });
         let r = be.call("ingest.sheet", compact(input)).await?;
         if a.json {
@@ -1595,15 +1637,26 @@ pub(crate) fn print_semantics(st: &Style, plan: &Value) {
                 }
                 other => st.cyan(other),
             };
+            // Added facts are asserted (a new `extends`, a link type made
+            // transitive) or derived; only the latter are the reasoner's.
+            let added = c["added"].as_u64().unwrap_or(0);
+            let asserted = c["by_rule"]["asserted"].as_u64().unwrap_or(0).min(added);
+            let added_words = match (asserted, added - asserted) {
+                (0, d) => format!("+{d} derived"),
+                (a, 0) => format!("+{a} asserted"),
+                (a, d) => format!("+{added} added ({a} asserted, {d} derived)"),
+            };
+            let mut notes = String::new();
+            if c["fixpoint_reached"] == false {
+                notes.push_str(" (a run stopped before its fixpoint)");
+            }
+            if let Some(n) = c["refused"].as_u64().filter(|n| *n > 0) {
+                notes.push_str(&format!(" ({n} refused term(s): their facts are left out)"));
+            }
             println!(
-                "  consequences: +{} derived, -{} removed · {word}{}",
-                c["added"],
+                "  consequences: {added_words}, -{} removed · {word}{}",
                 c["removed"],
-                if c["fixpoint_reached"] == false {
-                    st.dim(" (a run stopped before its fixpoint)")
-                } else {
-                    String::new()
-                }
+                if notes.is_empty() { notes } else { st.dim(&notes) }
             );
             if let Some(by) = c["by_rule"].as_object().filter(|m| !m.is_empty()) {
                 let parts: Vec<String> = by.iter().map(|(r, n)| format!("{r} {n}")).collect();

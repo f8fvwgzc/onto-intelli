@@ -71,6 +71,17 @@ pub const RUN_MEANS: &str = "Derived facts are the engine's opinion under the ru
 
 /// Sample derivations listed by `reason.run` unless the input says otherwise.
 const RUN_SAMPLES: usize = 20;
+/// Derivations `reason.run` lists at most.
+const MAX_RUN_SAMPLES: usize = 1000;
+/// Bindings `reason.query` returns at most.
+const MAX_QUERY_LIMIT: usize = 1000;
+/// Lost facts `reason.slice_check` lists at most.
+const MAX_SLICE_LIMIT: usize = 1000;
+/// Justifications `reason.explain` searches for at most.
+const MAX_JUSTIFICATIONS: usize = 100;
+/// What a certificate of a closure that stopped at a limit means.
+const CERTIFY_PARTIAL: &str = "the closure stopped at a limit before its fixpoint: every listed derivation still \
+     checks, but they are a lower bound of what the rules derive";
 /// Bindings returned by `reason.query` unless the input says otherwise.
 const QUERY_LIMIT: usize = 50;
 /// New lint findings `pack.show` lists.
@@ -295,24 +306,54 @@ fn check_files(rules: &str, asserted: &str, derivations: &str, manifest: Option<
     onto_cert::check(&files).to_json()
 }
 
-/// The lint findings a pack adds when layered on `current` (schema checks
-/// only: the graph is not consulted).
+/// The lint findings a pack brings (schema checks only: the graph is not
+/// consulted): those of the pack on the packages it requires that those
+/// packages alone do not have, so the counts are the pack's own whatever is
+/// installed; plus how many findings are new when it is layered on
+/// `current` (none once it is installed).
 fn pack_lint(current: &onto_core::Schema, id: &str) -> Value {
-    let layered = match packs::with_pack(current, id) {
-        Ok(s) => s,
-        Err(e) => return json!({ "skipped": e.to_string(), "means": lint::MEANS }),
-    };
     let all = |_: &Entity| true;
-    let before: BTreeSet<String> = lint::lint(current, None, &all).findings.into_iter().map(|f| f.id).collect();
-    let after = lint::lint(&layered, None, &all);
-    let new: Vec<_> = after.findings.iter().filter(|f| !before.contains(&f.id)).collect();
+    let ids = |s: &onto_core::Schema| -> BTreeSet<String> {
+        lint::lint(s, None, &all).findings.into_iter().map(|f| f.id).collect()
+    };
+    let requires = || -> Result<onto_core::Schema> {
+        let mut s = onto_core::Schema::empty();
+        for r in &packs::find(id)?.meta.requires {
+            s.extend_toml(onto_core::schema::builtin_package(r)?)?;
+        }
+        Ok(s)
+    };
+    let (own, base) = match (packs::standalone(id), requires()) {
+        (Ok(own), Ok(base)) => (own, base),
+        (Err(e), _) | (_, Err(e)) => return json!({ "skipped": e.to_string(), "means": lint::MEANS }),
+    };
+    let base_ids = ids(&base);
+    let report = lint::lint(&own, None, &all);
+    let mine: Vec<_> = report.findings.iter().filter(|f| !base_ids.contains(&f.id)).collect();
+    let mut counts = lint::LintCounts::default();
+    for f in &mine {
+        match f.severity {
+            lint::Severity::Error => counts.error += 1,
+            lint::Severity::Warning => counts.warning += 1,
+            lint::Severity::Info => counts.info += 1,
+        }
+    }
+    let new_on_current = match packs::with_pack(current, id) {
+        Ok(layered) => {
+            let before = ids(current);
+            json!(ids(&layered).difference(&before).count())
+        }
+        Err(e) => json!({ "skipped": e.to_string() }),
+    };
     json!({
-        "counts": after.counts,
-        "new_findings": new.len(),
-        "findings": new.into_iter().take(PACK_LINT_SAMPLES).collect::<Vec<_>>(),
-        "checks_run": after.checks_run,
-        "means": format!("{} Schema checks of the pack layered on the current schema; findings already present \
-                          without the pack are not listed.", lint::MEANS),
+        "counts": counts,
+        "new_findings": mine.len(),
+        "findings": mine.into_iter().take(PACK_LINT_SAMPLES).collect::<Vec<_>>(),
+        "new_on_current": new_on_current,
+        "checks_run": report.checks_run,
+        "means": format!("{} Schema checks of the pack on the packages it requires; findings those packages have \
+                          without the pack are not counted. new_on_current counts the findings layering the pack \
+                          on the current schema adds (none once it is installed).", lint::MEANS),
     })
 }
 
@@ -322,15 +363,17 @@ pub fn graph_read(onto: &Ontology, p: &Principal, action: &str, input: Value) ->
         "reason.run" => {
             let i: RunIn = parse(action, input)?;
             let mut opts = scope(i.workspace);
+            // A caller may lower the engine's bound, never raise it (and a
+            // bound at the default shares the cached closure).
             if let Some(m) = i.max_derived.filter(|m| *m > 0) {
-                opts.max_derived = m;
+                opts.max_derived = m.min(opts.max_derived);
             }
             let c = onto.reason(p, &opts)?;
             let mut v = to_json(&c.stats())?;
             let samples: Vec<Value> = c
                 .derived()
                 .iter()
-                .take(i.samples.unwrap_or(RUN_SAMPLES))
+                .take(i.samples.unwrap_or(RUN_SAMPLES).min(MAX_RUN_SAMPLES))
                 .map(|d| json!({ "fact": d.conclusion, "rule": d.rule, "premises": d.premises }))
                 .collect();
             v["samples"] = Value::Array(samples);
@@ -342,14 +385,15 @@ pub fn graph_read(onto: &Ontology, p: &Principal, action: &str, input: Value) ->
             if i.pattern.is_empty() {
                 return Err(Error::invalid("reason.query: pattern needs at least one [s, p, o] atom"));
             }
-            to_json(&onto.reason_query(p, &scope(i.workspace), &i.pattern, i.limit.unwrap_or(QUERY_LIMIT))?)
+            let limit = i.limit.unwrap_or(QUERY_LIMIT).min(MAX_QUERY_LIMIT);
+            to_json(&onto.reason_query(p, &scope(i.workspace), &i.pattern, limit)?)
         }
         "reason.explain" => {
             let i: ExplainIn = parse(action, input)?;
             let claim = claim_of(i.fact)?;
             let mut bounds = JustifyOptions::default();
             if let Some(m) = i.max.filter(|m| *m > 0) {
-                bounds.max_justifications = m;
+                bounds.max_justifications = m.min(MAX_JUSTIFICATIONS);
             }
             to_json(&onto.reason_explain(p, &scope(i.workspace), &claim, &bounds)?)
         }
@@ -361,10 +405,26 @@ pub fn graph_read(onto: &Ontology, p: &Principal, action: &str, input: Value) ->
         }
         "reason.certify" => {
             let i: ScopeIn = parse(action, input)?;
-            let cert = onto.reason_certificate(p, &scope(i.workspace))?;
+            let opts = scope(i.workspace);
+            let cert = onto.reason_certificate(p, &opts)?;
             let check =
                 check_files(&cert.rules_tsv, &cert.asserted_tsv, &cert.derivations_tsv, Some(&cert.manifest_json));
-            Ok(json!({ "certificate": cert, "check": check }))
+            // The checker does not read attested fields (by design); the
+            // closure's own flag is carried next to its verdict instead.
+            let stats = onto.reason_stats(p, &opts)?;
+            let mut v = json!({
+                "certificate": cert,
+                "check": check,
+                "fixpoint_reached": stats.fixpoint_reached,
+                "rounds": stats.rounds,
+            });
+            if let Some(t) = stats.truncated {
+                v["truncated"] = json!(t);
+            }
+            if !stats.fixpoint_reached {
+                v["means"] = json!(CERTIFY_PARTIAL);
+            }
+            Ok(v)
         }
         "reason.binding" => {
             let i: BindingIn = parse(action, input)?;
@@ -378,7 +438,7 @@ pub fn graph_read(onto: &Ontology, p: &Principal, action: &str, input: Value) ->
             let i: SliceIn = parse(action, input)?;
             let mut opts = SliceOptions { reason: scope(i.workspace), ..SliceOptions::default() };
             if let Some(l) = i.limit.filter(|l| *l > 0) {
-                opts.limit = l;
+                opts.limit = l.min(MAX_SLICE_LIMIT);
             }
             let slice: BTreeSet<String> = i.entities.into_iter().map(|id| onto.resolve_id(&id)).collect();
             let goals = i.goals.filter(|g| !g.is_empty());

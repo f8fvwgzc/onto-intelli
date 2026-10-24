@@ -464,7 +464,7 @@ fn shapes_are_live_editable() {
     assert!(plan.valid, "{:?}", plan.errors);
     assert!(!plan.breaking);
     assert_eq!(plan.changes[0].op, "put_shape");
-    assert!(plan.changes[0].summary.contains("add shape issue_has_project (on issue, 1 property shapes)"));
+    assert!(plan.changes[0].summary.contains("add shape issue_has_project (on issue, 1 property shape)"));
     assert!(plan.diff.entries.iter().any(|e| e.section == "shapes" && e.change == DiffKind::Added));
     let v2 = o.schema_apply(&ctx, put).unwrap();
     assert_eq!(v2.version.version, 2);
@@ -651,4 +651,76 @@ fn horn_rules_are_validated_when_put_live() {
     assert_eq!(derived_by(&c, &f("<issue:1>", "watched_by", "<team:payments>")), "schema/watched");
     // The per-entity walk keeps working and skips Horn rules.
     assert!(o.infer(&admin(), "issue:1").unwrap().iter().all(|i| i.rule != "watched"));
+}
+
+#[test]
+fn a_variable_predicate_says_what_the_closure_leaves_out() {
+    // No rule reads state or properties: the closure holds neither, and a
+    // ?p query answers without them, saying so.
+    let o = Ontology::in_memory(Schema::enterprise());
+    let ctx = ActionContext::new(admin(), "acme");
+    o.apply(&ctx, vec![Mutation::Upsert(EntityInput::new("task", "p", "Plan").state("todo").prop("priority", "high"))])
+        .unwrap();
+    let opts = ReasonOptions::default();
+    let answer = o.reason_query(&admin(), &opts, &[vec![json!("task:p"), json!("?p"), json!("?o")]], 50).unwrap();
+    assert!(answer.bindings.iter().all(|b| b["p"] == "a"), "{answer:?}");
+    let note = answer.truncated.expect("a variable predicate is noted");
+    assert!(note.contains("variable predicate") && note.contains("state facts are not held"), "{note}");
+    assert!(note.contains("no property facts are held"), "{note}");
+    // Spelled out, the same read is refused.
+    let err = o.reason_query(&admin(), &opts, &[vec![json!("task:p"), json!("state"), json!("?s")]], 50).unwrap_err();
+    assert!(err.to_string().contains("holds no state facts"), "{err}");
+    // With a rule reading state, state facts are held and the note says so.
+    let (w, _) = world();
+    let answer = w.reason_query(&admin(), &acme(), &[vec![json!("issue:1"), json!("?p"), json!("?o")]], 50).unwrap();
+    assert!(answer.bindings.iter().any(|b| b["p"] == "state"), "{answer:?}");
+    let note = answer.truncated.unwrap();
+    assert!(note.contains("state facts are held") && note.contains("prop.priority"), "{note}");
+}
+
+#[test]
+fn a_query_counts_refused_terms() {
+    // `>` cannot be spelled in an entity term: the entity and its links
+    // are left out of the closure, and the answer says so.
+    let o = Ontology::in_memory(Schema::enterprise());
+    let ctx = ActionContext::new(admin(), "acme");
+    o.apply(
+        &ctx,
+        vec![
+            Mutation::Upsert(EntityInput::new("task", "s", "S")),
+            Mutation::Upsert(EntityInput::new("task", "q>r", "Q").link("depends_on", "task:s")),
+            Mutation::Upsert(EntityInput::new("task", "p", "P").link("depends_on", "task:q>r")),
+        ],
+    )
+    .unwrap();
+    let answer = o
+        .reason_query(&admin(), &ReasonOptions::default(), &[vec![json!("?x"), json!("depends_on"), json!("?y")]], 50)
+        .unwrap();
+    assert!(answer.bindings.is_empty());
+    assert_eq!(answer.refused, 1, "{answer:?}");
+    assert!(answer.truncated.unwrap().contains("could not be spelled"));
+    let clean = world().0.reason_query(&admin(), &acme(), &[vec![json!("?x"), json!("a"), json!("team")]], 5).unwrap();
+    assert_eq!(clean.refused, 0);
+    assert!(clean.truncated.is_none(), "{clean:?}");
+}
+
+#[test]
+fn stale_closures_leave_the_cache() {
+    let (o, ctx) = world();
+    let old = o.reason(&admin(), &acme()).unwrap();
+    assert_eq!(Arc::strong_count(&old), 2, "cached");
+    o.apply(&ctx, vec![Mutation::Upsert(EntityInput::new("team", "zz", "Late team"))]).unwrap();
+    let new = o.reason(&admin(), &acme()).unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    assert_eq!(Arc::strong_count(&old), 1, "a closure of an older revision is not kept");
+    assert_eq!(Arc::strong_count(&new), 2);
+}
+
+#[test]
+fn not_evaluated_names_the_per_entity_checks() {
+    let (o, _) = world();
+    let st = o.reason_stats(&admin(), &acme()).unwrap();
+    for c in ["required_properties", "state_values", "property_types"] {
+        assert!(st.not_evaluated.iter().any(|n| n == c), "{c}: {:?}", st.not_evaluated);
+    }
 }

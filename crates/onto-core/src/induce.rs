@@ -1455,6 +1455,17 @@ pub fn mapping_onto(schema: &Schema, ind: &Induced, kind: &str) -> Result<SheetM
         induced.into_iter().cloned().chain([snake(column)]).find(|p| schema.prop_def(kind, p).is_some())
     };
     let admits = |kinds: &[String], k: &str| kinds.is_empty() || kinds.iter().any(|t| schema.kind_is(k, t));
+    // The link type from `kind` a column is named after (as written, by its
+    // reference stem, or prefixed with the kind as induction names a
+    // clashing one), when it leads to exactly one kind.
+    let link_named = |column: &str| {
+        let (stem, _) = ref_stem(column);
+        [snake(column), stem.clone(), format!("{kind}_{stem}")].into_iter().find_map(|n| {
+            let lt = schema.link_type(&n)?;
+            let fits = !lt.provenance && !lt.from.is_empty() && admits(&lt.from, kind) && lt.to.len() == 1;
+            fits.then(|| (n.clone(), lt.to[0].clone()))
+        })
+    };
     let mut m = SheetMapping {
         kind: kind.to_string(),
         key: ind.key.column.clone(),
@@ -1471,7 +1482,17 @@ pub fn mapping_onto(schema: &Schema, ind: &Induced, kind: &str) -> Result<SheetM
                 Some(p) => {
                     m.properties.insert(h.clone(), p);
                 }
-                None => unmatched.push(format!("{h} (no property of {kind} by that name)")),
+                // Whether a column holds references is read from this
+                // sheet's cells, which may name no existing object (a new
+                // sheet, a missing target); a column named like a link type
+                // of `kind` is that link, and its missing targets are
+                // reported row by row.
+                None => match link_named(h) {
+                    Some((rel, target)) => {
+                        m.links.insert(h.clone(), LinkMapping { rel, target_kind: target });
+                    }
+                    None => unmatched.push(format!("{h} (no property of {kind} by that name)")),
+                },
             },
             ColumnRole::Link => {
                 let Some(l) = ind.links.iter().find(|l| l.column == *h) else { continue };

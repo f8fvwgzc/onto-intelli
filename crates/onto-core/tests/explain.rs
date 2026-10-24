@@ -847,3 +847,31 @@ fn verification_work_is_bounded() {
     assert_eq!(j.justifications.len(), 1);
     assert!(j.justifications[0].sufficient);
 }
+
+#[test]
+fn verify_names_an_entity_the_reasoner_refused() {
+    // A stored, readable entity whose id cannot be spelled is not unknown:
+    // its claim says the reasoner refused it, and why.
+    let (o, ctx) = world();
+    o.apply(
+        &ctx,
+        vec![
+            Mutation::Upsert(EntityInput::new("task", "q>r", "Q")),
+            Mutation::Upsert(EntityInput::new("task", "p", "P").link("depends_on", "task:q>r")),
+        ],
+    )
+    .unwrap();
+    let claims = [
+        Claim::new("task:p", "depends_on", json!("task:q>r")),
+        Claim::new("task:p", "depends_on", json!("task:nosuch")),
+    ];
+    let r = o.reason_verify(&admin(), &acme(), &claims).unwrap();
+    assert_eq!(r.refused, 1, "{r:?}");
+    let refused = &r.verdicts[0];
+    assert_eq!(refused.verdict, Verdict::OutsideVocabulary);
+    assert!(refused.reason.starts_with("cannot be reasoned over"), "{}", refused.reason);
+    assert!(refused.reason.contains("refused by the reasoner") && refused.reason.contains('>'), "{}", refused.reason);
+    let missing = &r.verdicts[1];
+    assert_eq!(missing.verdict, Verdict::OutsideVocabulary);
+    assert!(missing.reason.starts_with("not in this schema or not visible"), "{}", missing.reason);
+}

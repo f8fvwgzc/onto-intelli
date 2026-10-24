@@ -79,7 +79,8 @@ pub const VERIFY_MEANS: &str = "Each claim is compared with the graph and its cl
      asserted and derived are lookups (derived carries its derivation down to asserted leaves); contradicted reads a \
      stored single-valued fact that says otherwise (a state, a property value, a cardinality-one link, an entity's \
      kind); not_entailed is absence from this closure under its rules, not falsity; outside_vocabulary means the \
-     claim uses relations, classes, properties or entities this schema and this reader do not have. A step label \
+     claim uses relations, classes, properties or entities this schema and this reader do not have, or an entity \
+     whose id the reasoner refuses to spell (its reason says so). A step label \
      says whether the claimed rule and premises are a sound step over the graph; it is the engine's check, not a \
      certificate verdict.";
 
@@ -1475,6 +1476,12 @@ fn spell_claim(
     let subject = strip_entity(claim.subject.trim());
     let object_str = claim.object.as_str().map(str::trim);
     let entity = |id: &str, unknown: &mut Vec<String>| -> Option<String> {
+        // A stored entity whose id cannot be spelled is not unknown: the
+        // reasoner refused it, and the claim says why.
+        if let Err(why) = reason::spell_entity(id) {
+            unknown.push(format!("entity {id} ({REFUSED_TERM}: {why})"));
+            return None;
+        }
         let spelled = if known { visible_in(closure, g, id) } else { reason::spell_entity(id).ok() };
         if spelled.is_none() || !id.contains(':') {
             unknown.push(format!("entity {id}"));
@@ -1680,8 +1687,19 @@ pub struct VerifyReport {
     /// False when the closure is a lower bound: `not_entailed` may then be
     /// "not derived yet".
     pub fixpoint_reached: bool,
+    /// Terms the closure refused to spell: claims naming them are
+    /// `outside_vocabulary` with the refusal as the reason.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused: usize,
     pub means: String,
 }
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// How a claim's reason names a term the reasoner refused.
+const REFUSED_TERM: &str = "refused by the reasoner";
 
 /// Stored facts that contradict a claim that is not entailed.
 fn conflicts(schema: &Schema, g: &Graph, closure: &Closure, sp: &Spelled) -> Vec<Fact> {
@@ -1925,7 +1943,11 @@ pub fn verify(schema: &Schema, g: &Graph, closure: &Closure, claims: &[Claim]) -
                 Ok(sp) => sp,
                 Err(unknown) => {
                     v.verdict = Verdict::OutsideVocabulary;
-                    v.reason = format!("not in this schema or not visible: {}", unknown.join(", "));
+                    v.reason = if unknown.iter().any(|u| u.contains(REFUSED_TERM)) {
+                        format!("cannot be reasoned over: {}", unknown.join(", "))
+                    } else {
+                        format!("not in this schema or not visible: {}", unknown.join(", "))
+                    };
                     v.unknown = unknown;
                     return v;
                 }
@@ -1970,12 +1992,18 @@ pub fn verify(schema: &Schema, g: &Graph, closure: &Closure, claims: &[Claim]) -
         .collect()
 }
 
-fn verify_report(verdicts: Vec<ClaimVerdict>, fixpoint_reached: bool) -> VerifyReport {
+fn verify_report(verdicts: Vec<ClaimVerdict>, closure: &Closure) -> VerifyReport {
     let mut counts = BTreeMap::new();
     for v in &verdicts {
         *counts.entry(v.verdict.as_str().to_string()).or_insert(0) += 1;
     }
-    VerifyReport { verdicts, counts, fixpoint_reached, means: VERIFY_MEANS.into() }
+    VerifyReport {
+        verdicts,
+        counts,
+        fixpoint_reached: closure.fixpoint_reached(),
+        refused: closure.stats().refused,
+        means: VERIFY_MEANS.into(),
+    }
 }
 
 // ── slices ───────────────────────────────────────────────────────────────
@@ -2302,7 +2330,7 @@ impl Ontology {
 
     /// Verdicts on claims (see [`verify`]).
     pub fn reason_verify(&self, p: &Principal, opts: &ReasonOptions, claims: &[Claim]) -> Result<VerifyReport> {
-        self.with_closure(p, opts, |schema, g, c| Ok(verify_report(verify(schema, g, c, claims), c.fixpoint_reached())))
+        self.with_closure(p, opts, |schema, g, c| Ok(verify_report(verify(schema, g, c, claims), c)))
     }
 
     /// Does `slice` keep what `p`'s visible graph entails (see [`slice_check`])?

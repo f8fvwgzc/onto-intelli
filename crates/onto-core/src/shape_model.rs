@@ -112,6 +112,9 @@ pub struct PropertyShape {
     pub unknown: BTreeMap<String, Value>,
 }
 
+/// Relation steps a shape path may have.
+pub const MAX_PATH_STEPS: usize = 16;
+
 /// What a property shape path walks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShapePath {
@@ -184,6 +187,13 @@ impl Shape {
                     }
                 }
                 ShapePath::Relations(steps) => {
+                    if steps.len() > MAX_PATH_STEPS {
+                        return Err(format!(
+                            "{at}: path {} has {} steps, more than {MAX_PATH_STEPS}",
+                            p.path,
+                            steps.len()
+                        ));
+                    }
                     for s in &steps {
                         if s.is_empty() || !rel_ok(s) {
                             return Err(format!("{at}: unknown relation {s} in path {}", p.path));

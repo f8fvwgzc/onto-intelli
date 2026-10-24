@@ -91,19 +91,37 @@ pub struct PropertyDef {
     pub max_length: Option<usize>,
 }
 
-/// Compiled `pattern`s, shared by every schema.
+/// Longest `pattern` accepted, in bytes.
+pub const MAX_PATTERN_LEN: usize = 1024;
+/// Compiled size a `pattern` may reach (regex-lite's own limit is 10 MiB).
+const PATTERN_SIZE_LIMIT: usize = 256 * 1024;
+/// Compiled patterns kept at once.
+const PATTERN_CACHE: usize = 256;
+
+/// Compiled `pattern`s, shared by every schema. Patterns also come from
+/// callers (draft shapes, `shapes.check`), so each one is bounded in length
+/// and compiled size, and the cache is emptied when full rather than kept
+/// forever: what it holds is bounded and never pinned.
 pub(crate) fn pattern_regex(p: &str) -> std::result::Result<std::sync::Arc<regex_lite::Regex>, String> {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
     static CACHE: LazyLock<Mutex<HashMap<String, Arc<regex_lite::Regex>>>> = LazyLock::new(Default::default);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(r) = cache.get(p) {
+    if let Some(r) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(p) {
         return Ok(r.clone());
     }
-    let r = Arc::new(regex_lite::Regex::new(p).map_err(|e| format!("invalid pattern {p:?}: {e}"))?);
-    if cache.len() < 1024 {
-        cache.insert(p.to_string(), r.clone());
+    if p.len() > MAX_PATTERN_LEN {
+        return Err(format!("pattern of {} bytes is longer than {MAX_PATTERN_LEN}", p.len()));
     }
+    let r = regex_lite::RegexBuilder::new(p)
+        .size_limit(PATTERN_SIZE_LIMIT)
+        .build()
+        .map_err(|e| format!("invalid pattern {p:?}: {e}"))?;
+    let r = Arc::new(r);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= PATTERN_CACHE {
+        cache.clear();
+    }
+    cache.insert(p.to_string(), r.clone());
     Ok(r)
 }
 
@@ -1219,7 +1237,9 @@ impl Schema {
             let _ = writeln!(out, "\nShapes:");
             for (name, sh) in &self.shapes {
                 let target = sh.target.as_deref().unwrap_or("(ids or relation)");
-                let _ = writeln!(out, "  {name:<24} {target}, {} property shapes", sh.properties.len());
+                let n = sh.properties.len();
+                let _ =
+                    writeln!(out, "  {name:<24} {target}, {n} property {}", if n == 1 { "shape" } else { "shapes" });
             }
         }
         if !self.metrics.is_empty() {

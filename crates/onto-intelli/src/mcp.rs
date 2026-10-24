@@ -400,12 +400,12 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "query_inferred",
             "reason.query",
-            "Match triple patterns over asserted AND derived facts (rule chains, inheritance, transitive and symmetric links). Atoms are [subject, predicate, object] with ?variables: [[\"?i\", \"handled_by_team\", \"team:payments\"]]. Derived is not asserted: a derived fact is the engine's opinion under the schema rules, never stored data; explain_fact shows why. With fixpoint_reached false the answer is a lower bound.",
+            "Match triple patterns over asserted AND derived facts (rule chains, inheritance, transitive and symmetric links). Atoms are [subject, predicate, object] with ?variables: [[\"?i\", \"handled_by_team\", \"team:payments\"]]. Derived is not asserted: a derived fact is the engine's opinion under the schema rules, never stored data; explain_fact shows why. With fixpoint_reached false the answer is a lower bound. state and prop.<name> facts are in the closure only when a schema rule reads them: an atom with such a predicate is refused otherwise, and an atom with a ?variable predicate is answered without them (truncated says so). At most 8 atoms.",
             obj(
                 json!({
-                    "pattern": { "type": "array", "description": "Atoms [s, p, o]: entity ids, relation names (inverse names allowed), `a` with a kind, `state`, `prop.<name>`; ?x for variables", "items": { "type": "array", "items": {} } },
+                    "pattern": { "type": "array", "description": "Atoms [s, p, o]: entity ids, relation names (inverse names allowed), `a` with a kind, `state` or `prop.<name>` (only when a rule reads them); ?x for variables", "items": { "type": "array", "items": {} } },
                     "workspace": s("Only this workspace's entities"),
-                    "limit": { "type": "integer", "description": "Bindings returned (default 50)" }
+                    "limit": { "type": "integer", "description": "Bindings returned (default 50, at most 1000)" }
                 }),
                 &["pattern"],
             ),
@@ -428,7 +428,7 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "verify_claims",
             "reason.verify",
-            "Check statements before you rely on them: each claim gets asserted, derived (with its derivation), not_entailed, contradicted (with the stored facts that say otherwise) or outside_vocabulary (it names a kind or relation the schema does not know). A claim may carry the rule and premises of a reasoning step to check that step. not_entailed is not false: the graph may simply not say.",
+            "Check statements before you rely on them: each claim gets asserted, derived (with its derivation), not_entailed, contradicted (with the stored facts that say otherwise) or outside_vocabulary (it names a kind, relation, property or entity this schema and reader do not have, or an entity id the reasoner refuses to spell; the reason says which). A claim may carry the rule and premises of a reasoning step to check that step. not_entailed is not false: the graph may simply not say.",
             obj(
                 json!({
                     "claims": { "type": "array", "description": "Claims {subject, relation, object, rule?, premises?: [claim]}", "items": { "type": "object", "properties": { "subject": s("Entity id or schema name"), "relation": s("Relation, a, state or prop.<name>"), "object": { "description": "Entity id, name or value" }, "rule": s("Rule the step claims to apply"), "premises": { "type": "array", "items": { "type": "object" } } }, "required": ["subject", "relation", "object"] } },
@@ -455,7 +455,7 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "certify_reasoning",
             "reason.certify",
-            "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the verdict of the independent onto-cert checker, which re-derives every line by pattern alone. Only `check` carries a checker verdict; entailed_under_supplied_rules means the conclusions hold IF the supplied schema rules do. A certificate binds bytes, not the state of the world.",
+            "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the verdict of the independent onto-cert checker, which re-derives every line by pattern alone. Only `check` carries a checker verdict; entailed_under_supplied_rules means the conclusions hold IF the supplied schema rules do. A certificate binds bytes, not the state of the world. With fixpoint_reached false (also given at the top level) the closure stopped at a limit and the derivations are a lower bound.",
             obj(json!({ "workspace": s("Only this workspace's entities") }), &[]),
             false,
         ),
@@ -689,6 +689,32 @@ pub fn profile_offers(profile: &str, tool: &str) -> bool {
         || PROFILE_TOOLS.iter().any(|(p, tools)| *p == profile && tools.contains(&tool))
 }
 
+/// Why a `what_if` call is refused under `profile`: a scenario query runs an
+/// engine action, so under a focused profile each one must be the action of
+/// a tool that profile offers (else what_if would reach what it withholds).
+fn scenario_refusal(profile: &str, args: &Value) -> Option<String> {
+    if profile == "full" {
+        return None;
+    }
+    let tools = tools();
+    for q in args.get("queries").and_then(Value::as_array).into_iter().flatten() {
+        let action = q.get("action").and_then(Value::as_str).unwrap_or_default();
+        let offered: Vec<&str> = tools.iter().filter(|t| t.1 == action).map(|t| t.0).collect();
+        if offered.is_empty() {
+            return Some(format!(
+                "what_if query {action} is no MCP tool's action, so the profile {profile} does not offer it"
+            ));
+        }
+        if !offered.iter().any(|t| profile_offers(profile, t)) {
+            return Some(format!(
+                "what_if query {action} is the action of {}, which the MCP profile {profile} does not offer",
+                offered.join(", ")
+            ));
+        }
+    }
+    None
+}
+
 /// The names of every tool, in table order.
 pub fn tool_names() -> Vec<&'static str> {
     tools().into_iter().map(|t| t.0).collect()
@@ -786,13 +812,21 @@ impl McpServer {
                 let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
                 let all = tools();
                 let withheld = all.iter().filter(|t| !profile_offers(self.profile, t.0)).count();
+                // Write tools the profile offers but allow_writes hides, so
+                // offered + withheld + hidden is every tool.
+                let hidden =
+                    all.iter().filter(|t| profile_offers(self.profile, t.0) && !self.offered(t.0, t.4)).count();
                 let profile = format!(
                     " Tool profile: {} ({} of {} tools offered, {withheld} withheld by the profile{}; \
                      set [mcp] profile, ONTO_MCP_PROFILE or onto mcp --profile to change it).",
                     self.profile,
                     all.iter().filter(|t| self.offered(t.0, t.4)).count(),
                     all.len(),
-                    if self.allow_writes { "" } else { ", write tools hidden" },
+                    if hidden > 0 {
+                        format!(", {hidden} write tools hidden by allow_writes = false")
+                    } else {
+                        String::new()
+                    },
                 );
                 Self::reply(
                     &id,
@@ -829,6 +863,11 @@ impl McpServer {
                         -32602,
                         &format!("tool {name} is not offered under the MCP profile {}", self.profile),
                     ));
+                }
+                if name == "what_if"
+                    && let Some(why) = scenario_refusal(self.profile, &args)
+                {
+                    return Some(Self::error(&id, -32602, &why));
                 }
                 if writes && !self.allow_writes {
                     return Some(Self::reply(

@@ -277,6 +277,7 @@ function CertifyCard() {
   const c = cert.data;
   const manifest = c ? parseManifest(c.certificate.manifest_json) : undefined;
   const check = c?.check;
+  const partial = c ? c.fixpoint_reached === false || manifest?.attested.fixpoint_reached === false : false;
   return (
     <Card
       title="Certificate"
@@ -334,6 +335,11 @@ function CertifyCard() {
               )}
             </Verdict>
           )}
+          {partial ? (
+            <p className="text-[13px] text-danger">
+              The closure is a lower bound (stopped: {c.truncated ?? `after ${manifest?.attested.rounds ?? c.rounds} rounds`}): every derivation listed checks, but more may follow.
+            </p>
+          ) : null}
           {manifest ? (
             <dl className="grid gap-x-4 gap-y-1.5 text-[12.5px] sm:grid-cols-[max-content_minmax(0,1fr)]">
               <Digest label="asserted.tsv" value={manifest.derived.asserted_sha256} />
@@ -342,7 +348,8 @@ function CertifyCard() {
               <dt className="text-ink-3">attested</dt>
               <dd className="tnum min-w-0 text-ink-2">
                 {manifest.attested.engine} · schema v{manifest.attested.schema_version} · graph revision {manifest.attested.graph_revision} · {manifest.attested.principal}
-                {manifest.attested.workspace ? ` · ${manifest.attested.workspace}` : ""} · {manifest.attested.created_at}
+                {manifest.attested.workspace ? ` · ${manifest.attested.workspace}` : ""} · {manifest.attested.created_at} · {plural(manifest.attested.rounds, "round")},{" "}
+                {manifest.attested.fixpoint_reached ? "fixpoint reached" : "fixpoint not reached"}
               </dd>
             </dl>
           ) : null}
