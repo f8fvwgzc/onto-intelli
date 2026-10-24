@@ -139,13 +139,19 @@ enum Support {
 }
 
 /// The premise for one hop of a derivation, in canonical direction.
-fn premise(schema: &Schema, hop: &Hop) -> Premise {
+///
+/// `stored(from, rel, to)` says whether the graph holds that link as written.
+/// A symmetric hop may have walked its stored link backwards; the premise
+/// text then spells the stored link, not its mirror, so it is an assertion
+/// and not an inference (DESIGN §0.1).
+fn premise(schema: &Schema, hop: &Hop, stored: impl Fn(&str, &str, &str) -> bool) -> Premise {
     let (base, dir) = schema.resolve_rel_lenient(&hop.rel);
     let out: Link = (hop.from.clone(), base.clone(), hop.to.clone());
     let inc: Link = (hop.to.clone(), base, hop.from.clone());
     let links = match dir {
         Dir::Out => vec![out],
         Dir::In => vec![inc],
+        Dir::Both if !stored(&out.0, &out.1, &out.2) && stored(&inc.0, &inc.1, &inc.2) => vec![inc, out],
         Dir::Both => vec![out, inc],
     };
     let (from, rel, to) = &links[0];
@@ -359,7 +365,11 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
                 );
                 let claim = Claim {
                     spelled: format!("{} {} {}", inf.from, inf.rel, inf.to),
-                    premises: inf.because.iter().map(|h| premise(schema, h)).collect(),
+                    premises: inf
+                        .because
+                        .iter()
+                        .map(|h| premise(schema, h, |f, r, t| g.get_link(f, r, t).is_some()))
+                        .collect(),
                 };
                 support.insert(i, Support::Claims(claim));
             }
@@ -396,11 +406,13 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
         }
         if provenance_q {
             for r in input.seeds.iter().take(2) {
-                if let Some(e) = g.get(&r.id) {
+                // Only links between entities the principal can read are stated.
+                if let Some(e) = g.get(&r.id).filter(|e| can(e)) {
                     let steps: Vec<_> = g
                         .steps_via(&r.id, "derived_from", Dir::Out)
                         .into_iter()
                         .chain(g.steps_via(&r.id, "generated_by", Dir::Out))
+                        .filter(|s| g.get(s.other).is_some_and(can))
                         .collect();
                     let chain: Vec<String> = steps.iter().map(|s| format!("{} {}", s.rel, s.other)).collect();
                     if !chain.is_empty() {
@@ -631,26 +643,38 @@ mod tests {
         Fact { text: text.into(), score: 0.5, tokens: estimate(text) + 1, source: source.into() }
     }
 
+    /// A graph that stores every link in walk direction.
+    fn walked(_: &str, _: &str, _: &str) -> bool {
+        true
+    }
+
     fn claim(spelled: &str, hops: &[Hop]) -> Support {
         let schema = Schema::enterprise();
-        Support::Claims(Claim { spelled: spelled.into(), premises: hops.iter().map(|h| premise(&schema, h)).collect() })
+        let premises = hops.iter().map(|h| premise(&schema, h, walked)).collect();
+        Support::Claims(Claim { spelled: spelled.into(), premises })
     }
 
     #[test]
     fn premises_are_spelled_in_canonical_direction() {
         let schema = Schema::enterprise();
-        let p = premise(&schema, &hop("person:kenji", "member_of", "team:payments"));
+        let p = premise(&schema, &hop("person:kenji", "member_of", "team:payments"), walked);
         assert_eq!(p.links, vec![link("person:kenji", "member_of", "team:payments")]);
         assert_eq!(p.text, "premise: person:kenji member_of → team:payments");
         // `owned_by` is the declared inverse of `owns`.
-        let p = premise(&schema, &hop("project:alpha", "owned_by", "team:payments"));
+        let p = premise(&schema, &hop("project:alpha", "owned_by", "team:payments"), walked);
         assert_eq!(p.links, vec![link("team:payments", "owns", "project:alpha")]);
         assert_eq!(p.text, "premise: team:payments owns → project:alpha");
-        let p = premise(&schema, &hop("task:2", "^depends_on", "task:1"));
+        let p = premise(&schema, &hop("task:2", "^depends_on", "task:1"), walked);
         assert_eq!(p.links, vec![link("task:1", "depends_on", "task:2")]);
         // A symmetric link is stated by either spelling.
-        let p = premise(&schema, &hop("doc:b", "relates_to", "doc:a"));
+        let p = premise(&schema, &hop("doc:b", "relates_to", "doc:a"), walked);
         assert_eq!(p.links, vec![link("doc:b", "relates_to", "doc:a"), link("doc:a", "relates_to", "doc:b")]);
+        assert_eq!(p.text, "premise: doc:b relates_to → doc:a");
+        // Walked backwards, a symmetric hop is spelled as the link is stored.
+        let stored = |f: &str, r: &str, t: &str| (f, r, t) == ("doc:a", "relates_to", "doc:b");
+        let p = premise(&schema, &hop("doc:b", "relates_to", "doc:a"), stored);
+        assert_eq!(p.links, vec![link("doc:a", "relates_to", "doc:b"), link("doc:b", "relates_to", "doc:a")]);
+        assert_eq!(p.text, "premise: doc:a relates_to → doc:b");
     }
 
     #[test]
@@ -712,7 +736,7 @@ mod tests {
     #[test]
     fn a_claim_that_does_not_fit_adds_nothing() {
         let hops = [hop("issue:1", "assigned_to", "person:a"), hop("person:a", "member_of", "team:x")];
-        let one = premise(&Schema::enterprise(), &hops[0]);
+        let one = premise(&Schema::enterprise(), &hops[0], walked);
         let cost_one = estimate(&one.text) + 1;
         let mut kept = vec![fact("derived: issue:1 handled_by_team team:x", "derived")];
         let support = vec![claim("issue:1 handled_by_team team:x", &hops)];

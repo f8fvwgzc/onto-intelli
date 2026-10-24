@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
+use serde_json::json;
+
 use onto_core::reason::{Fact as RFact, ReasonOptions, Status};
+use onto_core::{ActionContext, EntityInput, Mutation, Role};
 use onto_intelli::context::{ContextPack, PRESERVATION_MEANS};
 use onto_intelli::{Config, Intelli, Principal, seed};
 
@@ -168,4 +171,91 @@ async fn preservation_is_deterministic() {
     for _ in 0..3 {
         assert_eq!(run(), first);
     }
+}
+
+#[tokio::test]
+async fn a_symmetric_hop_walked_backwards_is_spelled_as_stored() {
+    // issue:100 stores `relates_to → issue:421`; the rule walks it from issue:421.
+    let dir = std::env::temp_dir().join(format!("onto-preservation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let layer = dir.join("related.toml");
+    std::fs::write(
+        &layer,
+        r#"
+[[rules]]
+name = "related_assignee"
+description = "Whoever is assigned related work."
+chain = ["relates_to", "assigned_to"]
+infer = "related_assignee"
+"#,
+    )
+    .unwrap();
+    let path = layer.to_string_lossy().to_string();
+    let i = demo_with(|c| {
+        c.ontology.extend.push(path);
+        c.context.max_nodes = 1;
+    })
+    .await;
+    let ctx = ActionContext::new(admin(), "acme");
+    i.ontology()
+        .apply(
+            &ctx,
+            vec![Mutation::Upsert(
+                EntityInput::new("issue", "100", "Checkout retries")
+                    .link("relates_to", "issue:421")
+                    .link("assigned_to", "person:aiko"),
+            )],
+        )
+        .unwrap();
+    let pack = i.build_context(&admin(), "acme", TEAM_Q, None).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_well_formed(&pack);
+    assert!(pack.text.contains("derived: issue:421 related_assignee person:aiko"), "{}", pack.text);
+    let premises: Vec<&str> = pack.facts.iter().filter(|f| f.source == "premise").map(|f| f.text.as_str()).collect();
+    assert!(premises.contains(&"premise: issue:100 relates_to → issue:421"), "{premises:?}");
+    assert!(!premises.contains(&"premise: issue:421 relates_to → issue:100"), "{premises:?}");
+
+    // Every premise, the backwards symmetric one included, is an asserted link.
+    let closure = i.ontology().reason(&admin(), &ReasonOptions::default()).unwrap();
+    for text in &premises {
+        let (s, p, o) = premise_link(text);
+        let fact = RFact::new(format!("<{s}>"), p, format!("<{o}>"));
+        assert_eq!(closure.contains(&fact), Some(Status::Asserted), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn provenance_lines_name_only_readable_sources() {
+    let i = demo().await;
+    let ctx = ActionContext::new(admin(), "acme");
+    i.ontology()
+        .apply(
+            &ctx,
+            vec![
+                Mutation::Upsert(
+                    EntityInput::new("knowledge", "topsecret", "Board notes")
+                        .prop("visibility", "restricted")
+                        .prop("acl", json!(["person:sarah"])),
+                ),
+                Mutation::Upsert(
+                    EntityInput::new("knowledge", "summary", "Quarter summary")
+                        .link("derived_from", "knowledge:topsecret")
+                        .link("derived_from", "knowledge:runbook-payments"),
+                ),
+            ],
+        )
+        .unwrap();
+    let q = "Where did knowledge:summary come from? What is it derived from?";
+    let lead = i.build_context(&admin(), "acme", q, None).unwrap();
+    let provenance =
+        |text: &str| text.lines().find(|l| l.starts_with("- provenance of knowledge:summary: ")).map(str::to_string);
+    let line = provenance(&lead.text).expect("a provenance line for the lead");
+    assert!(line.contains("derived_from knowledge:topsecret"), "{line}");
+
+    let member = Principal::new("aiko", vec![Role::Member], vec!["acme".into()]).with_entity("person:aiko");
+    let pack = i.build_context(&member, "acme", q, None).unwrap();
+    assert_well_formed(&pack);
+    assert!(!pack.text.contains("topsecret"), "an unreadable source leaked: {}", pack.text);
+    let line = provenance(&pack.text).expect("a provenance line for the member");
+    assert_eq!(line, "- provenance of knowledge:summary: derived_from knowledge:runbook-payments");
 }
