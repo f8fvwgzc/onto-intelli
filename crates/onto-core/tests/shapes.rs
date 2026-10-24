@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use onto_core::reason::{self, ReasonOptions};
-use onto_core::shapes::{self, InduceOptions, ShapeIssueKind, ShapeReport, ShapeVerdict, ShapesQuery};
+use onto_core::shapes::{self, ShapeInduceOptions, ShapeIssueKind, ShapeReport, ShapeVerdict, ShapesQuery};
 use onto_core::{
     ActionContext, EntityInput, Mutation, Ontology, OntologyOptions, Principal, Schema, SchemaChangeSet, Shape,
     ShapeSeverity,
@@ -196,7 +196,7 @@ fn subtypes_are_targets_and_instances() {
     assert_eq!(r.focus_by_shape["s"], 4, "an incident is an issue: {r:#?}");
     conforms(&run(&o, one("task", json!({ "path": "part_of", "class": "issue" }))));
     violates(&run(&o, one("task", json!({ "path": "part_of", "class": "incident" }))), &[("task:t1", "class")]);
-    let ind = o.shapes_induce(&admin(), "task", &InduceOptions::default()).unwrap();
+    let ind = o.shapes_induce(&admin(), "task", &ShapeInduceOptions::default()).unwrap();
     let part = ind.shape.properties.iter().find(|p| p.path == "part_of").expect("part_of");
     assert_eq!(part.class.as_deref(), Some("issue"), "the most specific common ancestor of issue and incident");
     assert!(
@@ -614,7 +614,7 @@ fn check_reports_every_issue_kind() {
 #[test]
 fn induction_round_trip() {
     let (o, ctx) = world();
-    let ind = o.shapes_induce(&admin(), "issue", &InduceOptions::default()).unwrap();
+    let ind = o.shapes_induce(&admin(), "issue", &ShapeInduceOptions::default()).unwrap();
     assert_eq!((ind.kind.as_str(), ind.name.as_str(), ind.entities), ("issue", "issue_shape", 3));
     assert!(ind.means.contains("describes the data as it is, not what it should be"));
     let by_path: BTreeMap<&str, &onto_core::PropertyShape> =
@@ -670,8 +670,9 @@ fn induction_reads_enums_and_round_trips_at_scale() {
         muts.push(Mutation::Upsert(t));
     }
     o.apply(&ctx, muts).unwrap();
-    let ind =
-        o.shapes_induce(&admin(), "task", &InduceOptions { name: Some("tasks".into()), ..Default::default() }).unwrap();
+    let ind = o
+        .shapes_induce(&admin(), "task", &ShapeInduceOptions { name: Some("tasks".into()), ..Default::default() })
+        .unwrap();
     let by_path: BTreeMap<&str, &onto_core::PropertyShape> =
         ind.shape.properties.iter().map(|p| (p.path.as_str(), p)).collect();
     assert_eq!(by_path["state"].values, vec![json!("done"), json!("todo")]);
@@ -689,8 +690,8 @@ fn induction_reads_enums_and_round_trips_at_scale() {
     let mut q = ShapesQuery::default();
     q.drafts.insert(ind.name.clone(), ind.shape.clone());
     conforms(&o.shapes_validate(&admin(), &q).unwrap());
-    assert!(o.shapes_induce(&admin(), "spaceship", &InduceOptions::default()).is_err());
-    let none = o.shapes_induce(&admin(), "deployment", &InduceOptions::default()).unwrap();
+    assert!(o.shapes_induce(&admin(), "spaceship", &ShapeInduceOptions::default()).is_err());
+    let none = o.shapes_induce(&admin(), "deployment", &ShapeInduceOptions::default()).unwrap();
     assert_eq!(none.entities, 0);
     assert!(none.notes.iter().any(|n| n.contains("nothing to induce")));
 }
@@ -710,7 +711,7 @@ fn induction_keeps_mixed_json_values_apart() {
         })
         .collect();
     o.apply(&ctx, muts).unwrap();
-    let ind = o.shapes_induce(&admin(), "widget", &InduceOptions::default()).unwrap();
+    let ind = o.shapes_induce(&admin(), "widget", &ShapeInduceOptions::default()).unwrap();
     let code = ind.shape.properties.iter().find(|p| p.path == "prop.code").expect("prop.code");
     assert_eq!(code.values, vec![json!(1), json!(2), json!("1")]);
     assert_eq!(code.datatype, None);
@@ -774,7 +775,7 @@ fn pg_live_put_shape_then_validate() {
     let o = pg.open(schema(), OntologyOptions::default());
     let ctx = ActionContext::new(admin(), "acme");
     o.apply(&ctx, seed()).unwrap();
-    let ind = o.shapes_induce(&admin(), "issue", &InduceOptions::default()).unwrap();
+    let ind = o.shapes_induce(&admin(), "issue", &ShapeInduceOptions::default()).unwrap();
     o.schema_apply(&ctx, ind.change_set).unwrap();
     drop(o);
     let o = pg.open(schema(), OntologyOptions::default());

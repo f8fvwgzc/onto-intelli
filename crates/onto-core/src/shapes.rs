@@ -264,7 +264,7 @@ pub struct ShapeCheck {
 /// Options of [`induce`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct InduceOptions {
+pub struct ShapeInduceOptions {
     /// Only entities of this workspace.
     pub workspace: Option<String>,
     /// Name of the induced shape (`<kind>_shape` when unset).
@@ -1300,7 +1300,7 @@ pub fn induce(
     schema: &Schema,
     g: &Graph,
     kind: &str,
-    opts: &InduceOptions,
+    opts: &ShapeInduceOptions,
     can_read: &dyn Fn(&Entity) -> bool,
 ) -> Result<InducedShape> {
     if !schema.is_type_or_interface(kind) {
@@ -1525,7 +1525,7 @@ impl Ontology {
     }
 
     /// Induce a shape for `kind` from what `p` may read.
-    pub fn shapes_induce(&self, p: &Principal, kind: &str, opts: &InduceOptions) -> Result<InducedShape> {
+    pub fn shapes_induce(&self, p: &Principal, kind: &str, opts: &ShapeInduceOptions) -> Result<InducedShape> {
         if let Some(ws) = &opts.workspace
             && !p.in_workspace(ws)
         {

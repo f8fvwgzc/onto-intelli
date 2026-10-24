@@ -80,7 +80,7 @@ pub use reason::{
 pub use schema::{Dir, Schema};
 pub use shape_model::{PropertyShape, Shape, ShapeSeverity};
 pub use shapes::{
-    InduceOptions, InducedShape, ShapeCheck, ShapeDelta, ShapeIssue, ShapeIssueKind, ShapeReport, ShapeResult,
+    InducedShape, ShapeCheck, ShapeDelta, ShapeInduceOptions, ShapeIssue, ShapeIssueKind, ShapeReport, ShapeResult,
     ShapeVerdict, ShapesQuery, SkippedConstraint,
 };
 /// The sqlx 0.9 API the PostgreSQL store is built on, as `sqlx::…` paths.

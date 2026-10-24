@@ -40,6 +40,12 @@ pub const PACKAGES: &[(&str, &str)] = &[
     ("supply-chain", crate::packs::SUPPLY_CHAIN_SCHEMA),
     ("retail", crate::packs::RETAIL_SCHEMA),
     ("logistics", crate::packs::LOGISTICS_SCHEMA),
+    ("healthcare", crate::packs::HEALTHCARE_SCHEMA),
+    ("finance", crate::packs::FINANCE_SCHEMA),
+    ("insurance", crate::packs::INSURANCE_SCHEMA),
+    ("energy", crate::packs::ENERGY_SCHEMA),
+    ("telecom", crate::packs::TELECOM_SCHEMA),
+    ("saas", crate::packs::SAAS_SCHEMA),
 ];
 
 /// The TOML of a built-in package.

@@ -70,6 +70,36 @@ pub const LOGISTICS_SCHEMA: &str = include_str!("../schemas/packs/logistics.toml
 /// Sample data for [`LOGISTICS_SCHEMA`].
 pub const LOGISTICS_SAMPLE: &str = include_str!("../schemas/packs/logistics.sample.jsonl");
 
+/// Healthcare delivery: patients, facilities, encounters, diagnoses, observations, medications, care plans.
+pub const HEALTHCARE_SCHEMA: &str = include_str!("../schemas/packs/healthcare.toml");
+/// Sample data for [`HEALTHCARE_SCHEMA`].
+pub const HEALTHCARE_SAMPLE: &str = include_str!("../schemas/packs/healthcare.sample.jsonl");
+
+/// Banking, KYC and AML: customers, jurisdictions, accounts, transfers, reviews, alerts, sanctions.
+pub const FINANCE_SCHEMA: &str = include_str!("../schemas/packs/finance.toml");
+/// Sample data for [`FINANCE_SCHEMA`].
+pub const FINANCE_SAMPLE: &str = include_str!("../schemas/packs/finance.sample.jsonl");
+
+/// Property and casualty insurance: policies, coverage, insured items, perils, losses, claims, reinsurance.
+pub const INSURANCE_SCHEMA: &str = include_str!("../schemas/packs/insurance.toml");
+/// Sample data for [`INSURANCE_SCHEMA`].
+pub const INSURANCE_SAMPLE: &str = include_str!("../schemas/packs/insurance.sample.jsonl");
+
+/// Energy and utilities: grid assets, electrical topology, outages, crews, condition assessments.
+pub const ENERGY_SCHEMA: &str = include_str!("../schemas/packs/energy.toml");
+/// Sample data for [`ENERGY_SCHEMA`].
+pub const ENERGY_SAMPLE: &str = include_str!("../schemas/packs/energy.sample.jsonl");
+
+/// Telecommunications: sites, network elements, cells, transport, services, subscribers, alarms, tickets.
+pub const TELECOM_SCHEMA: &str = include_str!("../schemas/packs/telecom.toml");
+/// Sample data for [`TELECOM_SCHEMA`].
+pub const TELECOM_SAMPLE: &str = include_str!("../schemas/packs/telecom.sample.jsonl");
+
+/// SaaS: products, plans, accounts, subscriptions, invoices, support tickets, NPS, feature requests.
+pub const SAAS_SCHEMA: &str = include_str!("../schemas/packs/saas.toml");
+/// Sample data for [`SAAS_SCHEMA`].
+pub const SAAS_SAMPLE: &str = include_str!("../schemas/packs/saas.sample.jsonl");
+
 /// The registry: `(id, schema TOML, sample JSONL)`, in listing order. Every
 /// entry is also in [`PACKAGES`] under the same id.
 pub const REGISTRY: &[(&str, &str, &str)] = &[
@@ -77,6 +107,12 @@ pub const REGISTRY: &[(&str, &str, &str)] = &[
     ("supply-chain", SUPPLY_CHAIN_SCHEMA, SUPPLY_CHAIN_SAMPLE),
     ("retail", RETAIL_SCHEMA, RETAIL_SAMPLE),
     ("logistics", LOGISTICS_SCHEMA, LOGISTICS_SAMPLE),
+    ("healthcare", HEALTHCARE_SCHEMA, HEALTHCARE_SAMPLE),
+    ("finance", FINANCE_SCHEMA, FINANCE_SAMPLE),
+    ("insurance", INSURANCE_SCHEMA, INSURANCE_SAMPLE),
+    ("energy", ENERGY_SCHEMA, ENERGY_SAMPLE),
+    ("telecom", TELECOM_SCHEMA, TELECOM_SAMPLE),
+    ("saas", SAAS_SCHEMA, SAAS_SAMPLE),
 ];
 
 /// What a pack's own words mean, for every report that shows one.
