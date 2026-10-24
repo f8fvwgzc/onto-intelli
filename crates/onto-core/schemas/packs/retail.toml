@@ -13,7 +13,7 @@ id = "retail"
 title = "Retail and omnichannel commerce"
 industry = "retail"
 version = "1.0.0"
-description = "Store and online retail: stores and districts, SKUs in a merchandise category hierarchy, stock positions and planograms per store, shoppers with loyalty tiers, orders and returns, promotions and product recalls. Vocabulary inspired by GS1 (GTIN, Global Product Classification) and the ARTS operational data model; it borrows their words and claims no compliance with any of them. Its rules (promoted stockouts, recalled stock on hand, shoppers affected by a recall, VIP shoppers) are supplied assumptions, so certificates that cite them are entailed only under those rules."
+description = "Store and online retail: stores and districts, SKUs in a merchandise category hierarchy, stock positions and planograms per store, shoppers with loyalty tiers, orders and returns, promotions and product recalls. Vocabulary inspired by GS1 (GTIN, Global Product Classification) and the ARTS operational data model; it borrows their words and claims no compliance with any of them. Its rules (what a promotion covers across the category hierarchy, promoted stockouts, recalled stock on hand, shoppers affected by a recall) are supplied assumptions, so certificates that cite them are entailed only under those rules."
 requires = ["enterprise"]
 standards = [
     "GS1 GTIN (Global Trade Item Number): product identification",
@@ -302,21 +302,27 @@ weight = 0.6
 # ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
 
 [[rules]]
-name = "order_district"
-description = "An order belongs to the district of the store that fulfils it."
-chain = ["fulfilled_from", "store_in_district"]
-infer = "order_district"
+name = "promotion_covers_sku"
+description = "A promotion on a SKU covers that SKU."
+when = [["?promo", "promotes", "?sku"], ["?sku", "a", "sku"]]
+then = ["?promo", "covers_sku", "?sku"]
 
 [[rules]]
 name = "promotion_covers_category"
 description = "A promotion on a category covers every SKU assigned to that category."
-when = [["?promo", "promotes", "?cat"], ["?cat", "a", "merch_category"], ["?sku", "in_merch_category", "?cat"]]
-then = ["?promo", "covers_sku", "?sku"]
+chain = ["promotes", "category_skus"]
+infer = "covers_sku"
+
+[[rules]]
+name = "promotion_covers_subcategories"
+description = "A promotion on a category also covers every SKU of the categories beneath it, at any depth of the merchandise hierarchy."
+chain = ["promotes", "merch_subcategories", "category_skus"]
+infer = "covers_sku"
 
 [[rules]]
 name = "promoted_stockout"
-description = "A stock position that is out of stock while a live promotion pushes its SKU loses sales."
-when = [["?p", "a", "stock_position"], ["?p", "prop.stock_status", "out_of_stock"], ["?p", "stock_of", "?sku"], ["?promo", "promotes", "?sku"], ["?promo", "state", "live"]]
+description = "A stock position that is out of stock while a live promotion covers its SKU (directly or through its category) loses sales."
+when = [["?p", "a", "stock_position"], ["?p", "prop.stock_status", "out_of_stock"], ["?p", "stock_of", "?sku"], ["?promo", "covers_sku", "?sku"], ["?promo", "state", "live"]]
 then = ["?p", "a", "promoted_stockout"]
 
 [[rules]]
@@ -330,12 +336,6 @@ name = "shopper_affected_by_recall"
 description = "A shopper who ordered a recalled SKU is affected by the recall and should be contacted."
 when = [["?r", "recalls_sku", "?sku"], ["?o", "order_contains", "?sku"], ["?o", "placed_by_shopper", "?c"]]
 then = ["?c", "affected_by_recall", "?r"]
-
-[[rules]]
-name = "vip_shopper"
-description = "An active platinum loyalty member is a VIP shopper."
-when = [["?c", "a", "shopper"], ["?c", "prop.loyalty_tier", "platinum"], ["?c", "state", "active"]]
-then = ["?c", "a", "vip_shopper"]
 
 # ── Shapes (conditions the data should meet; a report is a measurement) ─────
 

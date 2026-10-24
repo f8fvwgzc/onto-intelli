@@ -13,7 +13,7 @@ id = "supply-chain"
 title = "Supply chain and sourcing"
 industry = "supply_chain"
 version = "1.0.0"
-description = "Supplier networks across tiers: suppliers and their sites, sourcing regions and their trade-compliance status, purchased items and sourcing categories, purchase orders, contracts and goods receipts, supplier audits and supply disruptions. Vocabulary inspired by the SCOR model, GS1 identification keys and ISO 28000; it borrows their words and claims no compliance with any of them. Its risk rules (sanctioned sites, high-risk suppliers, upstream risk, disruption exposure) are supplied assumptions, so certificates that cite them are entailed only under those rules. Sample regions with a sanctioned status are fictional."
+description = "Supplier networks across tiers: suppliers and their sites, sourcing regions and their trade-compliance status, purchased items and sourcing categories, purchase orders, contracts and goods receipts, supplier audits and supply disruptions. Vocabulary inspired by the SCOR model, GS1 identification keys and ISO 28000; it borrows their words and claims no compliance with any of them. Its risk rules (sanctioned sites, high-risk suppliers, upstream risk climbing the tiers, disruption exposure) are supplied assumptions, so certificates that cite them are entailed only under those rules. Sample regions with a sanctioned status are fictional."
 requires = ["enterprise"]
 standards = [
     "SCOR (Supply Chain Operations Reference model): source, make and deliver vocabulary",
@@ -286,12 +286,11 @@ cardinality = "one"
 weight = 0.6
 
 [link_types.sources_from]
-description = "The supplier buys from the object supplier (tier-n network; a dependency, transitive)."
+description = "The supplier buys directly from the object supplier (one tier of the network; a dependency). Not transitive: A buying from B and B from C does not make A a buyer of C. Reach across tiers is what the upstream risk rules derive, as supplied assumptions."
 from = ["supplier"]
 to = ["supplier"]
 inverse = "sources_to"
 dependency = true
-transitive = true
 weight = 0.8
 
 # ── Rules (supplied assumptions; derived facts are labelled, never stored) ───
@@ -316,15 +315,15 @@ then = ["?s", "a", "high_risk_supplier"]
 
 [[rules]]
 name = "upstream_supply_risk"
-description = "A supplier that sources, at any tier, from a high-risk supplier inherits its risk."
+description = "A supplier that buys directly from a high-risk supplier inherits its risk (the first tier)."
 when = [["?s", "sources_from", "?t"], ["?t", "a", "high_risk_supplier"]]
 then = ["?s", "inherits_supply_risk_from", "?t"]
 
 [[rules]]
-name = "item_sourcing_region"
-description = "An item is sourced from the region its production site is in."
-chain = ["produced_at_site", "site_in_region"]
-infer = "sourced_from_region"
+name = "upstream_supply_risk_tiers"
+description = "A supplier that buys directly from a supplier that inherits a risk inherits it too, so the risk climbs the network one tier per step (tier-n reach is this assumption, not a property of sources_from)."
+chain = ["sources_from", "inherits_supply_risk_from"]
+infer = "inherits_supply_risk_from"
 
 [[rules]]
 name = "order_disruption_exposure"

@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use onto_core::graph::Graph;
 use onto_core::live_schema::Migration;
 use onto_core::packs::{self, InstallMode, PackInstallOptions};
-use onto_core::reason::{self, ReasonOptions};
-use onto_core::schema::{PACKAGES, PropType};
+use onto_core::reason::{self, Fact, ReasonOptions};
+use onto_core::schema::{Cardinality, Dir, PACKAGES, PropType};
 use onto_core::shape_model::ShapePath;
 use onto_core::store::MemoryStore;
 use onto_core::{
@@ -238,7 +238,7 @@ fn pack_names_never_collide() {
         [[rules]]
         name = "flag"
         when = [["?x", "a", "gadget"]]
-        then = ["?x", "a", "vip_shopper"]
+        then = ["?x", "a", "promoted_stockout"]
         [glossary.kinds]
         vendor = "gadget"
     "#;
@@ -249,7 +249,7 @@ fn pack_names_never_collide() {
     let found = packs::collisions_in(&layers, &packs_ids);
     let names: BTreeSet<(String, String)> = found.iter().map(|c| (c.namespace.clone(), c.name.clone())).collect();
     for (ns, name) in
-        [("names", "supplier"), ("names", "carries"), ("names", "vip_shopper"), ("glossary.kinds", "vendor")]
+        [("names", "supplier"), ("names", "carries"), ("names", "promoted_stockout"), ("glossary.kinds", "vendor")]
     {
         assert!(names.contains(&(ns.to_string(), name.to_string())), "{ns} {name} not caught: {found:#?}");
     }
@@ -307,6 +307,51 @@ fn pack_rules_are_supplied_rules_in_the_certificate() {
         found,
         BTreeSet::from(["<supplier:borealis-chem>".to_string(), "<supplier:kestrel-alloys>".to_string()])
     );
+}
+
+#[test]
+fn supplier_risk_climbs_tiers_only_through_the_supplied_rules() {
+    // rhein-bearings buys from lumen-metals, which buys from kestrel-alloys
+    // (high risk). sources_from is not transitive: rhein does not buy from
+    // kestrel, but it inherits kestrel's risk under the supplied tier rule.
+    let o = sampled("supply-chain");
+    o.read(|g, schema| {
+        let c = reason::closure(schema, g, &ReasonOptions::default(), &|_| true);
+        let fact = |s: &str, p: &str, o: &str| Fact::new(format!("<{s}>"), p, format!("<{o}>"));
+        assert!(!schema.link_types["sources_from"].transitive);
+        assert_eq!(c.contains(&fact("supplier:rhein-bearings", "sources_from", "supplier:kestrel-alloys")), None);
+        assert!(c.derived().iter().all(|d| d.conclusion.p != "sources_from"), "nothing derives a purchase relation");
+        let direct = fact("supplier:lumen-metals", "inherits_supply_risk_from", "supplier:kestrel-alloys");
+        assert_eq!(c.derivation(&direct).unwrap().rule, "schema/upstream_supply_risk");
+        let tier2 = fact("supplier:rhein-bearings", "inherits_supply_risk_from", "supplier:kestrel-alloys");
+        assert_eq!(c.derivation(&tier2).unwrap().rule, "schema/upstream_supply_risk_tiers");
+        assert!(!c.rules().iter().find(|r| r.name == "schema/upstream_supply_risk_tiers").unwrap().is_builtin());
+    });
+}
+
+#[test]
+fn retail_promotions_cover_skus_directly_and_down_the_category_hierarchy() {
+    let o = sampled("retail");
+    o.read(|g, schema| {
+        let c = reason::closure(schema, g, &ReasonOptions::default(), &|_| true);
+        let covers = |promo: &str, sku: &str| {
+            let f = Fact::new(format!("<promotion:{promo}>"), "covers_sku", format!("<sku:{sku}>"));
+            c.derivation(&f).map(|d| d.rule.clone())
+        };
+        assert_eq!(covers("cracker-clearance", "oat-crackers").as_deref(), Some("schema/promotion_covers_sku"));
+        assert_eq!(covers("snack-week", "trail-mix-500").as_deref(), Some("schema/promotion_covers_category"));
+        // grocery is the parent of snacks and beverages.
+        for sku in ["trail-mix-500", "granola-bar-6", "sparkling-water-12", "cold-brew-4"] {
+            assert_eq!(covers("pantry-days", sku).as_deref(), Some("schema/promotion_covers_subcategories"), "{sku}");
+        }
+        assert_eq!(covers("snack-week", "cold-brew-4"), None, "a category covers only its own subtree");
+        // snack-week promotes the snacks category only; the stockout is still found.
+        let stockout = Fact::new("<stock_position:0142-trail-mix>", "a", "#promoted_stockout");
+        assert!(c.contains(&stockout).is_some(), "a category promotion makes a promoted stockout");
+        // Ended and scheduled promotions do not.
+        let cold = Fact::new("<stock_position:0217-cold-brew>", "a", "#promoted_stockout");
+        assert_eq!(c.contains(&cold), None);
+    });
 }
 
 /// A shape result: `shape/constraint focus: what`.
@@ -539,6 +584,7 @@ fn install_with_sample_loads_it_and_reverts_with_migrations() {
         let lines = packs::sample(id).unwrap();
         assert_eq!(done.sample_entities, lines.len(), "{id}");
         assert_eq!(done.sample_links, lines.iter().map(|e| e.links.len()).sum::<usize>(), "{id}");
+        assert_eq!(done.sample_links_skipped, 0, "{id}: nothing curated to keep");
         for e in &lines {
             let got = o.get(&admin(), &format!("{}:{}", e.kind, e.key.as_deref().unwrap())).unwrap();
             assert_eq!(got.workspace, "acme");
@@ -547,6 +593,7 @@ fn install_with_sample_loads_it_and_reverts_with_migrations() {
         let rev = o.revision();
         let again = o.pack_install(&ctx, id, options(InstallMode::Apply, true)).unwrap();
         assert!(again.already_installed && again.sample_entities == lines.len());
+        assert_eq!(again.sample_links_skipped, 0, "{id}: the sample's own links are no-ops, not conflicts");
         assert_eq!(o.revision(), rev, "{id}: a reloaded sample writes nothing");
 
         // Reverting a schema whose types hold data needs migrations.
@@ -582,6 +629,43 @@ fn sample_respects_curated_data_and_is_checked_before_the_schema_changes() {
     assert!(err.to_string().contains("sample of pack supply-chain does not load"), "{err}");
     assert_eq!(o.schema_version(), v0, "nothing was applied");
     assert!(!o.schema().object_types.contains_key("supplier"));
+}
+
+#[test]
+fn reloading_a_sample_keeps_curated_single_valued_links() {
+    let o = Ontology::in_memory(Schema::enterprise());
+    let ctx = ActionContext::new(admin(), "acme");
+    o.pack_install(&ctx, "logistics", options(InstallMode::Apply, true)).unwrap();
+    let carrier = |o: &Ontology| -> Vec<String> {
+        o.read(|g, _| g.neighbors("shipment:sh-88001", "carried_by", Dir::Out).into_iter().map(String::from).collect())
+    };
+    assert_eq!(carrier(&o), vec!["carrier:blue-anchor".to_string()]);
+    assert_eq!(o.schema().link_types["carried_by"].cardinality, Cardinality::One);
+    // A curator reassigns the shipment.
+    o.link(&ctx, "shipment:sh-88001", "carried_by", "carrier:nexa-freight").unwrap();
+    assert_eq!(carrier(&o), vec!["carrier:nexa-freight".to_string()]);
+    let rev = o.revision();
+    let again = o.pack_install(&ctx, "logistics", options(InstallMode::Apply, true)).unwrap();
+    assert!(again.already_installed);
+    assert_eq!(again.sample_links_skipped, 1, "the sample's carrier is held back");
+    assert_eq!(carrier(&o), vec!["carrier:nexa-freight".to_string()], "the curated link survives the reload");
+    assert_eq!(o.revision(), rev, "the reload writes nothing");
+
+    // The same holds for an entity curated before the sample first loads.
+    let o = Ontology::in_memory(Schema::enterprise());
+    o.pack_install(&ctx, "logistics", options(InstallMode::Apply, false)).unwrap();
+    o.upsert(&ctx, EntityInput::new("carrier", "own-fleet", "Own fleet")).unwrap();
+    o.upsert(
+        &ctx,
+        EntityInput::new("shipment", "sh-88001", "Curated SH-88001")
+            .prop("tracking_number", "CUR-1")
+            .link("carried_by", "carrier:own-fleet"),
+    )
+    .unwrap();
+    let done = o.pack_install(&ctx, "logistics", options(InstallMode::Apply, true)).unwrap();
+    assert_eq!(done.sample_links_skipped, 1);
+    assert_eq!(carrier(&o), vec!["carrier:own-fleet".to_string()]);
+    assert_eq!(o.get(&admin(), "shipment:sh-88001").unwrap().title, "Curated SH-88001");
 }
 
 fn governed(gov: Governance) -> Ontology {
@@ -627,6 +711,19 @@ fn apply_needs_governance_and_propose_files_a_proposal() {
     let listed = o.pack_list(&admin()).unwrap();
     assert!(listed.iter().find(|p| p.meta.id == "retail").unwrap().installed);
 
+    // A sample the policy refuses during the dry run is audited too.
+    let audited = |o: &Ontology| {
+        o.events(&admin(), &EventFilter { action: Some("authorization.denied".into()), ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.actor == "mo" && e.payload["reason"].as_str().is_some_and(|r| r.contains("other")))
+            .count()
+    };
+    let before = audited(&o);
+    let err = o.pack_install(&ActionContext::new(member.clone(), "other"), "retail", options(InstallMode::Apply, true));
+    let err = err.unwrap_err();
+    assert!(matches!(err, Error::Denied(_)) && err.to_string().contains("does not load"), "{err}");
+    assert_eq!(audited(&o), before + 1, "the cross-workspace sample load is audited");
     // Once applied, a member loads the sample: the schema part is a no-op.
     let loaded =
         o.pack_install(&ActionContext::new(member, "acme"), "retail", options(InstallMode::Propose, true)).unwrap();
@@ -636,6 +733,28 @@ fn apply_needs_governance_and_propose_files_a_proposal() {
     assert!(o.pack_plan(&viewer, "retail").unwrap().valid);
     let err = o.pack_install(&ActionContext::new(viewer, "acme"), "retail", options(InstallMode::Apply, true));
     assert!(matches!(err.unwrap_err(), Error::Denied(_)));
+}
+
+#[test]
+fn propose_and_approve_installs_every_pack() {
+    let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
+    for id in ids() {
+        let o = governed(Governance::default());
+        let filed =
+            o.pack_install(&ActionContext::new(agent.clone(), "acme"), id, options(InstallMode::Propose, false));
+        let filed = filed.unwrap_or_else(|e| panic!("{id}: {e}"));
+        let view = filed.proposal.unwrap_or_else(|| panic!("{id}: a proposal"));
+        assert!(filed.version.is_none() && !filed.already_installed && filed.changes > 0, "{id}");
+        assert_eq!(view.proposal.change_set.changes.len(), filed.changes, "{id}");
+        assert!(!o.pack_list(&admin()).unwrap().iter().find(|p| p.meta.id == id).unwrap().installed, "{id}");
+        let out = o
+            .review_proposal(&ActionContext::new(admin(), "acme"), &view.proposal.id, Decision::Approve, "ok", None)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert!(out.applied.is_some(), "{id}: the approval applies it");
+        assert!(o.pack_list(&admin()).unwrap().iter().find(|p| p.meta.id == id).unwrap().installed, "{id}");
+        let diff = onto_core::live_schema::diff(&o.schema(), &with_pack(id));
+        assert!(diff.is_empty(), "{id}: the approved schema equals enterprise + builtin:{id}: {diff:?}");
+    }
 }
 
 #[test]

@@ -22,10 +22,14 @@
 //! * **Requirements are checked, not assumed.** A pack names the packages it
 //!   layers on (`requires`); every object type of each must exist in the
 //!   current schema, or the pack is refused with what is missing.
-//! * **Samples load after their schema.** A sample is validated against the
-//!   planned schema before anything is written, loads only into existing
-//!   fields it does not overwrite (`fill_only`), and contains exactly one
-//!   deliberate shape violation that the pack's `sample_note` documents.
+//! * **Samples load after their schema and never overwrite.** A sample is
+//!   validated against the planned schema before anything is written. It
+//!   only fills gaps: an existing entity keeps its title, state and
+//!   properties (`fill_only`), and a sample link on a single-valued
+//!   (`cardinality = "one"`) relation is skipped when its source already
+//!   holds that relation to another target, so reloading a sample never
+//!   undoes a curator's change. A sample contains exactly one deliberate
+//!   shape violation that the pack's `sample_note` documents.
 //! * **Determinism.** Packs, names and listings come out sorted or in
 //!   registry order.
 
@@ -34,13 +38,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::action_types::ActionType;
-use crate::engine::{ActionContext, entity_id};
+use crate::engine::{ActionContext, Extra, entity_id};
+use crate::graph::Graph;
 use crate::live_schema::{SchemaChangeSet, SchemaPlan, SchemaVersionInfo, apply_changes, changes_between};
 use crate::metrics::MetricDef;
 use crate::model::{EntityInput, LinkInput, Mutation};
 use crate::policy::{Access, Principal};
 use crate::proposals::{ProposalInput, ProposalView};
-use crate::schema::{Glossary, InterfaceType, LinkType, ObjectType, PACKAGES, Rule, Schema};
+use crate::schema::{Cardinality, Dir, Glossary, InterfaceType, LinkType, ObjectType, PACKAGES, Rule, Schema};
 use crate::shape_model::Shape;
 use crate::time::now_ms;
 use crate::{Error, Ontology, Result};
@@ -256,7 +261,11 @@ pub struct PackInstalled {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ProposalView>,
     pub sample_entities: usize,
+    /// Sample links submitted (one already in the graph is a no-op).
     pub sample_links: usize,
+    /// Sample links not written because their source already holds that
+    /// single-valued relation to another target (curated data is kept).
+    pub sample_links_skipped: usize,
     /// Graph revision after the last write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
@@ -677,6 +686,36 @@ pub fn collisions_in(layers: &[(&str, &str)], packs: &[&str]) -> Vec<NameCollisi
 }
 
 impl Ontology {
+    /// `muts` without the links that would overwrite curated data: a link on
+    /// a single-valued relation whose source already links that relation to
+    /// another target (the engine would replace it). Returns the mutations
+    /// kept and how many links were held back.
+    fn fill_only_links(&self, g: &Graph, schema: &Schema, muts: &[Mutation]) -> (Vec<Mutation>, usize) {
+        let mut kept = Vec::with_capacity(muts.len());
+        let mut held = 0;
+        for m in muts {
+            if let Mutation::Link(l) = m {
+                // Resolve the link as the engine stages it: canonical
+                // direction, merged ids followed, symmetric pairs ordered.
+                let (base, dir) = schema.resolve_rel_lenient(&l.rel);
+                let (from, to) = if dir == Dir::In { (&l.to, &l.from) } else { (&l.from, &l.to) };
+                let (mut from, mut to) = (self.resolve_in(g, from), self.resolve_in(g, to));
+                let lt = schema.link_type(&base);
+                if lt.is_some_and(|l| l.symmetric) && from > to {
+                    std::mem::swap(&mut from, &mut to);
+                }
+                if lt.is_some_and(|l| l.cardinality == Cardinality::One)
+                    && g.neighbors(&from, &base, Dir::Out).into_iter().any(|t| t != to)
+                {
+                    held += 1;
+                    continue;
+                }
+            }
+            kept.push(m.clone());
+        }
+        (kept, held)
+    }
+
     fn pack_reader(&self, p: &Principal) -> Result<()> {
         if !p.allows(Access::Read) {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
@@ -734,6 +773,7 @@ impl Ontology {
             proposal: None,
             sample_entities: 0,
             sample_links: 0,
+            sample_links_skipped: 0,
             revision: None,
         };
         // Refuse what the caller may not do before any work is staged.
@@ -772,8 +812,14 @@ impl Ontology {
             };
             {
                 let g = self.inner_graph_read();
-                self.stage_only(&g, &planned, ctx, muts.clone())
-                    .map_err(|e| prefix(e, &format!("the sample of pack {id} does not load")))?;
+                let (kept, _) = self.fill_only_links(&g, &planned, &muts);
+                if let Err(e) = self.stage_only(&g, &planned, ctx, kept) {
+                    // A dry run does not audit; a plain apply would have.
+                    if let Error::Denied(reason) = &e {
+                        self.audit_denied(ctx, reason, now_ms());
+                    }
+                    return Err(prefix(e, &format!("the sample of pack {id} does not load")));
+                }
             }
             Some(muts)
         } else {
@@ -804,9 +850,20 @@ impl Ontology {
             }
         }
         if let Some(muts) = sample_muts {
-            out.sample_links = muts.iter().filter(|m| matches!(m, Mutation::Link(_))).count();
-            out.sample_entities = muts.len() - out.sample_links;
-            let res = self.apply(ctx, muts).map_err(|e| {
+            let links = muts.iter().filter(|m| matches!(m, Mutation::Link(_))).count();
+            out.sample_entities = muts.len() - links;
+            // Links are filtered again under the write lock, against the
+            // schema now in force, so a curator's change made since the dry
+            // run is kept too.
+            let mut skipped = 0;
+            let res = self.transact(ctx, |o, g| {
+                let (kept, held) = o.fill_only_links(g, &o.schema(), &muts);
+                skipped = held;
+                Ok((kept, Extra::default(), ()))
+            });
+            out.sample_links_skipped = skipped;
+            out.sample_links = links - skipped;
+            let res = res.map(|(r, ())| r).map_err(|e| {
                 let at = match &out.version {
                     Some(v) => format!("pack {id} was installed as schema version {}, but its sample", v.version),
                     None => format!("the sample of pack {id}"),
