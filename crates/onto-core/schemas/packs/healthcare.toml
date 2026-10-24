@@ -1,0 +1,570 @@
+# Industry pack: healthcare delivery.
+#
+# Layered on top of builtin:enterprise. Clinicians are people (they extend
+# `person`), care teams are enterprise `team`s and clinical guidelines are
+# enterprise `knowledge`. The pack adds patients, facilities and their units,
+# encounters, diagnoses, observations, medications and orders, and care plans.
+#
+# Codes (ICD-10, SNOMED CT, LOINC, ATC) are stored as plain strings checked
+# only for their lexical shape; the pack does not ship or validate the
+# terminologies themselves.
+
+[pack]
+id = "healthcare"
+title = "Healthcare delivery"
+industry = "healthcare"
+version = "1.0.0"
+description = "Patients, care facilities and units, encounters, diagnoses, clinical observations, medications, medication orders and care plans, with rules for treating clinicians, drug-class allergies and critical results. Clinical decisions stay with clinicians: the rules flag, they do not prescribe. The sample contains one deliberate shape violation (see sample_note)."
+requires = ["enterprise"]
+standards = [
+    "vocabulary inspired by HL7 FHIR R4 resources (Patient, Encounter, Condition, Observation, Medication, MedicationRequest, CarePlan, Location)",
+    "ICD-10 and SNOMED CT code fields (lexical shape only, terminologies not included)",
+    "LOINC observation code fields (lexical shape only)",
+    "drug classes in the style of the WHO ATC classification",
+]
+sample_note = "medication_order:mo-1003 is a verbal order with no prescribed_by link yet; it violates shape medication_order_complete (constraint medication_order_complete/prescriber, min_count)."
+
+# ── Actors ───────────────────────────────────────────────────────────────────
+
+[object_types.patient]
+label = "Patient"
+category = "actor"
+description = "Person receiving care. Identified by a medical record number (MRN)."
+color = "#2563eb"
+icon = "user-round"
+states = ["active", "inactive", "deceased"]
+terminal_states = ["deceased"]
+properties.mrn = { type = "string", required = true, pattern = "^MRN-[0-9]{6}$", description = "Medical record number, MRN-nnnnnn." }
+properties.birth_date = { type = "timestamp" }
+properties.administrative_gender = { type = "enum", values = ["female", "male", "other", "unknown"] }
+properties.preferred_language = { type = "string" }
+
+[object_types.clinician]
+extends = "person"
+label = "Clinician"
+category = "actor"
+description = "Licensed practitioner (physician, nurse, pharmacist) who provides or orders care."
+color = "#0d9488"
+icon = "stethoscope"
+properties.license_number = { type = "string", description = "Professional registration number." }
+properties.specialty = { type = "enum", values = ["general_practice", "internal_medicine", "emergency_medicine", "cardiology", "oncology", "pediatrics", "surgery", "radiology", "nursing", "pharmacy"] }
+
+# ── Places ───────────────────────────────────────────────────────────────────
+
+[object_types.care_facility]
+label = "Care facility"
+category = "container"
+description = "Hospital, clinic, laboratory or pharmacy that delivers care."
+color = "#7c3aed"
+icon = "hospital"
+states = ["operational", "restricted", "closed"]
+terminal_states = ["closed"]
+alert_states = ["restricted"]
+properties.facility_type = { type = "enum", values = ["hospital", "clinic", "long_term_care", "laboratory", "pharmacy"] }
+properties.bed_count = { type = "int" }
+
+[object_types.care_unit]
+label = "Care unit"
+category = "container"
+description = "Ward, department or bay inside a facility or inside another unit."
+color = "#9333ea"
+icon = "bed"
+states = ["open", "on_diversion", "closed"]
+terminal_states = ["closed"]
+alert_states = ["on_diversion"]
+properties.unit_type = { type = "enum", values = ["inpatient_ward", "intensive_care", "emergency", "outpatient", "operating_theatre", "laboratory"] }
+properties.beds = { type = "int" }
+
+# ── Clinical records ─────────────────────────────────────────────────────────
+
+[object_types.encounter]
+implements = ["clinical_record"]
+label = "Encounter"
+description = "Interaction between a patient and care providers: a visit, an admission, a teleconsultation."
+color = "#ea580c"
+icon = "calendar-clock"
+states = ["planned", "arrived", "in_progress", "on_leave", "finished", "cancelled"]
+terminal_states = ["finished", "cancelled"]
+properties.encounter_class = { type = "enum", values = ["ambulatory", "emergency", "inpatient", "virtual", "home_health"] }
+properties.admitted_at = { type = "timestamp" }
+properties.discharged_at = { type = "timestamp" }
+properties.discharge_note = { type = "text", searchable = true }
+
+[object_types.diagnosis]
+implements = ["clinical_record"]
+label = "Diagnosis"
+description = "Clinical condition, problem or diagnosis recorded for a patient."
+color = "#dc2626"
+icon = "clipboard-plus"
+states = ["active", "recurrence", "remission", "resolved", "refuted"]
+terminal_states = ["resolved", "refuted"]
+alert_states = ["recurrence"]
+properties.icd10_code = { type = "string", pattern = "^[A-Z][0-9]{2}(\\.[0-9A-Z]{1,4})?$", description = "ICD-10 code such as I10 or E11.9." }
+properties.snomed_code = { type = "string", pattern = "^[0-9]{6,18}$" }
+properties.severity = { type = "enum", values = ["mild", "moderate", "severe"] }
+properties.chronic = { type = "bool" }
+
+[object_types.clinical_observation]
+implements = ["clinical_record"]
+label = "Clinical observation"
+description = "Measurement or finding: a laboratory result, a vital sign, a score."
+color = "#ca8a04"
+icon = "activity"
+states = ["registered", "preliminary", "final", "amended", "cancelled"]
+terminal_states = ["final", "amended", "cancelled"]
+properties.loinc_code = { type = "string", pattern = "^[0-9]{1,7}-[0-9]$", description = "LOINC code such as 2160-0." }
+properties.value = { type = "float" }
+properties.unit = { type = "string" }
+properties.interpretation = { type = "enum", values = ["normal", "abnormal", "low", "high", "critical"] }
+properties.effective_at = { type = "timestamp" }
+
+[object_types.medication]
+label = "Medication"
+description = "Drug product that can be ordered and administered."
+color = "#16a34a"
+icon = "pill"
+properties.atc_code = { type = "string", pattern = "^[A-Z][0-9]{2}[A-Z]{2}[0-9]{2}$" }
+properties.form = { type = "enum", values = ["tablet", "capsule", "injection", "infusion", "inhaler", "topical", "liquid"] }
+properties.controlled = { type = "bool", description = "Controlled substance schedule applies." }
+properties.high_alert = { type = "bool", description = "On the facility's high-alert medication list." }
+
+[object_types.drug_class]
+label = "Drug class"
+description = "Therapeutic or chemical group of medications (for example penicillins). Classes nest."
+color = "#65a30d"
+icon = "layers"
+properties.atc_prefix = { type = "string", pattern = "^[A-Z]([0-9]{2}([A-Z]([A-Z]([0-9]{2})?)?)?)?$" }
+
+[object_types.medication_order]
+implements = ["clinical_record"]
+label = "Medication order"
+description = "Prescription or inpatient order of a medication for a patient."
+color = "#059669"
+icon = "file-pen"
+states = ["draft", "active", "on_hold", "completed", "cancelled", "stopped"]
+terminal_states = ["completed", "cancelled", "stopped"]
+alert_states = ["on_hold"]
+properties.dose = { type = "string", description = "Dose with its unit, for example 500 mg." }
+properties.route = { type = "enum", values = ["oral", "intravenous", "intramuscular", "subcutaneous", "inhaled", "topical"] }
+properties.frequency = { type = "string" }
+properties.as_needed = { type = "bool" }
+properties.hold_reason = { type = "text" }
+
+[object_types.care_plan]
+implements = ["clinical_record"]
+label = "Care plan"
+description = "Intended care for a patient: goals and planned activities for one or more diagnoses."
+color = "#0284c7"
+icon = "list-checks"
+states = ["draft", "active", "on_hold", "completed", "revoked"]
+terminal_states = ["completed", "revoked"]
+alert_states = ["on_hold"]
+properties.goal = { type = "text", searchable = true }
+properties.review_due = { type = "timestamp" }
+
+# ── Relations ────────────────────────────────────────────────────────────────
+
+[link_types.for_patient]
+description = "The clinical record is about this patient."
+from = ["clinical_record"]
+to = ["patient"]
+inverse = "patient_records"
+cardinality = "one"
+weight = 1.0
+
+[link_types.seen_at]
+description = "Where the encounter takes place."
+from = ["encounter"]
+to = ["care_unit", "care_facility"]
+inverse = "site_of_encounter"
+weight = 0.8
+
+[link_types.attended_by]
+description = "Clinician responsible for the encounter."
+from = ["encounter"]
+to = ["clinician"]
+inverse = "attends_encounter"
+weight = 0.9
+
+[link_types.care_unit_within]
+description = "The unit sits inside this unit or facility (a bay in a ward in a hospital)."
+from = ["care_unit"]
+to = ["care_unit", "care_facility"]
+inverse = "contains_care_unit"
+transitive = true
+weight = 0.7
+
+[link_types.practices_at]
+description = "Facility where the clinician holds privileges."
+from = ["clinician"]
+to = ["care_facility"]
+inverse = "clinician_staff"
+weight = 0.6
+
+[link_types.primary_clinician]
+description = "The patient's primary care clinician (general practitioner)."
+from = ["patient"]
+to = ["clinician"]
+inverse = "primary_care_of"
+cardinality = "one"
+weight = 0.8
+
+[link_types.diagnosed_in]
+description = "Encounter in which the diagnosis was made."
+from = ["diagnosis"]
+to = ["encounter"]
+inverse = "diagnoses_made"
+weight = 0.8
+
+[link_types.supported_by_observation]
+description = "Observation that supports the diagnosis."
+from = ["diagnosis"]
+to = ["clinical_observation"]
+inverse = "supports_diagnosis"
+weight = 0.7
+
+[link_types.observed_during]
+description = "Encounter in which the observation was taken."
+from = ["clinical_observation"]
+to = ["encounter"]
+inverse = "observations_taken"
+weight = 0.6
+
+[link_types.orders_medication]
+description = "Medication the order is for."
+from = ["medication_order"]
+to = ["medication"]
+inverse = "medication_orders"
+cardinality = "one"
+weight = 1.0
+
+[link_types.prescribed_by]
+description = "Clinician who signed the order."
+from = ["medication_order"]
+to = ["clinician"]
+inverse = "prescribed"
+cardinality = "one"
+weight = 0.9
+
+[link_types.in_drug_class]
+description = "Drug class the medication belongs to."
+from = ["medication"]
+to = ["drug_class"]
+inverse = "drug_class_members"
+weight = 0.8
+
+[link_types.drug_class_within]
+description = "The drug class is a subgroup of this broader class (penicillins within beta-lactams)."
+from = ["drug_class"]
+to = ["drug_class"]
+inverse = "narrower_drug_classes"
+transitive = true
+weight = 0.6
+
+[link_types.allergic_to]
+description = "Recorded allergy or intolerance to every medication of this drug class."
+from = ["patient"]
+to = ["drug_class"]
+inverse = "allergic_patients"
+weight = 1.0
+
+[link_types.plan_addresses]
+description = "Diagnosis the care plan addresses."
+from = ["care_plan"]
+to = ["diagnosis"]
+inverse = "addressed_by_plan"
+weight = 0.8
+
+[link_types.follows_guideline]
+description = "Clinical guideline or protocol (enterprise knowledge) the care plan follows."
+from = ["care_plan"]
+to = ["knowledge"]
+inverse = "guideline_for_plan"
+weight = 0.5
+
+# ── Interfaces ───────────────────────────────────────────────────────────────
+
+[interfaces.clinical_record]
+description = "Anything recorded in a patient's chart: encounters, diagnoses, observations, orders and care plans."
+properties.recorded_at = { type = "timestamp" }
+links = ["for_patient"]
+
+# ── Glossary ─────────────────────────────────────────────────────────────────
+
+[glossary.kinds]
+hospital = "care_facility"
+clinic = "care_facility"
+ward = "care_unit"
+icu = "care_unit"
+patient_visit = "encounter"
+hospital_admission = "encounter"
+clinic_appointment = "encounter"
+medical_condition = "diagnosis"
+patient_chart = "clinical_record"
+lab_result = "clinical_observation"
+vital_sign = "clinical_observation"
+vitals = "clinical_observation"
+drug = "medication"
+prescription = "medication_order"
+physician = "clinician"
+doctor = "clinician"
+nurse = "clinician"
+practitioner = "clinician"
+care_team = "team"
+
+[glossary.relations]
+prescriber = "prescribed_by"
+attending = "attended_by"
+allergy = "allergic_to"
+gp = "primary_clinician"
+
+# ── Inference rules ──────────────────────────────────────────────────────────
+
+[[rules]]
+name = "treating_clinician"
+description = "A clinician attending one of the patient's encounters is treating the patient."
+chain = ["patient_records", "attended_by"]
+infer = "treated_by_clinician"
+
+[[rules]]
+name = "medication_exposure"
+description = "A patient receives every medication on one of their active orders (draft, on-hold, completed, stopped and cancelled orders do not count)."
+when = [["?o", "for_patient", "?p"], ["?o", "orders_medication", "?m"], ["?o", "state", "active"]]
+then = ["?p", "receives_medication", "?m"]
+
+[[rules]]
+name = "drug_class_membership"
+description = "A medication in a drug class is also in every broader class that class sits within."
+chain = ["in_drug_class", "drug_class_within"]
+infer = "in_drug_class"
+
+[[rules]]
+name = "allergy_contraindication"
+description = "An active order of a medication from a drug class the patient is allergic to is contraindicated."
+when = [
+    ["?o", "orders_medication", "?m"],
+    ["?m", "in_drug_class", "?c"],
+    ["?o", "for_patient", "?p"],
+    ["?p", "allergic_to", "?c"],
+    ["?o", "state", "active"],
+]
+then = ["?o", "a", "contraindicated_order"]
+
+[[rules]]
+name = "critical_result"
+description = "A patient with a final observation interpreted as critical has a critical result."
+when = [
+    ["?r", "a", "clinical_observation"],
+    ["?r", "prop.interpretation", "critical"],
+    ["?r", "state", "final"],
+    ["?r", "for_patient", "?p"],
+]
+then = ["?p", "a", "critical_result_patient"]
+
+[[rules]]
+name = "critical_result_notification"
+description = "The clinician attending an in-progress encounter of a patient with a critical result must be notified."
+when = [
+    ["?p", "a", "critical_result_patient"],
+    ["?e", "for_patient", "?p"],
+    ["?e", "a", "encounter"],
+    ["?e", "state", "in_progress"],
+    ["?e", "attended_by", "?c"],
+]
+then = ["?c", "notify_critical_result", "?p"]
+
+# ── Shapes ───────────────────────────────────────────────────────────────────
+
+[shapes.patient_identity]
+description = "Every patient carries one well-formed MRN and a birth date."
+target = "patient"
+
+[[shapes.patient_identity.properties]]
+id = "patient_identity/mrn"
+path = "prop.mrn"
+min_count = 1
+max_count = 1
+pattern = "^MRN-[0-9]{6}$"
+
+[[shapes.patient_identity.properties]]
+id = "patient_identity/birth_date"
+path = "prop.birth_date"
+min_count = 1
+
+[shapes.medication_order_complete]
+description = "An order names exactly one medication, its patient and the clinician who signed it."
+target = "medication_order"
+
+[[shapes.medication_order_complete.properties]]
+id = "medication_order_complete/medication"
+path = "orders_medication"
+min_count = 1
+max_count = 1
+class = "medication"
+
+[[shapes.medication_order_complete.properties]]
+id = "medication_order_complete/patient"
+path = "for_patient"
+min_count = 1
+max_count = 1
+class = "patient"
+
+[[shapes.medication_order_complete.properties]]
+id = "medication_order_complete/prescriber"
+path = "prescribed_by"
+min_count = 1
+class = "clinician"
+message = "Orders must be signed by a clinician."
+
+[[shapes.medication_order_complete.properties]]
+id = "medication_order_complete/route"
+path = "prop.route"
+min_count = 1
+in = ["oral", "intravenous", "intramuscular", "subcutaneous", "inhaled", "topical"]
+
+[shapes.observation_coded]
+description = "Observations carry a LOINC code; measured values are numbers."
+target = "clinical_observation"
+
+[[shapes.observation_coded.properties]]
+id = "observation_coded/loinc"
+path = "prop.loinc_code"
+min_count = 1
+pattern = "^[0-9]{1,7}-[0-9]$"
+
+[[shapes.observation_coded.properties]]
+id = "observation_coded/value"
+path = "prop.value"
+max_count = 1
+datatype = "float"
+
+[[shapes.observation_coded.properties]]
+id = "observation_coded/patient"
+path = "for_patient"
+min_count = 1
+class = "patient"
+
+[shapes.encounter_staffed]
+description = "Encounters happen somewhere and someone is responsible for them."
+target = "encounter"
+
+[[shapes.encounter_staffed.properties]]
+id = "encounter_staffed/site"
+path = "seen_at"
+min_count = 1
+
+[[shapes.encounter_staffed.properties]]
+id = "encounter_staffed/attending"
+path = "attended_by"
+min_count = 1
+class = "clinician"
+severity = "warning"
+
+[shapes.diagnosis_coded]
+description = "Diagnoses carry an ICD-10 code and belong to a patient."
+target = "diagnosis"
+
+[[shapes.diagnosis_coded.properties]]
+id = "diagnosis_coded/icd10"
+path = "prop.icd10_code"
+min_count = 1
+max_count = 1
+pattern = "^[A-Z][0-9]{2}(\\.[0-9A-Z]{1,4})?$"
+
+[[shapes.diagnosis_coded.properties]]
+id = "diagnosis_coded/patient"
+path = "for_patient"
+min_count = 1
+class = "patient"
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+[metrics.active_inpatients]
+description = "Inpatient encounters in progress, by care unit."
+kind = "encounter"
+measure = "count"
+filter = { state = ["in_progress"], props = { encounter_class = "inpatient" } }
+dimensions = { unit = "seen_at", attending = "attended_by" }
+certified = true
+
+[metrics.open_medication_orders]
+description = "Medication orders not yet completed, cancelled or stopped."
+kind = "medication_order"
+measure = "count"
+filter = { open = true }
+dimensions = { state = "state", route = "route", prescriber = "prescribed_by" }
+
+[metrics.critical_observations]
+description = "Observations interpreted as critical, by LOINC code."
+kind = "clinical_observation"
+measure = "count"
+filter = { props = { interpretation = "critical" } }
+dimensions = { code = "loinc_code", patient = "for_patient" }
+
+[metrics.encounter_length]
+description = "Days from the encounter record being created to it finishing or being cancelled (record creation time, not recorded_at or admitted_at)."
+kind = "encounter"
+measure = "lead_time"
+window_days = 90
+
+# ── Action types ─────────────────────────────────────────────────────────────
+
+[action_types.discharge_patient]
+description = "Finish an encounter that is in progress or on leave, with a discharge note."
+phrases = ["discharge", "release patient"]
+roles = ["member", "admin"]
+risk = "medium"
+parameters.encounter = { type = "entity", kinds = ["encounter"], required = true, description = "The encounter to finish" }
+parameters.note = { type = "text", required = true, cue = ["with", "note"] }
+
+[[action_types.discharge_patient.preconditions]]
+check = "state_in"
+param = "encounter"
+values = ["in_progress", "on_leave"]
+message = "Only an encounter in progress or on leave can be discharged."
+
+[[action_types.discharge_patient.effects]]
+patch = { id = "{encounter}", state = "finished", props = { discharge_note = "{note}", discharged_at = "{now}" } }
+
+[[action_types.discharge_patient.effects]]
+event = { action = "encounter.discharged", target = "{encounter}", payload = { note = "{note}" } }
+
+[action_types.hold_medication_order]
+description = "Put an active medication order on hold, recording why."
+phrases = ["hold", "pause order", "suspend order"]
+risk = "low"
+parameters.order = { type = "entity", kinds = ["medication_order"], required = true }
+parameters.reason = { type = "text", required = true, cue = ["because", "for"] }
+
+[[action_types.hold_medication_order.preconditions]]
+check = "state_in"
+param = "order"
+values = ["active"]
+message = "Only an active order can be put on hold."
+
+[[action_types.hold_medication_order.effects]]
+patch = { id = "{order}", state = "on_hold", props = { hold_reason = "{reason}" } }
+
+[[action_types.hold_medication_order.effects]]
+event = { action = "medication_order.held", target = "{order}", payload = { reason = "{reason}" } }
+
+[action_types.assign_primary_clinician]
+description = "Make a clinician the patient's primary care clinician (replaces the current one)."
+phrases = ["assign gp", "register with"]
+risk = "low"
+parameters.patient = { type = "entity", kinds = ["patient"], required = true }
+parameters.clinician = { type = "entity", kinds = ["clinician"], required = true, cue = ["to", "with"] }
+
+[[action_types.assign_primary_clinician.preconditions]]
+check = "no_link"
+param = "patient"
+rel = "primary_clinician"
+to = "{clinician}"
+message = "That clinician is already the patient's primary clinician."
+
+[[action_types.assign_primary_clinician.effects]]
+link = { from = "{patient}", rel = "primary_clinician", to = "{clinician}" }
+replace = true
+
+[[action_types.assign_primary_clinician.effects]]
+event = { action = "patient.primary_clinician_assigned", target = "{patient}", payload = { clinician = "{clinician}" } }
