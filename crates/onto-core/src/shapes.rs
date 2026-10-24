@@ -5,12 +5,14 @@
 //! * **A report is a measurement, not a proof.** [`validate`] measures the
 //!   graph as one principal can read it (and, with `inferred`, the reasoner's
 //!   closure of it). Its `means` field says so.
-//! * **Three answers, not two.** `conforms` means every selected constraint
-//!   ran over at least one focus node and none produced a result; `violates`
-//!   means some constraint produced a result (of any severity, as in SHACL);
-//!   `undetermined` means nothing produced a result but the question could not
-//!   be answered: a constraint was skipped, no target selected anything, or the
-//!   closure is a lower bound. Silence is never read as "valid".
+//! * **Three answers, not two.** `conforms` means every selected shape with a
+//!   target selected at least one focus node, no constraint was skipped, and
+//!   none produced a result; `violates` means some constraint produced a
+//!   result (of any severity, as in SHACL); `undetermined` means the question
+//!   could not be answered: nothing produced a result but a constraint was
+//!   skipped or a selected shape's target selected nothing, or the closure is a
+//!   lower bound (its results are then listed but decide nothing). Silence is
+//!   never read as "valid".
 //! * **Whitelist what is implemented.** Keys a property shape carries that this
 //!   module does not evaluate (`PropertyShape::unknown`) are reported as
 //!   skipped, which makes a report without results undetermined. Annotation
@@ -49,10 +51,11 @@ use crate::{Error, Ontology, Result};
 
 /// What a shape report is.
 pub const REPORT_MEANS: &str = "A shape report is a measurement of the graph as this principal can read it (with \
-     inferred, of the reasoner's closure too), not a proof. conforms: every selected constraint ran over at least one \
-     focus node and none produced a result. violates: some constraint produced a result, of any severity. \
-     undetermined: no result, but a constraint was skipped, no target selected anything, or the closure is a lower \
-     bound.";
+     inferred, of the reasoner's closure too), not a proof. conforms: every selected shape with a target selected at least one \
+     focus node, no constraint was skipped, and none produced a result. violates: some constraint produced a result, \
+     of any severity. undetermined: no result, but a constraint was skipped or a selected shape's target selected \
+     nothing (see unmatched_targets); or the closure is a lower bound, and then any results are listed but decide \
+     nothing.";
 
 /// What an induced shape is.
 pub const INDUCE_MEANS: &str = "An induced shape describes the data as it is, not what it should be. Each constraint \
@@ -866,6 +869,27 @@ fn text_of(v: &Value) -> String {
     }
 }
 
+/// Order of scalar JSON types in an induced `in` list: booleans, numbers,
+/// strings, anything else.
+fn scalar_rank(v: &Value) -> u8 {
+    match v {
+        Value::Bool(_) => 0,
+        Value::Number(_) => 1,
+        Value::String(_) => 2,
+        _ => 3,
+    }
+}
+
+/// A total order on scalar values, numbers by value.
+fn cmp_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
+    scalar_rank(a).cmp(&scalar_rank(b)).then_with(|| match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Number(x), Value::Number(y)) => x.as_f64().unwrap_or(0.0).total_cmp(&y.as_f64().unwrap_or(0.0)),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => a.to_string().cmp(&b.to_string()),
+    })
+}
+
 fn list(values: &[Value]) -> String {
     values.iter().map(text_of).collect::<Vec<_>>().join("|")
 }
@@ -1015,7 +1039,9 @@ pub fn validate(
     let focus_nodes = focus_by_shape.values().sum();
     let skipped: Vec<SkippedConstraint> = ev.skipped.into_iter().collect();
     let fixpoint_reached = closure.map(Closure::fixpoint_reached);
-    let undetermined = skipped.iter().any(|s| !s.is_deactivation()) || focus_nodes == 0;
+    // One selected shape whose target matched nothing leaves part of the
+    // question unanswered, however many other focus nodes there were.
+    let undetermined = skipped.iter().any(|s| !s.is_deactivation()) || focus_nodes == 0 || !unmatched.is_empty();
     // A lower-bound closure can both hide and invent results (a class or a
     // min_count the missing facts would satisfy), so it answers nothing.
     let verdict = if fixpoint_reached == Some(false) {
@@ -1134,8 +1160,11 @@ pub fn check(schema: &Schema, shapes: &BTreeMap<String, Shape>) -> ShapeCheck {
         for (i, ps) in raw.properties.iter().enumerate() {
             constraints += 1;
             let cid = Some(shape.properties[i].id.as_str());
-            if !ps.id.is_empty() && !ids.insert(ps.id.as_str()) {
-                issue(cid, ShapeIssueKind::DuplicateId, format!("property shape id {} is used twice", ps.id));
+            // Compared after normalization, as compile does: an explicit id
+            // can collide with another property's default `<shape>/<index>`.
+            let nid = shape.properties[i].id.as_str();
+            if !ids.insert(nid) {
+                issue(cid, ShapeIssueKind::DuplicateId, format!("property shape id {nid} is used twice"));
             }
             match ShapePath::parse(&ps.path) {
                 ShapePath::Title | ShapePath::State => {}
@@ -1408,22 +1437,26 @@ pub fn induce(
         let enumerable = matches!(plan, PathPlan::Prop(_) | PathPlan::State)
             && values.iter().all(|v| v.is_string() || v.is_number() || v.is_boolean());
         if enumerable && !values.is_empty() {
-            let mut distinct: BTreeMap<String, Value> = BTreeMap::new();
+            // Distinct by the equality `in` is validated with ([`same`]), so 1
+            // and "1" stay apart and every source value is listed.
+            let mut distinct: Vec<Value> = Vec::new();
             for v in &values {
-                distinct.entry(text_of(v)).or_insert_with(|| (*v).clone());
+                if !distinct.iter().any(|d| same(d, v)) {
+                    distinct.push((*v).clone());
+                    if distinct.len() > 12 {
+                        break;
+                    }
+                }
             }
+            distinct.sort_by(cmp_scalar);
             let d = distinct.len();
             if (2..=12).contains(&d) && values.len() >= 5 * d {
-                let names: Vec<&String> = distinct.keys().collect();
-                ps.values = distinct.values().cloned().collect();
-                say(
-                    "in",
-                    format!(
-                        "{} {path} values take {d} distinct values ({})",
-                        values.len(),
-                        names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                    ),
-                );
+                // Mixed JSON types are shown as JSON so 1 and "1" read apart.
+                let mixed = distinct.iter().any(|v| scalar_rank(v) != scalar_rank(&distinct[0]));
+                let names: Vec<String> =
+                    distinct.iter().map(|v| if mixed { v.to_string() } else { text_of(v) }).collect();
+                ps.values = distinct;
+                say("in", format!("{} {path} values take {d} distinct values ({})", values.len(), names.join(", ")));
             }
         }
         let constrained = ps.min_count.is_some()

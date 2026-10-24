@@ -426,6 +426,12 @@ fn partial_closure_is_undetermined() {
     });
     assert_eq!(r.verdict, ShapeVerdict::Undetermined, "{r:#?}");
     assert_eq!(r.fixpoint_reached, Some(false));
+    // Results under a lower bound are listed but decide nothing.
+    let q = query(one("issue", json!({ "path": "affects", "min_count": 1 })), true);
+    let r = o.read(|g, s| shapes::validate(s, g, Some(&reason::closure(s, g, &opts, &|_| true)), &q, &|_| true));
+    assert_eq!((r.verdict, r.conforms), (ShapeVerdict::Undetermined, None), "{r:#?}");
+    assert!(r.total_results > 0, "{r:#?}");
+    assert!(r.means.contains("any results are listed but decide nothing"));
 }
 
 #[test]
@@ -452,6 +458,19 @@ fn empty_target_is_undetermined() {
     assert_eq!(r.verdict, ShapeVerdict::Undetermined, "{r:#?}");
     assert_eq!(r.unmatched_targets, vec!["s".to_string()]);
     assert_eq!(r.focus_nodes, 0);
+    // One shape that matched nothing leaves the report undetermined, even
+    // when another shape ran over focus nodes and produced no result.
+    let mixed = run(
+        &o,
+        json!({
+            "a": { "target": "issue", "properties": [{ "path": "belongs_to", "min_count": 1 }] },
+            "b": { "target": "deployment", "properties": [{ "path": "deploys", "min_count": 1 }] }
+        }),
+    );
+    assert_eq!((mixed.verdict, mixed.conforms), (ShapeVerdict::Undetermined, None), "{mixed:#?}");
+    assert_eq!(mixed.unmatched_targets, vec!["b".to_string()]);
+    assert!(mixed.results.is_empty() && mixed.focus_nodes == 3, "{mixed:#?}");
+    assert!(mixed.means.contains("every selected shape with a target selected at least one focus node"));
     // No shapes at all answers nothing either.
     let none = o.shapes_validate(&admin(), &ShapesQuery::default()).unwrap();
     assert_eq!(none.verdict, ShapeVerdict::Undetermined);
@@ -578,6 +597,15 @@ fn check_reports_every_issue_kind() {
     assert_eq!(task.issue, ShapeIssueKind::MissingProperty);
     assert!(task.detail.contains("task objects have no property email"), "{}", task.detail);
     assert_eq!(task.constraint_id.as_deref(), Some("task_props/0"));
+    // An explicit id equal to another property's default id is a duplicate,
+    // as compile sees it after normalization.
+    let clash = drafts(json!({ "x": { "target": "issue", "properties": [
+        { "id": "x/1", "path": "title" },
+        { "path": "title" }
+    ] } }));
+    let c = o.shapes_check(&clash);
+    assert!(!c.ok);
+    assert!(c.issues.iter().any(|i| i.issue == ShapeIssueKind::DuplicateId), "{:#?}", c.issues);
     // work_item declares priority, so a work_item shape may read it.
     let iface = drafts(json!({ "w": { "target": "work_item", "properties": [{ "path": "prop.priority" }] } }));
     assert!(o.shapes_check(&iface).ok);
@@ -665,6 +693,31 @@ fn induction_reads_enums_and_round_trips_at_scale() {
     let none = o.shapes_induce(&admin(), "deployment", &InduceOptions::default()).unwrap();
     assert_eq!(none.entities, 0);
     assert!(none.notes.iter().any(|n| n.contains("nothing to induce")));
+}
+
+#[test]
+fn induction_keeps_mixed_json_values_apart() {
+    let mut schema = schema();
+    schema.extend_toml("[object_types.widget]\nproperties.code = { type = \"json\" }\n").unwrap();
+    let o = Ontology::in_memory(schema);
+    let ctx = ActionContext::new(admin(), "acme");
+    let codes = [json!(1), json!("1"), json!(2)];
+    let muts = (0..15)
+        .map(|i| {
+            Mutation::Upsert(
+                EntityInput::new("widget", format!("{i}"), format!("W {i}")).prop("code", codes[i % 3].clone()),
+            )
+        })
+        .collect();
+    o.apply(&ctx, muts).unwrap();
+    let ind = o.shapes_induce(&admin(), "widget", &InduceOptions::default()).unwrap();
+    let code = ind.shape.properties.iter().find(|p| p.path == "prop.code").expect("prop.code");
+    assert_eq!(code.values, vec![json!(1), json!(2), json!("1")]);
+    assert_eq!(code.datatype, None);
+    assert!(ind.evidence.iter().any(|e| e.text.contains("3 distinct values (1, 2, \"1\")")), "{:#?}", ind.evidence);
+    let mut q = ShapesQuery::default();
+    q.drafts.insert(ind.name.clone(), ind.shape.clone());
+    conforms(&o.shapes_validate(&admin(), &q).unwrap());
 }
 
 #[test]
