@@ -1,0 +1,4 @@
+#coffee	extends	#drink
+#espresso	extends	#coffee
+<cup:my>	a	#espresso
+<cup:other>	a

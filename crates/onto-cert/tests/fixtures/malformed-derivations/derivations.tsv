@@ -1,0 +1,4 @@
+builtin/extends_transitive	#espresso	extends	#drink	#espresso	extends	#coffee	#coffee	extends	#drink
+builtin/type_extends	<cup:my>	a	#coffee	<cup:my>	a	#espresso	#espresso	extends	#coffee
+builtin/type_extends	<cup:my>	a	#drink	<cup:my>	a	#coffee	#coffee	extends	#drink
+builtin/type_extends	<cup:my>		#drink	<cup:my>	a	#coffee	#coffee	extends	#drink

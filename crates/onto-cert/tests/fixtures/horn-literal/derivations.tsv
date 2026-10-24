@@ -1,0 +1,1 @@
+schema/high_risk_supplier	<supplier:acme>	a	#high_risk_supplier	<supplier:acme>	a	#supplier	<supplier:acme>	located_in	<country:xx>	<country:xx>	state	"sanctioned"
