@@ -166,7 +166,7 @@ $ onto reason run
   schema/production_crew                   3
   schema/responsible_team                  10
   schema/suspect_lot                       1
-not evaluated: cardinality, required_links, link_endpoints, property_types, shapes, metrics, derived_properties, quality_constraints, action_preconditions
+not evaluated: cardinality, required_properties, state_values, required_links, link_endpoints, property_types, shapes, metrics, derived_properties, quality_constraints, action_preconditions
   a clean run is not a consistency result
 Sample derivations (derived, not asserted)
   <artifact:postgres-ha-tf> a #knowledge_item  by builtin/type_implements from <artifact:postgres-ha-tf> a #artifact, #artifact implements #knowledge_item
@@ -176,14 +176,32 @@ Sample derivations (derived, not asserted)
 ```
 
 The `not evaluated` line is part of every run: the reasoner derives facts, it
-does not check cardinality, required links, link endpoints, property types,
-shapes, metrics, derived properties, quality constraints or action
-preconditions. Shapes and the quality report measure some of those.
+does not check cardinality, required properties, state values, required
+links, link endpoints, property types, shapes, metrics, derived properties,
+quality constraints or action preconditions. Shapes and the quality report
+measure some of those.
 
 Limits stop a run early and say so (`fixpoint_reached: false`, `truncated`
-with the reason): `max_derived` (default 1,000,000 derived facts) and
-`max_rounds` (default 10,000). The engine keeps the last four closures, keyed
-by graph revision, schema version, principal, roles, workspaces and workspace.
+with the reason): `max_derived` (default 1,000,000 derived facts; it stops a
+round inside the rule join, not only between rounds), `max_rounds` (default
+10,000) and `max_work` (default 50,000,000 candidate facts tried by the rule
+joins of one run). A caller may lower `max_derived`, never raise it, and
+`reason.run` lists at most 1,000 sample derivations:
+
+```text
+$ onto reason run --max-derived 10 --samples 0
+10 facts derived from 345 asserted (16 rules · 1 round · fixpoint NOT reached: a lower bound)
+  truncated: stopped at max_derived = 10
+  builtin/type_implements                  10
+not evaluated: cardinality, required_properties, state_values, required_links, link_endpoints, property_types, shapes, metrics, derived_properties, quality_constraints, action_preconditions
+  a clean run is not a consistency result
+means: Derived facts are the engine's opinion under the rule table: …
+```
+
+The facts are collected under the graph's read guard and the closure runs
+after it is released. The engine keeps the last four closures, keyed by graph
+revision, schema version, principal, roles, workspaces and workspace; a
+closure of an older revision or schema version leaves the cache.
 
 `onto reason query` matches a pattern over asserted and derived facts, with
 the same atom syntax as `when`:
@@ -194,6 +212,29 @@ $ onto reason query '[["?lot","a","suspect_lot"],["?lot","lot_of_part","?p"]]'
  <production_lot:l-2420>        <part:hb-100>                 
 1 binding
 ```
+
+A query has at most 8 atoms and returns at most `limit` bindings (default 50,
+at most 1,000). Its join may try 10,000,000 candidate facts and scan 100,000
+matches; an answer cut there says so in `truncated`. State and property facts
+are in the closure only when a rule reads them, so an atom that asks for
+others is refused, and a variable predicate is answered without them:
+
+```text
+$ onto reason query --limit 3 '["issue:421","?p","?o"]'
+?o                             ?p                             
+ "blocked"                      state                         
+ #issue                         a                             
+ #work_item                     a                             
+3 bindings · truncated: atom 0 has a variable predicate: the closure holds state and property facts only when a rule reads them (state facts are held; property facts are held only for prop.severity), so bindings for the rest are left out; read property values from the store
+$ onto reason query '["?i","prop.priority","critical"]'
+error: invalid: atom 0: the closure holds no prop.priority facts because no rule reads them; read property values from the store
+$ onto reason query '[["?a","a","issue"],["?a","assigned_to","?b"],["?b","member_of","?c"],["?c","owns","?d"],["?d","a","project"],["?a","belongs_to","?d"],["?b","a","person"],["?c","a","team"],["?d","owned_by","?c"]]'
+error: invalid: a query has at most 8 atoms (this one has 9)
+```
+
+When the closure refused terms (see [The fact model](#the-fact-model)), the
+answer carries `refused`, their count, and says in `truncated` that the facts
+naming them are left out.
 
 ## Certificates
 
@@ -227,7 +268,7 @@ wrote cert (check again with `onto cert check cert` or `onto-cert check cert`)
   },
   "attested": {
     "engine": "onto-intelli 0.2.0",
-    "created_at": "2026-10-24T12:11:21Z",
+    "created_at": "2026-10-24T13:33:11Z",
     "workspace": null,
     "schema_version": 2,
     "graph_revision": 1,
@@ -238,6 +279,14 @@ wrote cert (check again with `onto cert check cert` or `onto-cert check cert`)
   "means": "derived fields are recomputed by the checker; attested fields are claims of the engine that wrote this certificate"
 }
 ```
+
+The checker never reads the attested fields, so whether the closure reached
+its fixpoint stays the engine's claim. `reason.certify` returns it next to
+the verdict, as `fixpoint_reached` and `rounds` (and `truncated` when a limit
+cut the run). For a closure that stopped at a limit, `onto reason certify`
+prints a note under the verdict that the closure is a lower bound and why it
+stopped, and the web UI shows the same: every listed derivation still checks,
+but more may follow.
 
 ### The checker: onto-cert
 
@@ -398,7 +447,7 @@ Three words, three claims:
 |---|---|
 | `sufficient` | an independent evaluator re-derives the fact from exactly these facts |
 | `minimal` | it no longer does once any one of them is removed (each removal re-derived) |
-| `complete` | every minimal justification was enumerated; claimed only when no bound stopped the search (default 10 justifications, 10,000 steps) and the closure reached its fixpoint |
+| `complete` | every minimal justification was enumerated; claimed only when no bound stopped the search (default 10 justifications, at most 100 on request, and 10,000 steps) and the closure reached its fixpoint |
 
 One justification comes from deletion-based minimization of a witness, more
 from Reiter's hitting-set tree.
@@ -458,6 +507,10 @@ not_entailed         issue:421 handled_by_team team:platform  <issue:421> handle
 | `not_entailed` | absent from this closure under its rules; absence, not falsity |
 | `outside_vocabulary` | the claim uses a relation, class, property or entity this schema and this reader do not have |
 
+A claim that names a stored entity whose id the reasoner refuses to spell is
+`outside_vocabulary` too, with a reason that says it cannot be reasoned over
+and why; the report then counts the closure's `refused` terms.
+
 A step label tells an invented premise from a misapplied rule:
 `sound_step`, `premises_not_in_graph`, `rule_not_in_table`,
 `rule_does_not_conclude_this` or `no_rule_concludes_this_relation`. It is the
@@ -472,7 +525,7 @@ asserted facts rather than 345:
 
 ```text
 $ onto reason slice issue:421 person:kenji team:payments service:payment-api --goals '[{"subject":"issue:421","relation":"handled_by_team","object":"team:payments"},{"subject":"issue:421","relation":"escalate_to","object":"person:sarah"}]'
-slice of 4 entitys: 1 preserved, 1 lost (full graph 381 asserted, 62 derived · slice 22 asserted, 3 derived)
+slice of 4 entities: 1 preserved, 1 lost (full graph 381 asserted, 62 derived · slice 22 asserted, 3 derived)
   preserved          issue:421 handled_by_team team:payments
   lost               issue:421 escalate_to person:sarah
       missing <person:sarah> manages <team:payments>
@@ -482,7 +535,8 @@ means: Coverage is a proxy; preservation is the property. …
 `lost` lists the asserted leaves of the full derivation the slice lacks.
 `slice_only` (the slice entails what the whole does not) is impossible for
 these monotone rules and is reported loudly if it ever appears. Without goals,
-the report lists every derived fact over slice entities that the slice loses.
+the report counts every derived fact over slice entities that the slice loses
+and lists up to `limit` of them (default 100, at most 1,000).
 
 ## Semantic plans
 
@@ -498,9 +552,12 @@ fields to the impact report described in [SCHEMA.md](SCHEMA.md#impact-and-breaki
 | `shapes` | shape results the planned schema adds (`new_results`) and resolves, with the verdict before and after |
 
 Both closures are computed over the same current graph, as the planner may see
-it. Migrations are not applied to them; their data edits are counted under
-`migration`. Consequences and the shape delta are skipped (with a reason) when
-the asserted facts exceed 500,000.
+it: the facts for both are collected under the graph's read guard and the
+closures run after it is released, and the closure of the active schema is
+taken from the reasoner's cache when one matches. Migrations are not applied
+to them; their data edits are counted under `migration`. Consequences and the
+shape delta are skipped (with a reason) when the asserted facts exceed
+500,000. A filed proposal keeps the plan just made instead of planning twice.
 
 ### Consequences and conservativity
 
@@ -529,7 +586,7 @@ $ onto schema plan transitive.toml
 non-breaking on schema v2 · 0 entities · 0 links in scope
   · change link type project|task|service|issue|milestone|package -depends_on-> project|task|service|issue|milestone|repository|environment|package (now transitive) (0 entities, 0 links)
   risk medium: not conservative: 4 added facts are stated purely in the current vocabulary, e.g. <project:alpha> depends_on <service:auth-service>
-  consequences: +4 derived, -0 removed · not conservative (4 new over existing names)
+  consequences: +4 added (1 asserted, 3 derived), -0 removed · not conservative (4 new over existing names)
       asserted 1 · builtin/transitive 3
       + <project:alpha> depends_on <service:auth-service>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:auth-service>
       + <project:alpha> depends_on <service:postgres>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:postgres>
@@ -539,17 +596,24 @@ non-breaking on schema v2 · 0 entities · 0 links in scope
 ```
 
 Zero entities affected, yet four new facts, all stated in names that already
-existed: the change is **not conservative**. The added facts include the new
-schema fact itself (`depends_on a transitive`, counted under `asserted`).
+existed: the change is **not conservative**. One of them is the new schema
+fact itself (`depends_on a transitive`, asserted, counted under `asserted`);
+the other three are derived by `builtin/transitive`. The consequences line
+says which: `+N derived` when every added fact is the reasoner's, `+N
+asserted` when every one is a schema fact the change states (a new `extends`
+or `implements`, a link type made transitive), and `+N added (A asserted, D
+derived)` for a mix.
 
 The base signature is the current schema's names (object types, interfaces,
 link types, rule-derived relations and classes) plus every entity, keyword and
 literal. `new_over_existing_vocabulary` counts added facts whose terms are all
-in it; `conservative` is true when that count is 0 and both runs reached their
-fixpoint. `verdict` is `conservative`, `not_conservative` or `undetermined`
-(skipped, or a run stopped early). A new rule that derives a new relation name
-is conservative: everything it adds uses a name the current vocabulary does
-not have.
+in it; `conservative` is true when that count is 0, both runs reached their
+fixpoint and neither refused a term. `verdict` is `conservative`,
+`not_conservative` or `undetermined` (skipped, a run stopped early, or terms
+were refused: `refused` counts them, the facts naming them are left out of
+both closures and the consequences line says so). A new rule that derives a
+new relation name is conservative: everything it adds uses a name the current
+vocabulary does not have.
 
 ### Risk
 
@@ -568,7 +632,7 @@ it:
 
 ```text
 $ onto lock object_types vendor --reason 'procurement reports read vendor ids'
-object_types vendor locked by local at 2026-10-24T12:16:28Z: procurement reports read vendor ids
+object_types vendor locked by local at 2026-10-24T13:35:18Z: procurement reports read vendor ids
 $ onto schema plan drop-vendor.toml
 locked: apply refused on schema v3 · 15 entities · 21 links in scope
   · delete shape vendor (0 entities, 0 links)
@@ -636,11 +700,11 @@ closures. The plan is not applied:
 
 ```text
 $ onto do assign item=issue:433 assignee=person:maria --consequences
-planned assign 
+planned assign
   • link issue:433 -assigned_to-> person:maria (replacing person:kenji)
   • update issue:433: state open → triaged
   • record event work.assigned on issue:433
-  consequences: +3 derived, -3 removed · not conservative (3 new over existing names)
+  consequences: +3 added (2 asserted, 1 derived), -3 removed · not conservative (3 new over existing names)
       asserted 2 · schema/responsible_team 1
       + <issue:433> assigned_to <person:maria>
       + <issue:433> handled_by_team <team:platform>  by schema/responsible_team from <issue:433> assigned_to <person:maria>, <person:maria> member_of <team:platform>
@@ -651,8 +715,10 @@ planned assign
   risk low · reversible
 ```
 
-Conservativity is computed by the same definition, but a data edit almost
-always adds facts over existing names; the `means` field says so.
+The new link and state are asserted facts the action writes; the new team is
+derived from them. Conservativity is computed by the same definition, but a
+data edit almost always adds facts over existing names; the `means` field
+says so.
 
 ## Shapes
 
@@ -702,6 +768,26 @@ issues 1 shape · 3 constraints checked
   unknown_key        issue_triage issue_triage/2 qualified_value_shape is not a constraint this engine evaluates; it would be skipped and leave the report undetermined
 ```
 
+Validation is bounded. A path has at most 16 steps (the schema refuses a
+longer one, and `shapes check` reports it as `too_large`); a validation
+carries at most 64 draft shapes with 1,024 property shapes between them; and
+path evaluation may take 20,000,000 steps, after which the report lists the
+results of the focus nodes evaluated so far and records a `budget` skip, so a
+cut run is `violates` when those results exist and `undetermined` otherwise,
+never `conforms`. A `pattern` is at most 1,024 bytes and compiles within a size
+limit.
+
+```text
+$ onto shapes check long-path.toml
+issues 1 shape · 1 constraint checked
+  too_large          team_reach team_reach/0 path assigned_to.member_of.^member_of.member_of.^member_of.member_of.^member_of.member_of.^member_of.member_of.^member_of.member_of.^member_of.member_of.^member_of.member_of.^member_of has 17 steps, more than 16
+means: A structural dry run: …
+```
+
+With `inferred`, validation reads the reasoner's cached closure when it was
+computed at the current graph revision and schema version, and computes one
+otherwise.
+
 ### Shape induction
 
 `onto shapes induce <kind>` (action `shapes.induce`) reads a shape from the
@@ -710,7 +796,7 @@ schema layer:
 
 ```text
 $ onto shapes induce production_order
-# production_order_shape from 4 entitys of kind production_order
+# production_order_shape from 4 entities of kind production_order
 # production_order_shape/title min_count 4 of 4 production_orders have a title
 …
 # production_order_shape/makes_part min_count 4 of 4 production_orders have a makes_part link
@@ -811,21 +897,28 @@ are opinions.
 | link types | name 0.5, endpoints 0.5 (through the accepted kind matches) |
 
 A signal neither side has data for is left out and the weights renormalized.
-Matching is greedy and one to one; a competitor within 0.02 makes a pair
-`borderline`. `exact_match` needs a score of 0.85 and shared properties or
-link types (Jaccard 0.5); `close_match` needs 0.6. When a kind's best target is
-already matched to the kind's ancestor (below, `issue` to `ticket`, the parent
-of `incident`), the kind gets `broad_match` to it; the converse gives
-`narrow_match`. `accepted` needs 0.75, no tie, and
-structure or the same word.
+A link end that cannot be compared (no kind on it is matched) counts as half
+agreement, 0.50, when the other end is compared, so that agreeing on one
+shared end (every link type to `person` agrees on `to`) does not outweigh the
+names; two ends that both admit any kind stay out of the score. A name that
+is the same word through a glossary is reported with both definitions and the
+word they share. Matching is greedy and one to one; a competitor within 0.02
+makes a pair `borderline`. `exact_match` needs a score of 0.85 and shared
+properties or link types (Jaccard 0.5); `close_match` needs 0.6. When a kind's
+best target is already matched to the kind's ancestor (below, `issue` to
+`ticket`, the parent of `incident`), the kind gets `broad_match` to it; the
+converse gives `narrow_match`. `accepted` needs 0.75, no tie, and structure or
+the same word. The report names the source by its pack id (`onto align --pack
+supply-chain` reports `supply-chain → enterprise-execution`), else by the
+TOML file's `name`.
 
 ```text
 $ onto align helpdesk.toml --sssom helpdesk.sssom.tsv
-helpdesk → enterprise-execution 1 accepted, 4 borderline, 1 source and 73 target unmatched
+helpdesk → enterprise-execution 2 accepted, 3 borderline, 1 source and 73 target unmatched
 
 Object types
   accepted   employee                 close_match    person                   score 0.75
-      name: 'employee' and 'employee' are the same word through a glossary (1.00)
+      name: 'employee' and 'person' are the same word through the glossary word 'employee' (1.00)
       properties: 3 of 3 names shared (jaccard 1.00), types agree on 3 of 3 (1.00)
       links: 0 of 12 link types correspond by name (0.00)
       parents: not compared (neither extends or implements anything)
@@ -841,6 +934,20 @@ Object types
       states: 5 of 6 shared (0.83)
       close_match: score 0.691 >= 0.6
       borderline: score 0.691 is below 0.75
+
+Link types
+  accepted   assignee                 close_match    assigned_to              score 0.75
+      name: 'assignee' and 'assigned_to' are the same word through the glossary word 'assignee' (1.00)
+      from: not compared (no kind of [ticket] is mapped; counts as 0.50)
+      to: [employee] vs [person, agent, team] (0.50)
+      close_match: score 0.750 >= 0.6
+      accepted: score 0.750 >= 0.75 and no competitor within 0.02
+  borderline in_squad                 close_match    manages                  score 0.62
+      name: 'in_squad' vs 'manages' (similarity 0.49)
+      from: [employee] vs [person] (1.00)
+      to: not compared (no kind of [squad] is mapped; counts as 0.50)
+      close_match: score 0.620 >= 0.6
+      borderline: score 0.620 is below 0.75
 …
 wrote helpdesk.sssom.tsv
 means: scores are opinions; certify a mapping before you rely on it
@@ -944,6 +1051,50 @@ dry run vendor 2 rows · 0 objects · 0 links
   missing_required row 2 active vendor.active is required and this row has no readable value: row left out
 ```
 
+With `--kind`, columns are matched to the existing type by name. A column
+named like one of the type's link types (as written, by its reference stem,
+as `parent_code` names `parent`, or prefixed with the kind) is that link even
+when this sheet's cells do not name existing objects often enough to read as
+references, and each missing target is reported row by row. Here `lena` and
+`V-999` do not exist:
+
+```text
+$ cat vendors-2026.csv
+vendor_code,name,tier,rating,active,onboarded,account_manager,parent_code
+V-120,Contoso Springs,gold,4.5,yes,2026-01-10,lena,V-999
+V-121,Northwind Wire,silver,3.8,yes,2026-02-02,kenji,V-100
+V-122,Fabrikam Plating,bronze,3.2,no,2026-02-17,maria,
+$ onto induce vendors-2026.csv --kind vendor --ingest --dry-run
+dry run vendor 3 rows · 3 objects · 3 links
+  missing_target row 1 account_manager no object person:lena: account_manager link left out
+  missing_target row 1 parent_code no object vendor:V-999: parent link left out
+means: rows read with the mapping's declared types; …
+```
+
+A column that matches nothing the type declares stops the ingest. `--mapping
+FILE` says where each column goes instead (JSON: `{kind, key, title?, state?,
+properties: {column: property}, links: {column: {rel, target_kind}}}`):
+
+```text
+$ cat suppliers.csv
+code,company,level,score,is_active,since,manager
+V-130,Tailwind Bolts,gold,4.4,yes,2026-03-01,sarah
+V-131,Graphic Gaskets,silver,3.5,yes,2026-03-15,john
+$ onto induce suppliers.csv --kind vendor --ingest --dry-run
+error: invalid: the sheet's rows are vendor objects, but these columns match nothing vendor declares: level (no property of vendor by that name), score (no property of vendor by that name), is_active (no property of vendor by that name), since (no property of vendor by that name); pass a mapping that says where they go (or leaves them out), or add them to vendor first
+$ cat suppliers.mapping.json
+{
+  "kind": "vendor",
+  "key": "code",
+  "title": "company",
+  "properties": {"level": "tier", "score": "rating", "is_active": "active", "since": "onboarded"},
+  "links": {"manager": {"rel": "account_manager", "target_kind": "person"}}
+}
+$ onto induce suppliers.csv --ingest --mapping suppliers.mapping.json --dry-run
+dry run vendor 2 rows · 2 objects · 2 links
+means: rows read with the mapping's declared types; …
+```
+
 ## Context preservation
 
 When the orchestrator packs facts into a token budget for the LLM, a packed
@@ -1036,12 +1187,15 @@ so an agent sees fewer, more relevant tools. Precedence:
 `onto mcp --profile <name>`, then `ONTO_MCP_PROFILE`, then `[mcp] profile` in
 the config. Every profile includes `ask`, `search`, `get_entity` and
 `get_schema`; write tools still need `[mcp] allow_writes = true`. The
-`initialize` instructions name the active profile and what it withheld. Piping
-an `initialize` and a `tools/list` request into `onto mcp --profile reasoning`
-returned instructions that end with:
+`initialize` instructions name the active profile, what it withheld and how
+many of the write tools it offers `allow_writes = false` hides, so the three
+counts add up to every tool. Piping an `initialize` and a `tools/list` request
+into `onto mcp --profile reasoning` (no write tools) and `onto mcp --profile
+full` returned instructions that end with:
 
 ```text
-Tool profile: reasoning (16 of 51 tools offered, 35 withheld by the profile, write tools hidden; set [mcp] profile, ONTO_MCP_PROFILE or onto mcp --profile to change it).
+Tool profile: reasoning (16 of 51 tools offered, 35 withheld by the profile; set [mcp] profile, ONTO_MCP_PROFILE or onto mcp --profile to change it).
+Tool profile: full (48 of 51 tools offered, 0 withheld by the profile, 3 write tools hidden by allow_writes = false; set [mcp] profile, ONTO_MCP_PROFILE or onto mcp --profile to change it).
 ```
 
 The tools `tools/list` returned under each profile in those runs (with
@@ -1064,9 +1218,14 @@ $ echo '{}' | onto mcp --profile auditing
 error: invalid: unknown MCP profile 'auditing' (valid: full, catalog, authoring, reasoning, governance, retrieval, evaluation)
 ```
 
+Under any profile but `full`, `what_if` runs a scenario only when every one of
+its queries is the action of a tool the profile offers, so a scenario cannot
+reach what the profile withholds; a scenario runs at most 20 queries.
+
 Tool descriptions carry the warnings an agent needs: derived is not asserted,
 a clean run is not a consistency result, a certificate binds bytes, an
-installed pack is a proposal.
+installed pack is a proposal, and the limits (`query_inferred` takes at most
+8 atoms and returns at most 1,000 bindings).
 
 ## What is proved, measured, or an opinion
 
@@ -1109,8 +1268,9 @@ installed pack is a proposal.
   rule walk that `ask` and `context` already use for chain rules (it does not
   evaluate `when`/`then` rules).
 - **The closure is computed in memory, per caller.** It is cached (four
-  closures), bounded by `max_derived` and `max_rounds`, and plans skip
-  consequences above 500,000 asserted facts.
+  closures), bounded by `max_derived`, `max_rounds` and `max_work`, queries
+  by their atom count, limit and join work, and plans skip consequences above
+  500,000 asserted facts. A run cut by a bound is a lower bound and says so.
 - **States and properties enter reasoning only when a rule reads them.** A
   rule can classify by a state or a property value; it cannot derive one.
 - **A reserved word cannot name a relation.** The enterprise schema's
@@ -1128,8 +1288,10 @@ installed pack is a proposal.
   vocabulary (person, team) agree on endpoints easily: read borderline and
   even accepted link matches as candidates. Certification can only refute.
 - **Induction describes the sheet in front of it.** It does not know which
-  columns should be required; a link column is recognized only when at least
-  90% of its values already exist as objects of one kind.
+  columns should be required; a new link column is recognized only when at
+  least 90% of its values already exist as objects of one kind (ingesting
+  into an existing type also takes a column named like one of its link
+  types, or a `--mapping`).
 - **Packs borrow vocabulary.** A pack never claims compliance with the
   standards it names, and its rules flag, they do not decide (coverage,
   clinical or legal questions stay with people).

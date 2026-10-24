@@ -27,16 +27,17 @@ permission-filtered facts instead of the database.
 A schema change can touch no entity and no link and still change what the
 ontology says. Making `depends_on` transitive is one such change. On the demo
 workspace (with the manufacturing pack installed) the plan shows its blast
-radius, zero, and its consequences: the facts it adds (three derived, each
-with the rule and premises behind it, plus the new schema fact itself), all
-stated in names you already use, so the change is not conservative:
+radius, zero, and its consequences: the facts it adds (the new schema fact
+itself, asserted, and three derived facts, each with the rule and premises
+behind it), all stated in names you already use, so the change is not
+conservative:
 
 ```text
 $ onto schema plan transitive.toml
 non-breaking on schema v2 · 0 entities · 0 links in scope
   · change link type project|task|service|issue|milestone|package -depends_on-> project|task|service|issue|milestone|repository|environment|package (now transitive) (0 entities, 0 links)
   risk medium: not conservative: 4 added facts are stated purely in the current vocabulary, e.g. <project:alpha> depends_on <service:auth-service>
-  consequences: +4 derived, -0 removed · not conservative (4 new over existing names)
+  consequences: +4 added (1 asserted, 3 derived), -0 removed · not conservative (4 new over existing names)
       asserted 1 · builtin/transitive 3
       + <project:alpha> depends_on <service:auth-service>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:auth-service>
       + <project:alpha> depends_on <service:postgres>  by builtin/transitive from depends_on a transitive, <project:alpha> depends_on <service:payment-api>, <service:payment-api> depends_on <service:postgres>
@@ -169,7 +170,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Schema lint** — 19 checks with fixes and stable finding ids; dismiss or accept with a note, never hidden silently | `onto lint` · `onto lint --dismiss <id> --note "…"` |
 | **Industry packs** — manufacturing, supply chain, retail, logistics, healthcare, finance, insurance, energy, telecom and SaaS, each with rules, shapes, metrics, action types and a sample, installed as a governed schema change ([docs/PACKS.md](docs/PACKS.md)) | `onto pack list` · `onto pack plan retail` · `onto pack install manufacturing --sample` |
 | **Schema alignment** — scored matches between a pack or a TOML schema and yours, SSSOM export, certification of claimed mappings against both hierarchies | `onto align --pack supply-chain --sssom out.tsv` · `onto align other.toml --certify mappings.json` |
-| **One sheet in, one ontology out** — a CSV becomes an object type, link types and a shape, with an evidence sentence per line; ingest with a lexical guard that never coerces | `onto induce vendors.csv --change-set c.json` · `onto induce vendors.csv --ingest` |
+| **One sheet in, one ontology out** — a CSV becomes an object type, link types and a shape, with an evidence sentence per line; ingest with a lexical guard that never coerces | `onto induce vendors.csv --change-set c.json` · `onto induce vendors.csv --ingest` · `onto induce other.csv --ingest --mapping m.json` |
 | **PostgreSQL store** (16+, with pgvector) — the durable store: versioned migrations embedded in the binary, one schema per tenant, JSONB documents, an append-only event log and history, vectors in an HNSW index. Any number of processes (replicas embedding the library, several servers) share it consistently: optimistic commits on a commit log, in-memory graph indexes refreshed through LISTEN/NOTIFY, optional read-your-writes ([docs/STORAGE.md](docs/STORAGE.md)) | `make db-up` · `onto --database-url postgres://… status` |
 | **nexc-execution vocabulary** — `extend = ["builtin:nexc-execution"]`: graphs, node types (executor, default role, stage, produces_artifact, allow_code_exec) and relation types (blocking) as validated, versioned data, read and written in nexc's shape ([docs/NEXC_EXECUTION.md](docs/NEXC_EXECUTION.md)) | `onto call execution.init_graph '{"graph":"g1"}'` |
 | **Web UI** at `/ui` — workspace map (filter, search, expand, path, impact, history slider), Object Explorer, ontology Builder, schema editor with impact preview and apply/propose, proposals inbox, entity browser with history; iframe-embeddable with browser sessions, works on phones ([docs/UI.md](docs/UI.md)) | `onto serve --dev` then open http://127.0.0.1:50051/ui/ |

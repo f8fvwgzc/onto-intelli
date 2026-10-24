@@ -170,6 +170,15 @@ are separate modules that measure or score; each report says which in its
 `means` field. Only a checked certificate is a proof, and only under its rule
 table.
 
+**Bounded, and honest about it.** A closure is bounded by derived facts,
+rounds and the candidate facts its rule joins try; a query by its atoms,
+bindings and join work; shape validation by path steps and path work. The
+facts are collected under the graph's read guard and the closure runs after
+it is released. A run cut by a bound says so: a closure that stopped is a
+lower bound (its certificate still checks, and says so), a cut shape run
+never `conforms`, and a plan whose closures stopped or refused terms is
+`undetermined` rather than conservative.
+
 ## Performance notes
 
 * Reads take a single `RwLock` read guard; context building does all graph work under one

@@ -42,13 +42,13 @@ lets an admin apply a change that touches locked definitions ([Locks](#locks)).
 | op | fields | notes |
 |---|---|---|
 | `put_object_type` | `name`, `def`, `migrations?` | create or replace; `def` is an object type (`label`, `description`, `color`, `icon`, `category`, `extends`, `properties`, `states`, `terminal_states`, `alert_states`, `implements`, `derived`, `constraints`, `backing`: the table its objects come from, see [ONTOLOGY_BUILDER.md](ONTOLOGY_BUILDER.md#backing-in-the-schema)) |
-| `delete_object_type` | `name`, `migrations?` | |
+| `delete_object_type` | `name`, `migrations?` | drops the glossary words that named it (unless another type or interface keeps the name) |
 | `rename_object_type` | `from`, `to` | rewrites references; entity ids move from `from:key` to `to:key` and the old ids redirect |
 | `put_property` | `object_type`, `name`, `def`, `migrations?` | `def`: `type` (string, text, int, float, bool, timestamp, enum, list, json), `required`, `values`, `searchable`, `description` |
 | `delete_property` | `object_type`, `name`, `migrations?` | |
 | `rename_property` | `object_type`, `from`, `to` | moves the values |
 | `put_link_type` | `name`, `def`, `migrations?` | `from`/`to` kinds or interfaces (empty means any), `inverse`, `cardinality` (`many`/`one`), `dependency`, `symmetric`, `transitive`, `provenance`, `weight`, `label`, `backing` (a join table) |
-| `delete_link_type` | `name`, `migrations?` | |
+| `delete_link_type` | `name`, `migrations?` | drops the glossary words that named it or its inverse (unless another link type keeps the name) |
 | `rename_link_type` | `from`, `to` | moves links; rewrites rules, interfaces, glossary, constraints, metrics, actions |
 | `put_interface` / `delete_interface` | `name`, `def` | |
 | `put_action_type` / `delete_action_type` | `name`, `def` | parameters, preconditions, effects, roles, risk |
@@ -92,7 +92,7 @@ Every plan computed by the engine also carries semantic fields
 | Field | Content |
 |---|---|
 | `errors` | why the change set does not compile (then `valid` is false) |
-| `consequences` | `{added, removed, conservative, verdict, new_over_existing_vocabulary, by_rule, samples_added, witnesses, samples_removed, fixpoint_reached, skipped?, means}`: the facts the reasoner's closure gains and loses under the planned schema, over the current graph |
+| `consequences` | `{added, removed, conservative, verdict, new_over_existing_vocabulary, by_rule, samples_added, witnesses, samples_removed, fixpoint_reached, refused?, skipped?, means}`: the facts the reasoner's closure gains and loses under the planned schema, over the current graph (`refused`: terms the two runs could not spell, which make the verdict `undetermined`) |
 | `risk`, `risk_reasons` | `low`, `medium` or `high`, and why |
 | `locked_violations` | `[{section, name, change, touch, reason, renamed_to?, lock_reason, locked_by, overridden}]` |
 | `likely_renames` | `[{section, from, to, score, evidence}]`: a delete and a put in one section that look like one rename |
@@ -100,8 +100,10 @@ Every plan computed by the engine also carries semantic fields
 
 `verdict` is `conservative`, `not_conservative` or `undetermined`. Plans
 stored before these fields existed still load; their missing fields are
-empty. Consequences and the shape delta are skipped, with the reason, when the
-graph holds more than 500,000 asserted facts.
+empty, except the risk: a proposal stored without one has it assessed from
+its plan when it is read, rather than read as `low`. Consequences and the
+shape delta are skipped, with the reason, when the graph holds more than
+500,000 asserted facts.
 
 A change is **breaking** when existing data or vocabulary in use stops being
 valid:
@@ -161,7 +163,7 @@ its `from` kinds (or one list is empty):
 
 ```text
 $ onto schema plan bad-trans.toml
-invalid on schema v11 · 0 entities · 0 links in scope
+invalid on schema v12 · 0 entities · 0 links in scope
   error link type pages is transitive but its targets [person] can never be its sources [issue]
   risk high: the change set does not validate (1 error): it cannot be applied, and its effects are not shown; conservativity not shown: the change set does not compile
   consequences not computed: the change set does not compile
@@ -218,7 +220,7 @@ of a new rule shows what it would derive today:
 
 ```text
 $ onto schema plan rule.toml
-non-breaking on schema v11 · 0 entities · 0 links in scope
+non-breaking on schema v12 · 0 entities · 0 links in scope
   · add rule critical_exposure (?s a critical_exposure_service <= ?i a issue, ?i prop.priority critical, ?i affects ?s) (0 entities, 0 links)
   risk low
   consequences: +1 derived, -0 removed · conservative
@@ -269,13 +271,13 @@ properties = [
 
 | Property shape field | Meaning |
 |---|---|
-| `path` | a link type (out), an inverse name or `^rel` (in), a sequence `a.b`, `prop.<name>`, `state` or `title` |
+| `path` | a link type (out), an inverse name or `^rel` (in), a sequence `a.b` (at most 16 steps), `prop.<name>`, `state` or `title` |
 | `id` | a stable id for results and feedback (default `<shape>/<index>`) |
 | `min_count`, `max_count` | how many values the path reaches |
 | `class` | every linked entity is of this kind, a subtype, an implementer of this interface, or (with `inferred`) of this derived class |
 | `datatype` | a property type (`string`, `int`, `float`, `bool`, `timestamp`, ...) |
 | `in`, `has_value` | allowed values; a value that must be present |
-| `pattern`, `min_length`, `max_length` | text constraints (regular expression) |
+| `pattern`, `min_length`, `max_length` | text constraints (a regular expression of at most 1,024 bytes) |
 | `min_value`, `max_value` | numeric bounds |
 | `node` | every linked entity conforms to that shape (nesting up to depth 5) |
 | `severity`, `message` | override the shape's |
