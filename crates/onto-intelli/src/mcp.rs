@@ -428,7 +428,7 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "verify_claims",
             "reason.verify",
-            "Check statements before you rely on them: each claim gets asserted, derived (with its derivation), not_entailed or contradicted (with the stored facts that say otherwise). A claim may carry the rule and premises of a reasoning step to check that step. not_entailed is not false: the graph may simply not say.",
+            "Check statements before you rely on them: each claim gets asserted, derived (with its derivation), not_entailed, contradicted (with the stored facts that say otherwise) or outside_vocabulary (it names a kind or relation the schema does not know). A claim may carry the rule and premises of a reasoning step to check that step. not_entailed is not false: the graph may simply not say.",
             obj(
                 json!({
                     "claims": { "type": "array", "description": "Claims {subject, relation, object, rule?, premises?: [claim]}", "items": { "type": "object", "properties": { "subject": s("Entity id or schema name"), "relation": s("Relation, a, state or prop.<name>"), "object": { "description": "Entity id, name or value" }, "rule": s("Rule the step claims to apply"), "premises": { "type": "array", "items": { "type": "object" } } }, "required": ["subject", "relation", "object"] } },
@@ -497,7 +497,7 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "lint_schema",
             "schema.lint",
-            "Schema lint: naming, missing inverses, orphan types, unused properties, rules that never fire, keyword clashes, with a fix for each finding. A lint report is a measurement by fixed heuristics, not a consistency proof; dismissed findings are counted in `suppressed`.",
+            "Schema lint: missing descriptions and inverses, orphan and unused types and link types, dead or recursive rules, keyword collisions, duplicate labels, shape references, with a fix for each finding. A lint report is a measurement by fixed heuristics, not a consistency proof; dismissed findings are counted in `suppressed`.",
             obj(
                 json!({ "checks": arr("Checks to run (all when omitted)"), "include_dismissed": { "type": "boolean" } }),
                 &[],

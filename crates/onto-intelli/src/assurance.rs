@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use onto_core::align::{AlignOptions, AlignSource, Mapping};
 use onto_core::explain::{Claim, JustifyOptions, Semiring, SliceOptions};
-use onto_core::induce::{InduceOptions, SheetMapping};
+use onto_core::induce::{self, InduceOptions, SheetMapping};
 use onto_core::lint::{self, LintDecision, LintQuery};
 use onto_core::packs::{self, InstallMode, PackInstallOptions};
 use onto_core::reason::ReasonOptions;
@@ -497,14 +497,25 @@ impl Intelli {
                         let opts =
                             InduceOptions { kind: i.kind, key: i.key, file: i.file, workspace: Some(ws.clone()) };
                         let ind = onto.induce_sheet(p, &i.csv, &opts)?;
-                        if !onto.schema().object_types.contains_key(&ind.kind) {
+                        // Induction always names a free kind (`task_2` when
+                        // `task` exists), so rows go into the existing type
+                        // the sheet designates, mapped column by column.
+                        let schema = onto.schema();
+                        if schema.object_types.contains_key(&ind.base_kind) {
+                            induce::mapping_onto(&schema, &ind, &ind.base_kind)?
+                        } else if ind.base_kind == ind.kind {
                             return Err(Error::invalid(format!(
-                                "the sheet describes object type {}, which the schema does not define: apply or \
-                                 propose the change_set of model.induce first, then ingest with its mapping",
+                                "the sheet describes object type {}, which the schema does not define yet: apply \
+                                 or propose the change_set of model.induce first, then ingest with its mapping",
                                 ind.kind
                             )));
+                        } else {
+                            return Err(Error::invalid(format!(
+                                "the sheet's rows are named {}, which is not an object type here (an interface, \
+                                 derived class or kind in use): pass kind to name an object type, or a mapping",
+                                ind.base_kind
+                            )));
                         }
-                        ind.mapping
                     }
                 };
                 let ctx = self.ctx(p, Some(ws)).with_intent(action);

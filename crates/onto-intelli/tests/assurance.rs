@@ -253,7 +253,9 @@ async fn sheets_induce_and_ingest() {
     assert_eq!(i.ontology().revision(), start, "induction writes nothing");
     // Without a mapping the sheet is induced, and a new type must be applied first.
     let new_kind = err(&i, &admin(), "ingest.sheet", json!({ "csv": csv, "kind": "widget", "key": "sku" })).await;
-    assert!(new_kind.to_string().contains("change_set"), "{new_kind}");
+    let msg = new_kind.to_string();
+    assert!(msg.contains("change_set") && msg.contains("widget,"), "{msg}");
+    assert!(!msg.contains("widget_2"), "the base kind is named, not a suffixed one: {msg}");
 
     ok(&i, &admin(), "schema.apply", induced["change_set"].clone()).await;
     let before = i.ontology().revision();
@@ -268,6 +270,29 @@ async fn sheets_induce_and_ingest() {
     let done = ok(&i, &member(), "ingest.sheet", json!({ "csv": csv, "mapping": mapping })).await;
     assert_eq!(done["upserts"], 2, "{done}");
     assert!(i.ontology().revision() > before);
+
+    // Once the type exists, a mapping-less ingest goes into it (induction
+    // alone would name widget_2), column by column.
+    let more = "sku,name,weight\nA3,Washer,0.2\n";
+    let into = ok(&i, &member(), "ingest.sheet", json!({ "csv": more, "kind": "widget", "key": "sku" })).await;
+    assert_eq!(into["mapping_induced"], true, "{into}");
+    assert_eq!(into["mapping"]["kind"], "widget", "{into}");
+    assert_eq!(into["mapping"]["key"], "sku", "{into}");
+    assert_eq!(into["upserts"], 1, "{into}");
+    assert!(!i.ontology().schema().object_types.contains_key("widget_2"), "no duplicate type");
+    for id in ["widget:A1", "widget:A3"] {
+        let e = i.ontology().get(&admin(), id).unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(e.kind, "widget");
+    }
+    // The same for a seeded type (induction alone would name task_2).
+    let tasks = json!({ "csv": "id,title\nzz1,Hello\n", "kind": "task", "dry_run": true });
+    let task = ok(&i, &admin(), "ingest.sheet", tasks).await;
+    assert_eq!(task["mapping"]["kind"], "task", "{task}");
+    assert_eq!(task["dry_run"], true, "{task}");
+    // An existing type that lacks a column is refused, naming the column.
+    let extra = "sku,name,colour\nA4,Pin,red\n";
+    let refused = err(&i, &admin(), "ingest.sheet", json!({ "csv": extra, "kind": "widget", "key": "sku" })).await;
+    assert!(refused.to_string().contains("colour"), "{refused}");
 }
 
 #[tokio::test]

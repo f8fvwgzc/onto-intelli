@@ -293,7 +293,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "reason.verify",
         false,
-        "Verdicts on claims (asserted, derived, not derived, contradicted) with the derivation behind each. Input: {claims: [{subject, relation, object, rule?, premises?}], workspace?}.",
+        "Verdicts on claims (asserted, derived, not_entailed, contradicted, outside_vocabulary) with the derivation behind each. Input: {claims: [{subject, relation, object, rule?, premises?}], workspace?}.",
     ),
     a(
         "reason.slice_check",
@@ -366,7 +366,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "ingest.sheet",
         true,
-        "Write a sheet's rows as objects with a mapping (induced when absent); dry_run validates only. Input: {csv, mapping?, kind?, key?, workspace?, dry_run?}.",
+        "Write a sheet's rows as objects with a mapping; when absent, the rows go into the existing object type the sheet names (kind, else induced), column by column, and a type the schema lacks must be applied from model.induce first. dry_run validates only. Input: {csv, mapping?, kind?, key?, workspace?, dry_run?}.",
     ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
