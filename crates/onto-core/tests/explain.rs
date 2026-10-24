@@ -655,3 +655,195 @@ fn a_supplied_horn_rule_rests_on_its_premises() {
     assert_eq!(step.label, StepLabel::RuleDoesNotConcludeThis, "{step:?}");
     assert!(step.reason.contains("near a transitive does not hold"), "{}", step.reason);
 }
+
+// ── review fixes ─────────────────────────────────────────────────────────
+
+const KINDS: &str = r#"
+[object_types.step]
+[object_types.step.properties.confidence]
+type = "float"
+[object_types.step.properties.score]
+type = "float"
+
+[object_types.mid]
+extends = "step"
+
+[object_types.leaf]
+extends = "mid"
+
+[object_types.gate]
+
+[link_types.next]
+transitive = true
+"#;
+
+/// Steps `a`, `b`, `c` linked a -> b -> c, `leaf:x`, and `gate:g`.
+fn kinds() -> Ontology {
+    let o = Ontology::in_memory(Schema::from_toml(KINDS).unwrap());
+    let ctx = ActionContext::new(admin(), "acme");
+    o.apply(
+        &ctx,
+        vec![
+            Mutation::Upsert(EntityInput::new("step", "c", "C")),
+            Mutation::Upsert(EntityInput::new("step", "b", "B").link("next", "step:c")),
+            Mutation::Upsert(
+                EntityInput::new("step", "a", "A")
+                    .state("open")
+                    .prop("confidence", 0.4)
+                    .prop("score", 3.0)
+                    .link("next", "step:b"),
+            ),
+            Mutation::Upsert(EntityInput::new("leaf", "x", "X")),
+            Mutation::Upsert(EntityInput::new("gate", "g", "G")),
+        ],
+    )
+    .unwrap();
+    o
+}
+
+#[test]
+fn provenance_reads_store_values_like_explain_and_verify() {
+    let o = kinds();
+    let opts = ReasonOptions::default();
+    let open = Claim::new("step:a", "state", "open");
+    let fact = f("<step:a>", "state", "\"open\"");
+    let explained = o.reason_explain(&admin(), &opts, &open, &JustifyOptions::default()).unwrap();
+    assert_eq!(explained.status, Entailment::Asserted);
+    let prov = |claim: &Claim, semiring| {
+        o.reason_provenance(&admin(), &opts, claim, semiring, &JustifyOptions::default()).unwrap()
+    };
+    let count = prov(&open, Semiring::Count);
+    assert_eq!((count.status, &count.value, count.exact), (Entailment::Asserted, &ProvenanceValue::Count(1), true));
+    let trust = prov(&open, Semiring::Trust);
+    assert_eq!(trust.value, ProvenanceValue::Trust(0.4), "the entity's confidence");
+    let why = prov(&open, Semiring::Why);
+    assert_eq!(why.value, ProvenanceValue::Why(vec![vec![fact]]));
+    // A value the store does not hold has no derivation at all: rules never
+    // conclude states.
+    let done = prov(&Claim::new("step:a", "state", "done"), Semiring::Count);
+    assert_eq!((done.status, done.value), (Entailment::NotEntailed, ProvenanceValue::Count(0)));
+}
+
+#[test]
+fn self_supporting_instances_are_cycles() {
+    // `a next b` rests on itself through `a next a` (and `b next b`); a
+    // self-loop is the same shape (unit tests: the engine refuses one).
+    {
+        let links = [("a", "next", "b"), ("b", "next", "a")];
+        let o = steps(&links);
+        let claim = Claim::new("step:a", "next", "step:b");
+        for semiring in [Semiring::Count, Semiring::Why] {
+            let p = o
+                .reason_provenance(&admin(), &ReasonOptions::default(), &claim, semiring, &JustifyOptions::default())
+                .unwrap();
+            assert!(p.cycle_in_support, "{links:?} {p:?}");
+            if semiring == Semiring::Count {
+                assert!(!p.exact, "a count over a cycle is a lower bound: {p:?}");
+                assert_eq!(p.value, ProvenanceValue::Count(1));
+            } else {
+                assert!(p.exact, "the minimal witness sets are still all listed");
+            }
+        }
+    }
+    let o = steps(&[("a", "next", "b"), ("b", "next", "a")]);
+    let s = o.reason(&admin(), &ReasonOptions::default()).unwrap();
+    let p = explain::provenance(&s, &f("<step:a>", "next", "<step:a>"), Semiring::Count, &BTreeMap::new());
+    assert!(p.cycle_in_support && !p.exact, "{p:?}");
+}
+
+#[test]
+fn a_partial_closure_never_contradicts_a_kind() {
+    let o = kinds();
+    let partial = ReasonOptions { max_rounds: 1, ..Default::default() };
+    let claims = [Claim::new("leaf:x", "a", "step"), Claim::new("leaf:x", "a", "gate")];
+    let r = o.reason_verify(&admin(), &partial, &claims).unwrap();
+    assert!(!r.fixpoint_reached);
+    assert_eq!(r.verdicts[0].verdict, Verdict::NotEntailed, "{:#?}", r.verdicts[0]);
+    assert!(r.verdicts[0].reason.contains("lower bound"), "{}", r.verdicts[0].reason);
+    assert_eq!(r.verdicts[1].verdict, Verdict::Contradicted, "a leaf is never a gate");
+    assert_eq!(r.verdicts[1].conflicting, vec![f("<leaf:x>", "a", "#leaf")]);
+    let full = o.reason_verify(&admin(), &ReasonOptions::default(), &claims[..1]).unwrap();
+    assert_eq!(full.verdicts[0].verdict, Verdict::Derived);
+}
+
+#[test]
+fn numbers_compare_by_value() {
+    let o = kinds();
+    let claims = [
+        Claim::new("step:a", "prop.score", 3),
+        Claim::new("step:a", "prop.score", 3.0),
+        Claim::new("step:a", "prop.score", 4),
+    ];
+    let r = o.reason_verify(&admin(), &ReasonOptions::default(), &claims).unwrap();
+    let verdicts: Vec<Verdict> = r.verdicts.iter().map(|v| v.verdict).collect();
+    assert_eq!(verdicts, vec![Verdict::Asserted, Verdict::Asserted, Verdict::Contradicted], "{:#?}", r.verdicts);
+    assert_eq!(r.verdicts[2].conflicting, vec![f("<step:a>", "prop.score", "3.0")]);
+}
+
+#[test]
+fn steps_may_leave_out_schema_premises_that_hold() {
+    let o = kinds();
+    let ab = Claim::new("step:a", "next", "step:b");
+    let bc = Claim::new("step:b", "next", "step:c");
+    let claims = vec![
+        Claim::new("step:a", "next", "step:c").step(Some("transitive"), vec![ab.clone(), bc.clone()]),
+        Claim::new("step:a", "next", "step:c")
+            .step(Some("transitive"), vec![ab.clone(), bc.clone(), Claim::new("next", "a", "transitive")]),
+        Claim::new("leaf:x", "a", "step").step(Some("type_extends"), vec![Claim::new("leaf:x", "a", "mid")]),
+        Claim::new("step:a", "next", "step:c")
+            .step(Some("transitive"), vec![Claim::new("step:a", "fixes", "step:b"), bc.clone()]),
+        // An entity premise is never supplied.
+        Claim::new("step:a", "next", "step:c").step(Some("transitive"), vec![ab.clone()]),
+    ];
+    let r = o.reason_verify(&admin(), &ReasonOptions::default(), &claims).unwrap();
+    let labels: Vec<StepLabel> = r.verdicts.iter().map(|v| v.step.as_ref().unwrap().label).collect();
+    use StepLabel::*;
+    assert_eq!(
+        labels,
+        vec![SoundStep, SoundStep, SoundStep, RuleDoesNotConcludeThis, RuleDoesNotConcludeThis],
+        "{:#?}",
+        r.verdicts
+    );
+    let step = |i: usize| r.verdicts[i].step.clone().unwrap();
+    assert_eq!(step(3).unknown, vec!["relation fixes"]);
+    for v in &r.verdicts {
+        let s = v.step.as_ref().unwrap();
+        assert!(!s.reason.contains("entailed"), "the checker's word: {}", s.reason);
+    }
+}
+
+#[test]
+fn schema_facts_are_not_counted_as_preserved_by_a_slice() {
+    let o = kinds();
+    let empty = BTreeSet::new();
+    let r = o.reason_slice_check(&admin(), &SliceOptions::default(), &empty, None).unwrap();
+    assert!(r.full_derived > 0);
+    assert_eq!((r.preserved, r.lost), (0, 0), "{r:?}");
+}
+
+#[test]
+fn verification_work_is_bounded() {
+    let keys: Vec<String> = (0..80).map(|i| format!("{i:02}")).collect();
+    let links: Vec<(&str, &str, &str)> = keys.windows(2).map(|w| (w[0].as_str(), "next", w[1].as_str())).collect();
+    let o = steps(&links);
+    let claim = Claim::new("step:00", "next", "step:79");
+    let started = std::time::Instant::now();
+    let j = o.reason_explain(&admin(), &ReasonOptions::default(), &claim, &JustifyOptions::default()).unwrap();
+    eprintln!("80-link chain explained in {:?}: {:?}", started.elapsed(), j.verification);
+    assert_eq!(j.justifications.len(), 1);
+    assert_eq!(j.justifications[0].facts.len(), 80);
+    assert!(j.justifications[0].sufficient);
+    // A budget too small for minimality says so instead of claiming it.
+    let tight = JustifyOptions { verify_budget: 50_000, ..Default::default() };
+    let j = o.reason_explain(&admin(), &ReasonOptions::default(), &claim, &tight).unwrap();
+    let x = &j.justifications[0];
+    assert!(!x.minimal);
+    assert!(j.verification.as_deref().is_some_and(|v| v.contains("not established")), "{:?}", j.verification);
+    // A search out of work keeps what it found and says it stopped.
+    let short = JustifyOptions { max_work: 1, ..Default::default() };
+    let j = o.reason_explain(&admin(), &ReasonOptions::default(), &claim, &short).unwrap();
+    assert!(!j.complete);
+    assert!(j.stopped.as_deref().is_some_and(|s| s.contains("max_work")), "{:?}", j.stopped);
+    assert_eq!(j.justifications.len(), 1);
+    assert!(j.justifications[0].sufficient);
+}

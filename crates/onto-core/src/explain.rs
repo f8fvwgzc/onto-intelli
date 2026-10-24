@@ -91,10 +91,13 @@ pub const SLICE_MEANS: &str = "Coverage is a proxy; preservation is the property
      monotone rules make impossible: it is reported loudly when it happens. coverage is the share of asserted facts \
      touching slice entities that the slice keeps.";
 
-/// Facts the independent evaluator may materialize while verifying the
-/// justifications of one fact; past it, `sufficient`/`minimal` stay false
-/// (not established) and the report says why.
-const VERIFY_BUDGET: usize = 2_000_000;
+/// Join steps (candidate facts examined) the independent evaluator may take
+/// while verifying the justifications of one fact; past it,
+/// `sufficient`/`minimal` stay false (not established) and the report says
+/// why.
+const VERIFY_BUDGET: usize = 5_000_000;
+/// Propagation steps the hitting-set search may take over the support cone.
+const SEARCH_WORK: usize = 50_000_000;
 /// Facts listed per sample (missing premises, unknown ids, alarms).
 const SAMPLE: usize = 20;
 
@@ -162,13 +165,30 @@ fn store_holds(closure: &Closure, g: &Graph, f: &Fact) -> bool {
     if visible_in(closure, g, id).is_none() {
         return false;
     }
-    let Some(e) = g.get(id) else { return false };
-    let value = if f.p == "state" {
+    stored_value(g, f).is_some_and(|v| same_value(&v, &f.o))
+}
+
+/// The stored `state` or `prop.<name>` value of the entity a store-value
+/// fact is about.
+fn stored_value(g: &Graph, f: &Fact) -> Option<Value> {
+    let e = g.get(entity_of(&f.s)?)?;
+    if f.p == "state" {
         e.state.as_ref().map(|s| Value::String(s.clone()))
     } else {
         f.p.strip_prefix("prop.").and_then(|name| e.props.get(name)).filter(|v| !v.is_null()).cloned()
-    };
-    value.is_some_and(|v| serde_json::to_string(&v).is_ok_and(|t| t == f.o))
+    }
+}
+
+/// Is the spelled literal `literal` the stored value `v`? Numbers compare by
+/// value (`3` is `3.0`), everything else by its spelling.
+fn same_value(v: &Value, literal: &str) -> bool {
+    if serde_json::to_string(v).is_ok_and(|t| t == literal) {
+        return true;
+    }
+    match (v.as_f64(), serde_json::from_str::<Value>(literal).ok().as_ref().and_then(Value::as_f64)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Whether a fact is asserted, derived or neither.
@@ -221,116 +241,303 @@ fn unfold(closure: &Closure, f: &Fact) -> (Vec<Derivation>, Vec<Fact>, Vec<Strin
 
 // ── independent evaluator ────────────────────────────────────────────────
 
-/// Spelled facts with lookups by predicate and by predicate plus subject or
-/// object, each list in insertion order.
+/// A slot not bound yet.
+const UNBOUND: u32 = u32::MAX;
+
+type Triple = [u32; 3];
+
+/// A multiplicative hasher for the evaluator's interned keys: they are small
+/// integers the evaluator made, never attacker-chosen strings.
+#[derive(Default, Clone, Copy)]
+struct Fx(u64);
+
+impl Fx {
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+type FxBuild = std::hash::BuildHasherDefault<Fx>;
+
+#[derive(Clone, Copy)]
+enum Term {
+    Var(usize),
+    Const(u32),
+}
+
+/// A rule line with its terms interned and its variables numbered.
+struct Compiled {
+    head: [Term; 3],
+    body: Vec<[Term; 3]>,
+    vars: usize,
+}
+
+/// Interned facts with lookups by predicate and by predicate plus subject or
+/// object, each list in insertion order (so ascending, and a range of
+/// insertion indices is a binary search away).
 #[derive(Default)]
 struct Store {
-    facts: Vec<Fact>,
-    set: HashSet<Fact>,
-    by_p: HashMap<String, Vec<usize>>,
-    by_ps: HashMap<(String, String), Vec<usize>>,
-    by_po: HashMap<(String, String), Vec<usize>>,
+    facts: Vec<Triple>,
+    set: HashSet<Triple, FxBuild>,
+    by_p: HashMap<u32, Vec<u32>, FxBuild>,
+    by_ps: HashMap<(u32, u32), Vec<u32>, FxBuild>,
+    by_po: HashMap<(u32, u32), Vec<u32>, FxBuild>,
+}
+
+/// The indices of a lookup list that fall in a range of insertion indices.
+enum Cands<'a> {
+    List(std::slice::Iter<'a, u32>),
+    Range(std::ops::Range<u32>),
+}
+
+impl Iterator for Cands<'_> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            Cands::List(i) => i.next().copied(),
+            Cands::Range(r) => r.next(),
+        }
+    }
 }
 
 impl Store {
-    fn insert(&mut self, f: Fact) -> bool {
-        if self.set.contains(&f) {
+    fn insert(&mut self, t: Triple) -> bool {
+        if !self.set.insert(t) {
             return false;
         }
-        let i = self.facts.len();
-        self.by_p.entry(f.p.clone()).or_default().push(i);
-        self.by_ps.entry((f.p.clone(), f.s.clone())).or_default().push(i);
-        self.by_po.entry((f.p.clone(), f.o.clone())).or_default().push(i);
-        self.set.insert(f.clone());
-        self.facts.push(f);
+        let i = self.facts.len() as u32;
+        self.by_p.entry(t[1]).or_default().push(i);
+        self.by_ps.entry((t[1], t[0])).or_default().push(i);
+        self.by_po.entry((t[1], t[2])).or_default().push(i);
+        self.facts.push(t);
         true
     }
 
-    /// Facts in `range` that may match `atom` grounded by `b`.
-    fn candidates(&self, atom: &Fact, range: (usize, usize)) -> Vec<usize> {
-        let pick = |l: Option<&Vec<usize>>| -> Vec<usize> {
-            l.map(|l| l.iter().copied().filter(|i| (range.0..range.1).contains(i)).collect()).unwrap_or_default()
-        };
-        match (is_var(&atom.s), is_var(&atom.p), is_var(&atom.o)) {
-            (false, false, _) => pick(self.by_ps.get(&(atom.p.clone(), atom.s.clone()))),
-            (_, false, false) => pick(self.by_po.get(&(atom.p.clone(), atom.o.clone()))),
-            (_, false, _) => pick(self.by_p.get(&atom.p)),
-            _ => (range.0..range.1).collect(),
+    /// Facts inserted in `range` that may match `pat` (`UNBOUND` where the
+    /// pattern is open).
+    fn candidates(&self, pat: Triple, range: (u32, u32)) -> Cands<'_> {
+        fn clip(l: Option<&Vec<u32>>, range: (u32, u32)) -> Cands<'_> {
+            let l = l.map(Vec::as_slice).unwrap_or_default();
+            let a = l.partition_point(|i| *i < range.0);
+            let b = l.partition_point(|i| *i < range.1).max(a);
+            Cands::List(l[a..b].iter())
+        }
+        match (pat[0] != UNBOUND, pat[1] != UNBOUND, pat[2] != UNBOUND) {
+            (true, true, _) => clip(self.by_ps.get(&(pat[1], pat[0])), range),
+            (_, true, true) => clip(self.by_po.get(&(pat[1], pat[2])), range),
+            (_, true, _) => clip(self.by_p.get(&pat[1]), range),
+            _ => Cands::Range(range.0..range.1.max(range.0)),
         }
     }
 }
 
-/// Does the rule table derive `goal` from exactly `base`? A semi-naive
-/// fixpoint over spelled facts, independent of the reasoner's interned
-/// evaluation, so a justification is checked by a second implementation.
-/// Every fact it materializes is taken from `budget`; `None` when the budget
-/// runs out first.
-fn entails(rules: &[RuleLine], base: &BTreeSet<Fact>, goal: &Fact, budget: &mut usize) -> Option<bool> {
-    let mut st = Store::default();
-    for f in base {
-        st.insert(f.clone());
+/// How a join ended early.
+enum Halt {
+    Goal,
+    Budget,
+}
+
+/// One semi-naive join of a rule body: atom `order[k]` ranges over
+/// `ranges[k]`.
+struct Join<'a> {
+    st: &'a Store,
+    rule: &'a Compiled,
+    order: Vec<usize>,
+    ranges: Vec<(u32, u32)>,
+    slots: Vec<u32>,
+    goal: Triple,
+    budget: &'a mut usize,
+    out: &'a mut Vec<Triple>,
+}
+
+impl Join<'_> {
+    fn value(&self, t: Term) -> u32 {
+        match t {
+            Term::Const(c) => c,
+            Term::Var(v) => self.slots[v],
+        }
     }
-    let mut delta = (0, st.facts.len());
-    while delta.0 < delta.1 {
-        if st.set.contains(goal) {
+
+    fn go(&mut self, k: usize) -> std::result::Result<(), Halt> {
+        let Some(&ai) = self.order.get(k) else {
+            let h = self.rule.head;
+            let t = [self.value(h[0]), self.value(h[1]), self.value(h[2])];
+            if t.contains(&UNBOUND) {
+                return Ok(());
+            }
+            if t == self.goal {
+                return Err(Halt::Goal);
+            }
+            if !self.st.set.contains(&t) {
+                self.out.push(t);
+            }
+            return Ok(());
+        };
+        let atom = self.rule.body[ai];
+        let pat = [self.value(atom[0]), self.value(atom[1]), self.value(atom[2])];
+        let st = self.st;
+        for i in st.candidates(pat, self.ranges[k]) {
+            // Every candidate examined is join work taken from the budget.
+            if *self.budget == 0 {
+                return Err(Halt::Budget);
+            }
+            *self.budget -= 1;
+            let fact = st.facts[i as usize];
+            let mut bound = [0usize; 3];
+            let mut n = 0;
+            let mut ok = true;
+            for (term, v) in atom.iter().zip(fact) {
+                match *term {
+                    Term::Const(c) if c != v => ok = false,
+                    Term::Const(_) => {}
+                    Term::Var(s) if self.slots[s] == UNBOUND => {
+                        self.slots[s] = v;
+                        bound[n] = s;
+                        n += 1;
+                    }
+                    Term::Var(s) if self.slots[s] != v => ok = false,
+                    Term::Var(_) => {}
+                }
+                if !ok {
+                    break;
+                }
+            }
+            let res = if ok { self.go(k + 1) } else { Ok(()) };
+            for s in &bound[..n] {
+                self.slots[*s] = UNBOUND;
+            }
+            res?;
+        }
+        Ok(())
+    }
+}
+
+/// A semi-naive evaluator over interned spelled facts, independent of the
+/// reasoner's own evaluation, so a justification is checked by a second
+/// implementation.
+struct Evaluator {
+    ids: HashMap<String, u32>,
+    rules: Vec<Compiled>,
+}
+
+impl Evaluator {
+    fn new(rules: &[RuleLine]) -> Self {
+        let mut ev = Evaluator { ids: HashMap::new(), rules: Vec::new() };
+        for r in rules {
+            let mut vars: HashMap<String, usize> = HashMap::new();
+            let mut term = |t: &str, ev: &mut Evaluator| -> Term {
+                if is_var(t) {
+                    let n = vars.len();
+                    Term::Var(*vars.entry(t.to_string()).or_insert(n))
+                } else {
+                    Term::Const(ev.id(t))
+                }
+            };
+            let mut atom = |a: &[String; 3], ev: &mut Evaluator| [term(&a[0], ev), term(&a[1], ev), term(&a[2], ev)];
+            let body: Vec<[Term; 3]> = r.body.iter().map(|a| atom(a, &mut ev)).collect();
+            let head = atom(&r.head, &mut ev);
+            ev.rules.push(Compiled { head, body, vars: vars.len() });
+        }
+        ev
+    }
+
+    fn id(&mut self, t: &str) -> u32 {
+        if let Some(&i) = self.ids.get(t) {
+            return i;
+        }
+        let i = self.ids.len() as u32;
+        self.ids.insert(t.to_string(), i);
+        i
+    }
+
+    fn triple(&mut self, f: &Fact) -> Triple {
+        [self.id(&f.s), self.id(&f.p), self.id(&f.o)]
+    }
+
+    /// Does the rule table derive `goal` from exactly `base`? Every
+    /// candidate fact a join examines is taken from `budget`; `None` when the
+    /// budget runs out first.
+    fn entails(&mut self, base: &BTreeSet<Fact>, goal: &Fact, budget: &mut usize) -> Option<bool> {
+        let mut st = Store::default();
+        for f in base {
+            let t = self.triple(f);
+            st.insert(t);
+        }
+        let goal = self.triple(goal);
+        if st.set.contains(&goal) {
             return Some(true);
         }
-        let mut fresh: Vec<Fact> = Vec::new();
-        for r in rules {
-            // Some premise is new this round: atom i ranges over the delta.
-            for i in 0..r.body.len() {
-                join_semi(&st, &r.body, i, delta, &Bind::new(), &mut |b| fresh.push(ground(&r.head, b)));
+        let mut delta = (0u32, st.facts.len() as u32);
+        while delta.0 < delta.1 {
+            let mut fresh: Vec<Triple> = Vec::new();
+            for rule in &self.rules {
+                // Atom i ranges over the delta, the atoms before it over the
+                // facts older than the delta and those after it over all:
+                // each new combination is joined once.
+                for i in 0..rule.body.len() {
+                    let order: Vec<usize> =
+                        std::iter::once(i).chain((0..rule.body.len()).filter(|j| *j != i)).collect();
+                    let ranges = order
+                        .iter()
+                        .map(|j| match j.cmp(&i) {
+                            Ordering::Equal => delta,
+                            Ordering::Less => (0, delta.0),
+                            Ordering::Greater => (0, delta.1),
+                        })
+                        .collect();
+                    let mut join = Join {
+                        st: &st,
+                        rule,
+                        order,
+                        ranges,
+                        slots: vec![UNBOUND; rule.vars],
+                        goal,
+                        budget: &mut *budget,
+                        out: &mut fresh,
+                    };
+                    match join.go(0) {
+                        Ok(()) => {}
+                        Err(Halt::Goal) => return Some(true),
+                        Err(Halt::Budget) => return None,
+                    }
+                }
             }
+            let end = st.facts.len() as u32;
+            for t in fresh {
+                st.insert(t);
+            }
+            delta = (end, st.facts.len() as u32);
         }
-        let end = st.facts.len();
-        for f in fresh {
-            st.insert(f);
-        }
-        let grown = st.facts.len() - end;
-        if grown > *budget {
-            *budget = 0;
-            return None;
-        }
-        *budget -= grown;
-        delta = (end, st.facts.len());
+        Some(false)
     }
-    Some(st.set.contains(goal))
 }
 
-/// Join `body` with atom `first` over `delta` and the others over every
-/// fact known when the round began.
-fn join_semi(
-    st: &Store,
-    body: &[[String; 3]],
-    first: usize,
-    delta: (usize, usize),
-    b: &Bind,
-    emit: &mut dyn FnMut(&Bind),
-) {
-    // Atom `first` is matched before the rest, so the delta binds them.
-    fn go(
-        st: &Store,
-        order: &[usize],
-        body: &[[String; 3]],
-        first: usize,
-        delta: (usize, usize),
-        b: &Bind,
-        emit: &mut dyn FnMut(&Bind),
-    ) {
-        let Some((&ai, rest)) = order.split_first() else {
-            emit(b);
-            return;
-        };
-        let atom = &body[ai];
-        let range = if ai == first { delta } else { (0, delta.1) };
-        for i in st.candidates(&ground(atom, b), range) {
-            if let Some(next) = unify(atom, &st.facts[i], b) {
-                go(st, rest, body, first, delta, &next, emit);
-            }
-        }
-    }
-    let order: Vec<usize> = std::iter::once(first).chain((0..body.len()).filter(|j| *j != first)).collect();
-    go(st, &order, body, first, delta, b, emit);
+/// [`Evaluator::entails`] under a fresh evaluator.
+#[cfg(test)]
+fn entails(rules: &[RuleLine], base: &BTreeSet<Fact>, goal: &Fact, budget: &mut usize) -> Option<bool> {
+    Evaluator::new(rules).entails(base, goal, budget)
 }
 
 // ── the support cone of one fact ─────────────────────────────────────────
@@ -364,6 +571,13 @@ struct Cone {
     /// False when a budget or a cut query left instances out.
     complete: bool,
     stopped: Option<String>,
+    /// Some instance concludes a fact from premises that include the fact
+    /// itself (`a next a, a next b ⊢ a next b`): left out of the instances
+    /// (a fact never supports itself), yet a cycle that makes the number of
+    /// derivation trees infinite.
+    self_support: bool,
+    /// Propagation work spent so far (facts and premise uses visited).
+    work: std::cell::Cell<usize>,
 }
 
 impl Cone {
@@ -376,6 +590,8 @@ impl Cone {
             concluding: Vec::new(),
             complete: true,
             stopped: None,
+            self_support: false,
+            work: std::cell::Cell::new(0),
         };
         let mut ids: HashMap<Fact, usize> = HashMap::new();
         let mut node = |cone: &mut Cone, f: Fact| -> usize {
@@ -432,8 +648,10 @@ impl Cone {
                         full.insert(format!("?{k}"), v.clone());
                     }
                     let premises: Vec<Fact> = line.body.iter().map(|a| ground(a, &full)).collect();
-                    // A fact never supports itself.
+                    // A fact never supports itself, but such an instance is a
+                    // cycle in the support (every premise is in the closure).
                     if premises.contains(&f) {
+                        cone.self_support = true;
                         continue;
                     }
                     let pidx: Vec<usize> = premises.into_iter().map(|p| node(&mut cone, p)).collect();
@@ -479,10 +697,12 @@ impl Cone {
                 queue.push_back(v);
             }
         }
+        let mut work = 0;
         while let Some(v) = queue.pop_front() {
             if stop_at == Some(v) {
                 break;
             }
+            work += 1 + self.uses[v].len();
             for &ii in &self.uses[v] {
                 missing[ii] -= 1;
                 if missing[ii] == 0 {
@@ -494,6 +714,7 @@ impl Cone {
                 }
             }
         }
+        self.work.set(self.work.get().saturating_add(work));
         sup
     }
 
@@ -537,18 +758,29 @@ impl Cone {
     }
 
     /// Deletion-based minimization: drop each fact (in fact order) that the
-    /// goal does not need given the others.
-    fn minimize(&self, mut set: BTreeSet<usize>, goal: usize, steps: &mut usize) -> BTreeSet<usize> {
+    /// goal does not need given the others. Stops, with `true`, once the
+    /// cone's propagation work reaches `limit`: the set is then sufficient
+    /// but perhaps not minimal.
+    fn minimize(
+        &self,
+        mut set: BTreeSet<usize>,
+        goal: usize,
+        steps: &mut usize,
+        limit: usize,
+    ) -> (BTreeSet<usize>, bool) {
         let mut order: Vec<usize> = set.iter().copied().collect();
         order.sort_by(|a, b| self.facts[*a].cmp(&self.facts[*b]));
         for v in order {
+            if self.work.get() >= limit {
+                return (set, true);
+            }
             set.remove(&v);
             *steps += 1;
             if !self.derivable_from(&set, goal) {
                 set.insert(v);
             }
         }
-        set
+        (set, false)
     }
 
     /// Facts the goal's support reaches (through concluding instances).
@@ -632,16 +864,29 @@ impl Cone {
 pub struct JustifyOptions {
     /// Stop after this many justifications.
     pub max_justifications: usize,
-    /// Stop after this many oracle calls and hitting-set nodes (the first
-    /// justification is always minimized to the end).
+    /// Stop after this many oracle calls and hitting-set nodes (it never
+    /// cuts the first justification's minimization; `max_work` does).
     pub max_steps: usize,
     /// Rule instances collected for the support of the fact.
     pub max_instances: usize,
+    /// Propagation work (facts and premise uses visited) the search may
+    /// spend; a first justification whose minimization it cuts is reported
+    /// as found (sufficient, minimality left to the evaluator).
+    pub max_work: usize,
+    /// Join steps (candidate facts examined) the independent evaluator may
+    /// spend verifying sufficiency and minimality.
+    pub verify_budget: usize,
 }
 
 impl Default for JustifyOptions {
     fn default() -> Self {
-        Self { max_justifications: 10, max_steps: 10_000, max_instances: 100_000 }
+        Self {
+            max_justifications: 10,
+            max_steps: 10_000,
+            max_instances: 100_000,
+            max_work: SEARCH_WORK,
+            verify_budget: VERIFY_BUDGET,
+        }
     }
 }
 
@@ -714,22 +959,39 @@ impl Justifications {
 pub fn justify(closure: &Closure, fact: &Fact, opts: &JustifyOptions) -> Justifications {
     let (justs, cone, status, steps, stopped) = search(closure, fact, opts);
     let rules = closure.rules();
-    let mut budget = VERIFY_BUDGET;
-    let mut unverified = false;
+    let mut budget = opts.verify_budget;
+    let mut eval = Evaluator::new(rules);
+    let sets: Vec<BTreeSet<Fact>> =
+        justs.iter().map(|set| set.iter().map(|v| cone.facts[*v].clone()).collect()).collect();
+    // Sufficiency of every justification first (cheap: the evaluator stops
+    // at the goal), then minimality, which needs a full fixpoint per fact.
+    let sufficient: Vec<Option<bool>> = sets.iter().map(|facts| eval.entails(facts, fact, &mut budget)).collect();
+    let minimal: Vec<Option<bool>> = sets
+        .iter()
+        .zip(&sufficient)
+        .map(|(facts, ok)| {
+            if *ok != Some(true) {
+                return Some(false);
+            }
+            for f in facts {
+                let mut less = facts.clone();
+                less.remove(f);
+                match eval.entails(&less, fact, &mut budget)? {
+                    false => {}
+                    true => return Some(false),
+                }
+            }
+            Some(true)
+        })
+        .collect();
+    let unverified = sufficient.iter().chain(&minimal).any(Option::is_none);
     let mut out: Vec<Justification> = justs
         .iter()
-        .map(|set| {
-            let facts: BTreeSet<Fact> = set.iter().map(|v| cone.facts[*v].clone()).collect();
-            let sufficient = entails(rules, &facts, fact, &mut budget) == Some(true);
-            let minimal = sufficient
-                && facts.iter().all(|f| {
-                    let mut less = facts.clone();
-                    less.remove(f);
-                    entails(rules, &less, fact, &mut budget) == Some(false)
-                });
-            if budget == 0 {
-                unverified = true;
-            }
+        .zip(sets)
+        .zip(sufficient.iter().zip(&minimal))
+        .map(|((set, facts), (sufficient, minimal))| {
+            let sufficient = *sufficient == Some(true);
+            let minimal = sufficient && *minimal == Some(true);
             let sup = cone.propagate(&|v| set.contains(&v), Some(Cone::GOAL));
             let (_, order) = cone.witness(&sup, Cone::GOAL);
             let mut supplied = BTreeSet::new();
@@ -766,8 +1028,9 @@ pub fn justify(closure: &Closure, fact: &Fact, opts: &JustifyOptions) -> Justifi
     let stopped = stopped.or_else(|| (!fixpoint_reached).then(|| "the closure is a lower bound".to_string()));
     let verification = unverified.then(|| {
         format!(
-            "the independent evaluator's budget ({VERIFY_BUDGET} facts) ran out: a false sufficient or minimal \
-             means not established, not refuted"
+            "the independent evaluator's budget (verify_budget = {} join steps) ran out: a false sufficient or \
+             minimal means not established, not refuted",
+            opts.verify_budget
         )
     });
     Justifications {
@@ -804,18 +1067,25 @@ fn search(closure: &Closure, fact: &Fact, opts: &JustifyOptions) -> Search {
         return (justs, cone, status, steps, stopped);
     }
     let goal = Cone::GOAL;
-    let first = |removed: &BTreeSet<usize>, steps: &mut usize| -> Option<BTreeSet<usize>> {
+    let out_of_work = || format!("stopped after max_work = {} propagation steps", opts.max_work);
+    let first = |removed: &BTreeSet<usize>, steps: &mut usize| -> Option<(BTreeSet<usize>, bool)> {
         *steps += 1;
         let sup = cone.propagate(&|v| !removed.contains(&v), Some(goal));
         sup[goal]?;
         let (leaves, _) = cone.witness(&sup, goal);
-        Some(cone.minimize(leaves, goal, steps))
+        Some(cone.minimize(leaves, goal, steps, opts.max_work))
     };
-    let Some(root) = first(&BTreeSet::new(), &mut steps) else {
+    let Some((root, cut)) = first(&BTreeSet::new(), &mut steps) else {
         stopped.get_or_insert_with(|| "the support found does not derive the fact".into());
         return (justs, cone, status, steps, stopped);
     };
+    // A root whose minimization was cut is still reported (sufficient; the
+    // evaluator checks minimality); the search ends there.
     justs.push(root.clone());
+    if cut {
+        stopped.get_or_insert_with(out_of_work);
+        return (justs, cone, status, steps, stopped);
+    }
     let mut queue: VecDeque<BTreeSet<usize>> = VecDeque::new();
     let mut seen: HashSet<BTreeSet<usize>> = HashSet::new();
     let mut closed: Vec<BTreeSet<usize>> = Vec::new();
@@ -838,6 +1108,10 @@ fn search(closure: &Closure, fact: &Fact, opts: &JustifyOptions) -> Search {
             stopped.get_or_insert_with(|| format!("stopped after max_steps = {}", opts.max_steps));
             break;
         }
+        if cone.work.get() >= opts.max_work {
+            stopped.get_or_insert_with(out_of_work);
+            break;
+        }
         steps += 1;
         // Reuse a justification the path does not hit.
         let label = match justs.iter().find(|j| j.is_disjoint(&path)) {
@@ -850,7 +1124,12 @@ fn search(closure: &Closure, fact: &Fact, opts: &JustifyOptions) -> Search {
                     break;
                 }
                 match first(&path, &mut steps) {
-                    Some(j) => {
+                    // Not minimized to the end: dropped, the search ends.
+                    Some((_, true)) => {
+                        stopped.get_or_insert_with(out_of_work);
+                        break;
+                    }
+                    Some((j, false)) => {
                         justs.push(j.clone());
                         j
                     }
@@ -907,6 +1186,29 @@ pub struct Provenance {
     pub means: String,
 }
 
+impl Provenance {
+    /// A store value (`state`, `prop.*`) the closure does not hold: asserted,
+    /// its own single derivation tree.
+    fn store_value(fact: Fact, semiring: Semiring, weight: f64, fixpoint_reached: bool) -> Self {
+        let (value, means) = match semiring {
+            Semiring::Why => (ProvenanceValue::Why(vec![vec![fact.clone()]]), WHY_MEANS),
+            Semiring::Trust => (ProvenanceValue::Trust(weight), TRUST_MEANS),
+            Semiring::Count => (ProvenanceValue::Count(1), COUNT_MEANS),
+        };
+        Provenance {
+            fact,
+            semiring,
+            status: Entailment::Asserted,
+            value,
+            exact: true,
+            cycle_in_support: false,
+            fixpoint_reached,
+            stopped: None,
+            means: means.into(),
+        }
+    }
+}
+
 /// Weights of asserted facts for trust provenance: an entity fact weighs the
 /// entity's `confidence` property, a link fact the link's own `confidence`,
 /// else the lower of its endpoints'. Only weights other than 1.0 are listed;
@@ -948,7 +1250,7 @@ pub fn provenance_with(
     if semiring == Semiring::Why {
         let j = justify(closure, fact, opts);
         let cone = Cone::build(closure, fact, opts.max_instances);
-        let cycle = !cone.is_empty() && cone.topo(&cone.reach(Cone::GOAL), &|_| true).is_none();
+        let cycle = !cone.is_empty() && (cone.self_support || cone.topo(&cone.reach(Cone::GOAL), &|_| true).is_none());
         return Provenance {
             fact: fact.clone(),
             semiring,
@@ -978,7 +1280,9 @@ pub fn provenance_with(
     } else {
         let reach = cone.reach(Cone::GOAL);
         let order = cone.topo(&reach, &|_| true);
-        let cycle = order.is_none();
+        // The instances left out because they rest on their own conclusion
+        // keep the count below the number of trees: a cycle too.
+        let cycle = order.is_none() || cone.self_support;
         match semiring {
             Semiring::Trust => (cycle, ProvenanceValue::Trust(trust(&cone, weights)), bounded),
             _ => {
@@ -1380,21 +1684,14 @@ pub struct VerifyReport {
 }
 
 /// Stored facts that contradict a claim that is not entailed.
-fn conflicts(g: &Graph, closure: &Closure, sp: &Spelled) -> Vec<Fact> {
+fn conflicts(schema: &Schema, g: &Graph, closure: &Closure, sp: &Spelled) -> Vec<Fact> {
     let f = &sp.fact;
     match &sp.form {
-        Form::StoreValue => {
-            let Some(e) = entity_of(&f.s).and_then(|id| g.get(id)) else { return Vec::new() };
-            let stored = if f.p == "state" {
-                e.state.as_ref().map(|s| Value::String(s.clone()))
-            } else {
-                f.p.strip_prefix("prop.").and_then(|n| e.props.get(n)).filter(|v| !v.is_null()).cloned()
-            };
-            stored
-                .map(|v| Fact::new(f.s.clone(), f.p.clone(), serde_json::to_string(&v).unwrap_or_default()))
-                .into_iter()
-                .collect()
-        }
+        Form::StoreValue => stored_value(g, f)
+            .filter(|v| !same_value(v, &f.o))
+            .map(|v| Fact::new(f.s.clone(), f.p.clone(), serde_json::to_string(&v).unwrap_or_default()))
+            .into_iter()
+            .collect(),
         Form::Relation { link: Some((Cardinality::One, false)) } => {
             let atoms = [AtomPattern { s: f.s.clone(), p: f.p.clone(), o: "?z".into() }];
             closure
@@ -1406,8 +1703,14 @@ fn conflicts(g: &Graph, closure: &Closure, sp: &Spelled) -> Vec<Fact> {
                 .collect()
         }
         Form::Class { object_type: true } => {
-            // Kinds are closed: an entity has exactly one stored kind.
+            // Kinds are closed: an entity has exactly one stored kind, and is
+            // of the claimed kind only if its kind is it or extends it. Read
+            // from the schema, not the closure, so a closure that stopped
+            // short of deriving the extends chain never contradicts it.
             let Some(e) = entity_of(&f.s).and_then(|id| g.get(id)) else { return Vec::new() };
+            if schema.kind_is(&e.kind, strip_class(&f.o)) {
+                return Vec::new();
+            }
             reason::spell_class(&e.kind).map(|k| Fact::new(f.s.clone(), "a", k)).into_iter().collect()
         }
         _ => Vec::new(),
@@ -1423,19 +1726,33 @@ fn find_rule<'r>(rules: &'r [RuleLine], name: &str) -> Option<&'r RuleLine> {
         .or_else(|| rules.iter().find(|r| r.name == format!("builtin/{name}")))
 }
 
-/// Assign premises to body atoms (in any order) under one binding.
-fn match_body(body: &[[String; 3]], premises: &[Fact], used: &mut [bool], b: &Bind) -> bool {
-    let Some((atom, rest)) = body.split_first() else { return true };
-    for (j, p) in premises.iter().enumerate() {
-        if used[j] {
-            continue;
-        }
-        if let Some(next) = unify(atom, p, b) {
-            used[j] = true;
-            if match_body(rest, premises, used, &next) {
+/// Assign each claimed premise to a distinct body atom (in any order) under
+/// one binding; the atoms left over must be schema-level facts that hold
+/// (`?r a transitive`, `#leaf extends #step`), supplied rather than demanded.
+fn match_body(
+    closure: &Closure,
+    g: &Graph,
+    body: &[&[String; 3]],
+    premises: &[Fact],
+    used: &mut [bool],
+    b: &Bind,
+) -> bool {
+    let Some(k) = used.iter().position(|u| !u) else {
+        return body.iter().all(|a| {
+            let x = ground(a, b);
+            ![&x.s, &x.p, &x.o].iter().any(|t| is_var(t))
+                && entity_terms(&x).next().is_none()
+                && held(closure, g, &x) != Entailment::NotEntailed
+        });
+    };
+    for (j, atom) in body.iter().enumerate() {
+        if let Some(next) = unify(atom, &premises[k], b) {
+            used[k] = true;
+            let rest: Vec<&[String; 3]> = body.iter().enumerate().filter(|(i, _)| *i != j).map(|(_, a)| *a).collect();
+            if match_body(closure, g, &rest, premises, used, &next) {
                 return true;
             }
-            used[j] = false;
+            used[k] = false;
         }
     }
     false
@@ -1521,10 +1838,15 @@ fn check_step(
         }
     }
     if !unknown.is_empty() {
+        // A premise outside the vocabulary cannot be spelled, so no rule body
+        // atom matches it: the rule does not conclude the claim from it.
         let mut s = step(
-            StepLabel::PremisesNotInGraph,
+            StepLabel::RuleDoesNotConcludeThis,
             named,
-            "a premise uses terms outside the vocabulary, so it is not in the graph".into(),
+            format!(
+                "a premise uses terms outside the vocabulary ({}): no rule in the table can be applied to it",
+                unknown.join(", ")
+            ),
         );
         s.unknown = unknown;
         return Some(s);
@@ -1534,14 +1856,16 @@ fn check_step(
         None => concluding,
     };
     let applies = candidates.into_iter().find(|r| {
-        r.body.len() == premises.len()
+        let body: Vec<&[String; 3]> = r.body.iter().collect();
+        premises.len() <= body.len()
             && unify(&r.head, fact, &Bind::new())
-                .is_some_and(|b| match_body(&r.body, &premises, &mut vec![false; premises.len()], &b))
+                .is_some_and(|b| match_body(closure, g, &body, &premises, &mut vec![false; premises.len()], &b))
     });
     let Some(rule) = applies else {
         let reason = match named {
             Some(r) => format!(
-                "{} needs {} premise(s) matching {}; the claimed premises do not instantiate it with this conclusion",
+                "{} needs {} premise(s) matching {} (schema premises that hold may be left out); the claimed \
+                 premises do not instantiate it with this conclusion",
                 r.name,
                 r.body.len(),
                 r.body.iter().map(|a| a.join(" ")).collect::<Vec<_>>().join(", ")
@@ -1556,13 +1880,20 @@ fn check_step(
         Some(step(
             StepLabel::SoundStep,
             Some(rule),
-            format!("{} concludes {fact} from the claimed premises, all entailed", rule.name),
+            format!(
+                "{} concludes {fact} from the claimed premises, all asserted or derived in this closure",
+                rule.name
+            ),
         ))
     } else {
         let mut s = step(
             StepLabel::PremisesNotInGraph,
             Some(rule),
-            format!("{} applies, but {} premise(s) are not entailed by the graph", rule.name, missing.len()),
+            format!(
+                "{} applies, but {} premise(s) are neither asserted nor derived in this closure",
+                rule.name,
+                missing.len()
+            ),
         );
         s.missing = missing;
         Some(s)
@@ -1616,7 +1947,7 @@ pub fn verify(schema: &Schema, g: &Graph, closure: &Closure, claims: &[Claim]) -
                     v.rules = rules;
                 }
                 Entailment::NotEntailed => {
-                    let conflicting = conflicts(g, closure, &sp);
+                    let conflicting = conflicts(schema, g, closure, &sp);
                     if conflicting.is_empty() {
                         v.reason = format!("{f} is neither asserted nor derived{partial}");
                     } else {
@@ -1865,7 +2196,9 @@ pub fn slice_check(
         None => {
             for d in full.derived() {
                 let f = &d.conclusion;
-                if !entity_terms(f).all(|id| slice.contains(id)) {
+                // Facts over slice entities only: schema-level facts
+                // (`#a extends #c`) are in every slice and say nothing about it.
+                if entity_terms(f).next().is_none() || !entity_terms(f).all(|id| slice.contains(id)) {
                     continue;
                 }
                 if sliced.contains(f).is_some() {
@@ -1952,6 +2285,15 @@ impl Ontology {
     ) -> Result<Provenance> {
         self.with_closure(p, opts, |schema, g, c| {
             let fact = claim_fact(schema, g, c, claim)?;
+            // A store value the closure does not hold (no rule reads it) is
+            // read from the store, as `reason_explain` and `reason_verify`
+            // do. One the store does not hold either has no derivation at
+            // all (rules never conclude states or property values), so the
+            // general path's exact 0 is the truth.
+            if is_store_value(&fact) && c.contains(&fact).is_none() && store_holds(c, g, &fact) {
+                let weight = confidence_weights(g, std::slice::from_ref(&fact)).get(&fact).copied().unwrap_or(1.0);
+                return Ok(Provenance::store_value(fact, semiring, weight, c.fixpoint_reached()));
+            }
             let weights =
                 if semiring == Semiring::Trust { confidence_weights(g, c.asserted()) } else { BTreeMap::new() };
             Ok(provenance_with(c, &fact, semiring, &weights, bounds))
@@ -2124,6 +2466,19 @@ mod tests {
     }
 
     #[test]
+    fn a_self_loop_makes_the_count_a_lower_bound() {
+        let s = schema();
+        let g = graph(&["a", "b"], &[("a", "next", "b"), ("b", "next", "b")]);
+        let c = closure(&s, &g, &ReasonOptions::default(), &all);
+        let ab = f("<node:a>", "next", "<node:b>");
+        let p = provenance(&c, &ab, Semiring::Count, &BTreeMap::new());
+        assert!(p.cycle_in_support && !p.exact, "{p:?}");
+        assert_eq!(p.value, ProvenanceValue::Count(1));
+        let w = provenance(&c, &ab, Semiring::Why, &BTreeMap::new());
+        assert!(w.cycle_in_support && w.exact, "{w:?}");
+    }
+
+    #[test]
     fn provenance_values_serialize_untagged() {
         assert_eq!(serde_json::to_value(ProvenanceValue::Count(2)).unwrap(), json!(2));
         assert_eq!(serde_json::to_value(ProvenanceValue::Trust(0.5)).unwrap(), json!(0.5));
@@ -2177,6 +2532,21 @@ mod tests {
             }
             let g = graph(&refs, &links);
             let c = closure(&s, &g, &ReasonOptions::default(), &all);
+            // The evaluator agrees with the reasoner on every pair.
+            let base: BTreeSet<Fact> = c.asserted().iter().cloned().collect();
+            for a in &refs {
+                for b in &refs {
+                    for rel in ["next", "near"] {
+                        let x = f(&format!("<node:{a}>"), rel, &format!("<node:{b}>"));
+                        let want = c.contains(&x).is_some();
+                        assert_eq!(
+                            entails(c.rules(), &base, &x, &mut usize::MAX.clone()),
+                            Some(want),
+                            "round {round}: {x}"
+                        );
+                    }
+                }
+            }
             for d in c.derived() {
                 let j = justify(&c, &d.conclusion, &JustifyOptions::default());
                 assert!(!j.justifications.is_empty(), "round {round}: {}", d.conclusion);
