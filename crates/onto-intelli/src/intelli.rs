@@ -224,6 +224,7 @@ impl Intelli {
     ) -> Result<Arc<Self>> {
         let schema = load_schema(&config)?;
         config.traces.check()?;
+        config.mcp.check()?;
         let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,

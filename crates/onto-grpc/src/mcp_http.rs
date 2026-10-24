@@ -9,7 +9,8 @@
 //! API key is the intended credential) and addresses the credential's
 //! project. The messages go to [`McpServer::handle`], which is transport
 //! independent. Tools that write are offered only when `[mcp] allow_writes`
-//! is on and the principal may write. No MCP session state is kept, so
+//! is on and the principal may write; the tool profile is `ONTO_MCP_PROFILE`,
+//! else `[mcp] profile` (see [`onto_intelli::mcp::MCP_PROFILES`]). No MCP session state is kept, so
 //! `Mcp-Session-Id` is not needed; `Mcp-Protocol-Version`, when sent, must be
 //! one of [`onto_intelli::mcp::SUPPORTED`]. Calls are traced with the source
 //! `mcp`, the request's `x-onto-session-id` and `traceparent`, and the API
@@ -72,7 +73,13 @@ async fn mcp(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Resp
     };
     let allow_writes = intelli.config().mcp.allow_writes && caller.principal.allows(Access::Write);
     let ctx = crate::observe::trace_ctx(&headers, &caller, "mcp");
-    let server = McpServer::new(intelli, caller.principal, allow_writes).with_trace_ctx(ctx);
+    // The tool profile: ONTO_MCP_PROFILE, else `[mcp] profile` (there is no
+    // CLI flag on this transport); an unknown one refuses every request.
+    let profile = intelli.config().mcp.effective_profile(None);
+    let server = match McpServer::new(intelli, caller.principal, allow_writes).with_profile(&profile) {
+        Ok(s) => s.with_trace_ctx(ctx),
+        Err(e) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, -32603, &e.to_string()),
+    };
     match msg {
         Value::Array(batch) => {
             if batch.is_empty() {

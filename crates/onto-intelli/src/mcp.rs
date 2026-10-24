@@ -3,6 +3,14 @@
 //! lets agents (Claude Code, IDEs, other MCP clients) query the same verified,
 //! permission-filtered ontology people use. Writes go through governed action
 //! types and are disabled unless `[mcp] allow_writes = true`.
+//!
+//! A tool profile ([`MCP_PROFILES`]) narrows the tool list to one job
+//! (catalog, authoring, reasoning, governance, retrieval, evaluation) on top
+//! of a floor every profile offers ([`FLOOR_TOOLS`]); `full` offers every
+//! tool. The profile comes from `onto mcp --profile`, else `ONTO_MCP_PROFILE`,
+//! else `[mcp] profile` ([`resolve_profile`]), and [`McpServer::with_profile`]
+//! refuses an unknown name. `initialize` reports the profile and how many
+//! tools it withholds.
 
 use std::sync::Arc;
 
@@ -23,6 +31,7 @@ pub struct McpServer {
     principal: Principal,
     allow_writes: bool,
     ctx: TraceCtx,
+    profile: &'static str,
 }
 
 fn obj(props: Value, required: &[&str]) -> Value {
@@ -388,12 +397,363 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             obj(json!({ "id": s("Proposal id") }), &["id"]),
             false,
         ),
+        (
+            "query_inferred",
+            "reason.query",
+            "Match triple patterns over asserted AND derived facts (rule chains, inheritance, transitive and symmetric links). Atoms are [subject, predicate, object] with ?variables: [[\"?i\", \"handled_by_team\", \"team:payments\"]]. Derived is not asserted: a derived fact is the engine's opinion under the schema rules, never stored data; explain_fact shows why. With fixpoint_reached false the answer is a lower bound.",
+            obj(
+                json!({
+                    "pattern": { "type": "array", "description": "Atoms [s, p, o]: entity ids, relation names (inverse names allowed), `a` with a kind, `state`, `prop.<name>`; ?x for variables", "items": { "type": "array", "items": {} } },
+                    "workspace": s("Only this workspace's entities"),
+                    "limit": { "type": "integer", "description": "Bindings returned (default 50)" }
+                }),
+                &["pattern"],
+            ),
+            false,
+        ),
+        (
+            "explain_fact",
+            "reason.explain",
+            "Why a fact holds: the minimal sets of asserted facts and the rules it is derived from, each re-derived independently. A derived fact rests on supplied schema rules, which are assumptions, not facts; an asserted fact is its own justification.",
+            obj(
+                json!({
+                    "fact": { "description": "[subject, relation, object] or {subject, relation, object}, e.g. [\"issue:421\", \"handled_by_team\", \"team:payments\"]" },
+                    "workspace": s("Only this workspace's entities"),
+                    "max": { "type": "integer", "description": "Justifications listed (default 10)" }
+                }),
+                &["fact"],
+            ),
+            false,
+        ),
+        (
+            "verify_claims",
+            "reason.verify",
+            "Check statements before you rely on them: each claim gets asserted, derived (with its derivation), not_entailed, contradicted (with the stored facts that say otherwise) or outside_vocabulary (it names a kind or relation the schema does not know). A claim may carry the rule and premises of a reasoning step to check that step. not_entailed is not false: the graph may simply not say.",
+            obj(
+                json!({
+                    "claims": { "type": "array", "description": "Claims {subject, relation, object, rule?, premises?: [claim]}", "items": { "type": "object", "properties": { "subject": s("Entity id or schema name"), "relation": s("Relation, a, state or prop.<name>"), "object": { "description": "Entity id, name or value" }, "rule": s("Rule the step claims to apply"), "premises": { "type": "array", "items": { "type": "object" } } }, "required": ["subject", "relation", "object"] } },
+                    "workspace": s("Only this workspace's entities")
+                }),
+                &["claims"],
+            ),
+            false,
+        ),
+        (
+            "check_slice",
+            "reason.slice_check",
+            "Does a subset of entities (the context you plan to use) keep what the whole visible graph derives, or the goals you name? Lists the facts and entities the slice loses. Coverage is a proxy; preservation is the property.",
+            obj(
+                json!({
+                    "entities": arr("Entity ids in the slice"),
+                    "goals": { "type": "array", "description": "Claims {subject, relation, object} the slice must preserve", "items": { "type": "object" } },
+                    "workspace": s("Only this workspace's entities")
+                }),
+                &["entities"],
+            ),
+            false,
+        ),
+        (
+            "certify_reasoning",
+            "reason.certify",
+            "A reasoning certificate (rules.tsv, asserted.tsv, derivations.tsv, manifest.json) and the verdict of the independent onto-cert checker, which re-derives every line by pattern alone. Only `check` carries a checker verdict; entailed_under_supplied_rules means the conclusions hold IF the supplied schema rules do. A certificate binds bytes, not the state of the world.",
+            obj(json!({ "workspace": s("Only this workspace's entities") }), &[]),
+            false,
+        ),
+        (
+            "validate_shapes",
+            "shapes.validate",
+            "Validate the schema's shapes (cardinality, classes, datatypes, values, patterns, closed shapes) over the graph. The verdict is conforms, violates or undetermined; undetermined (something was skipped) is never valid. A shape report is a measurement of the data, not a proof.",
+            obj(
+                json!({
+                    "shapes": arr("Shape names (all when omitted)"),
+                    "workspace": s("Only this workspace's entities"),
+                    "inferred": { "type": "boolean", "description": "Also read derived classes and relations" },
+                    "limit": { "type": "integer", "description": "Results listed (all are counted)" }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "induce_shape",
+            "shapes.induce",
+            "Read a shape for one object type from its data, with the counts behind each constraint and a put_shape change set to plan or propose. It describes the data as it is, not what it should be.",
+            obj(
+                json!({ "kind": s("Object type"), "workspace": s("Only this workspace's entities"), "name": s("Shape name (default <kind>_shape)") }),
+                &["kind"],
+            ),
+            false,
+        ),
+        (
+            "check_shapes",
+            "shapes.check",
+            "Structural dry run of draft shape definitions against the schema (names, keys, patterns, bounds) before you propose them. Nothing is validated against data and nothing is saved.",
+            obj(
+                json!({ "shapes": { "type": "object", "description": "Shape definitions by name: {description?, target?, severity?, closed?, properties: [{path, min_count?, max_count?, class?, datatype?, in?, pattern?, ...}]}" } }),
+                &["shapes"],
+            ),
+            false,
+        ),
+        (
+            "lint_schema",
+            "schema.lint",
+            "Schema lint: missing descriptions and inverses, orphan and unused types and link types, dead or recursive rules, keyword collisions, duplicate labels, shape references, with a fix for each finding. A lint report is a measurement by fixed heuristics, not a consistency proof; dismissed findings are counted in `suppressed`.",
+            obj(
+                json!({ "checks": arr("Checks to run (all when omitted)"), "include_dismissed": { "type": "boolean" } }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "list_packs",
+            "pack.list",
+            "Industry packs (object types, link types, rules, shapes, metrics, actions) with counts and whether each is installed. The standards a pack lists are vocabulary it borrows, not compliance it claims.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        (
+            "show_pack",
+            "pack.show",
+            "Everything one pack defines, its rules as text, and the lint findings it would add to the current schema.",
+            obj(json!({ "id": s("Pack id, e.g. manufacturing") }), &["id"]),
+            false,
+        ),
+        (
+            "plan_pack",
+            "pack.plan",
+            "The schema plan of installing a pack: changes, consequences (derived facts that appear, conservative or not), risk, lock violations and shape delta. Nothing is written.",
+            obj(json!({ "id": s("Pack id") }), &["id"]),
+            false,
+        ),
+        (
+            "install_pack",
+            "pack.install",
+            "File a pack's schema as a change proposal for human review. Over MCP it is always a proposal: agents never apply schema. Plan it first with plan_pack.",
+            obj(json!({ "id": s("Pack id"), "message": s("Why the pack is needed") }), &["id"]),
+            false,
+        ),
+        (
+            "align_schema",
+            "schema.align",
+            "Align a pack (or a TOML schema) onto the schema in force: scored object and link type matches with the signals behind each, SSSOM TSV and a glossary change set to propose. Scores are opinions; certify a mapping before relying on it.",
+            obj(
+                json!({ "pack": s("Pack id"), "toml": s("A schema TOML document (instead of pack)"), "threshold": { "type": "number", "description": "Minimum score of a candidate (default 0.5)" } }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "induce_sheet",
+            "model.induce",
+            "One sheet in, one ontology out: from CSV text, an object type (typed properties, key, title), links to existing objects and a shape, each with its evidence, plus the change set to plan or propose. Nothing is written; it describes the data as it is.",
+            obj(
+                json!({ "csv": s("The CSV text (header row first)"), "kind": s("Object type name"), "key": s("Key column"), "workspace": s("Workspace whose objects links may target") }),
+                &["csv"],
+            ),
+            false,
+        ),
     ]
 }
 
+/// Tool profiles, the names `[mcp] profile`, `ONTO_MCP_PROFILE` and
+/// `onto mcp --profile` accept. `full` (the default) offers every tool.
+pub const MCP_PROFILES: &[&str] =
+    &["full", "catalog", "authoring", "reasoning", "governance", "retrieval", "evaluation"];
+
+/// Tools every profile offers: what an agent needs to orient itself.
+pub const FLOOR_TOOLS: &[&str] = &["ask", "search", "get_entity", "get_schema"];
+
+/// The tools each profile adds to [`FLOOR_TOOLS`] (`full` offers all).
+const PROFILE_TOOLS: &[(&str, &[&str])] = &[
+    (
+        "catalog",
+        &[
+            "find_data",
+            "join_path",
+            "trusted_metric",
+            "authority",
+            "learned_facts",
+            "crawl",
+            "object_types",
+            "explore_objects",
+            "find_entities",
+            "neighbors",
+            "metric",
+            "history",
+            "changes",
+            "experts",
+        ],
+    ),
+    (
+        "authoring",
+        &[
+            "object_types",
+            "draft_ontology",
+            "refine_ontology",
+            "advise_ontology",
+            "propose_ontology",
+            "plan_schema_change",
+            "propose_schema_change",
+            "list_proposals",
+            "get_proposal",
+            "list_packs",
+            "show_pack",
+            "plan_pack",
+            "install_pack",
+            "align_schema",
+            "induce_sheet",
+            "induce_shape",
+            "check_shapes",
+            "validate_shapes",
+            "lint_schema",
+        ],
+    ),
+    (
+        "reasoning",
+        &[
+            "query_inferred",
+            "explain_fact",
+            "verify_claims",
+            "check_slice",
+            "certify_reasoning",
+            "neighbors",
+            "find_entities",
+            "dependencies",
+            "impact",
+            "explain_blockers",
+            "critical_path",
+            "what_if",
+        ],
+    ),
+    (
+        "governance",
+        &[
+            "list_actions",
+            "plan_action",
+            "apply_action",
+            "undo_action",
+            "plan_schema_change",
+            "propose_schema_change",
+            "list_proposals",
+            "get_proposal",
+            "lint_schema",
+            "validate_shapes",
+            "plan_pack",
+            "install_pack",
+            "verify_claims",
+            "certify_reasoning",
+            "data_quality",
+            "history",
+            "changes",
+        ],
+    ),
+    (
+        "retrieval",
+        &[
+            "find_entities",
+            "neighbors",
+            "explore_objects",
+            "object_types",
+            "find_data",
+            "trusted_metric",
+            "metric",
+            "history",
+            "changes",
+            "experts",
+            "query_inferred",
+            "explain_fact",
+            "check_slice",
+        ],
+    ),
+    (
+        "evaluation",
+        &[
+            "verify_claims",
+            "certify_reasoning",
+            "check_slice",
+            "explain_fact",
+            "query_inferred",
+            "validate_shapes",
+            "lint_schema",
+            "data_quality",
+            "metric",
+            "what_if",
+        ],
+    ),
+];
+
+/// Does `profile` offer `tool`? Unknown profiles offer nothing.
+pub fn profile_offers(profile: &str, tool: &str) -> bool {
+    profile == "full"
+        || FLOOR_TOOLS.contains(&tool)
+        || PROFILE_TOOLS.iter().any(|(p, tools)| *p == profile && tools.contains(&tool))
+}
+
+/// The names of every tool, in table order.
+pub fn tool_names() -> Vec<&'static str> {
+    tools().into_iter().map(|t| t.0).collect()
+}
+
+/// Every tool with the engine action it calls: `(tool, action, writes)`.
+pub fn tool_actions() -> Vec<(&'static str, &'static str, bool)> {
+    tools().into_iter().map(|t| (t.0, t.1, t.4)).collect()
+}
+
+/// The profile an MCP server runs with, by precedence: the CLI flag
+/// (`onto mcp --profile`), else `ONTO_MCP_PROFILE`, else `[mcp] profile`
+/// (`full` by default). Empty values are skipped. The name is not checked
+/// here: [`McpServer::with_profile`] refuses an unknown one.
+pub fn resolve_profile(cli: Option<&str>, configured: &str) -> String {
+    choose_profile(cli, std::env::var("ONTO_MCP_PROFILE").ok().as_deref(), configured)
+}
+
+/// [`resolve_profile`] with the environment value given: the first
+/// non-empty of `cli`, `env`, `configured`, else `full`.
+pub fn choose_profile(cli: Option<&str>, env: Option<&str>, configured: &str) -> String {
+    [cli, env, Some(configured)]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or("full")
+        .to_string()
+}
+
+/// `Ok` for a known profile name, else the error that lists the valid ones.
+pub fn check_profile(profile: &str) -> onto_core::Result<()> {
+    if MCP_PROFILES.contains(&profile) {
+        return Ok(());
+    }
+    Err(onto_core::Error::Invalid(format!("unknown MCP profile '{profile}' (valid: {})", MCP_PROFILES.join(", "))))
+}
+
 impl McpServer {
+    /// A server offering every tool (profile `full`); see [`Self::with_profile`].
     pub fn new(intelli: Arc<Intelli>, principal: Principal, allow_writes: bool) -> Self {
-        Self { intelli, principal, allow_writes, ctx: TraceCtx::from_source("mcp") }
+        Self { intelli, principal, allow_writes, ctx: TraceCtx::from_source("mcp"), profile: "full" }
+    }
+
+    /// Offer only the tools of `profile` (one of [`MCP_PROFILES`]) plus
+    /// [`FLOOR_TOOLS`]. Write tools still need `allow_writes`. An unknown
+    /// name is refused with an error that lists the valid ones. Callers pass
+    /// [`resolve_profile`]`(cli_flag, &cfg.mcp.profile)`, so the precedence
+    /// is CLI flag, then `ONTO_MCP_PROFILE`, then `[mcp] profile`.
+    pub fn with_profile(mut self, profile: &str) -> onto_core::Result<Self> {
+        let profile = profile.trim();
+        check_profile(profile)?;
+        self.profile = MCP_PROFILES.iter().copied().find(|p| *p == profile).unwrap_or("full");
+        Ok(self)
+    }
+
+    /// The active tool profile.
+    pub fn profile(&self) -> &str {
+        self.profile
+    }
+
+    /// Tools this server lists: in the profile, and writing ones only with
+    /// `allow_writes`.
+    fn offered(&self, name: &str, writes: bool) -> bool {
+        profile_offers(self.profile, name) && (self.allow_writes || !writes)
     }
 
     /// The trace context of the calls this server makes (source `mcp` by
@@ -424,15 +784,26 @@ impl McpServer {
             "initialize" => {
                 let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
                 let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
+                let all = tools();
+                let withheld = all.iter().filter(|t| !profile_offers(self.profile, t.0)).count();
+                let profile = format!(
+                    " Tool profile: {} ({} of {} tools offered, {withheld} withheld by the profile{}; \
+                     set [mcp] profile, ONTO_MCP_PROFILE or onto mcp --profile to change it).",
+                    self.profile,
+                    all.iter().filter(|t| self.offered(t.0, t.4)).count(),
+                    all.len(),
+                    if self.allow_writes { "" } else { ", write tools hidden" },
+                );
                 Self::reply(
                     &id,
                     json!({
                         "protocolVersion": version,
                         "capabilities": { "tools": { "listChanged": false } },
                         "serverInfo": { "name": "onto-intelli", "version": crate::VERSION },
-                        "instructions": "Ontology of the workspace: teams, people, projects, issues, tasks, services, knowledge. \
+                        "instructions": format!("Ontology of the workspace: teams, people, projects, issues, tasks, services, knowledge. \
                             Prefer `ask` for questions; use graph tools for precise lookups; cite entity ids. \
-                            Writes only through plan_action/apply_action (governed, reversible).",
+                            Writes only through plan_action/apply_action (governed, reversible). \
+                            Derived facts are not asserted facts, and a clean reasoner or shape run is not a consistency result.{profile}"),
                     }),
                 )
             }
@@ -440,7 +811,7 @@ impl McpServer {
             "tools/list" => {
                 let list: Vec<Value> = tools()
                     .into_iter()
-                    .filter(|t| self.allow_writes || !t.4)
+                    .filter(|t| self.offered(t.0, t.4))
                     .map(|(name, _, description, schema, _)| json!({ "name": name, "description": description, "inputSchema": schema }))
                     .collect();
                 Self::reply(&id, json!({ "tools": list }))
@@ -452,6 +823,13 @@ impl McpServer {
                 let Some((_, action, _, _, writes)) = tools().into_iter().find(|t| t.0 == name) else {
                     return Some(Self::error(&id, -32602, &format!("unknown tool {name}")));
                 };
+                if !profile_offers(self.profile, name) {
+                    return Some(Self::error(
+                        &id,
+                        -32602,
+                        &format!("tool {name} is not offered under the MCP profile {}", self.profile),
+                    ));
+                }
                 if writes && !self.allow_writes {
                     return Some(Self::reply(
                         &id,
@@ -475,6 +853,16 @@ impl McpServer {
                     }
                     m.insert("mode".into(), json!("propose"));
                     m.insert("proposal_source".into(), json!("mcp"));
+                }
+                // Likewise a pack: always a proposal, never sample data (a
+                // sample needs the pack's schema in force, which a proposal
+                // is not).
+                if name == "install_pack" {
+                    let Some(m) = args.as_object_mut() else {
+                        return Some(Self::error(&id, -32602, "install_pack takes an object of arguments"));
+                    };
+                    m.remove("sample");
+                    m.insert("mode".into(), json!("propose"));
                 }
                 match self.intelli.call_traced(&self.principal, action, args, self.ctx.clone()).await.result {
                     Ok(v) => {

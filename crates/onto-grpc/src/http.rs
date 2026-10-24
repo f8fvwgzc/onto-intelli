@@ -26,6 +26,14 @@
 //! * `POST /v1/ontology/apply`   apply a draft, or `{mode: "propose"}` file it
 //! * `GET  /v1/objects/types`    object types with counts (`?workspace=`)
 //! * `POST /v1/objects/explore`  Object Explorer: filters, facets, statistics
+//! * `POST /v1/reason/query`    match triple patterns over asserted and derived facts
+//! * `POST /v1/reason/certify`  a reasoning certificate with the onto-cert checker's report
+//! * `POST /v1/reason/verify`   verdicts on claims `{claims, workspace?}`
+//! * `POST /v1/shapes/validate` shape report (`{shapes?, workspace?, inferred?, limit?}`)
+//! * `GET  /v1/schema/lint`     lint findings (`?checks=a,b&include_dismissed=true`)
+//! * `GET  /v1/packs`           industry packs; `GET /v1/packs/{id}` one pack with its lint
+//! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
+//! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
@@ -103,6 +111,14 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/ontology/apply", post(ontology_apply))
         .route("/v1/objects/types", get(object_types))
         .route("/v1/objects/explore", post(objects_explore))
+        .route("/v1/reason/query", post(reason_query))
+        .route("/v1/reason/certify", post(reason_certify))
+        .route("/v1/reason/verify", post(reason_verify))
+        .route("/v1/shapes/validate", post(shapes_validate))
+        .route("/v1/schema/lint", get(schema_lint))
+        .route("/v1/packs", get(packs_list))
+        .route("/v1/packs/{id}", get(pack_show))
+        .route("/v1/packs/{id}/{verb}", post(pack_verb))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -635,4 +651,65 @@ async fn object_types(
 
 async fn objects_explore(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     run(&s, &headers, "objects.explore", body_or_empty(body)).await
+}
+
+// ── assurance ────────────────────────────────────────────────────────────
+
+async fn reason_query(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "reason.query", body_or_empty(body)).await
+}
+
+async fn reason_certify(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "reason.certify", body_or_empty(body)).await
+}
+
+async fn reason_verify(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "reason.verify", body_or_empty(body)).await
+}
+
+async fn shapes_validate(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "shapes.validate", body_or_empty(body)).await
+}
+
+/// `?checks=a,b` (or repeated values joined by commas) and `?include_dismissed=true`.
+async fn schema_lint(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut input = serde_json::Map::new();
+    if let Some(c) = q.get("checks") {
+        let checks: Vec<&str> = c.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+        input.insert("checks".into(), json!(checks));
+    }
+    if let Some(d) = q.get("include_dismissed") {
+        input.insert("include_dismissed".into(), json!(matches!(d.as_str(), "true" | "1" | "yes")));
+    }
+    run(&s, &headers, "schema.lint", Value::Object(input)).await
+}
+
+async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "pack.list", json!({})).await
+}
+
+async fn pack_show(State(s): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "pack.show", json!({ "id": id })).await
+}
+
+async fn pack_verb(
+    State(s): State<AppState>,
+    Path((id, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "plan" => "pack.plan",
+        "install" => "pack.install",
+        other => return error_response(&Error::not_found(format!("pack action '{other}'"))),
+    };
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("id".into(), Value::String(id));
+    }
+    run(&s, &headers, action, input).await
 }

@@ -772,3 +772,28 @@ fn kinds_in_use_count_only_where_the_principal_reads() {
     // Someone who reads globex sees the kind in use.
     assert_eq!(o.induce_sheet(&admin(), "a\n1\n", &named).unwrap().kind, "secretproject_2");
 }
+
+#[test]
+fn a_sheet_maps_onto_the_existing_type_it_names() {
+    let (o, ctx) = world();
+    let ind = o.induce_sheet(&admin(), &orders(), &opts("orders.csv")).unwrap();
+    apply(&o, &ctx, &ind);
+    // Induced again, the sheet describes a free kind; its base is order.
+    let again = o.induce_sheet(&admin(), &orders(), &opts("orders.csv")).unwrap();
+    assert_eq!((again.kind.as_str(), again.base_kind.as_str()), ("order_2", "order"));
+    let m = induce::mapping_onto(&o.schema(), &again, "order").unwrap();
+    assert_eq!(m.kind, "order");
+    assert_eq!(m.key.as_deref(), Some("order_id"));
+    assert_eq!(m.links["customer_id"], LinkMapping { rel: "customer".into(), target_kind: "customer".into() });
+    assert_eq!(m.properties.get("amount").map(String::as_str), Some("amount"));
+    assert_eq!(m, ind.mapping, "the same mapping as the induction that made the type");
+    let out = o.ingest_sheet(&ctx, &orders(), &m, true).unwrap();
+    assert_eq!((out.upserts, out.links), (20, 19));
+
+    // A column the type does not declare is named, never dropped.
+    let extra = "order_id,amount,weight\no1,1.5,3\no2,2.5,4\n";
+    let ind3 = o.induce_sheet(&admin(), extra, &opts("orders.csv")).unwrap();
+    let e = induce::mapping_onto(&o.schema(), &ind3, "order").unwrap_err();
+    assert!(e.to_string().contains("weight"), "{e}");
+    assert!(induce::mapping_onto(&o.schema(), &ind3, "nope").is_err());
+}

@@ -563,6 +563,11 @@ pub struct SheetMapping {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Induced {
     pub kind: String,
+    /// The name the sheet designates before any suffix: `kind` itself, or
+    /// the existing name it was suffixed away from (see [`mapping_onto`]
+    /// for ingesting into an existing object type of that name).
+    #[serde(default)]
+    pub base_kind: String,
     /// Why the kind has this name.
     pub kind_evidence: String,
     /// Data rows read.
@@ -1419,6 +1424,7 @@ pub fn induce_parsed(
     };
     Ok(Induced {
         kind,
+        base_kind: base,
         kind_evidence,
         rows: n,
         delimiter: sheet.delimiter.to_string(),
@@ -1434,6 +1440,84 @@ pub fn induce_parsed(
         warnings,
         means: MEANS.into(),
     })
+}
+
+/// Map an induced sheet onto the existing object type `kind` instead of
+/// the new type the induction describes: the key, title and state columns
+/// as induced, each property column onto the property of `kind` it names,
+/// and each link column onto the one link type from `kind` to its target.
+/// A column that matches nothing is an error naming it, never dropped.
+pub fn mapping_onto(schema: &Schema, ind: &Induced, kind: &str) -> Result<SheetMapping> {
+    let ty = schema
+        .object_type(kind)
+        .ok_or_else(|| Error::invalid(format!("{kind} is not an object type the schema defines")))?;
+    let prop_of = |column: &str, induced: Option<&String>| {
+        induced.into_iter().cloned().chain([snake(column)]).find(|p| schema.prop_def(kind, p).is_some())
+    };
+    let admits = |kinds: &[String], k: &str| kinds.is_empty() || kinds.iter().any(|t| schema.kind_is(k, t));
+    let mut m = SheetMapping {
+        kind: kind.to_string(),
+        key: ind.key.column.clone(),
+        title: ind.title.column.clone(),
+        ..Default::default()
+    };
+    let mut unmatched = Vec::new();
+    for col in &ind.columns {
+        let h = &col.column;
+        match col.role {
+            ColumnRole::Key | ColumnRole::Title | ColumnRole::Skipped => {}
+            ColumnRole::State if !ty.states.is_empty() => m.state = Some(h.clone()),
+            ColumnRole::Property | ColumnRole::State => match prop_of(h, col.property.as_ref()) {
+                Some(p) => {
+                    m.properties.insert(h.clone(), p);
+                }
+                None => unmatched.push(format!("{h} (no property of {kind} by that name)")),
+            },
+            ColumnRole::Link => {
+                let Some(l) = ind.links.iter().find(|l| l.column == *h) else { continue };
+                let target = if l.self_link { kind.to_string() } else { l.target_kind.clone() };
+                let (stem, _) = ref_stem(h);
+                let fits = |lt: &LinkType| !lt.provenance && admits(&lt.from, kind) && admits(&lt.to, &target);
+                // The induced link type when it exists and fits; else the
+                // one named after the column; else the only link type that
+                // names `kind` as a source and admits the target.
+                let named = [l.rel.as_str(), stem.as_str()]
+                    .into_iter()
+                    .find(|n| schema.link_type(n).is_some_and(fits))
+                    .map(str::to_string);
+                let declared: Vec<&String> = schema
+                    .link_types
+                    .iter()
+                    .filter(|(_, lt)| !lt.from.is_empty() && fits(lt))
+                    .map(|(n, _)| n)
+                    .collect();
+                let rel = named.or_else(|| (declared.len() == 1).then(|| declared[0].clone()));
+                match (rel, prop_of(h, None)) {
+                    (Some(rel), _) => {
+                        m.links.insert(h.clone(), LinkMapping { rel, target_kind: target });
+                    }
+                    (None, Some(p)) => {
+                        m.properties.insert(h.clone(), p);
+                    }
+                    (None, None) if declared.is_empty() => {
+                        unmatched.push(format!("{h} (no link type from {kind} to {target})"))
+                    }
+                    (None, None) => unmatched.push(format!(
+                        "{h} (several link types from {kind} to {target}: {})",
+                        declared.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    )),
+                }
+            }
+        }
+    }
+    if !unmatched.is_empty() {
+        return Err(Error::invalid(format!(
+            "the sheet's rows are {kind} objects, but these columns match nothing {kind} declares: {}; pass a \
+             mapping that says where they go (or leaves them out), or add them to {kind} first",
+            unmatched.join(", ")
+        )));
+    }
+    Ok(m)
 }
 
 // ── rows → mutations ─────────────────────────────────────────────────────
