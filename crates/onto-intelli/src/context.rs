@@ -1,6 +1,24 @@
 //! Question Context Graph: the small, relevant, permission-filtered slice of
 //! the ontology that an LLM needs to answer one question, packed into a token
 //! budget as compact fact lines.
+//!
+//! After packing, every packed `derived` fact (a relation an inference rule
+//! derived) is checked for preservation: the links its derivation walks (its
+//! premises) must be stated by packed facts too, or the model is handed a
+//! conclusion without the facts it rests on. A claim whose premises are all
+//! packed is `preserved`. When some are missing and the remaining budget
+//! allows, compact `premise` facts are appended for them (`repaired`);
+//! otherwise the claim is `lost`. The result is reported in
+//! [`ContextPack::preservation`]. Packing itself is untouched: the facts it
+//! kept stay in the same order with the same text, and premise facts only
+//! ever follow them.
+//!
+//! A link counts as stated only when a packed fact spells it with entity ids:
+//! a `relations` line (every link between packed nodes, grouped by its
+//! subject), a provenance line, or a premise fact. Cause chains name entities
+//! by title, so they do not count. The check is a measurement of the packed
+//! text against the engine's own derivation: the derived facts are the
+//! engine's opinion (`derived`), not checked certificates.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -9,7 +27,7 @@ use serde_json::Value;
 
 use onto_core::deps::{self, DepNode};
 use onto_core::policy;
-use onto_core::query::Edge;
+use onto_core::query::{Edge, Hop};
 use onto_core::rules;
 use onto_core::schema::Dir;
 use onto_core::time::fmt_date;
@@ -37,7 +55,8 @@ pub struct Fact {
     pub text: String,
     pub score: f32,
     pub tokens: usize,
-    /// entity | relations | derived | cause | impact | event | knowledge | memory
+    /// entity | relations | derived | cause | impact | event | knowledge | catalog |
+    /// memory | premise (a link a packed derived fact rests on, added after packing)
     pub source: String,
 }
 
@@ -59,6 +78,78 @@ pub struct ContextPack {
     pub naive_tokens: usize,
     pub dropped_facts: usize,
     pub revision: u64,
+    /// Whether the packed derived facts kept the facts they rest on. Absent
+    /// when no derived fact was packed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preservation: Option<Preservation>,
+}
+
+/// Preservation of the packed derived facts (claims) under token packing.
+///
+/// `claims == preserved + repaired + lost.len()`. This is a measurement of
+/// the packed text, not a proof.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preservation {
+    /// Packed derived facts checked.
+    pub claims: usize,
+    /// Claims whose premises were all stated by facts that packing kept.
+    pub preserved: usize,
+    /// Claims whose missing premises were added as `premise` facts.
+    pub repaired: usize,
+    /// Claims whose missing premises did not fit the remaining budget, spelled
+    /// `"<from> <relation> <to>"`, in packed order.
+    pub lost: Vec<String>,
+    pub means: String,
+}
+
+/// What [`Preservation::means`] says.
+pub const PRESERVATION_MEANS: &str = "measured: a derived fact is preserved when every link its derivation \
+walks is spelled by a packed fact (a relations line, a provenance line or a premise fact), repaired when the missing \
+links were appended as premise facts within the token budget, and lost when they did not fit; the derived facts are \
+the engine's opinion, not checked certificates";
+
+/// A link stated in canonical direction: (from, relation, to).
+type Link = (String, String, String);
+
+/// One link a derived fact rests on.
+#[derive(Clone, Debug)]
+struct Premise {
+    /// Canonical spellings that state it (two for a symmetric relation).
+    links: Vec<Link>,
+    /// The compact premise fact added when it is missing.
+    text: String,
+}
+
+/// A derived fact and the links its derivation walked.
+#[derive(Clone, Debug)]
+struct Claim {
+    spelled: String,
+    premises: Vec<Premise>,
+}
+
+/// What a candidate fact contributes to the preservation check.
+#[derive(Clone, Debug, Default)]
+enum Support {
+    #[default]
+    None,
+    /// The fact spells these links.
+    States(Vec<Link>),
+    /// The fact is a derived claim.
+    Claims(Claim),
+}
+
+/// The premise for one hop of a derivation, in canonical direction.
+fn premise(schema: &Schema, hop: &Hop) -> Premise {
+    let (base, dir) = schema.resolve_rel_lenient(&hop.rel);
+    let out: Link = (hop.from.clone(), base.clone(), hop.to.clone());
+    let inc: Link = (hop.to.clone(), base, hop.from.clone());
+    let links = match dir {
+        Dir::Out => vec![out],
+        Dir::In => vec![inc],
+        Dir::Both => vec![out, inc],
+    };
+    let (from, rel, to) = &links[0];
+    Premise { text: format!("premise: {from} {rel} → {to}"), links }
 }
 
 pub struct ContextInput<'a> {
@@ -154,9 +245,12 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
     let depth = cfg.max_depth + usize::from(matches!(intent, Intent::Blockers | Intent::Impact | Intent::Dependencies));
     let seed_ids: Vec<Id> = input.seeds.iter().map(|r| r.id.clone()).collect();
     let mut facts: Vec<(Fact, bool)> = Vec::new();
-    let add = |facts: &mut Vec<(Fact, bool)>, text: String, score: f32, source: &str, pinned: bool| {
+    // Preservation support of a candidate fact, by its index in `facts`.
+    let mut support: BTreeMap<usize, Support> = BTreeMap::new();
+    let add = |facts: &mut Vec<(Fact, bool)>, text: String, score: f32, source: &str, pinned: bool| -> usize {
         let tokens = estimate(&text) + 1;
         facts.push((Fact { text, score, tokens, source: source.to_string() }, pinned));
+        facts.len() - 1
     };
 
     // Graph work happens under one read lock; no other ontology call inside.
@@ -244,20 +338,30 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
         }
         for (from, (s, rels)) in grouped {
             let parts: Vec<String> = rels.iter().map(|(rel, tos)| format!("{rel} → {}", tos.join(", "))).collect();
-            add(&mut facts, format!("{from}: {}", parts.join("; ")), s * 0.95 + 0.02, "relations", false);
+            let stated: Vec<Link> = rels
+                .iter()
+                .flat_map(|(rel, tos)| tos.iter().map(move |to| (from.to_string(), rel.to_string(), to.to_string())))
+                .collect();
+            let i = add(&mut facts, format!("{from}: {}", parts.join("; ")), s * 0.95 + 0.02, "relations", false);
+            support.insert(i, Support::States(stated));
         }
 
         // Derived relations from inference rules.
         for r in input.seeds.iter().take(4) {
             for inf in rules::infer(schema, g, &r.id, &can).into_iter().take(6) {
                 let via: Vec<&str> = inf.because.iter().map(|h| h.rel.as_str()).collect();
-                add(
+                let i = add(
                     &mut facts,
                     format!("derived: {} {} {} (via {})", inf.from, inf.rel, inf.to, via.join(" > ")),
                     0.85 * r.confidence,
                     "derived",
                     false,
                 );
+                let claim = Claim {
+                    spelled: format!("{} {} {}", inf.from, inf.rel, inf.to),
+                    premises: inf.because.iter().map(|h| premise(schema, h)).collect(),
+                };
+                support.insert(i, Support::Claims(claim));
             }
         }
 
@@ -293,14 +397,23 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
         if provenance_q {
             for r in input.seeds.iter().take(2) {
                 if let Some(e) = g.get(&r.id) {
-                    let chain: Vec<String> = g
+                    let steps: Vec<_> = g
                         .steps_via(&r.id, "derived_from", Dir::Out)
                         .into_iter()
                         .chain(g.steps_via(&r.id, "generated_by", Dir::Out))
-                        .map(|s| format!("{} {}", s.rel, s.other))
                         .collect();
+                    let chain: Vec<String> = steps.iter().map(|s| format!("{} {}", s.rel, s.other)).collect();
                     if !chain.is_empty() {
-                        add(&mut facts, format!("provenance of {}: {}", e.id, chain.join("; ")), 1.1, "derived", true);
+                        let stated =
+                            steps.iter().map(|s| (e.id.clone(), s.rel.to_string(), s.other.to_string())).collect();
+                        let i = add(
+                            &mut facts,
+                            format!("provenance of {}: {}", e.id, chain.join("; ")),
+                            1.1,
+                            "derived",
+                            true,
+                        );
+                        support.insert(i, Support::States(stated));
                     }
                 }
             }
@@ -415,22 +528,213 @@ pub fn build(onto: &Ontology, p: &Principal, ws: &str, cfg: &ContextConfig, inpu
     }
 
     let candidate_tokens: usize = facts.iter().map(|(f, _)| f.tokens).sum();
-    let items =
-        facts.into_iter().map(|(f, pinned)| Packable { score: f.score, tokens: f.tokens, pinned, item: f }).collect();
-    let packed = pack(items, input.budget.max(64));
-    let text = packed.kept.iter().map(|f| format!("- {}", f.text)).collect::<Vec<_>>().join("\n");
+    let items = facts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (f, pinned))| Packable {
+            score: f.score,
+            tokens: f.tokens,
+            pinned,
+            item: (support.remove(&i).unwrap_or_default(), f),
+        })
+        .collect();
+    let budget = input.budget.max(64);
+    let packed = pack(items, budget);
+    let (kept_support, mut kept): (Vec<Support>, Vec<Fact>) = packed.kept.into_iter().unzip();
+    let mut used = packed.used;
+    let preservation = preserve(&mut kept, &kept_support, budget, &mut used);
+    let text = kept.iter().map(|f| format!("- {}", f.text)).collect::<Vec<_>>().join("\n");
     ContextPack {
         question: input.question.to_string(),
         intent: intent.as_str().to_string(),
         seeds: seed_ids,
         nodes,
         edges,
-        tokens: packed.used,
-        facts: packed.kept,
+        tokens: used,
+        facts: kept,
         text,
         candidate_tokens,
         naive_tokens: naive_tokens.max(candidate_tokens),
         dropped_facts: packed.dropped,
         revision: onto.revision(),
+        preservation,
+    }
+}
+
+/// Check every packed claim against the links the packed facts state, and
+/// append premise facts for missing links while `budget` allows.
+///
+/// `kept` and `support` are parallel, in packed order. Claims are visited in
+/// that order (best first). A claim is repaired only when ALL its missing
+/// premises fit: half a derivation supports nothing, so a claim that does not
+/// fit adds no premise. A premise added for one claim is reused by later
+/// claims at no cost (those count as repaired, not preserved). Returns `None`
+/// when no claim was packed, so the context JSON is unchanged for questions
+/// without derived facts.
+fn preserve(kept: &mut Vec<Fact>, support: &[Support], budget: usize, used: &mut usize) -> Option<Preservation> {
+    let packed: HashSet<&Link> = support
+        .iter()
+        .filter_map(|s| match s {
+            Support::States(links) => Some(links),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let mut added: HashSet<Link> = HashSet::new();
+    let mut report = Preservation { means: PRESERVATION_MEANS.to_string(), ..Default::default() };
+    let scores: Vec<f32> = kept.iter().map(|f| f.score).collect();
+    for (claim, score) in support.iter().zip(scores) {
+        let Support::Claims(claim) = claim else { continue };
+        report.claims += 1;
+        let missing: Vec<&Premise> =
+            claim.premises.iter().filter(|p| !p.links.iter().any(|l| packed.contains(l))).collect();
+        if missing.is_empty() {
+            report.preserved += 1;
+            continue;
+        }
+        let mut new: Vec<&Premise> = Vec::new();
+        for p in missing {
+            let known = p.links.iter().any(|l| added.contains(l) || new.iter().any(|q| q.links.contains(l)));
+            if !known {
+                new.push(p);
+            }
+        }
+        let cost: usize = new.iter().map(|p| estimate(&p.text) + 1).sum();
+        if *used + cost > budget {
+            report.lost.push(claim.spelled.clone());
+            continue;
+        }
+        for p in new {
+            let tokens = estimate(&p.text) + 1;
+            kept.push(Fact { text: p.text.clone(), score, tokens, source: "premise".to_string() });
+            added.extend(p.links.iter().cloned());
+        }
+        *used += cost;
+        report.repaired += 1;
+    }
+    (report.claims > 0).then_some(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(s: &str, p: &str, o: &str) -> Link {
+        (s.to_string(), p.to_string(), o.to_string())
+    }
+
+    fn hop(from: &str, rel: &str, to: &str) -> Hop {
+        Hop { from: from.into(), rel: rel.into(), to: to.into() }
+    }
+
+    fn fact(text: &str, source: &str) -> Fact {
+        Fact { text: text.into(), score: 0.5, tokens: estimate(text) + 1, source: source.into() }
+    }
+
+    fn claim(spelled: &str, hops: &[Hop]) -> Support {
+        let schema = Schema::enterprise();
+        Support::Claims(Claim { spelled: spelled.into(), premises: hops.iter().map(|h| premise(&schema, h)).collect() })
+    }
+
+    #[test]
+    fn premises_are_spelled_in_canonical_direction() {
+        let schema = Schema::enterprise();
+        let p = premise(&schema, &hop("person:kenji", "member_of", "team:payments"));
+        assert_eq!(p.links, vec![link("person:kenji", "member_of", "team:payments")]);
+        assert_eq!(p.text, "premise: person:kenji member_of → team:payments");
+        // `owned_by` is the declared inverse of `owns`.
+        let p = premise(&schema, &hop("project:alpha", "owned_by", "team:payments"));
+        assert_eq!(p.links, vec![link("team:payments", "owns", "project:alpha")]);
+        assert_eq!(p.text, "premise: team:payments owns → project:alpha");
+        let p = premise(&schema, &hop("task:2", "^depends_on", "task:1"));
+        assert_eq!(p.links, vec![link("task:1", "depends_on", "task:2")]);
+        // A symmetric link is stated by either spelling.
+        let p = premise(&schema, &hop("doc:b", "relates_to", "doc:a"));
+        assert_eq!(p.links, vec![link("doc:b", "relates_to", "doc:a"), link("doc:a", "relates_to", "doc:b")]);
+    }
+
+    #[test]
+    fn no_claim_means_no_report() {
+        let mut kept = vec![fact("issue:1: assigned_to → person:a", "relations")];
+        let support = vec![Support::States(vec![link("issue:1", "assigned_to", "person:a")])];
+        let mut used = kept[0].tokens;
+        assert_eq!(preserve(&mut kept, &support, 1000, &mut used), None);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn stated_premises_preserve_and_missing_ones_are_repaired_once() {
+        let mut kept = vec![
+            fact("derived: issue:1 handled_by_team team:x (via assigned_to > member_of)", "derived"),
+            fact("derived: issue:2 handled_by_team team:x (via assigned_to > member_of)", "derived"),
+            fact("issue:1: assigned_to → person:a", "relations"),
+        ];
+        let support = vec![
+            claim(
+                "issue:1 handled_by_team team:x",
+                &[hop("issue:1", "assigned_to", "person:a"), hop("person:a", "member_of", "team:x")],
+            ),
+            claim(
+                "issue:2 handled_by_team team:x",
+                &[hop("issue:2", "assigned_to", "person:a"), hop("person:a", "member_of", "team:x")],
+            ),
+            Support::States(vec![link("issue:1", "assigned_to", "person:a")]),
+        ];
+        let before: Vec<String> = kept.iter().map(|f| f.text.clone()).collect();
+        let mut used: usize = kept.iter().map(|f| f.tokens).sum();
+        let start = used;
+        let r = preserve(&mut kept, &support, 1000, &mut used).unwrap();
+        assert_eq!((r.claims, r.preserved, r.repaired), (2, 0, 2), "{r:?}");
+        assert!(r.lost.is_empty());
+        let texts: Vec<&str> = kept.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(&texts[..3], before.iter().map(String::as_str).collect::<Vec<_>>().as_slice());
+        // member_of is added once for both claims; issue:2's assignment is new.
+        assert_eq!(&texts[3..], ["premise: person:a member_of → team:x", "premise: issue:2 assigned_to → person:a"]);
+        assert!(kept[3..].iter().all(|f| f.source == "premise" && f.score == 0.5));
+        assert_eq!(used, start + kept[3..].iter().map(|f| f.tokens).sum::<usize>());
+
+        // With the member_of link packed too, the first claim is preserved.
+        let mut kept = vec![fact("derived: ...", "derived"), fact("relations", "relations")];
+        let support = vec![
+            claim(
+                "issue:1 handled_by_team team:x",
+                &[hop("issue:1", "assigned_to", "person:a"), hop("person:a", "member_of", "team:x")],
+            ),
+            Support::States(vec![link("issue:1", "assigned_to", "person:a"), link("person:a", "member_of", "team:x")]),
+        ];
+        let mut used = 0;
+        let r = preserve(&mut kept, &support, 1000, &mut used).unwrap();
+        assert_eq!((r.claims, r.preserved, r.repaired), (1, 1, 0));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn a_claim_that_does_not_fit_adds_nothing() {
+        let hops = [hop("issue:1", "assigned_to", "person:a"), hop("person:a", "member_of", "team:x")];
+        let one = premise(&Schema::enterprise(), &hops[0]);
+        let cost_one = estimate(&one.text) + 1;
+        let mut kept = vec![fact("derived: issue:1 handled_by_team team:x", "derived")];
+        let support = vec![claim("issue:1 handled_by_team team:x", &hops)];
+        // Room for exactly one of the two premises: half a derivation is not added.
+        let mut used = 100;
+        let r = preserve(&mut kept, &support, 100 + cost_one, &mut used).unwrap();
+        assert_eq!((r.claims, r.preserved, r.repaired), (1, 0, 0));
+        assert_eq!(r.lost, vec!["issue:1 handled_by_team team:x".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(used, 100);
+        assert_eq!(r.means, PRESERVATION_MEANS);
+    }
+
+    #[test]
+    fn a_symmetric_premise_is_stated_by_either_direction() {
+        let mut kept = vec![fact("derived: x", "derived"), fact("doc:a: relates_to → doc:b", "relations")];
+        let support = vec![
+            claim("doc:b see_also doc:a", &[hop("doc:b", "relates_to", "doc:a")]),
+            Support::States(vec![link("doc:a", "relates_to", "doc:b")]),
+        ];
+        let mut used = 0;
+        let r = preserve(&mut kept, &support, 1000, &mut used).unwrap();
+        assert_eq!((r.claims, r.preserved), (1, 1));
     }
 }
