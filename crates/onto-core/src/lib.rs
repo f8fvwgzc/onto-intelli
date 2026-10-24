@@ -26,6 +26,7 @@ pub mod experts;
 pub mod explorer;
 pub mod export;
 pub mod graph;
+pub mod induce;
 pub mod learn;
 pub mod live_schema;
 pub mod map;
@@ -53,6 +54,7 @@ pub use engine::{
     SearchHit, SearchMode, SyncReport,
 };
 pub use error::{Error, Result};
+pub use induce::{InduceOptions, Induced, SheetIngest, SheetMapping};
 pub use live_schema::{
     Governance, Migration, SchemaApplied, SchemaChange, SchemaChangeSet, SchemaDiff, SchemaMode, SchemaPlan,
     SchemaVersion, SchemaVersionInfo,
