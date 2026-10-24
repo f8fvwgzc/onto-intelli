@@ -46,6 +46,7 @@ use crate::locks::{self, LockViolation, SchemaLock};
 use crate::metrics::MetricDef;
 use crate::model::{Entity, EntityInput, EntityRef, Id, LinkInput, Mutation};
 use crate::policy::{self, Access, Principal, Role};
+use crate::proposals::Proposer;
 use crate::reason::{self, AddedFact, Closure, Fact, ReasonOptions};
 use crate::schema::{Analysis, Cardinality, InterfaceType, LinkType, ObjectType, PropType, PropertyDef, Rule, Schema};
 use crate::shape_model::{Shape, ShapePath};
@@ -468,6 +469,28 @@ impl SchemaPlan {
         self.valid && self.needs_migration.is_empty() && self.locked_violations.iter().all(|v| v.overridden)
     }
 
+    /// Strip what belongs to one reader before the plan is stored where
+    /// others read it (a proposal): the consequences are facts as the
+    /// planner may see them, so the stored block holds none (only a note
+    /// that they are computed per reader), and the risk is reassessed
+    /// without them.
+    pub(crate) fn without_reader_facts(&mut self, set: &SchemaChangeSet) {
+        if self.consequences.is_none() {
+            return;
+        }
+        self.consequences = Some(Consequences::skipped(STORED_CONSEQUENCES, SCHEMA_CONSEQUENCES_MEANS));
+        (self.risk, self.risk_reasons) = assess_risk(self, set);
+    }
+
+    /// Take the reader-dependent parts of `fresh` (the same change set
+    /// planned now, against the same schema version, for one reader): its
+    /// consequences and lock violations, and the risk they imply.
+    pub(crate) fn with_reader_view(&mut self, fresh: &SchemaPlan, set: &SchemaChangeSet) {
+        self.consequences = fresh.consequences.clone();
+        self.locked_violations = fresh.locked_violations.clone();
+        (self.risk, self.risk_reasons) = assess_risk(self, set);
+    }
+
     /// The refusal for a plan that cannot be applied.
     pub fn refusal(&self) -> Error {
         if !self.valid {
@@ -554,6 +577,10 @@ pub const SCHEMA_CONSEQUENCES_MEANS: &str = "Facts the reasoner derives (or the 
      vocabulary; it is shown only when both runs reached a fixpoint. Asserted state and property facts are left out: \
      the graph is the same, and only what the rules read differs.";
 
+/// Why a stored proposal's plan holds no consequences.
+pub const STORED_CONSEQUENCES: &str = "consequences are computed for each reader, as that reader may see the graph, \
+     and are not stored with a proposal: read an open proposal to see them";
+
 /// What an action plan's consequences mean.
 pub const ACTION_CONSEQUENCES_MEANS: &str = "Facts the reasoner derives (or the store asserts) after this action's \
      mutations, staged on a fork, and not before, and the reverse, as the planner may see them. Derived facts are \
@@ -584,6 +611,11 @@ pub struct LikelyRename {
 
 /// Pairs scoring below this are not reported.
 const RENAME_THRESHOLD: f64 = 0.6;
+
+/// Link types and properties carry only coarse structure (equal endpoints,
+/// equal type), which almost any pair shares: below this name similarity
+/// the structure is not counted and the name alone scores the pair.
+const COARSE_NAME_FLOOR: f64 = 0.6;
 
 /// One stored schema version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -823,7 +855,7 @@ fn synced_tables(s: &Schema) -> BTreeMap<(String, String), Vec<String>> {
     out
 }
 
-fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String> {
+pub(crate) fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result<(), String> {
     match c {
         SchemaChange::PutObjectType { name, def, .. } => {
             if !s.object_types.contains_key(name) {
@@ -2523,7 +2555,20 @@ fn link_type_similarity(from: &str, old: &LinkType, to: &str, new: &LinkType) ->
     let equal = flags.iter().filter(|x| **x).count();
     evidence.push(format!("dependency/transitive/symmetric: {equal} of 3 flags equal"));
     let signals = [(0.5, (f + t) / 2.0), (0.1, if same_card { 1.0 } else { 0.0 }), (0.1, equal as f64 / 3.0)];
-    (rename_score(name, &signals), evidence)
+    (coarse_score(name, &signals, &mut evidence), evidence)
+}
+
+/// [`rename_score`] for a section with coarse structure: the name alone
+/// when it is below [`COARSE_NAME_FLOOR`].
+fn coarse_score(name: f64, signals: &[(f64, f64)], evidence: &mut Vec<String>) -> f64 {
+    if name < COARSE_NAME_FLOOR {
+        evidence.push(format!(
+            "names too far apart (below {COARSE_NAME_FLOOR:.2}) for the structure to count: the name alone scores it"
+        ));
+        rename_score(name, &[])
+    } else {
+        rename_score(name, signals)
+    }
 }
 
 fn property_similarity(from: &str, old: &PropertyDef, to: &str, new: &PropertyDef) -> (f64, Vec<String>) {
@@ -2540,7 +2585,7 @@ fn property_similarity(from: &str, old: &PropertyDef, to: &str, new: &PropertyDe
         signals.push((0.3, j));
         evidence.push(format!("values: {shared} of {union} shared"));
     }
-    (rename_score(name, &signals), evidence)
+    (coarse_score(name, &signals, &mut evidence), evidence)
 }
 
 /// Pairs at or above the threshold, assigned one-to-one, best score first.
@@ -2832,11 +2877,18 @@ pub fn data_consequences(
 ///   stopped before its fixpoint).
 /// * `low`: purely additive and conservative.
 ///
-/// Consequences count only when the plan carries them and its change set
-/// compiles.
+/// A plan that does not validate is `high`: it cannot be applied, and what
+/// it would do is not shown.
 pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<String>) {
     let mut high = Vec::new();
     let mut medium = Vec::new();
+    if !plan.valid {
+        let n = plan.errors.len();
+        high.push(format!(
+            "the change set does not validate ({n} {}): it cannot be applied, and its effects are not shown",
+            if n == 1 { "error" } else { "errors" }
+        ));
+    }
     if plan.breaking {
         for imp in plan.changes.iter().filter(|i| i.breaking) {
             high.push(format!("breaking: {} {} ({})", imp.op, imp.target, imp.reasons.join("; ")));
@@ -2862,7 +2914,7 @@ pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<Strin
             medium.push(format!("removes or moves a definition: {op} {}", c.target()));
         }
     }
-    if let Some(c) = plan.consequences.as_ref().filter(|_| !plan.changes.is_empty()) {
+    if let Some(c) = &plan.consequences {
         if c.removed > 0 {
             medium.push(format!("{} facts the closure holds now disappear from it", c.removed));
         }
@@ -2890,6 +2942,13 @@ pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<Strin
     };
     high.extend(medium);
     (risk, high)
+}
+
+/// May a proposal's `override_locks` be honoured, as far as its proposer
+/// goes? Only for an admin that is not an agent (the approver must be an
+/// admin too).
+pub(crate) fn proposer_may_override(r: &Proposer) -> bool {
+    !r.agent && r.roles.iter().any(|x| matches!(x, Role::Admin | Role::System))
 }
 
 /// Fill a plan's lock violations and risk. The override is honoured only
@@ -3153,6 +3212,18 @@ impl Ontology {
     /// its consequences for entailment (as `p` may see the graph), the locks
     /// it touches, likely renames and its risk.
     pub fn schema_plan(&self, p: &Principal, set: &SchemaChangeSet) -> Result<SchemaPlan> {
+        self.schema_plan_as(p, set, None)
+    }
+
+    /// [`Self::schema_plan`] for a proposal's change set: its override is
+    /// honoured as the approval's commit honours it, only when the proposer
+    /// is also an admin (and not an agent).
+    pub(crate) fn schema_plan_as(
+        &self,
+        p: &Principal,
+        set: &SchemaChangeSet,
+        proposer: Option<&Proposer>,
+    ) -> Result<SchemaPlan> {
         self.schema_reader(p)?;
         let held = locks::read_locks(&**self.store())?;
         let active = self.active_schema();
@@ -3164,7 +3235,8 @@ impl Ontology {
             Some(new) => schema_consequences(&active.schema, new, &g, &can),
             None => Consequences::skipped("the change set does not compile", SCHEMA_CONSEQUENCES_MEANS),
         });
-        assess(&mut planned.plan, &active.schema, set, &held, locks::can_manage(p));
+        let may_override = locks::can_manage(p) && proposer.is_none_or(proposer_may_override);
+        assess(&mut planned.plan, &active.schema, set, &held, may_override);
         Ok(planned.plan)
     }
 
@@ -3241,9 +3313,7 @@ impl Ontology {
         // only when both the proposer and the approver are admins, so an
         // agent cannot route an override through an approval.
         let proposer_may = match &origin.approve {
-            Some((pid, _, _)) => self.load_proposal(pid).is_ok_and(|r| {
-                !r.proposer.agent && r.proposer.roles.iter().any(|x| matches!(x, Role::Admin | Role::System))
-            }),
+            Some((pid, _, _)) => self.load_proposal(pid).is_ok_and(|r| proposer_may_override(&r.proposer)),
             None => true,
         };
         let may_override = locks::can_manage(&ctx.principal) && proposer_may;
@@ -3333,7 +3403,8 @@ impl Ontology {
             let overridden: Vec<&LockViolation> =
                 planned.plan.locked_violations.iter().filter(|v| v.overridden).collect();
             if !overridden.is_empty() {
-                let followed = locks::follow(&planned.plan.locked_violations, &held, &ctx.principal.id, &fmt_ts(now));
+                let followed =
+                    locks::follow(&planned.plan.locked_violations, &held, &schema, &ctx.principal.id, &fmt_ts(now));
                 payload["override_locks"] = json!({
                     "by": ctx.principal.id,
                     "violations": overridden,

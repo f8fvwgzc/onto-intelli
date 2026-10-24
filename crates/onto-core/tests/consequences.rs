@@ -565,3 +565,140 @@ fn locks_persist_in_postgres() {
     let plan = o.schema_plan(&admin(), &transitive_depends_on(&o)).unwrap();
     assert_eq!(plan.consequences.unwrap().verdict, Conservativity::NotConservative);
 }
+
+#[test]
+fn proposals_show_each_reader_only_the_facts_it_may_see() {
+    let (o, ctx) = world();
+    o.apply(
+        &ctx,
+        vec![Mutation::Upsert(
+            EntityInput::new("issue", "secret", "Layoff plan")
+                .state("open")
+                .prop("priority", "high")
+                .prop("visibility", "restricted")
+                .prop("acl", json!(["person:kenji"])),
+        )],
+    )
+    .unwrap();
+    let input: ProposalInput = serde_json::from_value(json!({
+        "title": "hot issues",
+        "changes": [{ "op": "put_rule", "def": {
+            "name": "hot_issue", "when": [["?i", "a", "issue"], ["?i", "prop.priority", "high"]],
+            "then": ["?i", "a", "hot_issue"] } }]
+    }))
+    .unwrap();
+    let filed = o.propose_schema(&ctx, input).unwrap();
+    // The proposer sees its own consequences, the restricted issue included.
+    let mine = filed.proposal.plan.consequences.as_ref().unwrap();
+    assert!(mine.samples_added.iter().any(|a| a.fact.s == "<issue:secret>"), "{mine:?}");
+
+    let bob = Principal::member("bob", "acme");
+    let read = o.get_proposal(&bob, &filed.proposal.id).unwrap();
+    let theirs = read.proposal.plan.consequences.as_ref().unwrap();
+    assert!(theirs.samples_added.iter().any(|a| a.fact.s == "<issue:1>"), "{theirs:?}");
+    assert_eq!(theirs.added, mine.added - 1, "counts are the reader's too");
+    let text = serde_json::to_string(&read).unwrap();
+    assert!(!text.contains("issue:secret"), "{text}");
+    // Listings return the stored plan, which holds no facts at all.
+    for v in o.list_proposals(&bob, None, 10).unwrap() {
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("issue:secret"), "{text}");
+        let stored = v.proposal.plan.consequences.as_ref().unwrap();
+        assert!(stored.skipped.as_deref().unwrap_or_default().contains("computed for each reader"), "{stored:?}");
+        assert_eq!(stored.added, 0);
+    }
+}
+
+#[test]
+fn a_stale_preview_honours_an_override_only_as_approval_would() {
+    let (o, ctx) = world();
+    o.schema_lock(&ctx, "link_types", "operates", "on-call").unwrap();
+    let bot = ActionContext::new(agent(), "acme");
+    let input: ProposalInput = serde_json::from_value(json!({
+        "title": "drop operates", "override_locks": true,
+        "changes": [{ "op": "delete_link_type", "name": "operates" }]
+    }))
+    .unwrap();
+    let filed = o.propose_schema(&bot, input).unwrap();
+    o.schema_apply(
+        &ctx,
+        set(json!({ "changes": [{ "op": "put_property", "object_type": "issue", "name": "sla",
+            "def": { "type": "string" } }] })),
+    )
+    .unwrap();
+    let lead = Principal::admin("lead");
+    let read = o.get_proposal(&lead, &filed.proposal.id).unwrap();
+    assert!(read.stale);
+    let preview = read.preview.expect("stale proposals get a preview");
+    assert!(!preview.locked_violations[0].overridden, "{:?}", preview.locked_violations);
+    assert!(!preview.applicable());
+    assert_eq!(preview.risk, Risk::High);
+    let reviewer = ActionContext::new(lead, "acme");
+    assert!(matches!(
+        o.review_proposal(&reviewer, &filed.proposal.id, Decision::Approve, "ok", None),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn locks_follow_chained_renames_and_deletes() {
+    let (o, ctx) = world();
+    o.schema_lock(&ctx, "object_types", "runbook", "").unwrap();
+    o.schema_lock(&ctx, "link_types", "operates", "").unwrap();
+    let s = set(json!({ "override_locks": true, "changes": [
+        { "op": "rename_object_type", "from": "runbook", "to": "playbook" },
+        { "op": "rename_object_type", "from": "playbook", "to": "guide" },
+        { "op": "rename_link_type", "from": "operates", "to": "runs" },
+        { "op": "delete_link_type", "name": "runs", "migrations": [{ "action": "delete_links" }] }
+    ] }));
+    let plan = o.schema_plan(&admin(), &s).unwrap();
+    let seen: Vec<(&str, &str)> = plan.locked_violations.iter().map(|v| (v.name.as_str(), v.change.as_str())).collect();
+    assert_eq!(
+        seen,
+        [
+            ("runbook", "rename_object_type runbook → playbook"),
+            ("runbook", "rename_object_type playbook → guide"),
+            ("operates", "rename_link_type operates → runs"),
+            ("operates", "delete_link_type runs"),
+        ],
+        "{:?}",
+        plan.locked_violations
+    );
+    assert!(plan.locked_violations[3].reason.contains("named runs by then"), "{:?}", plan.locked_violations[3]);
+    let applied = o.schema_apply(&ctx, s).unwrap();
+    assert!(applied.plan.locked_violations.iter().all(|v| v.overridden));
+    let keys: Vec<String> = o.schema_locks(&admin()).unwrap().iter().map(|l| l.key()).collect();
+    assert_eq!(keys, ["object_types/guide"]);
+    assert!(o.schema().object_types.contains_key("guide"));
+
+    // The moved lock guards the new name.
+    let s = set(json!({ "changes": [{ "op": "rename_object_type", "from": "guide", "to": "howto" }] }));
+    assert!(!o.schema_plan(&admin(), &s).unwrap().applicable());
+}
+
+#[test]
+fn a_change_set_that_does_not_validate_is_not_low_risk() {
+    let (o, _) = world();
+    let s = set(
+        json!({ "changes": [{ "op": "put_link_type", "name": "zz", "def": { "from": ["nope"], "to": ["issue"] } }] }),
+    );
+    let plan = o.schema_plan(&admin(), &s).unwrap();
+    assert!(!plan.valid);
+    assert_eq!(plan.risk, Risk::High, "{:?}", plan.risk_reasons);
+    assert!(plan.risk_reasons.iter().any(|r| r.contains("does not validate")), "{:?}", plan.risk_reasons);
+    assert!(plan.risk_reasons.iter().any(|r| r.contains("conservativity not shown")), "{:?}", plan.risk_reasons);
+}
+
+#[test]
+fn unrelated_definitions_with_alike_structure_are_not_renames() {
+    let (o, _) = world();
+    let s = set(json!({ "changes": [
+        { "op": "delete_property", "object_type": "runbook", "name": "url", "migrations": [{ "action": "drop_values" }] },
+        { "op": "put_property", "object_type": "runbook", "name": "owner_email", "def": { "type": "string" } },
+        { "op": "delete_link_type", "name": "operates" },
+        { "op": "put_link_type", "name": "sponsors", "def": { "from": ["team"], "to": ["service"] } }
+    ] }));
+    let plan = o.schema_plan(&admin(), &s).unwrap();
+    assert!(plan.likely_renames.is_empty(), "{:?}", plan.likely_renames);
+    assert!(!plan.warnings.iter().any(|w| w.contains("looks renamed")), "{:?}", plan.warnings);
+}

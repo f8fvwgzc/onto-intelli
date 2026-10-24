@@ -290,6 +290,13 @@ fn touches(base: &Schema, c: &SchemaChange) -> Vec<Touched> {
 /// The locks `set` violates. `impacts` are the plan's per-change impacts (by
 /// change index); an edit violates a lock only when its impact is breaking.
 /// `overridden` marks every violation when the override is honoured.
+///
+/// Each lock is followed through the change set in order, against the
+/// schema as the earlier changes leave it: after `rename a → b` the lock on
+/// `a` is touched by changes to `b`, and after a delete it is touched by
+/// nothing (a later definition of the same name is a new one). A violation
+/// names the lock (its original `section/name`); `renamed_to` is where that
+/// change moves it.
 pub fn violations(
     base: &Schema,
     set: &SchemaChangeSet,
@@ -300,36 +307,60 @@ pub fn violations(
     if locks.is_empty() {
         return Vec::new();
     }
+    // Where each lock's definition is now; `None` once it is deleted.
+    let mut at: Vec<Option<String>> = locks.iter().map(|l| Some(l.name.clone())).collect();
+    let mut schema = base.clone();
     let mut out: Vec<LockViolation> = Vec::new();
     for (i, c) in set.changes.iter().enumerate() {
         let impact = impacts.get(i);
-        for t in touches(base, c) {
-            let Some(lock) = locks.iter().find(|l| l.section == t.section && l.name == t.name) else { continue };
-            let reason = match t.touch {
-                Touch::BreakingChange => match impact.filter(|x| x.breaking) {
-                    Some(x) if x.reasons.is_empty() => {
-                        format!("a breaking change to the locked definition ({})", t.reason)
-                    }
-                    Some(x) => format!("a breaking change to the locked definition: {}", x.reasons.join("; ")),
-                    None => continue,
-                },
-                _ => t.reason,
-            };
-            let change = format!("{} {}", c.op(), c.target());
-            if out.iter().any(|v| v.section == lock.section && v.name == lock.name && v.change == change) {
-                continue;
+        for t in touches(&schema, c) {
+            for (lock, cur) in locks.iter().zip(at.iter_mut()) {
+                if lock.section != t.section || cur.as_deref() != Some(t.name.as_str()) {
+                    continue;
+                }
+                let moved = cur.as_deref() != Some(lock.name.as_str());
+                let reason = match t.touch {
+                    Touch::BreakingChange => match impact.filter(|x| x.breaking) {
+                        Some(x) if x.reasons.is_empty() => {
+                            format!("a breaking change to the locked definition ({})", t.reason)
+                        }
+                        Some(x) => format!("a breaking change to the locked definition: {}", x.reasons.join("; ")),
+                        None => continue,
+                    },
+                    _ => t.reason.clone(),
+                };
+                let reason = if moved {
+                    format!("{reason} (the locked definition is named {} by then)", t.name)
+                } else {
+                    reason
+                };
+                match t.touch {
+                    Touch::Delete => *cur = None,
+                    Touch::Rename => *cur = t.renamed_to.clone(),
+                    Touch::BreakingChange => {}
+                }
+                let change = format!("{} {}", c.op(), c.target());
+                if out.iter().any(|v| v.section == lock.section && v.name == lock.name && v.change == change) {
+                    continue;
+                }
+                out.push(LockViolation {
+                    section: lock.section.clone(),
+                    name: lock.name.clone(),
+                    change,
+                    touch: t.touch,
+                    reason,
+                    renamed_to: t.renamed_to.clone(),
+                    lock_reason: lock.reason.clone(),
+                    locked_by: lock.locked_by.clone(),
+                    overridden,
+                });
             }
-            out.push(LockViolation {
-                section: lock.section.clone(),
-                name: lock.name.clone(),
-                change,
-                touch: t.touch,
-                reason,
-                renamed_to: t.renamed_to,
-                lock_reason: lock.reason.clone(),
-                locked_by: lock.locked_by.clone(),
-                overridden,
-            });
+        }
+        // A change that does not apply leaves the schema as it was (the
+        // plan reports the error).
+        let mut next = schema.clone();
+        if crate::live_schema::apply_one(&mut next, c).is_ok() {
+            schema = next;
         }
     }
     out
@@ -360,32 +391,40 @@ pub(crate) struct Followed {
 }
 
 /// Release the locks of deleted definitions and move the locks of renamed
-/// ones (overridden violations only).
-pub(crate) fn follow(violations: &[LockViolation], locks: &[SchemaLock], by: &str, at: &str) -> Followed {
+/// ones (overridden violations only). Violations are in change order, so a
+/// lock renamed twice ends on the last name, and one renamed then deleted is
+/// released. A lock whose final name `new` does not define is released
+/// rather than moved: a lock always names a definition that exists.
+pub(crate) fn follow(violations: &[LockViolation], locks: &[SchemaLock], new: &Schema, by: &str, at: &str) -> Followed {
     let mut f = Followed::default();
-    let mut done: Vec<String> = Vec::new();
-    for v in violations.iter().filter(|v| v.overridden) {
-        let k = key(&v.section, &v.name);
-        if done.contains(&k) {
-            continue;
-        }
-        let Some(lock) = locks.iter().find(|l| l.key() == k) else { continue };
-        match (v.touch, &v.renamed_to) {
-            (Touch::Delete, _) => {
-                f.kv.push((NS_LOCKS.into(), k.clone(), Record::released(lock, by, at)));
-                f.released.push(k.clone());
+    for lock in locks {
+        let k = lock.key();
+        // `Some(None)`: deleted; `Some(Some(to))`: renamed to `to`.
+        let mut fate: Option<Option<&str>> = None;
+        for v in violations.iter().filter(|v| v.overridden && v.section == lock.section && v.name == lock.name) {
+            match (v.touch, &v.renamed_to) {
+                (Touch::Delete, _) => fate = Some(None),
+                (Touch::Rename, Some(to)) => fate = Some(Some(to.as_str())),
+                _ => {}
             }
-            (Touch::Rename, Some(to)) => {
-                let moved = SchemaLock { name: to.clone(), ..lock.clone() };
+        }
+        let to = match fate {
+            None => continue,
+            Some(Some(to)) if to == lock.name => continue,
+            Some(Some(to)) if target_exists(new, &lock.section, to).is_ok() => Some(to),
+            Some(_) => None,
+        };
+        f.kv.push((NS_LOCKS.into(), k.clone(), Record::released(lock, by, at)));
+        match to {
+            Some(to) => {
+                let moved = SchemaLock { name: to.to_string(), ..lock.clone() };
                 let new_key = moved.key();
-                f.kv.push((NS_LOCKS.into(), k.clone(), Record::released(lock, by, at)));
                 let record = Record { lock: moved, unlocked_by: None, unlocked_at: None };
                 f.kv.push((NS_LOCKS.into(), new_key.clone(), serde_json::to_value(record).unwrap_or(Value::Null)));
                 f.moved.push(format!("{k} → {new_key}"));
             }
-            _ => continue,
+            None => f.released.push(k),
         }
-        done.push(k);
     }
     f
 }
@@ -556,9 +595,17 @@ mod tests {
                 overridden: true,
             },
         ];
-        let f = follow(&v, &locks, "ada", "now");
+        let mut s = Schema::enterprise();
+        let mut chore = s.object_types["task"].clone();
+        chore.name = "chore".into();
+        s.object_types.insert("chore".into(), chore);
+        let f = follow(&v, &locks, &s, "ada", "now");
         assert_eq!(f.released, vec!["properties/task.estimate"]);
         assert_eq!(f.moved, vec!["object_types/task → object_types/chore"]);
         assert_eq!(f.kv.len(), 3);
+        // A lock never moves to a name the new schema does not define.
+        let f = follow(&v, &locks, &Schema::enterprise(), "ada", "now");
+        assert_eq!(f.released, vec!["object_types/task", "properties/task.estimate"]);
+        assert!(f.moved.is_empty());
     }
 }
