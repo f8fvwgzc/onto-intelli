@@ -225,7 +225,7 @@ function ExplainCard() {
         <div className="mt-3">
           <div className="flex flex-wrap items-center gap-2">
             <FactChip fact={j.fact} derived={j.status === "derived"} />
-            <Badge tone={j.status === "not_entailed" ? "danger" : j.status === "derived" ? "accent" : "neutral"}>{j.status.replace("_", " ")}</Badge>
+            <Badge tone={j.status === "not_entailed" ? "danger" : j.status === "derived" ? "accent" : "neutral"}>{j.status === "not_entailed" ? "not derived" : j.status}</Badge>
           </div>
           <p className="tnum mt-1 text-xs text-ink-3">
             {plural(j.justifications.length, "justification")}
@@ -243,8 +243,8 @@ function ExplainCard() {
                       {r}
                     </span>
                   ))}
-                  <span>{x.sufficient ? "sufficient" : "sufficiency unchecked"}</span>
-                  <span>· {x.minimal ? "minimal" : "minimality unchecked"}</span>
+                  <span>{x.sufficient ? "sufficient" : j.verification ? "sufficiency not established" : "not sufficient"}</span>
+                  <span>· {x.minimal ? "minimal" : j.verification || !x.sufficient ? "minimality not established" : "not minimal"}</span>
                 </p>
                 <ul className="mt-1.5 flex flex-col gap-1">
                   {x.facts.map((f, k) => (

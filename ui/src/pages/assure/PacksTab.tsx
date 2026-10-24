@@ -61,7 +61,7 @@ export function PacksTab({ id }: { id?: string }) {
         )}
       </div>
       <Panel open={Boolean(id)} onClose={close} wide title={<PanelTitle id={id} items={list.data?.items} />}>
-        {id ? <PackDrawer id={id} info={list.data?.items.find((p) => p.id === id)} /> : null}
+        {id ? <PackDrawer key={id} id={id} info={list.data?.items.find((p) => p.id === id)} /> : null}
       </Panel>
     </div>
   );

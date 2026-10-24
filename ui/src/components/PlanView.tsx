@@ -11,6 +11,11 @@ export function PlanVerdict({ plan }: { plan: SchemaPlan }) {
   if ((plan.locked_violations ?? []).some((v) => !v.overridden)) return <Badge tone="danger">Locked</Badge>;
   if ((plan.needs_migration ?? []).length) return <Badge tone="danger">Needs migration</Badge>;
   if (plan.breaking) return <Badge tone="warning">Breaking, migrated</Badge>;
+  // "Safe" only when nothing semantic argues otherwise; a risky or
+  // non-conservative plan breaks no data but is not safe to wave through.
+  const c = plan.consequences;
+  const semanticDoubt = plan.risk === "medium" || plan.risk === "high" || (c ? (c.verdict ?? (c.conservative ? "conservative" : "not_conservative")) !== "conservative" : false);
+  if (semanticDoubt) return <Badge tone="neutral">No data breaks</Badge>;
   return <Badge tone="accent">Safe</Badge>;
 }
 

@@ -47,7 +47,16 @@ export function ShapesTab() {
             </Verdict>
           ) : (
             <Verdict tone="unsure" word="undetermined">
-              {r.fixpoint_reached === false ? "The closure stopped before its fixpoint" : "Some constraints were not evaluated"}, so silence here is not a pass.
+              {r.fixpoint_reached === false
+                ? "The closure stopped before its fixpoint"
+                : skipped.length
+                  ? "Some constraints were not evaluated"
+                  : r.focus_nodes === 0
+                    ? "No focus nodes: no shape selected anything"
+                    : r.unmatched_targets?.length
+                      ? "Some targets selected nothing"
+                      : "The checker could not decide"}
+              , so silence here is not a pass.
               {r.total_results ? ` ${plural(r.total_results, "result")} found so far.` : ""}
             </Verdict>
           )}
