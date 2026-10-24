@@ -21,7 +21,7 @@ id = "saas"
 title = "SaaS: product, customers, subscriptions and support"
 industry = "software"
 version = "1.0.0"
-description = "Products, features and pricing plans, customer accounts and users, subscriptions and invoices, support tickets, NPS responses and feature requests, layered on enterprise. Rules derive feature entitlements and the customer success manager of a ticket, classify payment-risk, detractor and churn-risk accounts, and suggest plans that include requested features."
+description = "Products, features and pricing plans, customer accounts and users, subscriptions and invoices, support tickets, NPS responses and feature requests. Vocabulary inspired by schema.org, ITIL 4, OpenFeature and the Net Promoter Score method; it borrows their words and claims no compliance with any of them. Its rules (feature entitlements, the customer success manager of a ticket, payment-risk, detractor and churn-risk accounts, plans that include requested features) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "organization and offer vocabulary inspired by schema.org (Organization, Offer, SoftwareApplication)",
@@ -29,7 +29,7 @@ standards = [
     "feature flag terms inspired by the OpenFeature specification",
     "survey categories borrowed from the Net Promoter Score method (promoter 9-10, passive 7-8, detractor 0-6)",
 ]
-sample_note = "nps_response:nps-0007 records a score of 11 from a broken survey widget: the one deliberate violation (shape nps_scale, max_value 10 on nps_score)."
+sample_note = "nps_response:nps-0007 records a score of 11 from a broken survey widget: the one deliberate violation (shape nps_scale, max_value 10 on prop.nps_score). Everything else in the sample conforms."
 
 # ── Product ──────────────────────────────────────────────────────────────────
 

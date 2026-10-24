@@ -13,14 +13,14 @@ id = "retail"
 title = "Retail and omnichannel commerce"
 industry = "retail"
 version = "1.0.0"
-description = "Store and online retail: stores and districts, SKUs in a merchandise category hierarchy, stock positions and planograms per store, shoppers with loyalty tiers, orders and returns, promotions and product recalls. Vocabulary inspired by GS1 (GTIN, Global Product Classification) and the ARTS operational data model; it borrows their words and claims no compliance with any of them. Its rules (what a promotion covers across the category hierarchy, promoted stockouts, recalled stock on hand, shoppers affected by a recall) are supplied assumptions, so certificates that cite them are entailed only under those rules."
+description = "Store and online retail: stores and districts, SKUs in a merchandise category hierarchy, stock positions and planograms per store, shoppers with loyalty tiers, orders and returns, promotions and product recalls. Vocabulary inspired by GS1 (GTIN, Global Product Classification) and the ARTS operational data model; it borrows their words and claims no compliance with any of them. Its rules (what a promotion covers across the category hierarchy, promoted stockouts, recalled stock on hand, shoppers affected by a recall) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "GS1 GTIN (Global Trade Item Number): product identification",
     "GS1 Global Product Classification: merchandise hierarchy vocabulary",
     "ARTS Operational Data Model (NRF): store, item and transaction vocabulary",
 ]
-sample_note = "Stock position 0217-cold-brew shows on_hand -3 (a shrink adjustment posted twice), so stock_position_shape reports exactly one violation (prop.on_hand, min_value 0). Everything else in the sample conforms."
+sample_note = "stock_position:0217-cold-brew shows on_hand -3 (a shrink adjustment posted twice): the one deliberate violation (shape stock_position_shape, min_value 0 on prop.on_hand). Everything else in the sample conforms."
 
 # ── Stores ───────────────────────────────────────────────────────────────────
 

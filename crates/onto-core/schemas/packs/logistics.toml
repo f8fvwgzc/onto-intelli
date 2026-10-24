@@ -13,14 +13,14 @@ id = "logistics"
 title = "Logistics and transportation"
 industry = "logistics"
 version = "1.0.0"
-description = "Freight and parcel movements: carriers and their vehicles, hubs, lanes and consignees, shipments split into transport legs, nested handling units, delivery exceptions, freight invoices and customs declarations. Vocabulary inspired by GS1 logistics keys (SSCC, GLN), UN/LOCODE and the WCO Harmonized System; it borrows their words and claims no compliance with any of them. Its rules (carriers used via legs, delayed shipments, hub congestion risk, customs holds, hazmat vehicles) are supplied assumptions, so certificates that cite them are entailed only under those rules."
+description = "Freight and parcel movements: carriers and their vehicles, hubs, lanes and consignees, shipments split into transport legs, nested handling units, delivery exceptions, freight invoices and customs declarations. Vocabulary inspired by GS1 logistics keys (SSCC, GLN), UN/LOCODE and the WCO Harmonized System; it borrows their words and claims no compliance with any of them. Its rules (carriers used via legs, delayed shipments, hub congestion risk, customs holds, hazmat vehicles) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "GS1 logistics keys: SSCC for handling units, GLN for locations",
     "UN/LOCODE (UNECE): hub location codes",
     "WCO Harmonized System: commodity codes on customs declarations",
 ]
-sample_note = "Handling unit pal-2 carries an 11-digit SSCC (an SSCC has 18 digits), so handling_unit_shape reports exactly one violation (prop.sscc, pattern). Everything else in the sample conforms."
+sample_note = "handling_unit:pal-2 carries an 11-digit SSCC (an SSCC has 18 digits): the one deliberate violation (shape handling_unit_shape, pattern on prop.sscc). Everything else in the sample conforms."
 
 # ── Parties and places ───────────────────────────────────────────────────────
 

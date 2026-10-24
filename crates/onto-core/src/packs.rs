@@ -12,7 +12,10 @@
 //!   what they derive is labelled with the rule and never written to the
 //!   graph, and a certificate that cites them earns
 //!   `entailed_under_supplied_rules`, never `entailed`. The standards a pack
-//!   lists are vocabulary it borrows; a pack never claims compliance.
+//!   lists are vocabulary it borrows; a pack never claims compliance. Every
+//!   registered pack says both in its description (it "claims no
+//!   compliance" and its rules "are supplied assumptions"), and leaves the
+//!   checker's verdict words to the checker.
 //! * **Installing is a governed schema change.** [`change_set`] computes the
 //!   puts that turn the current schema into the current schema with the pack
 //!   layered on top. [`Ontology::pack_plan`] previews it like any change set,

@@ -40,12 +40,19 @@ fn builtin_packages_have_no_errors() {
         vec!["enterprise", "data-catalog", "code"],
         vec!["enterprise", "data-catalog", "code", "nexc-execution"],
     ];
-    // Packages that also load on their own are linted on their own.
+    // Packages that also load on their own are linted on their own; industry
+    // packs layer on enterprise, so they are linted there, one at a time and
+    // all together.
     for (name, text) in PACKAGES {
         if Schema::from_toml(text).is_ok() && !combos.iter().any(|c| c == &[*name]) {
             combos.push(vec![name]);
         }
     }
+    let packs: Vec<&str> = onto_core::packs::REGISTRY.iter().map(|(id, _, _)| *id).collect();
+    for id in &packs {
+        combos.push(vec!["enterprise", id]);
+    }
+    combos.push([&["enterprise"][..], &packs].concat());
     assert!(PACKAGES.iter().all(|(n, _)| combos.iter().any(|c| c.contains(n))), "every package is covered");
     for names in combos {
         let s = layered(&names);

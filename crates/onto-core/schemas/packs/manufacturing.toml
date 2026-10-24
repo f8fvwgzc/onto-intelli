@@ -12,14 +12,14 @@ id = "manufacturing"
 title = "Manufacturing operations"
 industry = "manufacturing"
 version = "1.0.0"
-description = "Discrete and batch manufacturing: factories, production lines and work centers, parts with multi-level bills of material and routings, production orders with lot genealogy, quality inspections and nonconformances, and equipment maintenance. Vocabulary inspired by ISA-95 / IEC 62264 and ISA-88; it borrows their words and claims no compliance with either. Its rules are supplied assumptions (bill-of-material explosion, suspect lots, at-risk orders), so certificates that cite them are entailed only under those rules."
+description = "Discrete and batch manufacturing: factories, production lines and work centers, parts with multi-level bills of material and routings, production orders with lot genealogy, quality inspections and nonconformances, and equipment maintenance. Vocabulary inspired by ISA-95 / IEC 62264, ISA-88 and ISO 9001; it borrows their words and claims no compliance with any of them. Its rules (bill-of-material explosion, suspect lots, at-risk orders) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "ISA-95 / IEC 62264 (enterprise-control system integration): equipment hierarchy and production order vocabulary",
     "ISA-88 / IEC 61512 (batch control): lot and batch vocabulary",
     "ISO 9001 (quality management): nonconformance vocabulary",
 ]
-sample_note = "Production order po-1004 is planned but not yet scheduled on a line or work center, so production_order_shape reports exactly one violation (scheduled_on, min_count 1). Everything else in the sample conforms."
+sample_note = "production_order:po-1004 is planned but not yet scheduled on a line or work center: the one deliberate violation (shape production_order_shape, min_count 1 on scheduled_on). Everything else in the sample conforms."
 
 # ── Plant floor ──────────────────────────────────────────────────────────────
 
@@ -485,7 +485,7 @@ line = "production_line"
 assembly_line = "production_line"
 machine = "work_center"
 workstation = "work_center"
-cell = "work_center"
+work_cell = "work_center"
 component = "part"
 part_number = "part"
 subassembly = "part"

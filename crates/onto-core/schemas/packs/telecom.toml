@@ -24,14 +24,14 @@ id = "telecom"
 title = "Telecommunications"
 industry = "telecom"
 version = "1.0.0"
-description = "Network resources (sites, elements, cells, transport links), the services they realize, subscribers, SIM cards, alarms, trouble tickets and maintenance windows, layered on enterprise. Rules trace which services and subscribers an alarm impacts through the transitive aggregation hierarchy, and flag SLA breach risk and SIM-swap fraud risk."
+description = "Network resources (sites, elements, radio cells, transport links), the services they realize, subscribers, SIM cards, alarms, trouble tickets and maintenance windows. Vocabulary inspired by the TM Forum SID, ITU-T X.733 and 3GPP radio access; it borrows their words and claims no compliance with any of them. Its rules (which services and subscribers an alarm impacts through the transitive aggregation hierarchy, SLA breach risk, SIM-swap fraud risk) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "resource and service vocabulary inspired by the TM Forum Information Framework (SID)",
     "alarm severity terms inspired by ITU-T X.733 alarm reporting",
     "radio access terms inspired by 3GPP (LTE and NR cells, physical cell identity)",
 ]
-sample_note = "transport_link:mw-hop-77 is a microwave hop recorded with only one end: the one deliberate violation (shape transport_endpoints, min_count 2 on terminates_on)."
+sample_note = "transport_link:mw-hop-77 is a microwave hop recorded with only one end: the one deliberate violation (shape transport_endpoints, min_count 2 on terminates_on). Everything else in the sample conforms."
 
 # ── Resources ────────────────────────────────────────────────────────────────
 
@@ -300,7 +300,6 @@ network_node = "network_element"
 router = "network_element"
 olt = "network_element"
 baseband = "network_element"
-cell = "radio_cell"
 sector = "radio_cell"
 backhaul = "transport_link"
 fiber_link = "transport_link"

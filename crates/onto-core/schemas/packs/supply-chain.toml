@@ -13,14 +13,14 @@ id = "supply-chain"
 title = "Supply chain and sourcing"
 industry = "supply_chain"
 version = "1.0.0"
-description = "Supplier networks across tiers: suppliers and their sites, sourcing regions and their trade-compliance status, purchased items and sourcing categories, purchase orders, contracts and goods receipts, supplier audits and supply disruptions. Vocabulary inspired by the SCOR model, GS1 identification keys and ISO 28000; it borrows their words and claims no compliance with any of them. Its risk rules (sanctioned sites, high-risk suppliers, upstream risk climbing the tiers, disruption exposure) are supplied assumptions, so certificates that cite them are entailed only under those rules. Sample regions with a sanctioned status are fictional."
+description = "Supplier networks across tiers: suppliers and their sites, sourcing regions and their trade-compliance status, purchased items and sourcing categories, purchase orders, contracts and goods receipts, supplier audits and supply disruptions. Vocabulary inspired by the SCOR model, GS1 identification keys and ISO 28000; it borrows their words and claims no compliance with any of them. Its risk rules (sanctioned sites, high-risk suppliers, upstream risk climbing the tiers, disruption exposure) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. Sample regions with a sanctioned status are fictional. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "SCOR (Supply Chain Operations Reference model): source, make and deliver vocabulary",
     "GS1 identification keys: GLN for supplier sites",
     "ISO 28000 (security management for the supply chain): disruption and risk vocabulary",
 ]
-sample_note = "Supplier northwind-distribution has no site on record, so supplier_shape reports exactly one violation (operates_site, min_count 1). Everything else in the sample conforms. Ruritania (XR) is a fictional region."
+sample_note = "supplier:northwind-distribution has no site on record: the one deliberate violation (shape supplier_shape, min_count 1 on operates_site). Everything else in the sample conforms. Ruritania (XR) and its regions are fictional."
 
 # ── Supplier network ─────────────────────────────────────────────────────────
 

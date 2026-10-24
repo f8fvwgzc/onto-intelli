@@ -14,7 +14,7 @@ id = "healthcare"
 title = "Healthcare delivery"
 industry = "healthcare"
 version = "1.0.0"
-description = "Patients, care facilities and units, encounters, diagnoses, clinical observations, medications, medication orders and care plans, with rules for treating clinicians, drug-class allergies and critical results. Clinical decisions stay with clinicians: the rules flag, they do not prescribe. The sample contains one deliberate shape violation (see sample_note)."
+description = "Patients, care facilities and units, encounters, diagnoses, clinical observations, medications, medication orders and care plans. Vocabulary inspired by HL7 FHIR R4, with code fields shaped like ICD-10, SNOMED CT, LOINC and the WHO ATC classification; it borrows their words and claims no compliance with any of them. Its rules (treating clinicians, drug-class allergies, critical results) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. Clinical decisions stay with clinicians: the rules flag, they do not prescribe. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "vocabulary inspired by HL7 FHIR R4 resources (Patient, Encounter, Condition, Observation, Medication, MedicationRequest, CarePlan, Location)",
@@ -22,7 +22,7 @@ standards = [
     "LOINC observation code fields (lexical shape only)",
     "drug classes in the style of the WHO ATC classification",
 ]
-sample_note = "medication_order:mo-1003 is a verbal order with no prescribed_by link yet; it violates shape medication_order_complete (constraint medication_order_complete/prescriber, min_count)."
+sample_note = "medication_order:mo-1003 is a verbal order with no prescriber recorded yet: the one deliberate violation (shape medication_order_complete, constraint medication_order_complete/prescriber, min_count 1 on prescribed_by). Everything else in the sample conforms."
 
 # ── Actors ───────────────────────────────────────────────────────────────────
 

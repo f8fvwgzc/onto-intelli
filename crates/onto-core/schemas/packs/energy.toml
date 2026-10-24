@@ -19,14 +19,14 @@ id = "energy"
 title = "Energy and utilities"
 industry = "energy"
 version = "1.0.0"
-description = "Electric utility grid assets, electrical topology, outages, crews and condition assessments, layered on enterprise. Rules trace which service points an outage interrupts, flag outages that reach life-support customers, and classify critical assets in very poor condition."
+description = "Electric utility grid assets, electrical topology, outages, crews and condition assessments. Vocabulary inspired by the IEC CIM (61968/61970), ISO 55000 and IEEE 1366; it borrows their words and claims no compliance with any of them. Its rules (which service points an outage interrupts, outages that reach life-support customers, critical assets in very poor condition) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "vocabulary inspired by the IEC 61968/61970 Common Information Model (CIM)",
     "asset-condition terms inspired by ISO 55000 asset management",
     "interruption terms inspired by IEEE 1366 distribution reliability indices",
 ]
-sample_note = "smart_meter:m-stock-0001 is a meter still in stock with no meter_at link: the one deliberate violation (shape smart_meter_installed, min_count 1 on meter_at)."
+sample_note = "smart_meter:m-stock-0001 is a meter still in stock with no service point: the one deliberate violation (shape smart_meter_installed, min_count 1 on meter_at). Everything else in the sample conforms."
 
 # ── Territory ────────────────────────────────────────────────────────────────
 

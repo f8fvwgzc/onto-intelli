@@ -15,14 +15,14 @@ id = "insurance"
 title = "Property and casualty insurance"
 industry = "insurance"
 version = "1.0.0"
-description = "Policy holders, insurance policies, coverage sections, insured items, a peril taxonomy, loss events, claims, intermediaries and reinsurance treaties, with rules for which perils a policy's cover wording names (before exclusions, so not a coverage decision), claims caused by an excluded peril or a narrower kind of one or made on a lapsed policy, duplicate claims on one item, and loss events recoverable under a treaty. The rules flag claims for review; they do not decide coverage. The sample contains one deliberate shape violation (see sample_note)."
+description = "Policy holders, insurance policies, coverage sections, insured items, a peril taxonomy, loss events, claims, intermediaries and reinsurance treaties. Vocabulary inspired by the ACORD data standards and the Solvency II lines of business; it borrows their words and claims no compliance with any of them. Its rules (which perils a policy's cover wording names, before exclusions, so not a coverage decision; claims caused by an excluded peril or a narrower kind of one, or made on a lapsed policy; duplicate claims on one item; loss events recoverable under a treaty) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The rules flag claims for review; they do not decide coverage. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "vocabulary inspired by the ACORD insurance data standards (party, policy, coverage, claim)",
     "lines of business in the style of the Solvency II classification",
     "reinsurance treaty types as used in common market practice (quota share, surplus, excess of loss, stop loss)",
 ]
-sample_note = "claim:clm-20260006 was taken by phone without a loss date; it violates shape claim_complete (constraint claim_complete/loss_date, min_count)."
+sample_note = "claim:clm-20260006 was taken by phone without a loss date: the one deliberate violation (shape claim_complete, constraint claim_complete/loss_date, min_count 1 on prop.loss_date). Everything else in the sample conforms."
 
 # ── Parties ──────────────────────────────────────────────────────────────────
 

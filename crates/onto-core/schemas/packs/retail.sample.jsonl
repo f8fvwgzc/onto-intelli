@@ -1,7 +1,8 @@
 {"kind":"team","key":"merchandising","title":"Merchandising"}
 {"kind":"person","key":"ava-chen","title":"Ava Chen","props":{"role":"Store manager"}}
 {"kind":"person","key":"raj-patel","title":"Raj Patel","props":{"role":"Category manager, snacks"}}
-{"kind":"retail_district","key":"northeast","title":"Northeast region","props":{"district_code":"NE"}}
+{"kind":"retail_district","key":"us-east","title":"US East division","props":{"district_code":"USE"}}
+{"kind":"retail_district","key":"northeast","title":"Northeast region","props":{"district_code":"NE"},"links":[{"rel":"district_within","to":"retail_district:us-east"}]}
 {"kind":"retail_district","key":"boston-metro","title":"Boston metro district","props":{"district_code":"NE-BOS"},"links":[{"rel":"district_within","to":"retail_district:northeast"}]}
 {"kind":"retail_store","key":"0142","title":"Store 0142, Boston Back Bay","state":"open","props":{"store_number":"0142","store_format":"supermarket","selling_area_m2":2400.0},"links":[{"rel":"store_in_district","to":"retail_district:boston-metro"},{"rel":"store_managed_by","to":"person:ava-chen"}]}
 {"kind":"retail_store","key":"0217","title":"Store 0217, Providence Downcity","state":"open","props":{"store_number":"0217","store_format":"convenience","selling_area_m2":650.0},"links":[{"rel":"store_in_district","to":"retail_district:northeast"}]}

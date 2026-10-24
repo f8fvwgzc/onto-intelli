@@ -15,7 +15,7 @@ id = "finance"
 title = "Banking, KYC and AML"
 industry = "financial_services"
 version = "1.0.0"
-description = "Customers (legal entities and private individuals), jurisdictions, bank accounts, banking products, funds transfers, KYC reviews, AML alerts, suspicious activity reports and sanctions designations, with rules for payment counterparties, sanctions exposure through control chains and enhanced due diligence. The rules flag parties and transfers for review; they are not legal determinations. The sample contains one deliberate shape violation (see sample_note)."
+description = "Customers (legal entities and private individuals), jurisdictions, bank accounts, banking products, funds transfers, KYC reviews, AML alerts, suspicious activity reports and sanctions designations. Vocabulary inspired by FIBO, the FATF Recommendations and ISO 20022, with identifier fields shaped like LEI, IBAN and ISO country and currency codes; it borrows their words and claims no compliance with any of them. Its rules (payment counterparties, sanctions exposure through control chains, enhanced due diligence) are supplied assumptions: what they derive is labelled with the rule that derived it and is never stored as a fact. The rules flag parties and transfers for review; they are not legal determinations. The sample contains one deliberate shape violation (see sample_note)."
 requires = ["enterprise"]
 standards = [
     "vocabulary inspired by the EDM Council Financial Industry Business Ontology (FIBO): legal entity, control, account, payment",
@@ -23,7 +23,7 @@ standards = [
     "payment fields in the style of ISO 20022 credit transfers",
     "identifier fields shaped like ISO 17442 (LEI), ISO 13616 (IBAN), ISO 3166-1 alpha-2 and ISO 4217 codes (lexical shape only)",
 ]
-sample_note = "legal_entity:northwind-holdings carries a 19-character LEI; it violates shape legal_entity_identified (constraint legal_entity_identified/lei, pattern)."
+sample_note = "legal_entity:northwind-holdings carries a 19-character LEI (an LEI has 20): the one deliberate violation (shape legal_entity_identified, constraint legal_entity_identified/lei, pattern on prop.lei). Everything else in the sample conforms."
 
 # ── Parties ──────────────────────────────────────────────────────────────────
 
