@@ -17,6 +17,8 @@ path = "src/main.rs"
 onto-intelli = { workspace = true, features = ["postgres", "http-llm"] }
 onto-grpc.workspace = true
 onto-control.workspace = true
+# The independent checker: `onto cert check` runs it offline, `onto reason certify` re-checks what it writes.
+onto-cert = { path = "../onto-cert" }
 tokio.workspace = true
 serde_json.workspace = true
 toml.workspace = true

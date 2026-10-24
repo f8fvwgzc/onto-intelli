@@ -1,5 +1,7 @@
 //! `onto` — the onto-intelli command line.
 
+mod assure;
+
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -133,6 +135,11 @@ enum Command {
         /// Plan only.
         #[arg(long)]
         dry_run: bool,
+        /// Plan only, with the derived facts the edits add and remove (consequences).
+        #[arg(long)]
+        consequences: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Undo an applied action by receipt id.
     Undo {
@@ -194,7 +201,12 @@ enum Command {
         no_schema: bool,
     },
     /// Serve the ontology to AI agents over MCP (stdio).
-    Mcp,
+    Mcp {
+        /// Tool profile: full (default), catalog, authoring, reasoning, governance,
+        /// retrieval or evaluation. Precedence: this flag, $ONTO_MCP_PROFILE, `[mcp] profile`.
+        #[arg(long, env = "ONTO_MCP_PROFILE")]
+        profile: Option<String>,
+    },
     /// Run competency questions (default: the built-in demo suite).
     Eval {
         #[arg(long)]
@@ -323,6 +335,54 @@ enum Command {
         #[command(subcommand)]
         sub: ConsoleCmd,
     },
+    /// Reasoning: closure, pattern queries, explanations, claim checks, certificates.
+    ///
+    /// Derived facts are the engine's opinion until a certificate passes the
+    /// independent checker (`onto reason certify --out DIR`, `onto cert check DIR`).
+    Reason {
+        #[command(subcommand)]
+        sub: assure::ReasonCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Check reasoning certificates offline with the onto-cert library (no store, no server).
+    Cert {
+        #[command(subcommand)]
+        sub: assure::CertCmd,
+    },
+    /// Shapes: validate the graph (exit 0 conforms, 1 violates, 3 undetermined),
+    /// induce a shape from data, check shape definitions.
+    Shapes {
+        #[command(subcommand)]
+        sub: assure::ShapesCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Lint the schema (a measurement); dismiss or accept findings. Exits 1 when an
+    /// error finding is shown (dismissed findings listed with --all do not count).
+    Lint(assure::LintArgs),
+    /// Lock a schema definition: changes that delete, rename or break it are refused (admins).
+    Lock(assure::LockArgs),
+    /// Release a schema lock (admins).
+    Unlock(assure::UnlockArgs),
+    /// Active schema locks.
+    Locks {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Industry packs: list, show, plan and install (or propose) them.
+    Pack {
+        #[command(subcommand)]
+        sub: assure::PackCmd,
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Align a pack or a schema TOML with the current schema (scores are an
+    /// opinion); write SSSOM, or certify mappings against both hierarchies.
+    Align(assure::AlignArgs),
+    /// One sheet in, one ontology out: induce an object type, links and a shape
+    /// from a CSV file (read locally), or ingest its rows with --ingest.
+    Induce(assure::InduceArgs),
     /// Compile configured proto files and print the gRPC route table.
     Protos,
     /// Graph, memory, cache and token statistics.
@@ -712,6 +772,8 @@ fn print_plan(st: &Style, plan: &Value) {
             m["entities_updated"], m["entities_retyped"], m["entities_deleted"], m["links_deleted"], m["links_moved"]
         );
     }
+    assure::print_risk(st, plan);
+    assure::print_semantics(st, plan);
 }
 
 fn print_version_line(st: &Style, v: &Value, active: Option<u64>) {
@@ -756,6 +818,7 @@ fn print_receipt(st: &Style, r: &Value) {
     for w in plan["warnings"].as_array().into_iter().flatten() {
         println!("  {} {}", st.dim("!"), w.as_str().unwrap_or(""));
     }
+    assure::print_semantics(st, plan);
     println!(
         "  {}",
         st.dim(&format!(
@@ -1591,13 +1654,31 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
-        Command::Do { action: Some(action), params, confirm, dry_run } => {
+        Command::Do { action: Some(action), params, confirm, dry_run, consequences, json: as_json } => {
             let be = backend(&cli).await?;
+            if *consequences {
+                let input = json!({
+                    "action": action, "params": parse_params(params)?, "consequences": true,
+                    "workspace": cli.workspace,
+                });
+                let plan = be.call("action.plan", input).await?;
+                if *as_json {
+                    print_json(&plan);
+                } else {
+                    print_receipt(st, &json!({ "status": "planned", "action": action, "plan": plan }));
+                }
+                return Ok(());
+            }
             let input = json!({
                 "action": action, "params": parse_params(params)?, "confirm": confirm,
                 "dry_run": dry_run, "workspace": cli.workspace,
             });
-            print_receipt(st, &be.call("action.apply", input).await?);
+            let r = be.call("action.apply", input).await?;
+            if *as_json {
+                print_json(&r)
+            } else {
+                print_receipt(st, &r)
+            }
             Ok(())
         }
         Command::Undo { receipt, force } => {
@@ -2011,9 +2092,20 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             print!("{}", r["content"].as_str().unwrap_or_default());
             Ok(())
         }
-        Command::Mcp => {
+        Command::Mcp { profile } => {
+            // INTEGRATOR (after I1 merges): pass `Some(&local_config(&cli)?.mcp.profile)` as the second argument.
+            let profile = assure::mcp_profile(profile.as_deref(), None);
+            // INTEGRATOR (after I1 merges): delete this guard; `with_profile` below refuses unknown names.
+            if profile != "full" {
+                return Err(Error::invalid(format!(
+                    "MCP profile '{profile}': this build serves only 'full' (profiles: {})",
+                    assure::KNOWN_PROFILES.join(", ")
+                )));
+            }
             let (intelli, cfg) = open_local(&cli).await?;
             let server = onto_intelli::mcp::McpServer::new(intelli, cfg.mcp.principal.clone(), cfg.mcp.allow_writes);
+            // INTEGRATOR (after I1 merges): enable the next line.
+            // let server = server.with_profile(&profile)?;
             let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
             let mut out = tokio::io::stdout();
             while let Some(line) = lines.next_line().await? {
@@ -2189,6 +2281,16 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
         Command::Console { sub } => console(&cli, st, sub).await,
+        Command::Reason { sub, json: as_json } => assure::reason(&cli, st, sub, *as_json).await,
+        Command::Cert { sub } => assure::cert(sub),
+        Command::Shapes { sub, json: as_json } => assure::shapes(&cli, st, sub, *as_json).await,
+        Command::Lint(a) => assure::lint(&cli, st, a).await,
+        Command::Lock(a) => assure::lock(&cli, st, a).await,
+        Command::Unlock(a) => assure::unlock(&cli, st, a).await,
+        Command::Locks { json: as_json } => assure::locks(&cli, st, *as_json).await,
+        Command::Pack { sub, json: as_json } => assure::pack(&cli, st, sub, *as_json).await,
+        Command::Align(a) => assure::align(&cli, st, a).await,
+        Command::Induce(a) => assure::induce(&cli, st, a).await,
         Command::Protos => {
             let cfg = Config::discover(cli.config.as_deref())?;
             let table = onto_grpc::RouteTable::build(&cfg)?;

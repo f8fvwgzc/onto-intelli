@@ -1409,6 +1409,7 @@ name = "onto-intelli-cli"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "onto-cert",
  "onto-control",
  "onto-grpc",
  "onto-intelli",
