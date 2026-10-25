@@ -336,6 +336,12 @@ effort = "medium"               # low | medium | high | xhigh | max
 # provider = "none"             # deterministic answers + fact summaries only
 ```
 
+On a platform, the shared **LLM connection contract v1** configures the same model access for
+every core: `LLM_PROVIDER` (`anthropic`, `openai`, `openai-compatible`), `LLM_BASE_URL`,
+`LLM_API_KEY_FILE` or `LLM_API_KEY`, `LLM_MODEL`, `LLM_MODEL_SMALL`, `LLM_TIMEOUT_SECS`,
+`LLM_MAX_RETRIES`, and `LLM_GATEWAY_URL` + `LLM_GATEWAY_TOKEN_FILE` (gateway mode: no provider key
+in onto). `[llm]` keys in the file win; see [docs/EMBEDDING.md](docs/EMBEDDING.md#llm-connection-contract).
+
 Keys are read from the environment only. If a key is missing the server still starts and
 answers deterministically; LLM questions return the most relevant facts with a note.
 The Anthropic provider uses the native Messages API with prompt caching on the stable system

@@ -215,3 +215,36 @@ title = "Ontology"
 
 Also set `ONTO_SESSION_SECRET` to the same value of at least 32 characters
 on every replica, so browser sessions work across all of them.
+
+## LLM connection contract
+
+Every core of the platform reads the same `LLM_*` environment variables (contract v1, as in
+texc-symphony), so one Kubernetes Secret and ConfigMap configure model access everywhere.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `LLM_PROVIDER` | yes, unless gateway mode | `anthropic`, `openai` or `openai-compatible` (vLLM, Ollama, LM Studio, OpenRouter, Groq, Together, Azure OpenAI: anything that speaks OpenAI Chat Completions, at `LLM_BASE_URL`). In gateway mode, the wire format (default `anthropic`). |
+| `LLM_BASE_URL` | for `openai-compatible` | The provider's API base URL (`http://` allowed). |
+| `LLM_API_KEY_FILE` | | A file holding the key (a mounted Secret), read on every request: a rotated Secret applies to the next call. Wins over `LLM_API_KEY`. |
+| `LLM_API_KEY` | | The key as text. |
+| `LLM_MODEL` | yes | The model. |
+| `LLM_MODEL_SMALL` | | A small, fast model. Read and kept (`[llm] model_small`); onto makes no small-model calls today. |
+| `LLM_TIMEOUT_SECS` | | Timeout of one request (`> 0`). |
+| `LLM_MAX_RETRIES` | | Retries of one request after a transport error, 408, 429 or 5xx (`0..=10`). |
+| `LLM_GATEWAY_URL` | | **Gateway mode**: every call goes to the platform's model gateway (attache), at its root URL (a trailing `/v1` is ignored). onto then holds no provider key: `LLM_API_KEY` and `ANTHROPIC_API_KEY` are not used. |
+| `LLM_GATEWAY_TOKEN_FILE` | with the gateway | A file holding the gateway token, sent as `Authorization: Bearer`. |
+
+Precedence, highest first: a project's own provider (the console's bring-your-own LLM); the
+keys that the configuration file's `[llm]` table sets; the contract; the defaults. A deployment
+that sets no `LLM_*` variable is unchanged. The contract applies once `LLM_PROVIDER` or
+`LLM_GATEWAY_URL` is set. Setting `LLM_MODEL`, `LLM_BASE_URL` or a key without one of them is
+an error, so a typo does not silently disable it. Errors name the variable (`LLM_MODEL can't
+be blank`, `LLM_PROVIDER is invalid`) and stop `onto serve` at start. Keys are never logged,
+and an unreadable key file fails the request with the file's path, not its contents.
+
+In Kubernetes the chart (`deploy/helm/onto-intelli`, `global.llm.enabled = true`) reads the
+ConfigMap `llm-config` (non-secret `LLM_*` keys, as `envFrom`) and mounts the Secret
+`llm-credentials` at `/var/run/secrets/llm` (`api-key` → `LLM_API_KEY_FILE`, `gateway-token` →
+`LLM_GATEWAY_TOKEN_FILE`). `global.llm.*` values (`provider`, `baseUrl`, `model`, `modelSmall`,
+`timeoutSecs`, `maxRetries`, `gatewayUrl`) win over the ConfigMap. With `global.llm.gatewayUrl`
+set, only the gateway token is mounted, so the pod holds no provider key.

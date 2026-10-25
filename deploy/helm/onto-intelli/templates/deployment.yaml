@@ -41,6 +41,15 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.existingSecret }}
+            {{- if and .Values.global.llm.enabled .Values.global.llm.configMap }}
+            - configMapRef:
+                name: {{ .Values.global.llm.configMap }}
+                optional: true
+            {{- end }}
+          {{- if .Values.global.llm.enabled }}
+          env:
+            {{- include "onto-intelli.llmEnv" . | trim | nindent 12 }}
+          {{- end }}
           # grpc.health.v1 (grpc.health = true in the config) answers without a token.
           readinessProbe:
             grpc: { port: {{ .Values.port }} }
@@ -57,6 +66,9 @@ spec:
             - { name: config, mountPath: /etc/onto, readOnly: true }
             - { name: data, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
+            {{- if and .Values.global.llm.enabled .Values.global.llm.secret }}
+            - { name: llm-credentials, mountPath: /var/run/secrets/llm, readOnly: true }
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -65,6 +77,20 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        {{- if and .Values.global.llm.enabled .Values.global.llm.secret }}
+        - name: llm-credentials
+          secret:
+            secretName: {{ .Values.global.llm.secret }}
+            # The Secret and each key are optional; only the keys onto uses are mounted.
+            optional: true
+            defaultMode: 0440
+            items:
+              {{- range splitList "," (include "onto-intelli.llmSecretKeys" $) }}
+              {{- if . }}
+              - { key: {{ . }}, path: {{ . }} }
+              {{- end }}
+              {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
