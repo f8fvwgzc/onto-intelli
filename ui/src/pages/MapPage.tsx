@@ -4,6 +4,7 @@ import { Crosshair, History, Maximize2, Minus, Plus, Route as RouteIcon, Search,
 
 import { EntityDetails, EntityTitle, isAlert, useEntity } from "../components/EntityCard";
 import { GraphCanvas, pairKey, type GraphCanvasHandle } from "../components/GraphCanvas";
+import { PhysicsSettings, usePhysics } from "../components/GraphPhysics";
 import { PageHeader } from "../components/Shell";
 import { Button, Dot, EmptyState, ErrorState, IconButton, Panel, Segmented, Spinner, cx } from "../components/ui";
 import { call, errorText } from "../lib/api";
@@ -43,6 +44,8 @@ export function MapPage() {
   const [history, setHistory] = useState<{ on: boolean; ts: number }>({ on: false, ts: Date.now() });
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [physics, setPhysics] = usePhysics();
+  const [pins, setPins] = useState(0);
 
   const overview = useQuery<Overview>({
     queryKey: ["overview", workspace, ...scope],
@@ -274,6 +277,7 @@ export function MapPage() {
         <Button size="sm" variant={history.on ? "secondary" : "ghost"} icon={<History className="size-4" />} aria-pressed={history.on} onClick={() => setHistory((h) => ({ on: !h.on, ts: Date.now() }))}>
           History
         </Button>
+        <PhysicsSettings value={physics} onChange={setPhysics} pinned={pins} onUnpinAll={() => canvas.current?.unpinAll()} />
       </PageHeader>
 
       {filtersOpen ? (
@@ -340,6 +344,8 @@ export function MapPage() {
               highlightTone={highlight?.tone}
               onSelect={select}
               onExpand={(id) => void expand(id)}
+              physics={physics}
+              onPinsChange={setPins}
             />
           )}
 

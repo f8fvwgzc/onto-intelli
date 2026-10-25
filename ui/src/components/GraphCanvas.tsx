@@ -1,7 +1,22 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
-import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation, type SimulationLinkDatum, type SimulationNodeDatum } from "d3-force";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import {
+  forceCenter,
+  forceCollide,
+  forceLink,
+  forceManyBody,
+  forceSimulation,
+  forceX,
+  forceY,
+  type ForceCollide,
+  type ForceLink,
+  type ForceManyBody,
+  type Simulation,
+  type SimulationLinkDatum,
+  type SimulationNodeDatum,
+} from "d3-force";
 
 import type { Edge, Entity } from "../lib/types";
+import { DEFAULT_PHYSICS, animates, type Physics } from "./GraphPhysics";
 
 interface SimNode extends SimulationNodeDatum {
   id: string;
@@ -14,6 +29,7 @@ export interface GraphCanvasHandle {
   fit: () => void;
   center: (id: string) => void;
   zoomBy: (factor: number) => void;
+  unpinAll: () => void;
 }
 
 export interface GraphCanvasProps {
@@ -29,6 +45,10 @@ export interface GraphCanvasProps {
   highlightTone?: "accent" | "danger";
   onSelect: (id: string | undefined) => void;
   onExpand: (id: string) => void;
+  /** Forces of the layout; dragging a node pulls its neighbours along through them. */
+  physics?: Physics;
+  /** How many nodes are pinned in place (Shift-drop, Shift-click or P). */
+  onPinsChange?: (count: number) => void;
   ariaLabel: string;
 }
 
@@ -37,19 +57,17 @@ export function pairKey(a: string, b: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
-const reduceMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
 export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(props, ref) {
-  const { nodes, edges, colorOf, isAlert, selected, picked, highlightNodes, highlightEdges, highlightTone = "accent", onSelect, onExpand, ariaLabel } = props;
+  const { nodes, edges, colorOf, isAlert, selected, picked, highlightNodes, highlightEdges, highlightTone = "accent", onSelect, onExpand, physics = DEFAULT_PHYSICS, onPinsChange, ariaLabel } = props;
   const svgRef = useRef<SVGSVGElement>(null);
   const viewRef = useRef<SVGGElement>(null);
   const positions = useRef(new Map<string, SimNode>());
   const nodeEls = useRef(new Map<string, SVGGElement>());
-  const edgeEls = useRef(new Map<string, SVGLineElement>());
+  const edgeEls = useRef(new Map<string, { el: SVGLineElement; from: string; to: string }>());
   const sim = useRef<Simulation<SimNode, SimLink> | null>(null);
   const view = useRef({ k: 1, x: 0, y: 0 });
   const fitted = useRef(false);
@@ -62,6 +80,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     }
     return d;
   }, [edges]);
+  const degreeRef = useRef(degree);
+  degreeRef.current = degree;
+  const physicsRef = useRef(physics);
+  physicsRef.current = physics;
+  const [pinned, setPinned] = useState<ReadonlySet<string>>(new Set());
 
   const applyView = useCallback(() => {
     const v = view.current;
@@ -74,8 +97,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       const p = positions.current.get(id);
       if (p) el.setAttribute("transform", `translate(${p.x ?? 0},${p.y ?? 0})`);
     }
-    for (const [key, el] of edgeEls.current) {
-      const [from, , to] = key.split("\u0000");
+    for (const { el, from, to } of edgeEls.current.values()) {
       const a = positions.current.get(from);
       const b = positions.current.get(to);
       if (!a || !b) continue;
@@ -129,6 +151,74 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     [applyView],
   );
 
+  /** Settle the layout in one step and draw the result: the layout does not animate. */
+  const settleNow = useCallback(
+    (s: Simulation<SimNode, SimLink>, alpha: number, ticks: number) => {
+      s.stop().alpha(Math.max(s.alpha(), alpha));
+      for (let i = 0; i < ticks; i++) s.tick();
+      draw();
+    },
+    [draw],
+  );
+
+  /** Wake the layout so a change settles. */
+  const stir = useCallback(
+    (alpha: number) => {
+      const s = sim.current;
+      if (!s) return;
+      if (animates(physicsRef.current)) s.alpha(Math.max(s.alpha(), alpha)).restart();
+      else settleNow(s, alpha, 120);
+    },
+    [settleNow],
+  );
+
+  const markPinned = useCallback((id: string, on: boolean) => {
+    setPinned((prev) => {
+      if (prev.has(id) === on) return prev;
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const togglePin = useCallback(
+    (id: string) => {
+      const p = positions.current.get(id);
+      if (!p) return;
+      const on = p.fx == null;
+      p.fx = on ? p.x : null;
+      p.fy = on ? p.y : null;
+      markPinned(id, on);
+      if (!on) stir(0.2);
+    },
+    [markPinned, stir],
+  );
+
+  const unpinAll = useCallback(() => {
+    for (const p of positions.current.values()) {
+      p.fx = null;
+      p.fy = null;
+    }
+    setPinned(new Set());
+    stir(0.3);
+  }, [stir]);
+
+  useEffect(() => onPinsChange?.(pinned.size), [pinned, onPinsChange]);
+
+  /** Push the physics settings into the simulation's forces. */
+  const applyPhysics = useCallback((s: Simulation<SimNode, SimLink>, p: Physics) => {
+    const deg = (n: SimNode | string | number) => degreeRef.current.get(typeof n === "object" ? n.id : String(n)) ?? 1;
+    s.velocityDecay(p.friction);
+    (s.force("charge") as ForceManyBody<SimNode>).strength(-p.repulsion).distanceMax(Math.max(420, p.distance * 6));
+    (s.force("link") as ForceLink<SimNode, SimLink>)
+      .distance(p.distance)
+      // A hub answers each of its links more softly, so dragging one of forty
+      // leaves does not haul the hub, and dragging the hub spreads the leaves.
+      .strength((l) => Math.min(1, p.follow / Math.sqrt(Math.max(1, Math.min(deg(l.source), deg(l.target))))));
+    (s.force("collide") as ForceCollide<SimNode>).radius((d) => d.r + p.collision);
+  }, []);
+
   useImperativeHandle(
     ref,
     () => ({
@@ -138,8 +228,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         const r = svgRef.current?.getBoundingClientRect();
         if (r) zoomAt(factor, r.width / 2, r.height / 2);
       },
+      unpinAll,
     }),
-    [fit, center, zoomAt],
+    [fit, center, zoomAt, unpinAll],
   );
 
   // Layout: keep known positions, place newcomers next to a neighbour.
@@ -170,19 +261,21 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     });
     const present = new Set(nodes.map((n) => n.id));
     for (const id of [...known.keys()]) if (!present.has(id)) known.delete(id);
+    setPinned((prev) => ([...prev].every((id) => present.has(id)) ? prev : new Set([...prev].filter((id) => present.has(id)))));
     const simLinks: SimLink[] = edges
       .filter((e) => present.has(e.from) && present.has(e.to))
       .map((e) => ({ source: e.from, target: e.to, rel: e.rel, key: `${e.from}\u0000${e.rel}\u0000${e.to}` }));
 
     if (!sim.current) {
       sim.current = forceSimulation<SimNode, SimLink>()
-        .force("charge", forceManyBody<SimNode>().strength(-180).distanceMax(420))
-        .force("link", forceLink<SimNode, SimLink>().id((d) => d.id).distance(70).strength(0.5))
-        .force("collide", forceCollide<SimNode>().radius((d) => d.r + 10))
+        .force("charge", forceManyBody<SimNode>())
+        .force("link", forceLink<SimNode, SimLink>().id((d) => d.id))
+        .force("collide", forceCollide<SimNode>())
         .force("x", forceX<SimNode>(0).strength(0.04))
         .force("y", forceY<SimNode>(0).strength(0.04))
         .force("center", forceCenter(0, 0).strength(0.05))
         .on("tick", draw);
+      applyPhysics(sim.current, physicsRef.current);
     }
     const s = sim.current;
     s.nodes(simNodes);
@@ -190,11 +283,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     const settle = () => {
       if (!fitted.current && nodes.length && fit()) fitted.current = true;
     };
-    if (reduceMotion()) {
-      s.stop();
-      s.alpha(1);
-      for (let i = 0; i < 260; i++) s.tick();
-      draw();
+    if (!animates(physicsRef.current)) {
+      settleNow(s, 1, 260);
       settle();
     } else {
       s.alpha(Math.max(s.alpha(), 0.7)).restart();
@@ -203,9 +293,25 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       const t = window.setTimeout(settle, 700);
       return () => window.clearTimeout(t);
     }
-  }, [nodes, edges, degree, draw, fit]);
+  }, [nodes, edges, degree, draw, fit, applyPhysics, settleNow]);
 
   useEffect(() => () => void sim.current?.stop(), []);
+
+  // Settings apply live and stir the layout so the change shows. Settling in
+  // one step runs at most once a frame while a slider moves.
+  const appliedPhysics = useRef(physics);
+  useEffect(() => {
+    const s = sim.current;
+    if (!s || appliedPhysics.current === physics) return;
+    appliedPhysics.current = physics;
+    applyPhysics(s, physics);
+    if (animates(physics)) {
+      s.alpha(Math.max(s.alpha(), 0.3)).restart();
+      return;
+    }
+    const frame = requestAnimationFrame(() => settleNow(s, 0.3, 80));
+    return () => cancelAnimationFrame(frame);
+  }, [physics, applyPhysics, settleNow]);
 
   // The first fit waits for the canvas to have a size (it may mount hidden).
   useEffect(() => {
@@ -226,7 +332,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
 
   // Pointer handling: pan the background, drag nodes, pinch and wheel zoom.
   const pointers = useRef(new Map<number, { x: number; y: number }>());
-  const drag = useRef<{ id?: string; startX: number; startY: number; moved: boolean; lastPinch?: number } | null>(null);
+  const drag = useRef<{ id?: string; startX: number; startY: number; moved: boolean; held?: boolean; lastPinch?: number } | null>(null);
 
   const local = (e: { clientX: number; clientY: number }) => {
     const r = svgRef.current!.getBoundingClientRect();
@@ -259,23 +365,40 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     if (!d.moved) return;
     if (d.id) {
       const p = positions.current.get(d.id);
-      if (p) {
+      const s = sim.current;
+      if (p && s) {
+        if (d.held === undefined) {
+          // Drag start: the node follows the pointer, and the warmed layout lets
+          // its links and charge pull the neighbours along and spread them out.
+          // This animates even when the layout does not: the motion is the user's own.
+          d.held = p.fx != null;
+          s.alphaTarget(0.3).alpha(Math.max(s.alpha(), 0.3)).restart();
+        }
         const v = view.current;
         p.fx = (now.x - v.x) / v.k;
         p.fy = (now.y - v.y) / v.k;
-        if (reduceMotion()) {
-          p.x = p.fx;
-          p.y = p.fy;
-          draw();
-        } else {
-          sim.current?.alphaTarget(0.25).restart();
-        }
       }
     } else {
       view.current.x += now.x - prev.x;
       view.current.y += now.y - prev.y;
       applyView();
     }
+  };
+
+  /** Drag end: the layout cools, and the node rejoins it unless it stays pinned. */
+  const release = (id: string, keep: boolean) => {
+    const s = sim.current;
+    const p = positions.current.get(id);
+    if (!s || !p) return;
+    p.x = p.fx ?? p.x;
+    p.y = p.fy ?? p.y;
+    if (!keep) {
+      p.fx = null;
+      p.fy = null;
+    }
+    markPinned(id, keep);
+    s.alphaTarget(0);
+    if (!animates(physicsRef.current)) settleNow(s, 0, 120);
   };
 
   // Taps select; a second tap on the same node expands it (pointer capture
@@ -286,8 +409,12 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     const d = drag.current;
     if (pointers.current.size > 0) return;
     drag.current = null;
-    sim.current?.alphaTarget(0);
+    if (d?.id && d.held !== undefined) release(d.id, d.held || e.shiftKey);
     if (!d || d.moved) return;
+    if (d.id && e.shiftKey) {
+      togglePin(d.id);
+      return;
+    }
     const now = performance.now();
     if (d.id && lastTap.current.id === d.id && now - lastTap.current.t < 330) {
       lastTap.current = { t: 0 };
@@ -330,7 +457,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     >
       <style>{`
         .graph-canvas[data-far="1"] .lbl-minor { display: none; }
-        .graph-canvas .node:focus-visible { outline: none; }
+        .graph-canvas .node:focus { outline: none; }
         .graph-canvas .node:focus-visible .ring { stroke: var(--accent); stroke-width: 2; opacity: 1; }
       `}</style>
       <g ref={viewRef}>
@@ -342,7 +469,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
               <line
                 key={key}
                 ref={(el) => {
-                  if (el) edgeEls.current.set(key, el);
+                  if (el) edgeEls.current.set(key, { el, from: e.from, to: e.to });
                   else edgeEls.current.delete(key);
                 }}
                 stroke={hl ? tone : "var(--gray-3)"}
@@ -362,6 +489,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
             const faded = anyHighlight && !hl && !isSel;
             const major = isSel || hl || (degree.get(n.id) ?? 0) >= 4;
             const alert = isAlert?.(n);
+            const pin = pinned.has(n.id);
             return (
               <g
                 key={n.id}
@@ -369,7 +497,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
                 className="node cursor-pointer"
                 role="button"
                 tabIndex={0}
-                aria-label={`${n.kind} ${n.title || n.id}${n.state ? `, ${n.state}` : ""}`}
+                aria-label={`${n.kind} ${n.title || n.id}${n.state ? `, ${n.state}` : ""}${pin ? ", pinned" : ""}`}
                 aria-pressed={isSel}
                 opacity={faded ? 0.32 : 1}
                 ref={(el) => {
@@ -382,12 +510,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
                     onSelect(n.id);
                   } else if (ev.key === "e") {
                     onExpand(n.id);
+                  } else if (ev.key === "p") {
+                    togglePin(n.id);
                   }
                 }}
               >
                 <circle className="ring" r={r + 4} fill="none" stroke={isSel ? "var(--text)" : hl ? tone : "transparent"} strokeWidth={isSel ? 2 : 1.6} opacity={isSel || hl ? 1 : 0} />
                 <circle r={r} fill={colorOf(n.kind)} stroke="var(--page)" strokeWidth={2} />
                 {alert ? <circle r={3} cx={r * 0.72} cy={-r * 0.72} fill="var(--danger)" stroke="var(--page)" strokeWidth={1.5} /> : null}
+                {pin ? <circle r={3} cx={-r * 0.72} cy={-r * 0.72} fill="var(--text)" stroke="var(--page)" strokeWidth={1.5} /> : null}
                 <text
                   y={r + 13}
                   textAnchor="middle"
