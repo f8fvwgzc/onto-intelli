@@ -65,6 +65,52 @@ jobs:
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --workspace --locked --no-fail-fast
 
+  # Advisories, licences, bans and sources (deny.toml), and the RustSec database again.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      - run: cargo deny --locked check
+      - if: ${{ !cancelled() }}
+        run: cargo audit
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint --strict deploy/helm/onto-intelli --set existingSecret=onto
+      - name: Render, and refuse to render without a Secret
+        run: |
+          helm template onto deploy/helm/onto-intelli --set existingSecret=onto > /dev/null
+          if helm template onto deploy/helm/onto-intelli > /dev/null 2>&1; then
+            echo "rendered without existingSecret" >&2; exit 1
+          fi
+
+  # The release image builds (linux/amd64 here; the release adds arm64) and carries git for the
+  # repository connector.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: onto-intelli:ci
+          cache-from: type=gha,scope=ci-amd64
+          cache-to: type=gha,scope=ci-amd64,mode=max
+      - name: onto and git run in the image
+        run: |
+          docker run --rm --entrypoint onto onto-intelli:ci --version
+          docker run --rm --entrypoint git onto-intelli:ci --version
+          test "$(docker run --rm --entrypoint id onto-intelli:ci -u)" = 10001
+
   ui:
     runs-on: ubuntu-latest
     steps:

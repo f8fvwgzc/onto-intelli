@@ -1,0 +1,75 @@
+image:
+  repository: ghcr.io/f8fvwgzc/onto-intelli
+  # Empty: the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The image is private while the repository is: a docker-registry Secret for ghcr.io.
+imagePullSecrets: []
+
+replicas: 1
+
+# gRPC, JSON over HTTP (/v1/...) and the UI share this port.
+port: 50051
+
+# Required. A Secret in the release namespace with:
+#   ONTO_DATABASE_URL  postgres://user:password@host:5432/db (PostgreSQL 16+, pgvector 0.7+)
+#   ONTO_TOKEN         the operator's API token (admin on every workspace); e.g. openssl rand -hex 24
+# Any other key (ANTHROPIC_API_KEY for llm provider "anthropic", ONTO_SESSION_SECRET, ...) reaches
+# the container as an environment variable too.
+existingSecret: ""
+
+# onto-intelli.toml, mounted read-only at /etc/onto (docs: crates/onto-intelli/templates/onto-intelli.toml).
+# grpc.listen is ignored: the chart passes --listen 0.0.0.0:<port>.
+config: |
+  [engine]
+  storage = "postgres"
+  default_workspace = "default"
+
+  [ontology]
+  schema = "builtin:enterprise"
+  schema_mode = "live"
+
+  [llm]
+  provider = "mock"
+
+  [grpc]
+  builtin_api = true
+  reflection = true
+  health = true
+  http = true
+  proto_files = []
+
+  [auth]
+  mode = "token"
+
+  [[auth.tokens]]
+  token_env = "ONTO_TOKEN"
+  principal = { id = "operator", roles = ["admin"], workspaces = ["*"] }
+
+# Extra files next to onto-intelli.toml in /etc/onto (schema layers, protos), name -> content.
+extraConfigFiles: {}
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { memory: 2Gi }
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: ["ALL"] }
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

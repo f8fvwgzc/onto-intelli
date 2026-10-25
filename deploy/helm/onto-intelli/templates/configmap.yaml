@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onto-intelli.fullname" . }}
+  labels:
+    {{- include "onto-intelli.labels" . | nindent 4 }}
+data:
+  onto-intelli.toml: |
+    {{- .Values.config | nindent 4 }}
+  {{- range $name, $content := .Values.extraConfigFiles }}
+  {{ $name }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}

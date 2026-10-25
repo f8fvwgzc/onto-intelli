@@ -1,0 +1,79 @@
+{{- if not .Values.existingSecret }}
+{{- fail "existingSecret is empty: create a Secret with ONTO_DATABASE_URL and ONTO_TOKEN and name it here" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "onto-intelli.fullname" . }}
+  labels:
+    {{- include "onto-intelli.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "onto-intelli.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "onto-intelli.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: onto-intelli
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["onto", "serve", "--config", "/etc/onto/onto-intelli.toml", "--listen", "0.0.0.0:{{ .Values.port }}"]
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.port }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          # grpc.health.v1 (grpc.health = true in the config) answers without a token.
+          readinessProbe:
+            grpc: { port: {{ .Values.port }} }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: grpc }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/onto, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "onto-intelli.fullname" . }}
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

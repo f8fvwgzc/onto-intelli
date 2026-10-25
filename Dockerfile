@@ -14,10 +14,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/onto /usr/local/bin/onto
 
 FROM debian:bookworm-slim
+# git: the repository connector clones and reads repositories (`onto connect git ...`).
+# uid 10001: the Helm chart's runAsUser.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates git \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --create-home --home-dir /data onto
+ && useradd --system --uid 10001 --user-group --create-home --home-dir /data onto
 COPY --from=build /usr/local/bin/onto /usr/local/bin/onto
 USER onto
 WORKDIR /data

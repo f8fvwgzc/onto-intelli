@@ -277,6 +277,8 @@ In the web UI: **Builder** (`#/build`) and **Explorer** (`#/explore`).
 | From source | `cargo install --path crates/onto-cli` (or `make install`) |
 | Docker | `ONTO_TOKEN=$(openssl rand -hex 24) docker compose --profile server up --build` (onto + PostgreSQL) |
 | Homebrew | formula template in [`packaging/homebrew/onto-intelli.rb`](packaging/homebrew/onto-intelli.rb) |
+| Image | `ghcr.io/f8fvwgzc/onto-intelli:<version>` (linux/amd64 and arm64, from the first tagged release) |
+| Kubernetes | `helm install onto oci://ghcr.io/f8fvwgzc/charts/onto-intelli --version <version> --set existingSecret=onto` ([chart](deploy/helm/onto-intelli/values.yaml); the Secret holds `ONTO_DATABASE_URL` and `ONTO_TOKEN`) |
 
 One binary (`onto`, ~13 MB release) plus PostgreSQL 16 or newer with the
 [pgvector](https://github.com/pgvector/pgvector) extension: the `pgvector/pgvector` images,
