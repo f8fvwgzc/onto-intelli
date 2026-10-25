@@ -1,22 +1,65 @@
 name: release
 
+# A v* tag: the `onto` CLI and libonto_intelli for five targets, a multi-arch image on GHCR, the
+# Helm chart as an OCI artifact on GHCR, and a GitHub release with the archives and checksums.
+# Nothing is built until the tag equals the Cargo version and the chart's version and appVersion.
+# Images and archives get Sigstore-signed build provenance (gh attestation verify) while the
+# repository is public; GitHub offers attestations on private repositories only with Enterprise Cloud.
+
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
+  version:
+    name: Tag matches the crate and chart versions
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $TAG is not v<semver>"
+            exit 1
+          fi
+          crate=$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          chart=$(sed -n 's/^version: \(.*\)$/\1/p' deploy/helm/onto-intelli/Chart.yaml)
+          app=$(sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' deploy/helm/onto-intelli/Chart.yaml)
+          if [[ $crate != "$version" || $chart != "$version" || $app != "$version" ]]; then
+            echo "::error::tag $TAG, but Cargo.toml says '$crate' and the chart version/appVersion '$chart'/'$app': set all three to $version, then tag again"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
   build:
+    name: Binaries (${{ matrix.target }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          # GitHub retired the Intel macos-13 image: Apple silicon cross-compiles x86_64 (not run).
+          - { target: x86_64-apple-darwin, os: macos-15, cross: true }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
     steps:
@@ -25,18 +68,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build
         run: cargo build --profile dist --locked --target ${{ matrix.target }} -p onto-intelli-cli -p onto-intelli-ffi
+      - name: Smoke test
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          exe="target/${{ matrix.target }}/dist/onto"
+          [[ -f $exe.exe ]] && exe=$exe.exe
+          v=$("$exe" --version)
+          echo "$v"
+          [[ $v == *"$VERSION"* ]]
       - name: Package
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          name="onto-${{ matrix.target }}"
-          out="target/${{ matrix.target }}/dist"
+          name="onto-$TARGET"
+          out="target/$TARGET/dist"
           mkdir -p "pkg/$name/lib" "pkg/$name/include"
           cp README.md LICENSE "pkg/$name/"
           cp crates/onto-ffi/include/onto_intelli.h "pkg/$name/include/"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
+          if [[ $TARGET == *windows* ]]; then
             cp "$out/onto.exe" "pkg/$name/"
             cp "$out/onto_intelli.dll" "$out/onto_intelli.lib" "pkg/$name/lib/" 2>/dev/null || true
             (cd pkg && 7z a "../$name.zip" "$name" >/dev/null)
@@ -53,15 +111,156 @@ jobs:
           name: onto-${{ matrix.target }}
           path: onto-${{ matrix.target }}.*
 
+  # Each architecture is built natively (no QEMU: the Rust build would take hours under emulation)
+  # and pushed by digest; image-publish joins them under the version tags.
+  image:
+    name: Image (linux/${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=onto-intelli
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,scope=release-${{ matrix.arch }},mode=max
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-publish:
+    name: Publish the image
+    needs: [version, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - id: manifest
+        name: Create the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+      # Verify with: gh attestation verify oci://ghcr.io/f8fvwgzc/onto-intelli:<version> --owner f8fvwgzc
+      - name: Sign the image's build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+  chart:
+    name: Publish the Helm chart
+    needs: [version, image-publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm package and push
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm lint deploy/helm/onto-intelli --set existingSecret=onto
+          helm package deploy/helm/onto-intelli --destination "$RUNNER_TEMP/chart"
+          printf %s "$GH_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm push "$RUNNER_TEMP/chart/onto-intelli-$VERSION.tgz" "$CHART_REPO"
+
   publish:
-    needs: build
-    runs-on: ubuntu-latest
+    name: GitHub release
+    needs: [build, image-publish, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      # Verify with: gh attestation verify <archive> --owner f8fvwgzc
+      - name: Sign the archives' build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
