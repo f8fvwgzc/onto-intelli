@@ -70,7 +70,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
   const edgeEls = useRef(new Map<string, { el: SVGLineElement; from: string; to: string }>());
   const sim = useRef<Simulation<SimNode, SimLink> | null>(null);
   const view = useRef({ k: 1, x: 0, y: 0 });
+  /** The first fit is done, or the view was moved before it and it no longer applies. */
   const fitted = useRef(false);
+  /** The first layout cooled while the canvas had no size: fit once it has one. */
+  const fitWhenSized = useRef(false);
 
   const degree = useMemo(() => {
     const d = new Map<string, number>();
@@ -135,6 +138,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       const { width, height } = svg.getBoundingClientRect();
       const k = Math.max(view.current.k, 1);
       view.current = { k, x: width / 2 - (p.x ?? 0) * k, y: height / 2 - (p.y ?? 0) * k };
+      fitted.current = true;
       applyView();
     },
     [applyView],
@@ -146,6 +150,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
       const k = Math.min(4, Math.max(0.1, v.k * factor));
       const f = k / v.k;
       view.current = { k, x: cx - (cx - v.x) * f, y: cy - (cy - v.y) * f };
+      fitted.current = true;
       applyView();
     },
     [applyView],
@@ -281,7 +286,9 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     s.nodes(simNodes);
     (s.force("link") as ReturnType<typeof forceLink<SimNode, SimLink>>).links(simLinks);
     const settle = () => {
-      if (!fitted.current && nodes.length && fit()) fitted.current = true;
+      if (fitted.current || !nodes.length) return;
+      fitted.current = fit();
+      fitWhenSized.current = !fitted.current;
     };
     if (!animates(physicsRef.current)) {
       settleNow(s, 1, 260);
@@ -313,21 +320,31 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     return () => cancelAnimationFrame(frame);
   }, [physics, applyPhysics, settleNow]);
 
-  // The first fit waits for the canvas to have a size (it may mount hidden).
+  // A canvas that mounts hidden takes its first fit once it has a size. Until
+  // the first fit, the view centres on the origin the layout spreads out from:
+  // fitting the unsettled layout would zoom in on a bunch of nodes.
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg || typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(() => {
-      if (!fitted.current && nodes.length && fit()) fitted.current = true;
+      if (fitted.current) return;
+      if (fitWhenSized.current) {
+        fitted.current = fit();
+        fitWhenSized.current = !fitted.current;
+        return;
+      }
+      const { width, height } = svg.getBoundingClientRect();
+      view.current = { ...view.current, x: width / 2, y: height / 2 };
+      applyView();
     });
     ro.observe(svg);
     return () => ro.disconnect();
-  }, [fit, nodes.length]);
+  }, [fit, applyView]);
 
   // A new data set (workspace, snapshot) refits.
   const signature = nodes.length ? nodes[0].id : "";
   useEffect(() => {
-    if (nodes.length === 0) fitted.current = false;
+    if (nodes.length === 0) fitted.current = fitWhenSized.current = false;
   }, [signature, nodes.length]);
 
   // Pointer handling: pan the background, drag nodes, pinch and wheel zoom.
@@ -372,6 +389,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
           // its links and charge pull the neighbours along and spread them out.
           // This animates even when the layout does not: the motion is the user's own.
           d.held = p.fx != null;
+          fitted.current = true;
           s.alphaTarget(0.3).alpha(Math.max(s.alpha(), 0.3)).restart();
         }
         const v = view.current;
