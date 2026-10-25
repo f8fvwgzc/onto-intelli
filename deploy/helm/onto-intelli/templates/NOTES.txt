@@ -1,0 +1,5 @@
+onto-intelli {{ .Chart.AppVersion }} serves gRPC, JSON over HTTP and the UI on
+{{ include "onto-intelli.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.port }}.
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "onto-intelli.fullname" . }} {{ .Values.port }}
+  curl -H "Authorization: Bearer $ONTO_TOKEN" http://127.0.0.1:{{ .Values.port }}/healthz

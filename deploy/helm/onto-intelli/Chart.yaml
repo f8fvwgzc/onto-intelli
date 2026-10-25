@@ -1,0 +1,18 @@
+apiVersion: v2
+name: onto-intelli
+description: >-
+  onto-intelli, the ontology intelligence engine: one `onto serve` (gRPC, JSON over HTTP and the
+  UI on one port) against your PostgreSQL 16+ with pgvector.
+type: application
+# The release workflow refuses a tag unless version and appVersion equal it and the Cargo version.
+version: 0.2.0
+appVersion: "0.2.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/f8fvwgzc/onto-intelli
+sources:
+  - https://github.com/f8fvwgzc/onto-intelli
+keywords:
+  - ontology
+  - knowledge-graph
+  - grpc
+  - postgresql
