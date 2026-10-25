@@ -499,10 +499,24 @@ async fn trace_actions_and_their_access() {
         let l = i.call(p, "trace.list", json!({ "kind": "ask" })).await.unwrap();
         assert_eq!(l["traces"][0]["id"], json!(id), "{}", p.id);
         assert!(l["traces"][0].get("input").is_none_or(Value::is_null), "no bodies in lists");
-        assert_eq!(l["traces"][0]["preview"], "Who owns Project Alpha?");
+        // The question may quote what the observer cannot read: admins only.
+        if p.is_privileged() {
+            assert_eq!(l["traces"][0]["preview"], "Who owns Project Alpha?");
+        } else {
+            assert!(l["traces"][0].get("preview").is_none_or(Value::is_null), "{}: {l}", p.id);
+            assert_eq!(l["traces"][0]["redacted"], true);
+        }
     }
-    let g = i.call(&observer, "trace.get", json!({ "id": id })).await.unwrap();
+    let g = i.call(&admin(), "trace.get", json!({ "id": id })).await.unwrap();
     assert_eq!(g["trace"]["input"]["question"], "Who owns Project Alpha?");
+    assert!(g["trace"].get("redacted").is_none(), "admins see everything");
+    for p in [&observer, &developer] {
+        let g = i.call(p, "trace.get", json!({ "id": id })).await.unwrap();
+        assert!(g["trace"]["input"].is_null() && g["trace"]["output"].is_null(), "{}: {g}", p.id);
+        assert!(g["spans"].as_array().unwrap().iter().all(|s| s["input"].is_null() && s["output"].is_null()));
+        assert_eq!(g["trace"]["redacted"], true);
+        assert!(!g["spans"].as_array().unwrap().is_empty(), "timings and names stay");
+    }
     assert!(i.call(&observer, "trace.get", json!({ "id": "00000000000000000000000000000001" })).await.is_err());
     let m = i.call(&observer, "trace.metrics", json!({ "bucket": "hour" })).await.unwrap();
     assert_eq!(m["requests"], 1);

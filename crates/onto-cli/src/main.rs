@@ -1252,7 +1252,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 auth.push_str(&format!(
                     " · console ({}; keys {}; LLM keys {})",
                     paths.join(", "),
-                    if c.can_create_keys() { "on" } else { "off: set ONTO_KEY_PEPPER or ONTO_MASTER_KEY" },
+                    if c.can_create_keys() { "on" } else { "off: set ONTO_KEY_PEPPER" },
                     if c.can_store_llm_keys() { "on" } else { "off: set ONTO_MASTER_KEY" }
                 ));
             }
@@ -2451,7 +2451,7 @@ async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
                 .audit(onto_control::AuditEntry::new("system", "member.role").org(&o.id).target(user).detail(json!({
                     "to": "owner", "via": "onto console add-owner",
                 })))
-                .await;
+                .await?;
             println!("{user} is an owner of {}", st.bold(&o.slug));
             Ok(())
         }

@@ -1,6 +1,8 @@
 //! JSON over HTTP/1.1 on the gRPC port, for curl, browsers and scripts.
 //!
-//! * `GET  /healthz`              liveness
+//! * `GET  /livez`                liveness, without credentials (the process answers)
+//! * `GET  /readyz`               readiness, without credentials (the store answers)
+//! * `GET  /healthz`              the server's health, for an authenticated caller
 //! * `GET  /v1/actions`           action catalogue
 //! * `GET  /v1/stats`             statistics
 //! * `POST /v1/call/{action}`     run any action with a JSON body
@@ -35,9 +37,12 @@
 //! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
 //! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
-//!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`
+//!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
+//!   A session minting a session cannot outlive itself. `DELETE` revokes the presented session.
+//! * `POST /v1/auth/session/revoke`  `{jti, tenant?}`: a config token revokes a session it minted
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
+//! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits
 //! * `/v1/traces`, `/v1/metrics`, `/v1/sessions`: observability (see [`crate::observe`])
 //! * `POST /mcp`: MCP over HTTP (see [`crate::mcp_http`])
 //!
@@ -70,6 +75,8 @@ pub struct AppState {
 
 pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
     axum::Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/healthz", get(health))
         .route("/v1/actions", get(actions))
         .route("/v1/stats", get(stats))
@@ -89,8 +96,10 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/schema/proposals", get(proposals_list).post(proposals_create))
         .route("/v1/schema/proposals/{id}", get(proposal_get))
         .route("/v1/schema/proposals/{id}/{verb}", post(proposal_verb))
-        .route("/v1/auth/session", post(session))
+        .route("/v1/auth/session", post(session).delete(session_logout))
+        .route("/v1/auth/session/revoke", post(session_revoke))
         .route("/v1/auth/whoami", get(whoami))
+        .route("/v1/admin/tenants", get(admin_tenants))
         .route("/v1/execution/graphs", get(exec_graphs).post(exec_init))
         .route("/v1/execution/graphs/{graph}/vocabulary", get(exec_vocab).put(exec_set_vocab))
         .route("/v1/catalog/connectors", get(connectors_list).post(connector_add))
@@ -199,6 +208,23 @@ fn with_trace_id(mut resp: Response, trace_id: Option<&str>) -> Response {
         resp.headers_mut().insert(crate::observe::TRACE_ID, v);
     }
     resp
+}
+
+/// The process answers. No credentials, no details.
+async fn livez() -> Response {
+    Json(json!({ "status": "ok" })).into_response()
+}
+
+/// The store answers (one query), so the server can serve requests. No
+/// credentials and nothing about the data: a probe may call it.
+async fn readyz(State(s): State<AppState>) -> Response {
+    match s.hub.ready().await {
+        Ok(()) => Json(json!({ "status": "ready" })).into_response(),
+        Err(e) => {
+            tracing::warn!("readiness: {e}");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "unavailable" }))).into_response()
+        }
+    }
 }
 
 async fn health(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -387,7 +413,10 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
     };
     let ttl = input.ttl_secs.unwrap_or(3600);
     let principal = c.principal.clone();
-    let (token, exp, tenant) = match &c.credential {
+    // A session minting a session cannot outlive itself: renewal ends when
+    // the first session would have.
+    let not_after = c.session.as_ref().map(|si| si.exp);
+    let (token, exp, jti, tenant) = match &c.credential {
         Credential::Console { .. } => {
             return error_response(&Error::Denied(
                 "console sessions cannot mint sessions; use the console session itself".into(),
@@ -395,16 +424,64 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
         }
         // The key's delegate: refused once the key is revoked.
         Credential::ApiKey { prefix, project, .. } => {
-            let (t, e) = s.auth.issue_key_session(principal.clone(), prefix, project, ttl);
-            (t, e, Some(project.clone()))
+            let (t, e, j) = s.auth.issue_key_session_until(principal.clone(), prefix, project, ttl, not_after);
+            (t, e, j, Some(project.clone()))
         }
         _ => {
             let tenant = c.tenant.clone().or_else(|| Some(s.hub.default_tenant().to_string()));
-            let (t, e) = s.auth.issue_session(principal.clone(), tenant.clone(), ttl);
-            (t, e, tenant)
+            let (t, e, j) = s.auth.issue_session_until(principal.clone(), tenant.clone(), ttl, not_after);
+            (t, e, j, tenant)
         }
     };
-    Json(json!({ "token": token, "expires_at": exp, "principal": principal, "tenant": tenant })).into_response()
+    Json(json!({ "token": token, "expires_at": exp, "jti": jti, "principal": principal, "tenant": tenant }))
+        .into_response()
+}
+
+/// Sign out: the presented session is revoked.
+async fn session_logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let c = match s.auth.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return auth_error_response(&e),
+    };
+    let Some(crate::auth::SessionInfo { exp, jti: Some(jti) }) = c.session else {
+        return error_response(&Error::invalid("DELETE /v1/auth/session revokes a session token: present one"));
+    };
+    match s.auth.revoke_session(c.tenant.as_deref(), &jti, exp).await {
+        Ok(()) => Json(json!({ "revoked": jti })).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeIn {
+    jti: String,
+    /// Unix seconds the session expires at (from the mint response); until
+    /// then the id stays revoked. Default: the longest session lifetime.
+    #[serde(default)]
+    expires_at: Option<u64>,
+}
+
+/// A service (a config token) revokes a session it minted for a user,
+/// within the tenants the token may address.
+async fn session_revoke(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    let c = match s.auth.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return auth_error_response(&e),
+    };
+    if !matches!(c.credential, Credential::Config | Credential::Dev) {
+        return error_response(&Error::Denied("only a service token ([[auth.tokens]]) revokes sessions by id".into()));
+    }
+    let input: RevokeIn = match serde_json::from_value(body_or_empty(body)) {
+        Ok(i) => i,
+        Err(e) => return error_response(&Error::invalid(format!("revoke: {e}"))),
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let exp = input.expires_at.unwrap_or(now + s.hub.config().auth.session_max_ttl_secs);
+    let tenant = c.tenant.clone().or_else(|| Some(s.hub.default_tenant().to_string()));
+    match s.auth.revoke_session(tenant.as_deref(), &input.jti, exp).await {
+        Ok(()) => Json(json!({ "revoked": input.jti, "tenant": tenant })).into_response(),
+        Err(e) => error_response(&e),
+    }
 }
 
 async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -448,6 +525,36 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
         },
         "governance": gov,
         "ui": { "title": cfg.ui.title },
+    }))
+    .into_response()
+}
+
+/// Open tenants with their estimated memory: an operator's view of the
+/// whole process, so project credentials (API keys, console sessions) and
+/// non-admins are refused.
+async fn admin_tenants(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let c = match s.auth.authenticate(&headers).await {
+        Ok(c) => c,
+        Err(e) => return auth_error_response(&e),
+    };
+    if c.credential.is_project() || !c.principal.is_privileged() {
+        return error_response(&Error::Denied(format!(
+            "{} may not list the server's tenants (operators only)",
+            c.principal.id
+        )));
+    }
+    let e = &s.hub.config().engine;
+    let tenants = s.hub.tenant_stats();
+    Json(json!({
+        "open": tenants.len(),
+        "estimated_bytes": tenants.iter().map(|t| t.estimated_bytes).sum::<u64>(),
+        "listening_stores": s.hub.listening_stores(),
+        "limits": {
+            "max_open_tenants": e.max_open_tenants,
+            "tenant_idle_secs": e.tenant_idle_secs,
+            "tenant_memory_budget_mb": e.tenant_memory_budget_mb,
+        },
+        "tenants": tenants,
     }))
     .into_response()
 }

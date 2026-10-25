@@ -242,7 +242,18 @@ impl Control {
     }
 
     /// The PostgreSQL control store in `config.schema` (migrated on connect).
+    /// It needs `ONTO_KEY_PEPPER`: API key hashes are kept here, and a
+    /// pepper derived from the master key would break them on rotation.
     pub async fn postgres(url: &str, config: ConsoleConfig, opts: ControlOptions) -> Result<Self> {
+        if opts.pepper.is_none() {
+            return Err(Error::Config(
+                "the console's PostgreSQL control store needs ONTO_KEY_PEPPER (at least 32 random characters, \
+                 e.g. `openssl rand -base64 32`), kept apart from ONTO_MASTER_KEY: API keys are hashed with it. \
+                 Keys made by earlier versions stay valid while ONTO_MASTER_KEY (or ONTO_MASTER_KEY_PREVIOUS) \
+                 still holds the master key they were made under"
+                    .into(),
+            ));
+        }
         let store = PgControl::connect(url, &config.schema).await?;
         Self::new(Arc::new(store), config, opts)
     }
@@ -269,13 +280,15 @@ impl Control {
         self.pepper.is_some()
     }
 
-    /// Write an audit entry; a failure is logged, never returned (the change
-    /// it records already happened).
-    pub async fn audit(&self, e: AuditEntry) {
+    /// Write an audit entry. A failure is logged and returned: the change it
+    /// records already happened, but the caller learns that its audit trail
+    /// did not, instead of a silent gap.
+    pub async fn audit(&self, e: AuditEntry) -> Result<()> {
         let action = e.action.clone();
-        if let Err(err) = self.store.audit(e).await {
+        self.store.audit(e).await.map_err(|err| {
             tracing::error!(%action, "control audit log: {err}");
-        }
+            Error::Unavailable(format!("the change was made, but writing its audit entry ({action}) failed: {err}"))
+        })
     }
 
     // ── cached lookups ───────────────────────────────────────────────────
@@ -333,8 +346,17 @@ impl Control {
         let Some((prefix, _)) = keys::parse(presented) else { return Ok(None) };
         let Some(pepper) = &self.pepper else { return Ok(None) };
         let Some((key, project)) = self.cached_key(prefix, now).await? else { return Ok(None) };
-        if !pepper.verify(presented, &key.hash) {
-            return Ok(None);
+        match pepper.check(presented, &key.hash) {
+            keys::PepperMatch::No => return Ok(None),
+            keys::PepperMatch::Current => {}
+            // Made under a previous pepper (or the master key): rewrite the
+            // hash with the current one, so the old secret can go.
+            keys::PepperMatch::Stale => {
+                match self.store.set_key_hash(&key.id, &key.hash, &pepper.hash(presented)).await {
+                    Ok(_) => self.keys.evict(prefix),
+                    Err(e) => tracing::warn!(key = %key.prefix, "rewriting a key hash with the current pepper: {e}"),
+                }
+            }
         }
         let ms = now_ms();
         if !key.usable(ms) || !project.active() {
@@ -383,7 +405,7 @@ impl Control {
             "name": key.name, "prefix": key.prefix, "scopes": key.scopes,
             "impersonate": key.impersonate, "expires_at": key.expires_at,
         })))
-        .await;
+        .await?;
         Ok((key, secret))
     }
 
@@ -395,9 +417,7 @@ impl Control {
         rotated_from: Option<String>,
     ) -> Result<(ApiKey, String)> {
         let Some(pepper) = &self.pepper else {
-            return Err(Error::invalid(
-                "neither ONTO_KEY_PEPPER nor ONTO_MASTER_KEY is set; refusing to create API keys",
-            ));
+            return Err(Error::invalid("ONTO_KEY_PEPPER is not set; refusing to create API keys"));
         };
         if !project.active() {
             return Err(Error::not_found(format!("project {}", project.r#ref)));
@@ -502,7 +522,7 @@ impl Control {
         self.audit(AuditEntry::new(by, "key.rotate").project(project).target(&old.id).detail(json!({
             "old_prefix": old.prefix, "new_prefix": key.prefix, "new_key": key.id, "grace_secs": grace_secs,
         })))
-        .await;
+        .await?;
         Ok((key, secret))
     }
 
@@ -517,7 +537,7 @@ impl Control {
                 .target(&key.id)
                 .detail(json!({ "prefix": key.prefix, "name": key.name })),
         )
-        .await;
+        .await?;
         self.project_key(project, id).await
     }
 
@@ -603,7 +623,7 @@ impl Control {
                     self.audit(AuditEntry::new(&user.id, "org.create").org(&o.id).target(&o.id).detail(json!({
                         "name": o.name, "slug": o.slug,
                     })))
-                    .await;
+                    .await?;
                     o
                 }
                 // Another replica created it at the same moment.
@@ -622,7 +642,7 @@ impl Control {
                 .target(&user.id)
                 .detail(json!({ "provider": provider })),
         )
-        .await;
+        .await?;
         Ok(SignIn { user, org, adopted })
     }
 
@@ -632,7 +652,7 @@ impl Control {
         let mut adopted = Vec::new();
         for t in tenants {
             if let Some(p) = self.store.adopt_project(&org.id, t, by).await? {
-                self.audit(AuditEntry::new(by, "project.adopt").project(&p).target(&p.r#ref)).await;
+                self.audit(AuditEntry::new(by, "project.adopt").project(&p).target(&p.r#ref)).await?;
                 adopted.push(p);
             }
         }
@@ -674,6 +694,52 @@ mod tests {
         assert!(a.authenticate_key_at(&unknown, t0).await.unwrap().is_none());
         assert_eq!(a.keys.get(&unknown[..keys::PREFIX_LEN], t0 + Duration::from_secs(4)), Some(None));
         assert_eq!(a.keys.get(&unknown[..keys::PREFIX_LEN], t0 + Duration::from_secs(6)), None);
+    }
+
+    #[tokio::test]
+    async fn rotating_the_master_key_never_breaks_api_keys() {
+        let store: Arc<dyn ControlStore> = Arc::new(MemoryControl::new());
+        let (pepper, m1, m2) = ("p".repeat(32), "00".repeat(32), "11".repeat(32));
+        let opts = |masters: [Option<String>; 2]| ControlOptions {
+            pepper: Pepper::from_values(Some(pepper.clone()), None, masters).unwrap(),
+            ..Default::default()
+        };
+        let c1 = Control::new(store.clone(), ConsoleConfig::default(), opts([Some(m1.clone()), None])).unwrap();
+        let project = c1.sign_in_local(&["t1".to_string()]).await.unwrap().adopted[0].clone();
+        // A key as earlier versions stored it: hashed with a pepper derived from ONTO_MASTER_KEY.
+        let (prefix, full) = keys::generate();
+        let legacy_pepper = keys::hmac_sha256(&keys::parse_master_key(&m1).unwrap(), keys::PEPPER_LABEL);
+        let legacy_hash = keys::sha256_hex(&[legacy_pepper, full.as_bytes().to_vec()].concat());
+        let key = store
+            .create_key(NewKey {
+                project_id: project.id.clone(),
+                name: "old".into(),
+                prefix,
+                hash: legacy_hash.clone(),
+                scopes: vec![KeyScope::Read],
+                workspaces: vec!["*".into()],
+                impersonate: false,
+                impersonate_roles: Vec::new(),
+                created_by: "u".into(),
+                created_at: now_ms(),
+                expires_at: None,
+                rotated_from: None,
+            })
+            .await
+            .unwrap();
+        assert!(c1.authenticate_key(&full).await.unwrap().is_some(), "still valid");
+        let rewritten = store.key(&key.id).await.unwrap().unwrap().hash;
+        assert_ne!(rewritten, legacy_hash, "rewritten under ONTO_KEY_PEPPER");
+        // The master key rotates and the old one is dropped: the key keeps working.
+        let c2 = Control::new(store.clone(), ConsoleConfig::default(), opts([Some(m2), None])).unwrap();
+        assert!(c2.authenticate_key(&full).await.unwrap().is_some());
+        // Without ONTO_KEY_PEPPER there are no keys, and a durable console refuses to start.
+        assert!(Pepper::from_values(None, None, [Some(m1), None]).unwrap().is_none());
+        let err = Control::postgres("postgres://127.0.0.1:1/none", ConsoleConfig::default(), ControlOptions::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("ONTO_KEY_PEPPER"), "{err}");
     }
 
     #[tokio::test]

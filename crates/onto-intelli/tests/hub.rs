@@ -180,3 +180,52 @@ mod hooks {
         assert!(!hub.refresh_tenant("never-opened").await.unwrap());
     }
 }
+
+#[tokio::test]
+async fn agents_neither_write_raw_nor_confirm_their_own_risky_actions() {
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let ws = hub.tenant("t").await.unwrap();
+    seed::load_demo(&ws, "acme").await.unwrap();
+    let agent = Principal::named("agent:bot", &["member", "agent"], &["*"]).unwrap();
+    let raw = [
+        ("entity.upsert", json!({ "id": "task:z", "title": "z" })),
+        ("entity.patch", json!({ "id": "project:alpha", "title": "renamed" })),
+        ("entity.delete", json!({ "id": "project:alpha" })),
+        ("link.create", json!({ "from": "project:alpha", "rel": "owned_by", "to": "team:platform" })),
+        ("graph.apply", json!({ "mutations": [{ "op": "delete", "id": "project:alpha" }] })),
+        ("ingest.batch", json!({ "records": [{ "kind": "task", "key": "q", "title": "q" }] })),
+    ];
+    for (action, input) in raw {
+        let err = ws.call(&agent, action, input).await.unwrap_err();
+        assert!(matches!(err, onto_intelli::Error::Denied(ref m) if m.contains("agent")), "{action}: {err}");
+    }
+    let admin = Principal::admin("x");
+    assert!(ws.call(&admin, "entity.get", json!({ "id": "project:alpha" })).await.is_ok());
+
+    // A high-risk action type: an agent's confirm does not count.
+    let delete = json!({ "action": "delete", "params": { "target": "project:alpha" }, "confirm": true });
+    let r = ws.call(&agent, "action.apply", delete.clone()).await.unwrap();
+    assert_eq!(r["status"], "proposed", "{r}");
+    assert!(r["reason"].as_str().unwrap().contains("cannot confirm"), "{r}");
+    assert!(ws.call(&admin, "entity.get", json!({ "id": "project:alpha" })).await.is_ok(), "not deleted");
+    // A person confirms it.
+    let person = Principal::named("user:m", &["member"], &["*"]).unwrap();
+    assert_eq!(ws.call(&person, "action.apply", delete).await.unwrap()["status"], "applied");
+    // Low-risk action types still work for agents.
+    let r = ws
+        .call(
+            &agent,
+            "action.apply",
+            json!({ "action": "set_state", "params": { "item": "issue:421", "state": "in_progress" } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "applied", "{r}");
+
+    // governance.agent_raw_writes = true opts back in.
+    let mut cfg = Config::in_memory();
+    cfg.governance.agent_raw_writes = true;
+    let hub = Hub::open(cfg).await.unwrap();
+    let ws = hub.tenant("t").await.unwrap();
+    ws.call(&agent, "entity.upsert", json!({ "id": "task:z", "title": "z" })).await.unwrap();
+}

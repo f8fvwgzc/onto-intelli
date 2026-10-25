@@ -23,6 +23,7 @@ use crate::store::{ControlStore, invitation_code, merge_settings, usage_horizon}
 pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (1, "control", include_str!("../migrations/0001_control.sql")),
     (2, "llm_usage", include_str!("../migrations/0002_llm_usage.sql")),
+    (3, "audit_no_delete", include_str!("../migrations/0003_audit_no_delete.sql")),
 ];
 
 /// Connections of the control pool.
@@ -1017,6 +1018,17 @@ impl ControlStore for PgControl {
             return Err(Error::not_found(format!("key {id}")));
         }
         Ok(())
+    }
+
+    async fn set_key_hash(&self, id: &str, old: &str, new: &str) -> Result<bool> {
+        let n = sqlx::query(sql(format!("UPDATE {} SET hash = $3 WHERE id = $1 AND hash = $2", self.t("api_keys"))))
+            .bind(id)
+            .bind(old)
+            .bind(new)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n == 1)
     }
 
     async fn expire_key(&self, id: &str, at: i64) -> Result<()> {

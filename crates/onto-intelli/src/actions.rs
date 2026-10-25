@@ -34,6 +34,19 @@ const fn a(name: &'static str, write: bool, description: &'static str) -> Action
     ActionInfo { name, description, write }
 }
 
+/// Actions that change entities and links directly, without an action
+/// type's checks: refused to agents unless `governance.agent_raw_writes`.
+pub const RAW_WRITES: &[&str] = &[
+    "entity.upsert",
+    "entity.patch",
+    "entity.delete",
+    "entity.merge",
+    "link.create",
+    "link.delete",
+    "graph.apply",
+    "ingest.batch",
+];
+
 pub const ACTIONS: &[ActionInfo] = &[
     a("entity.upsert", true, "Create or update an entity (merge props). Input: EntityInput."),
     a(
@@ -708,6 +721,13 @@ impl Intelli {
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
+        if RAW_WRITES.contains(&action) && p.is_agent() && !onto.options().governance.agent_raw_writes {
+            return Err(Error::Denied(format!(
+                "{} is an agent: {action} writes the graph directly, which agents may not \
+                 (use an action type, action.apply; or set governance.agent_raw_writes)",
+                p.id
+            )));
+        }
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
             return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
@@ -1230,16 +1250,26 @@ impl Intelli {
             )));
         }
         let store = self.ontology().store();
+        // Questions, answers and error texts may quote entities the observer
+        // cannot read (restricted ones): only admins see them.
+        let redact = !p.is_privileged();
         match action {
             "trace.list" => {
                 let mut q: TraceQuery = parse(action, input)?;
                 observe_scope(p, &mut q.workspace)?;
-                to_json(&store.trace_list(&q)?)
+                let mut page = store.trace_list(&q)?;
+                if redact {
+                    page.traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
+                }
+                to_json(&page)
             }
             "trace.get" => {
                 let i: IdIn = parse(action, input)?;
-                let d = self.find_trace(&i.id)?;
+                let mut d = self.find_trace(&i.id)?;
                 check_trace_workspace(p, &d)?;
+                if redact {
+                    d.redact();
+                }
                 to_json(&d)
             }
             "trace.metrics" => {
@@ -1250,12 +1280,19 @@ impl Intelli {
             "trace.sessions" => {
                 let mut q: SessionQuery = parse(action, input)?;
                 observe_scope(p, &mut q.workspace)?;
-                to_json(&store.trace_sessions(&q)?)
+                let mut page = store.trace_sessions(&q)?;
+                if redact {
+                    page.sessions.iter_mut().for_each(|s| s.preview = None);
+                }
+                to_json(&page)
             }
             "trace.session" => {
                 let i: SessionIn = parse(action, input)?;
                 let traces = store.trace_session(&i.id, i.limit.unwrap_or(onto_core::trace::DEFAULT_LIST))?;
-                let traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                let mut traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                if redact {
+                    traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
+                }
                 if traces.is_empty() {
                     return Err(Error::not_found(format!("session {}", i.id)));
                 }

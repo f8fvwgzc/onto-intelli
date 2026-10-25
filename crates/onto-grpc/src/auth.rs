@@ -24,9 +24,14 @@
 //! `x-onto-act-workspaces` and `x-onto-act-entity` name each call's
 //! principal, limited to `impersonate_roles` and the credential's workspaces.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use http::HeaderMap;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 
 use onto_control::{Control, OrgRole, User};
@@ -54,6 +59,32 @@ pub struct Auth {
     session_key: Vec<u8>,
     session_max_ttl: u64,
     control: Option<Arc<Control>>,
+    revocations: RwLock<Option<Arc<dyn Revocations>>>,
+    /// Session ids by whether they are revoked, and when that was read.
+    revoked: Mutex<HashMap<String, (bool, Instant)>>,
+}
+
+/// How long a session id read as not revoked is trusted before it is read
+/// again. A revocation on this replica applies at once.
+pub const REVOCATION_TTL: Duration = Duration::from_secs(10);
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Where revoked session ids are kept, shared by every replica: the KV
+/// store of the session's tenant (namespace `auth.revoked`, see
+/// [`crate::hub_revocations`]), until the session would have expired anyway.
+pub trait Revocations: Send + Sync {
+    fn revoke<'a>(&'a self, tenant: Option<&'a str>, jti: &'a str, exp: u64) -> BoxFuture<'a, ()>;
+    fn is_revoked<'a>(&'a self, tenant: Option<&'a str>, jti: &'a str) -> BoxFuture<'a, bool>;
+}
+
+/// A session presented with the request: when it expires and its id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionInfo {
+    /// Unix seconds.
+    pub exp: u64,
+    /// `None` for sessions minted before sessions had ids.
+    pub jti: Option<String>,
 }
 
 /// The console part of a session token: the user it was issued to.
@@ -79,6 +110,9 @@ pub struct SessionClaims {
     /// that key's delegate, refused once the key is revoked or expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// The session's id, for revocation. Older tokens have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 const SESSION_PREFIX: &str = "onto1.";
@@ -138,6 +172,9 @@ pub struct Caller {
     pub principal: Principal,
     pub tenant: Option<String>,
     pub credential: Credential,
+    /// Set when a session token (not a key or a config token) authenticated
+    /// the request: a session it mints may not outlive it.
+    pub session: Option<SessionInfo>,
 }
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -278,7 +315,51 @@ impl Auth {
                 key
             }
         };
-        Ok(Self { dev, tokens, session_key, session_max_ttl: cfg.session_max_ttl_secs.max(60), control })
+        Ok(Self {
+            dev,
+            tokens,
+            session_key,
+            session_max_ttl: cfg.session_max_ttl_secs.max(60),
+            control,
+            revocations: RwLock::new(None),
+            revoked: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Where revoked session ids are kept (the server passes the hub's).
+    pub fn set_revocations(&self, r: Arc<dyn Revocations>) {
+        *self.revocations.write() = Some(r);
+    }
+
+    /// Revoke a session by id: refused from now on, on every replica within
+    /// [`REVOCATION_TTL`] and on this one at once.
+    pub async fn revoke_session(&self, tenant: Option<&str>, jti: &str, exp: u64) -> Result<()> {
+        let r = self.revocations.read().clone();
+        let Some(r) = r else {
+            return Err(Error::Unavailable("this server keeps no session revocations".into()));
+        };
+        r.revoke(tenant, jti, exp).await?;
+        self.revoked.lock().insert(jti.to_string(), (true, Instant::now()));
+        Ok(())
+    }
+
+    async fn session_revoked(&self, tenant: Option<&str>, jti: &str) -> std::result::Result<bool, AuthError> {
+        let now = Instant::now();
+        if let Some((revoked, at)) = self.revoked.lock().get(jti).cloned()
+            && (revoked || now.duration_since(at) < REVOCATION_TTL)
+        {
+            return Ok(revoked);
+        }
+        let r = self.revocations.read().clone();
+        let Some(r) = r else { return Ok(false) };
+        let revoked =
+            r.is_revoked(tenant, jti).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
+        let mut cache = self.revoked.lock();
+        if cache.len() > 100_000 {
+            cache.retain(|_, (r, at)| *r || now.duration_since(*at) < REVOCATION_TTL);
+        }
+        cache.insert(jti.to_string(), (revoked, now));
+        Ok(revoked)
     }
 
     pub fn control(&self) -> Option<&Arc<Control>> {
@@ -309,22 +390,61 @@ impl Auth {
 
     /// A signed, short-lived token for one principal and tenant.
     pub fn issue_session(&self, principal: Principal, tenant: Option<String>, ttl_secs: u64) -> (String, u64) {
-        let exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
-        (self.mint(&SessionClaims { principal, tenant, exp, console: None, key: None }), exp)
+        let (token, exp, _) = self.issue_session_until(principal, tenant, ttl_secs, None);
+        (token, exp)
+    }
+
+    /// [`issue_session`](Self::issue_session) that expires no later than
+    /// `not_after` (Unix seconds; a session minting a session); also returns its id.
+    pub fn issue_session_until(
+        &self,
+        principal: Principal,
+        tenant: Option<String>,
+        ttl_secs: u64,
+        not_after: Option<u64>,
+    ) -> (String, u64, String) {
+        let mut exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
+        if let Some(cap) = not_after {
+            exp = exp.min(cap);
+        }
+        let jti = new_jti();
+        (
+            self.mint(&SessionClaims { principal, tenant, exp, console: None, key: None, jti: Some(jti.clone()) }),
+            exp,
+            jti,
+        )
     }
 
     /// A session minted by an API key: bound to the key's project and valid
     /// only while the key is.
     pub fn issue_key_session(&self, principal: Principal, prefix: &str, project: &str, ttl_secs: u64) -> (String, u64) {
-        let exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
+        let (token, exp, _) = self.issue_key_session_until(principal, prefix, project, ttl_secs, None);
+        (token, exp)
+    }
+
+    /// [`issue_key_session`](Self::issue_key_session), capped at `not_after`.
+    pub fn issue_key_session_until(
+        &self,
+        principal: Principal,
+        prefix: &str,
+        project: &str,
+        ttl_secs: u64,
+        not_after: Option<u64>,
+    ) -> (String, u64, String) {
+        let mut exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
+        if let Some(cap) = not_after {
+            exp = exp.min(cap);
+        }
+        let jti = new_jti();
         let claims = SessionClaims {
             principal,
             tenant: Some(project.to_string()),
             exp,
             console: None,
             key: Some(prefix.to_string()),
+            jti: Some(jti.clone()),
         };
-        (self.mint(&claims), exp)
+        (self.mint(&claims), exp, jti)
     }
 
     /// A console session for a user: principal `user:<id>` without roles and
@@ -339,6 +459,7 @@ impl Auth {
             exp,
             console: Some(ConsoleClaims { user: user.to_string(), iat }),
             key: None,
+            jti: None,
         };
         (self.mint(&claims), exp)
     }
@@ -407,6 +528,12 @@ impl Auth {
                 (Some(bound), _) => Some(bound.clone()),
                 (None, asked) => asked,
             };
+            if let Some(jti) = &claims.jti
+                && self.session_revoked(claims.tenant.as_deref(), jti).await?
+            {
+                return Err(AuthError::Unauthenticated("session revoked".into()));
+            }
+            let session = Some(SessionInfo { exp: claims.exp, jti: claims.jti.clone() });
             let credential = match &claims.key {
                 Some(prefix) => {
                     let control = self
@@ -423,7 +550,7 @@ impl Auth {
                 }
                 None => Credential::Session,
             };
-            return Ok(Caller { principal: claims.principal, tenant, credential });
+            return Ok(Caller { principal: claims.principal, tenant, credential, session });
         }
         if let Some(tok) = presented.filter(|t| t.starts_with(KEY_PREFIX)) {
             return self.key_caller(tok, h, tenant).await;
@@ -444,15 +571,11 @@ impl Auth {
             (None, Some(dev)) => (dev.clone(), true, Vec::new(), vec!["*".to_string()], Credential::Dev),
             (None, None) => return Err(AuthError::Unauthenticated("missing bearer token".into())),
         };
-        if let Some(t) = &tenant
-            && !tenants.iter().any(|x| x == "*" || x == t)
-        {
-            return Err(AuthError::Forbidden(format!("{} may not address tenant {t}", base.id)));
-        }
+        let tenant = token_tenant(&base.id, &tenants, tenant)?;
         // In dev mode anything goes; otherwise only the roles the token may grant.
         let limit = self.dev.is_none() || token.is_some();
         let principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
-        Ok(Caller { principal, tenant, credential })
+        Ok(Caller { principal, tenant, credential, session: None })
     }
 
     /// A console session on the data plane: `x-onto-tenant` names a project
@@ -477,6 +600,7 @@ impl Auth {
             principal,
             tenant: Some(project.r#ref),
             credential: Credential::Console { user: user.id, role, org: project.org_id },
+            session: None,
         })
     }
 
@@ -508,12 +632,34 @@ impl Auth {
             principal,
             tenant: Some(project.r#ref.clone()),
             credential: Credential::ApiKey { id: key.id, prefix: key.prefix, project: project.r#ref },
+            session: None,
         })
     }
 
     /// Back-compat helper: the principal only.
     pub async fn principal(&self, h: &HeaderMap) -> std::result::Result<Principal, String> {
         self.authenticate(h).await.map(|c| c.principal).map_err(|e| e.to_string())
+    }
+}
+
+/// The tenant a `[[auth.tokens]]` request addresses. A token limited to
+/// some tenants never reaches the default one by sending no
+/// `x-onto-tenant`: with one tenant it addresses that one, with several it
+/// must name one of them.
+fn token_tenant(id: &str, allowed: &[String], asked: Option<String>) -> std::result::Result<Option<String>, AuthError> {
+    let all = allowed.iter().any(|x| x == "*");
+    match asked {
+        Some(t) if all || allowed.contains(&t) => Ok(Some(t)),
+        Some(t) => Err(AuthError::Forbidden(format!("{id} may not address tenant {t}"))),
+        None if all => Ok(None),
+        None => match allowed {
+            [only] => Ok(Some(only.clone())),
+            [] => Err(AuthError::Forbidden(format!("{id} may not address any tenant (its tenants list is empty)"))),
+            _ => Err(AuthError::Forbidden(format!(
+                "{id} may address several tenants ({}): name one with the {TENANT} header",
+                allowed.join(", ")
+            ))),
+        },
     }
 }
 
@@ -574,6 +720,11 @@ pub async fn guard_project_call(
         m.insert("restricted".into(), Value::Bool(true));
     }
     Ok(())
+}
+
+/// A random session id.
+fn new_jti() -> String {
+    onto_control::keys::random_token(16)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -687,11 +838,23 @@ mod tests {
         assert!(matches!(a.authenticate(&headers(&[dash[0], (ACT_AS, "user:1")])).await, Err(AuthError::Forbidden(_))));
         assert!(matches!(a.authenticate(&headers(&[dash[0], (TENANT, "other")])).await, Err(AuthError::Forbidden(_))));
         assert_eq!(a.authenticate(&headers(&[dash[0], (TENANT, "acme")])).await.unwrap().principal.id, "dash");
-        // Workspaces are limited to the token's.
-        assert!(matches!(
-            a.authenticate(&headers(&[dash[0]])).await.map(|c| c.principal.workspaces),
-            Ok(ref w) if w == &vec!["acme".to_string()]
-        ));
+        // Workspaces are limited to the token's; without x-onto-tenant a token
+        // limited to one tenant addresses that tenant, never the default one.
+        let c = a.authenticate(&headers(&[dash[0]])).await.unwrap();
+        assert_eq!(c.principal.workspaces, vec!["acme".to_string()]);
+        assert_eq!(c.tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn limited_tokens_never_fall_back_to_the_default_tenant() {
+        let two = ["a".to_string(), "b".to_string()];
+        let err = token_tenant("svc", &two, None).unwrap_err();
+        assert!(matches!(err, AuthError::Forbidden(ref m) if m.contains(TENANT)), "{err}");
+        assert_eq!(token_tenant("svc", &two, Some("b".into())).unwrap().as_deref(), Some("b"));
+        assert!(token_tenant("svc", &two, Some("c".into())).is_err());
+        assert!(token_tenant("svc", &[], None).is_err(), "an empty list allows nothing");
+        assert_eq!(token_tenant("svc", &["*".into()], None).unwrap(), None, "all tenants: the default one");
+        assert_eq!(token_tenant("svc", &["only".into()], None).unwrap().as_deref(), Some("only"));
     }
 
     #[tokio::test]

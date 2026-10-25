@@ -4,8 +4,8 @@
 //!
 //! A key looks like `onto_sk_7f3k9q2m_Vb1wQ9…`: the prefix (`onto_sk_` and 8
 //! characters of `[a-z0-9]`) is stored and shown; the secret (base64url of 32
-//! random bytes, 43 characters) is never stored. The stored hash is lowercase
-//! hex `SHA-256(pepper || full key)`.
+//! random bytes, 43 characters) is never stored. The stored hash is
+//! `<pepper id>:` and lowercase hex `SHA-256(pepper || full key)` ([`Pepper`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -24,7 +24,8 @@ pub const KEY_PREFIX: &str = "onto_sk_";
 pub const PREFIX_LEN: usize = KEY_PREFIX.len() + 8;
 /// Base64url (no padding) of 32 bytes.
 pub const SECRET_LEN: usize = 43;
-/// Label of the pepper derived from `ONTO_MASTER_KEY`.
+/// Label of the pepper earlier versions derived from `ONTO_MASTER_KEY`
+/// (still accepted for the untagged hashes they wrote).
 pub const PEPPER_LABEL: &[u8] = b"onto api key pepper v1";
 
 const ALNUM: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -129,9 +130,53 @@ pub fn parse_master_key(v: &str) -> Result<Vec<u8>> {
     Err(Error::Config("ONTO_MASTER_KEY must be 32 bytes, as base64 or 64 hex characters".into()))
 }
 
-/// The secret mixed into every key hash.
+/// One pepper value and its id (the first 8 hex characters of
+/// `SHA-256("onto pepper id" || pepper)`), which tags the hashes it makes.
 #[derive(Clone)]
-pub struct Pepper(Vec<u8>);
+struct PepperKey {
+    id: String,
+    bytes: Vec<u8>,
+}
+
+impl PepperKey {
+    fn new(bytes: Vec<u8>) -> Self {
+        let mut data = b"onto pepper id".to_vec();
+        data.extend_from_slice(&bytes);
+        Self { id: sha256_hex(&data)[..8].to_string(), bytes }
+    }
+
+    fn digest(&self, full_key: &str) -> String {
+        let mut data = self.bytes.clone();
+        data.extend_from_slice(full_key.as_bytes());
+        sha256_hex(&data)
+    }
+}
+
+/// How a presented key matched its stored hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PepperMatch {
+    No,
+    /// Under the current pepper.
+    Current,
+    /// Under a previous (or the legacy master-key derived) pepper: the hash
+    /// should be rewritten with the current one.
+    Stale,
+}
+
+/// The secret mixed into every key hash: `ONTO_KEY_PEPPER`, its own secret,
+/// separate from `ONTO_MASTER_KEY`, so rotating the master key never breaks
+/// a key. A stored hash is `<pepper id>:<hex SHA-256(pepper || key)>`;
+/// verification tries the pepper the id names (the current one or
+/// `ONTO_KEY_PEPPER_PREVIOUS`), and an untagged hash (written before
+/// peppers had ids) every known pepper, including the one earlier versions
+/// derived from `ONTO_MASTER_KEY` (and `ONTO_MASTER_KEY_PREVIOUS`).
+#[derive(Clone)]
+pub struct Pepper {
+    current: PepperKey,
+    previous: Vec<PepperKey>,
+    /// Peppers of untagged hashes only (derived from the master keys).
+    legacy: Vec<PepperKey>,
+}
 
 impl std::fmt::Debug for Pepper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,46 +184,97 @@ impl std::fmt::Debug for Pepper {
     }
 }
 
+/// The pepper earlier versions derived from a master key.
+fn derived(master_key: &str) -> Result<PepperKey> {
+    Ok(PepperKey::new(hmac_sha256(&parse_master_key(master_key)?, PEPPER_LABEL)))
+}
+
+fn pepper_value(name: &str, v: String) -> Result<Vec<u8>> {
+    let v = v.trim().to_string();
+    if v.chars().count() < 32 {
+        return Err(Error::Config(format!("{name} must have at least 32 characters")));
+    }
+    Ok(v.into_bytes())
+}
+
 impl Pepper {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Pepper(bytes)
+        Pepper { current: PepperKey::new(bytes), previous: Vec::new(), legacy: Vec::new() }
     }
 
     /// A random pepper for this process only (the memory control store).
     pub fn random() -> Self {
-        Pepper(random_bytes(32))
+        Self::new(random_bytes(32))
     }
 
-    /// From `ONTO_KEY_PEPPER` (at least 32 characters), else HMAC-SHA256 of
-    /// `ONTO_MASTER_KEY` with the label `onto api key pepper v1`; `None`
-    /// when neither is set.
+    /// This pepper's id, as stored in front of its hashes.
+    pub fn id(&self) -> &str {
+        &self.current.id
+    }
+
+    /// From `ONTO_KEY_PEPPER` (at least 32 characters) and
+    /// `ONTO_KEY_PEPPER_PREVIOUS`; the master keys only verify untagged
+    /// hashes. `None` when `ONTO_KEY_PEPPER` is not set.
     pub fn from_env() -> Result<Option<Self>> {
-        Self::from_values(std::env::var("ONTO_KEY_PEPPER").ok(), std::env::var("ONTO_MASTER_KEY").ok())
+        let var = |n: &str| std::env::var(n).ok();
+        Self::from_values(
+            var("ONTO_KEY_PEPPER"),
+            var("ONTO_KEY_PEPPER_PREVIOUS"),
+            [var("ONTO_MASTER_KEY"), var("ONTO_MASTER_KEY_PREVIOUS")],
+        )
     }
 
-    pub fn from_values(pepper: Option<String>, master_key: Option<String>) -> Result<Option<Self>> {
-        if let Some(p) = pepper.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
-            if p.chars().count() < 32 {
-                return Err(Error::Config("ONTO_KEY_PEPPER must have at least 32 characters".into()));
+    pub fn from_values(
+        pepper: Option<String>,
+        previous: Option<String>,
+        master_keys: [Option<String>; 2],
+    ) -> Result<Option<Self>> {
+        let some = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        let Some(p) = some(pepper) else {
+            if some(previous).is_some() {
+                return Err(Error::Config("ONTO_KEY_PEPPER_PREVIOUS is set without ONTO_KEY_PEPPER".into()));
             }
-            return Ok(Some(Pepper(p.into_bytes())));
+            return Ok(None);
+        };
+        let mut me = Self::new(pepper_value("ONTO_KEY_PEPPER", p)?);
+        if let Some(prev) = some(previous) {
+            me.previous.push(PepperKey::new(pepper_value("ONTO_KEY_PEPPER_PREVIOUS", prev)?));
         }
-        match master_key.filter(|m| !m.trim().is_empty()) {
-            Some(m) => Ok(Some(Pepper(hmac_sha256(&parse_master_key(&m)?, PEPPER_LABEL)))),
-            None => Ok(None),
+        for m in master_keys.into_iter().flatten().filter(|m| !m.trim().is_empty()) {
+            me.legacy.push(derived(&m)?);
         }
+        Ok(Some(me))
     }
 
-    /// Lowercase hex SHA-256(pepper || full key).
+    /// `<id>:<hex SHA-256(pepper || full key)>` under the current pepper.
     pub fn hash(&self, full_key: &str) -> String {
-        let mut data = self.0.clone();
-        data.extend_from_slice(full_key.as_bytes());
-        sha256_hex(&data)
+        format!("{}:{}", self.current.id, self.current.digest(full_key))
     }
 
-    /// The presented key matches the stored hash (constant time).
+    /// Does the presented key match the stored hash (constant time per
+    /// candidate pepper), and under which pepper?
+    pub fn check(&self, full_key: &str, stored_hash: &str) -> PepperMatch {
+        let eq = |k: &PepperKey, hex: &str| constant_time_eq(k.digest(full_key).as_bytes(), hex.as_bytes());
+        match stored_hash.split_once(':') {
+            Some((id, hex)) => {
+                if id == self.current.id {
+                    return if eq(&self.current, hex) { PepperMatch::Current } else { PepperMatch::No };
+                }
+                match self.previous.iter().find(|k| k.id == id) {
+                    Some(k) if eq(k, hex) => PepperMatch::Stale,
+                    _ => PepperMatch::No,
+                }
+            }
+            None => {
+                let all = std::iter::once(&self.current).chain(&self.previous).chain(&self.legacy);
+                if all.into_iter().any(|k| eq(k, stored_hash)) { PepperMatch::Stale } else { PepperMatch::No }
+            }
+        }
+    }
+
+    /// The presented key matches the stored hash.
     pub fn verify(&self, full_key: &str, stored_hash: &str) -> bool {
-        constant_time_eq(self.hash(full_key).as_bytes(), stored_hash.as_bytes())
+        self.check(full_key, stored_hash) != PepperMatch::No
     }
 }
 
@@ -308,8 +404,9 @@ mod tests {
         let b = Pepper::new(b"b".repeat(32));
         let (_, key) = generate();
         let h = a.hash(&key);
-        assert_eq!(h.len(), 64);
-        assert!(a.verify(&key, &h));
+        assert_eq!(h.len(), 8 + 1 + 64);
+        assert!(h.starts_with(&format!("{}:", a.id())));
+        assert_eq!(a.check(&key, &h), PepperMatch::Current);
         assert!(!b.verify(&key, &h), "another pepper gives another hash");
         assert!(!a.verify(&format!("{key}x"), &h));
         assert!(constant_time_eq(b"abc", b"abc"));
@@ -319,18 +416,41 @@ mod tests {
 
     #[test]
     fn pepper_sources() {
-        assert!(Pepper::from_values(None, None).unwrap().is_none());
-        assert!(Pepper::from_values(Some("short".into()), None).is_err());
-        let p = Pepper::from_values(Some("p".repeat(32)), None).unwrap().unwrap();
-        assert_eq!(p.hash("k"), sha256_hex(format!("{}k", "p".repeat(32)).as_bytes()));
-        let hex_key = "00".repeat(32);
-        let from_master = Pepper::from_values(None, Some(hex_key.clone())).unwrap().unwrap();
-        let b64_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        let same = Pepper::from_values(None, Some(b64_key)).unwrap().unwrap();
-        assert_eq!(from_master.hash("k"), same.hash("k"));
-        assert_eq!(from_master.0, hmac_sha256(&[0u8; 32], PEPPER_LABEL));
-        assert!(Pepper::from_values(None, Some("not a key".into())).is_err());
+        let none = || [None, None];
+        assert!(Pepper::from_values(None, None, none()).unwrap().is_none());
+        assert!(Pepper::from_values(Some("short".into()), None, none()).is_err());
+        assert!(Pepper::from_values(None, Some("p".repeat(32)), none()).is_err(), "a previous one needs a current one");
+        let p = Pepper::from_values(Some("p".repeat(32)), None, none()).unwrap().unwrap();
+        assert_eq!(p.hash("k"), format!("{}:{}", p.id(), sha256_hex(format!("{}k", "p".repeat(32)).as_bytes())));
+        // A master key alone no longer makes a pepper.
+        assert!(Pepper::from_values(None, None, [Some("00".repeat(32)), None]).unwrap().is_none());
+        assert!(Pepper::from_values(Some("p".repeat(32)), None, [Some("not a key".into()), None]).is_err());
         assert_eq!(format!("{p:?}"), "Pepper(****)");
+    }
+
+    #[test]
+    fn rotating_the_master_key_keeps_keys_valid() {
+        let (_, key) = generate();
+        let old_master = "00".repeat(32);
+        // A hash as earlier versions stored it: untagged, master-key derived.
+        let legacy = derived(&old_master).unwrap().digest(&key);
+        let pepper = || Some("p".repeat(32));
+        let p = Pepper::from_values(pepper(), None, [Some(old_master.clone()), None]).unwrap().unwrap();
+        assert_eq!(p.check(&key, &legacy), PepperMatch::Stale, "verified, and to be rewritten");
+        // A key hashed now does not depend on the master key at all.
+        let tagged = p.hash(&key);
+        let new_master = "11".repeat(32);
+        let rotated = Pepper::from_values(pepper(), None, [Some(new_master), Some(old_master)]).unwrap().unwrap();
+        assert_eq!(rotated.check(&key, &tagged), PepperMatch::Current);
+        let alone = Pepper::from_values(pepper(), None, [None, None]).unwrap().unwrap();
+        assert_eq!(alone.check(&key, &tagged), PepperMatch::Current, "no master key needed");
+        assert_eq!(alone.check(&key, &legacy), PepperMatch::No, "the legacy pepper is gone with its master key");
+        // Rotating the pepper: the previous one still verifies its hashes.
+        let next = Pepper::from_values(Some("q".repeat(32)), pepper(), [None, None]).unwrap().unwrap();
+        assert_eq!(next.check(&key, &tagged), PepperMatch::Stale);
+        assert_eq!(next.check(&key, &next.hash(&key)), PepperMatch::Current);
+        let forgot = Pepper::from_values(Some("q".repeat(32)), None, [None, None]).unwrap().unwrap();
+        assert_eq!(forgot.check(&key, &tagged), PepperMatch::No);
     }
 
     #[test]

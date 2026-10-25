@@ -304,7 +304,8 @@ async fn oidc_callback(State(s): State<ConsoleState>, Query(q): Query<HashMap<St
     let hub = s.hub.clone();
     let open = move |r: String| {
         let hub = hub.clone();
-        Box::pin(async move { hub.tenant(&r).await.map(|_| ()) })
+        // The schema only: a sign-up does not keep a tenant open (it opens on first use).
+        Box::pin(async move { hub.provision(&r).await })
             as std::pin::Pin<Box<dyn std::future::Future<Output = onto_intelli::Result<()>> + Send>>
     };
     found(&s.control.oidc_callback(&q, &open).await)
@@ -389,7 +390,7 @@ async fn logout(State(s): State<ConsoleState>, h: HeaderMap, b: Option<Json<Valu
             if input.everywhere {
                 s.control.store().sign_out_everywhere(&user.id, now_ms()).await?;
                 s.control.evict_user(&user.id);
-                s.control.audit(AuditEntry::new(&user.id, "auth.logout_everywhere").target(&user.id)).await;
+                s.control.audit(AuditEntry::new(&user.id, "auth.logout_everywhere").target(&user.id)).await?;
             }
             Ok(json!({ "ok": true, "everywhere": input.everywhere }))
         }
@@ -449,7 +450,7 @@ async fn org_create(State(s): State<ConsoleState>, h: HeaderMap, b: Option<Json<
                             .audit(AuditEntry::new(&user.id, "org.create").org(&org.id).target(&org.id).detail(json!({
                                 "name": org.name, "slug": org.slug,
                             })))
-                            .await;
+                            .await?;
                         return Ok(with_role(&org, OrgRole::Owner));
                     }
                     Err(Error::Conflict(m)) => last = Some(m),
@@ -493,7 +494,7 @@ async fn org_patch(
                         .target(&o.id)
                         .detail(json!({ "from": o.name, "to": name })),
                 )
-                .await;
+                .await?;
             Ok(with_role(&renamed, role))
         }
         .await,
@@ -511,7 +512,7 @@ async fn org_delete(State(s): State<ConsoleState>, h: HeaderMap, Path(org): Path
                 .audit(
                     AuditEntry::new(&user.id, "org.delete").org(&o.id).target(&o.id).detail(json!({ "slug": o.slug })),
                 )
-                .await;
+                .await?;
             Ok(json!({ "deleted": o.id }))
         }
         .await,
@@ -563,7 +564,7 @@ async fn member_patch(
                         .target(&member)
                         .detail(json!({ "from": current, "to": input.role })),
                 )
-                .await;
+                .await?;
             Ok(json!({ "user_id": member, "role": input.role }))
         }
         .await,
@@ -599,7 +600,7 @@ async fn member_delete(
                         .target(&member)
                         .detail(json!({ "role": current })),
                 )
-                .await;
+                .await?;
             Ok(json!({ "removed": member }))
         }
         .await,
@@ -658,7 +659,7 @@ async fn invitation_create(
                         .target(&inv.id)
                         .detail(json!({ "email": inv.email, "role": inv.role })),
                 )
-                .await;
+                .await?;
             let base = s.control.config().public_url.trim_end_matches('/');
             Ok(json!({ "invitation": inv, "link": format!("{base}/ui/#/invite?code={code}") }))
         }
@@ -676,7 +677,7 @@ async fn invitation_revoke(
             let user = s.user(&h).await?;
             let (o, _) = s.org(&user, &org, OrgRole::Admin).await?;
             s.control.store().revoke_invitation(&o.id, &id).await?;
-            s.control.audit(AuditEntry::new(&user.id, "invitation.revoke").org(&o.id).target(&id)).await;
+            s.control.audit(AuditEntry::new(&user.id, "invitation.revoke").org(&o.id).target(&id)).await?;
             Ok(json!({ "revoked": id }))
         }
         .await,
@@ -768,7 +769,7 @@ async fn project_create(
                     .target(&project.r#ref)
                     .detail(json!({ "name": project.name, "seed": input.seed })),
             )
-            .await;
+            .await?;
         let mut out = with_role(&project, role);
         out["seeded"] = seeded;
         Ok(out)
@@ -817,7 +818,7 @@ async fn project_patch(
             let updated = s.control.store().update_project(&r, input, &user.id).await?;
             s.control
                 .audit(AuditEntry::new(&user.id, "project.update").project(&p).target(&p.r#ref).detail(detail))
-                .await;
+                .await?;
             if updated.settings_version != p.settings_version {
                 s.refresh(&updated).await;
             }
@@ -856,7 +857,7 @@ async fn project_delete(
                         .target(&p.r#ref)
                         .detail(json!({ "name": p.name })),
                 )
-                .await;
+                .await?;
             // Evict the tenant and drop its schema with everything in it.
             s.hub.drop_tenant(&p.r#ref)?;
             Ok(json!({ "deleted": p.r#ref }))

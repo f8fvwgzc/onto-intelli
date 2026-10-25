@@ -2,7 +2,12 @@
 //! PostgreSQL schema, or an in-memory store) with its own schema
 //! versions, proposals, memory and caches. The LLM provider is the server's
 //! unless [`TenantHooks`] (the control plane) give a tenant its own, with
-//! its limits and usage meter. Tenants open on first use and stay open.
+//! its limits and usage meter. Tenants open on first use. PostgreSQL
+//! tenants close again when idle (`engine.tenant_idle_secs`), when more than
+//! `engine.max_open_tenants` are open, or while the open ones' estimated
+//! memory is above `engine.tenant_memory_budget_mb` (least recently used
+//! first); the next request opens them again. In-memory tenants stay open:
+//! their data lives only there.
 //!
 //! An application with workspaces maps each workspace to a tenant and passes
 //! the caller's principal on every call:
@@ -18,13 +23,16 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::OnceCell;
 
 use onto_core::store::{MemoryStore, Store};
+use onto_core::time::now_ms;
 use onto_core::{Error, Result};
 
 use crate::config::Config;
@@ -72,13 +80,39 @@ enum Backend {
     Fixed,
 }
 
+/// An open (or opening) tenant and when it was last used.
+struct Slot {
+    cell: OnceCell<Arc<Intelli>>,
+    last_used: AtomicI64,
+}
+
+impl Slot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { cell: OnceCell::new(), last_used: AtomicI64::new(now_ms()) })
+    }
+}
+
+/// One open tenant, as `GET /v1/admin/tenants` reports it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TenantStat {
+    pub tenant: String,
+    /// [`Ontology::estimated_bytes`](onto_core::Ontology::estimated_bytes).
+    pub estimated_bytes: u64,
+    pub entities: usize,
+    pub links: usize,
+    /// Milliseconds since the last request.
+    pub idle_ms: i64,
+}
+
 pub struct Hub {
     config: Config,
     llm: Arc<dyn LlmProvider>,
     backend: Backend,
     default_tenant: String,
-    tenants: Mutex<HashMap<String, Arc<OnceCell<Arc<Intelli>>>>>,
+    tenants: Mutex<HashMap<String, Arc<Slot>>>,
     hooks: RwLock<Option<Arc<dyn TenantHooks>>>,
+    me: Weak<Hub>,
+    sweeping: AtomicBool,
 }
 
 /// `[A-Za-z0-9_.-]`, 1–128 characters.
@@ -115,25 +149,30 @@ impl Hub {
     pub fn single(intelli: Arc<Intelli>) -> Arc<Hub> {
         let config = intelli.config().clone();
         let tenant = default_tenant(&config);
-        let cell = Arc::new(OnceCell::new_with(Some(intelli.clone())));
-        Arc::new(Hub {
+        let slot =
+            Arc::new(Slot { cell: OnceCell::new_with(Some(intelli.clone())), last_used: AtomicI64::new(now_ms()) });
+        Arc::new_cyclic(|me| Hub {
             llm: intelli.llm(),
             backend: Backend::Fixed,
             default_tenant: tenant.clone(),
-            tenants: Mutex::new(HashMap::from([(tenant, cell)])),
+            tenants: Mutex::new(HashMap::from([(tenant, slot)])),
             hooks: RwLock::new(None),
             config,
+            me: me.clone(),
+            sweeping: AtomicBool::new(false),
         })
     }
 
     fn with_backend(config: Config, llm: Arc<dyn LlmProvider>, backend: Backend) -> Arc<Hub> {
-        Arc::new(Hub {
+        Arc::new_cyclic(|me| Hub {
             default_tenant: default_tenant(&config),
             tenants: Mutex::new(HashMap::new()),
             hooks: RwLock::new(None),
             config,
             llm,
             backend,
+            me: me.clone(),
+            sweeping: AtomicBool::new(false),
         })
     }
 
@@ -153,7 +192,7 @@ impl Hub {
     /// limits, meter). Returns whether the tenant was open; a tenant that is
     /// not open gets its settings when it opens.
     pub async fn refresh_tenant(&self, tenant: &str) -> Result<bool> {
-        let open = self.tenants.lock().get(tenant).and_then(|c| c.get().cloned());
+        let open = self.tenants.lock().get(tenant).and_then(|c| c.cell.get().cloned());
         let Some(intelli) = open else { return Ok(false) };
         let settings = self.settings_of(tenant).await?;
         self.apply(&intelli, settings);
@@ -197,8 +236,181 @@ impl Hub {
             return Err(Error::invalid(format!("invalid tenant id '{id}' (letters, digits, '_', '-', '.')")));
         }
         self.check_reserved(id)?;
-        let cell = self.tenants.lock().entry(id.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
-        cell.get_or_try_init(|| self.open_tenant(id)).await.cloned()
+        let slot = self.tenants.lock().entry(id.to_string()).or_insert_with(Slot::new).clone();
+        slot.last_used.store(now_ms(), Ordering::Relaxed);
+        let opened = !slot.cell.initialized();
+        let intelli = slot.cell.get_or_try_init(|| self.open_tenant(id)).await.cloned();
+        if intelli.is_err() {
+            // A failed open is not remembered: the next request tries again.
+            let mut tenants = self.tenants.lock();
+            if tenants.get(id).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
+                tenants.remove(id);
+            }
+        } else if opened && self.evicts() {
+            self.enforce_limits(Some(id), now_ms());
+            self.start_sweeper();
+        }
+        intelli
+    }
+
+    /// Create a tenant's storage (its PostgreSQL schema and migrations)
+    /// without opening it: nothing stays in memory, and nothing listens. New
+    /// sign-ups get their first project this way; it opens on first use.
+    pub async fn provision(&self, id: &str) -> Result<()> {
+        if !valid_tenant(id) {
+            return Err(Error::invalid(format!("invalid tenant id '{id}' (letters, digits, '_', '-', '.')")));
+        }
+        self.check_reserved(id)?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(shared) => {
+                let (shared, id) = (shared.clone(), id.to_string());
+                let opts = pg_options(&self.config);
+                tokio::task::spawn_blocking(move || shared.tenant(&id, opts).map(drop))
+                    .await
+                    .map_err(|e| Error::Other(format!("provisioning a tenant: {e}")))?
+            }
+            Backend::Memory => Ok(()),
+            Backend::Fixed => Err(Error::not_found(format!("tenant {id} (this hub serves one ontology)"))),
+        }
+    }
+
+    /// Only PostgreSQL tenants close when idle or over the limits: an
+    /// in-memory tenant's data would go with it.
+    fn evicts(&self) -> bool {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Close idle tenants, then the least recently used ones while more than
+    /// `max_open_tenants` are open or their estimated memory is over the
+    /// budget. `keep` (the tenant just opened) and the most recently used
+    /// tenant stay, whatever the budget. Returns those closed.
+    pub fn enforce_limits(&self, keep: Option<&str>, now: i64) -> Vec<String> {
+        if !self.evicts() {
+            return Vec::new();
+        }
+        let e = &self.config.engine;
+        let idle_ms = (e.tenant_idle_secs as i64).saturating_mul(1000);
+        let budget = e.tenant_memory_budget_mb.saturating_mul(1 << 20);
+        let mut open: Vec<(String, i64, Arc<Intelli>)> = self
+            .tenants
+            .lock()
+            .iter()
+            .filter_map(|(k, s)| s.cell.get().map(|i| (k.clone(), s.last_used.load(Ordering::Relaxed), i.clone())))
+            .collect();
+        // Oldest first.
+        open.sort_by_key(|(k, used, _)| (*used, k.clone()));
+        let mut bytes: u64 =
+            if budget > 0 { open.iter().map(|(_, _, i)| i.ontology().estimated_bytes()).sum() } else { 0 };
+        let mut count = open.len();
+        let newest = open.last().map(|(k, _, _)| k.clone());
+        let mut closed = Vec::new();
+        for (id, used, intelli) in &open {
+            if Some(id.as_str()) == keep {
+                continue;
+            }
+            let idle = idle_ms > 0 && now - used >= idle_ms;
+            if !idle && Some(id) == newest.as_ref() {
+                continue;
+            }
+            let over_count = e.max_open_tenants > 0 && count > e.max_open_tenants;
+            let over_budget = budget > 0 && bytes > budget;
+            if !(idle || over_count || over_budget) {
+                continue;
+            }
+            if self.close_if_unused_since(id, *used) {
+                count -= 1;
+                if budget > 0 {
+                    bytes = bytes.saturating_sub(intelli.ontology().estimated_bytes());
+                }
+                closed.push(id.clone());
+            }
+        }
+        if !closed.is_empty() {
+            tracing::info!(closed = closed.len(), open = count, "closed tenants (idle or over engine limits)");
+        }
+        closed
+    }
+
+    /// Forget a tenant unless a request used it after `used`.
+    fn close_if_unused_since(&self, id: &str, used: i64) -> bool {
+        let mut tenants = self.tenants.lock();
+        match tenants.get(id) {
+            Some(s) if s.last_used.load(Ordering::Relaxed) <= used && s.cell.initialized() => {
+                tenants.remove(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Close idle tenants every minute (or a quarter of the idle time).
+    fn start_sweeper(&self) {
+        if self.config.engine.tenant_idle_secs == 0 || self.sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.sweeping.store(false, Ordering::Release);
+            return;
+        };
+        let every = Duration::from_secs((self.config.engine.tenant_idle_secs / 4).clamp(1, 60));
+        let me = self.me.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(hub) = me.upgrade() else { break };
+                hub.enforce_limits(None, now_ms());
+            }
+        });
+    }
+
+    /// The backend answers: one query on PostgreSQL. For readiness probes.
+    pub async fn ready(&self) -> Result<()> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(shared) => {
+                let shared = shared.clone();
+                tokio::task::spawn_blocking(move || shared.ping())
+                    .await
+                    .map_err(|e| Error::Other(format!("readiness: {e}")))?
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Stores listening for other processes' commits on the pool's one
+    /// LISTEN connection (`None` without PostgreSQL).
+    pub fn listening_stores(&self) -> Option<usize> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(shared) => Some(shared.listening_stores()),
+            _ => None,
+        }
+    }
+
+    /// The open tenants with their estimated memory, largest first.
+    pub fn tenant_stats(&self) -> Vec<TenantStat> {
+        let now = now_ms();
+        let open: Vec<(String, i64, Arc<Intelli>)> = self
+            .tenants
+            .lock()
+            .iter()
+            .filter_map(|(k, s)| s.cell.get().map(|i| (k.clone(), s.last_used.load(Ordering::Relaxed), i.clone())))
+            .collect();
+        let mut out: Vec<TenantStat> = open
+            .into_iter()
+            .map(|(tenant, used, i)| {
+                let onto = i.ontology();
+                let (entities, links) = onto.counts();
+                TenantStat { tenant, estimated_bytes: onto.estimated_bytes(), entities, links, idle_ms: now - used }
+            })
+            .collect();
+        out.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes).then_with(|| a.tenant.cmp(&b.tenant)));
+        out
     }
 
     /// The default tenant, or the requested one when the hub is multi-tenant.
@@ -254,7 +466,7 @@ impl Hub {
     /// Tenants opened in this process.
     pub fn open_tenants(&self) -> Vec<String> {
         let mut v: Vec<String> =
-            self.tenants.lock().iter().filter(|(_, c)| c.initialized()).map(|(k, _)| k.clone()).collect();
+            self.tenants.lock().iter().filter(|(_, c)| c.cell.initialized()).map(|(k, _)| k.clone()).collect();
         v.sort();
         v
     }
