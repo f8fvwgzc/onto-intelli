@@ -387,7 +387,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
         if (d.held === undefined) {
           // Drag start: the node follows the pointer, and the warmed layout lets
           // its links and charge pull the neighbours along and spread them out.
-          // This animates even when the layout does not: the motion is the user's own.
+          // This, and the easing to rest after the drop, animates even when the
+          // layout does not: the motion is the user's own.
           d.held = p.fx != null;
           fitted.current = true;
           s.alphaTarget(0.3).alpha(Math.max(s.alpha(), 0.3)).restart();
@@ -403,7 +404,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     }
   };
 
-  /** Drag end: the layout cools, and the node rejoins it unless it stays pinned. */
+  /** Drag end: the node rejoins the layout unless it stays pinned, and the layout eases to rest. */
   const release = (id: string, keep: boolean) => {
     const s = sim.current;
     const p = positions.current.get(id);
@@ -416,7 +417,6 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(funct
     }
     markPinned(id, keep);
     s.alphaTarget(0);
-    if (!animates(physicsRef.current)) settleNow(s, 0, 120);
   };
 
   // Taps select; a second tap on the same node expands it (pointer capture

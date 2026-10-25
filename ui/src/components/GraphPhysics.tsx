@@ -23,7 +23,7 @@ export const DEFAULT_PHYSICS: Physics = { follow: 0.5, distance: 70, repulsion: 
 
 const reduceMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
-/** Whether the layout animates as it settles. Without it, it settles in one step; a drag moves nodes either way. */
+/** Whether the layout animates as it settles. Without it, it settles in one step; a drag, and the easing to rest after it, moves nodes either way. */
 export const animates = (p: Physics) => p.animate ?? !reduceMotion();
 
 const pct = (v: number) => `${Math.round(v * 100)}%`;
@@ -159,7 +159,7 @@ export function PhysicsSettings({ value, onChange, pinned, onUnpinAll }: { value
             <Checkbox label="Animate the layout" checked={animates(value)} onChange={(animate) => onChange({ ...value, animate })} />
             <p className="mt-0.5 text-xs text-ink-3">
               {reduceMotion() ? "Off by default because your system asks for reduced motion. " : ""}
-              When off, the map settles in one step as you let go.
+              When off, the map settles in one step as it loads or changes. A dragged node still pulls its neighbours along, and they ease to rest as you let go.
             </p>
           </div>
           <p className="mt-3 text-xs text-ink-3">Hold Shift as you drop a node to pin it there; Shift-click or P toggles a pin.</p>
