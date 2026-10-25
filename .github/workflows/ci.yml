@@ -38,6 +38,9 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgres://onto:onto@localhost:5432/onto
+      # Full debug info in every test binary fills the runner's disk (the
+      # linker dies with SIGBUS); line tables keep backtraces readable.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,7 +62,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked
+      # Every test binary runs, so one failure does not hide the rest.
+      - run: cargo test --workspace --locked --no-fail-fast
 
   ui:
     runs-on: ubuntu-latest

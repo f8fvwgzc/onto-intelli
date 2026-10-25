@@ -1129,8 +1129,22 @@ fn failure_exit_code(command: &Command) -> i32 {
     if verdict { assure::EXIT_FAILED } else { 1 }
 }
 
-#[tokio::main]
-async fn main() {
+/// Windows gives the main thread 1 MiB of stack (Linux and macOS 8 MiB), and
+/// clap's parser for the whole command tree overflows it in a debug build,
+/// so the command runs on a thread of its own with 8 MiB.
+fn main() {
+    let main = std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(8 << 20)
+        .spawn(|| tokio::runtime::Runtime::new().expect("starting the tokio runtime").block_on(cli_main()))
+        .expect("starting the main thread");
+    if main.join().is_err() {
+        // The panic message is printed; exit as a panicking main would.
+        std::process::exit(101);
+    }
+}
+
+async fn cli_main() {
     quiet_broken_pipe();
     let cli = Cli::parse();
     let level = if matches!(cli.command, Command::Serve { .. }) { "info" } else { "warn" };
@@ -1157,7 +1171,9 @@ fn quiet_broken_pipe() {
             .map(String::as_str)
             .or_else(|| info.payload().downcast_ref::<&str>().copied())
             .unwrap_or_default();
-        if msg.contains("failed printing to stdout") && msg.contains("Broken pipe") {
+        // "Broken pipe" on Unix; Windows says ERROR_NO_DATA (232) or ERROR_BROKEN_PIPE (109).
+        let closed = ["Broken pipe", "(os error 232)", "(os error 109)"].iter().any(|m| msg.contains(m));
+        if msg.contains("failed printing to stdout") && closed {
             // 128 + SIGPIPE, what a shell reports for a process the signal ends.
             std::process::exit(141);
         }
