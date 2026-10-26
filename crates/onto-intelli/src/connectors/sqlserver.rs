@@ -65,9 +65,13 @@ pub fn quote_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
 }
 
-/// The value of the first of `names` that the URL sets.
-fn param<'a>(t: &'a Target, names: &[&'a str]) -> Option<(&'a str, &'a str)> {
-    names.iter().find_map(|n| t.params.get(*n).map(|v| (*n, v.trim())))
+/// The value of the first of `names` that the URL sets, in any case
+/// (`Encrypt`, `TrustServerCertificate`), with the name as written.
+fn param<'a>(t: &'a Target, names: &[&str]) -> Option<(&'a str, &'a str)> {
+    names
+        .iter()
+        .find_map(|n| t.params.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)))
+        .map(|(k, v)| (k.as_str(), v.trim()))
 }
 
 /// `encrypt`: absent, `true`, `yes`, `1`, `on`, `mandatory` or `required`
@@ -94,39 +98,119 @@ fn flag(t: &Target, names: &[&str]) -> Result<Option<bool>> {
     }
 }
 
+/// What a SELECT permission covers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Scope {
+    /// The whole database (class 0).
+    Database,
+    /// Every table of a schema (class 3).
+    Schema(String),
+    /// One table (class 1), or some of its columns.
+    Table { schema: String, table: String, columns_only: bool },
+}
+
 /// One SELECT permission from `sys.database_permissions`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectPermission {
     pub grantee: String,
-    pub schema: String,
-    pub table: String,
-    /// On some columns only (`minor_id <> 0`), not the table.
-    pub columns_only: bool,
-    /// `DENY` (state `D`), not `GRANT`.
+    pub scope: Scope,
+    /// `DENY`, not `GRANT`.
     pub deny: bool,
 }
 
-/// Who reads each table: the grantees of a table-level GRANT, less every
-/// grantee with a DENY (on the table or any of its columns: that grantee
-/// cannot read the whole table). A column grant is not a table grant. A
-/// DENY to `public` reaches every user, so the table has no readers.
-pub fn table_readers(perms: &[SelectPermission]) -> BTreeMap<(String, String), Vec<String>> {
-    let mut granted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    let mut denied: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    for p in perms {
-        let key = (p.schema.clone(), p.table.clone());
-        if p.deny {
-            denied.entry(key).or_default().push(p.grantee.clone());
-        } else if !p.columns_only {
-            granted.entry(key).or_default().push(p.grantee.clone());
+impl SelectPermission {
+    /// From the row's raw values, failing closed: a state other than `G` or
+    /// `W` is a DENY; a DENY whose grantee or class cannot be read is a DENY
+    /// to `public` on the database; a GRANT that cannot be read whole is
+    /// dropped, and one whose column part cannot be read covers columns only.
+    pub fn read(
+        grantee: &str,
+        class: Option<i64>,
+        schema: &str,
+        table: &str,
+        minor_id: Option<i64>,
+        state: &str,
+    ) -> Option<Self> {
+        let deny = !matches!(state.trim(), "G" | "W");
+        let scope = match class {
+            Some(0) => Some(Scope::Database),
+            Some(3) if !schema.is_empty() => Some(Scope::Schema(schema.to_string())),
+            Some(1) if !schema.is_empty() && !table.is_empty() => Some(Scope::Table {
+                schema: schema.to_string(),
+                table: table.to_string(),
+                columns_only: minor_id != Some(0),
+            }),
+            _ => None,
+        };
+        match (scope, deny) {
+            (Some(scope), _) if !grantee.is_empty() => Some(Self { grantee: grantee.to_string(), scope, deny }),
+            (_, true) => Some(Self { grantee: "public".into(), scope: Scope::Database, deny }),
+            (_, false) => None,
         }
     }
-    for (key, readers) in granted.iter_mut() {
-        let no = denied.get(key).map(Vec::as_slice).unwrap_or_default();
-        if no.iter().any(|g| g == "public") {
-            readers.clear();
+
+    fn covers(&self, schema: &str, table: &str) -> bool {
+        match &self.scope {
+            Scope::Database => true,
+            Scope::Schema(s) => s == schema,
+            Scope::Table { schema: s, table: t, .. } => s == schema && t == table,
         }
-        readers.retain(|g| !no.contains(g));
+    }
+}
+
+/// Who reads each table that has table-level GRANTs. `members` are
+/// `(role, member)` pairs from `sys.database_role_members`.
+///
+/// A DENY (on the table, any of its columns, its schema or the database,
+/// and membership in `db_denydatareader`) wins for the denied principal and
+/// everyone in it, through nested roles. The ACL can only list readers, so
+/// it fails closed: once anyone is denied, `public` is no reader (it would
+/// let the denied in), nor is a granted role that holds a denied principal;
+/// a DENY to `public` leaves no reader at all. A column grant is not a table
+/// grant; grants on a schema or the database are not read (fewer readers).
+pub fn table_readers(
+    perms: &[SelectPermission],
+    members: &[(String, String)],
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut deny_all: Vec<SelectPermission> = perms.iter().filter(|p| p.deny).cloned().collect();
+    if members.iter().any(|(role, _)| role == "db_denydatareader") {
+        deny_all.push(SelectPermission { grantee: "db_denydatareader".into(), scope: Scope::Database, deny: true });
+    }
+    // Everyone in `p`, `p` included, through nested roles.
+    let within = |p: &str| -> Vec<String> {
+        let mut seen = vec![p.to_string()];
+        let mut i = 0;
+        while i < seen.len() {
+            for (role, member) in members {
+                if *role == seen[i] && !seen.contains(member) {
+                    seen.push(member.clone());
+                }
+            }
+            i += 1;
+        }
+        seen
+    };
+    let mut granted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for p in perms.iter().filter(|p| !p.deny) {
+        if let Scope::Table { schema, table, columns_only: false } = &p.scope {
+            granted.entry((schema.clone(), table.clone())).or_default().push(p.grantee.clone());
+        }
+    }
+    for ((schema, table), readers) in granted.iter_mut() {
+        let denied: Vec<&str> =
+            deny_all.iter().filter(|d| d.covers(schema, table)).map(|d| d.grantee.as_str()).collect();
+        if denied.is_empty() {
+            readers.sort();
+            readers.dedup();
+            continue;
+        }
+        if denied.contains(&"public") {
+            readers.clear();
+            continue;
+        }
+        // Everyone a DENY reaches.
+        let blocked: Vec<String> = denied.iter().flat_map(|d| within(d)).collect();
+        readers.retain(|g| g != "public" && !within(g).iter().any(|m| blocked.contains(m)));
         readers.sort();
         readers.dedup();
     }
@@ -238,18 +322,42 @@ fn s(r: &tiberius::Row, i: usize) -> String {
 }
 
 fn int(r: &tiberius::Row, i: usize) -> i64 {
+    int_opt(r, i).unwrap_or(0)
+}
+
+/// A `bit` column; a value that is not one fails the crawl rather than
+/// reading as `false`.
+fn bit(r: &tiberius::Row, i: usize) -> Result<bool> {
+    r.try_get::<bool, _>(i)
+        .ok()
+        .flatten()
+        .ok_or_else(|| Error::Unavailable(format!("sqlserver: column {i} is not a bit")))
+}
+
+/// An integer column, or `None` when it is NULL or not an integer.
+fn int_opt(r: &tiberius::Row, i: usize) -> Option<i64> {
     r.try_get::<i64, _>(i)
         .ok()
         .flatten()
         .or_else(|| r.try_get::<i32, _>(i).ok().flatten().map(i64::from))
         .or_else(|| r.try_get::<i16, _>(i).ok().flatten().map(i64::from))
         .or_else(|| r.try_get::<u8, _>(i).ok().flatten().map(i64::from))
-        .unwrap_or(0)
 }
 
-fn bit(r: &tiberius::Row, i: usize) -> bool {
-    r.try_get::<bool, _>(i).ok().flatten().unwrap_or(false)
-}
+/// Every SELECT permission on the database (class 0), a schema (3) or an
+/// object or its columns (1): grantee, class, schema, object, column id, state.
+pub const GRANTS_SQL: &str = "SELECT pr.name, p.class, COALESCE(os.name, ps.name), o.name, p.minor_id, p.state \
+     FROM sys.database_permissions p \
+     JOIN sys.database_principals pr ON pr.principal_id = p.grantee_principal_id \
+     LEFT JOIN sys.objects o ON p.class = 1 AND o.object_id = p.major_id \
+     LEFT JOIN sys.schemas os ON os.schema_id = o.schema_id \
+     LEFT JOIN sys.schemas ps ON p.class = 3 AND ps.schema_id = p.major_id \
+     WHERE p.permission_name = 'SELECT' AND p.class IN (0, 1, 3)";
+
+/// Role membership: (role, member).
+pub const MEMBERS_SQL: &str = "SELECT r.name, m.name FROM sys.database_role_members rm \
+     JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
+     JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id";
 
 const TYPE_NAME: &str = "CASE \
     WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') \
@@ -345,26 +453,16 @@ impl Connector for SqlServerConnector {
         .await?;
         let mut readers: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         if spec.map_grants {
-            let grants = rows_of(
-                &mut c,
-                "SELECT pr.name, s.name, o.name, CAST(CASE WHEN p.minor_id = 0 THEN 0 ELSE 1 END AS bit), \
-                 CAST(CASE WHEN p.state = 'D' THEN 1 ELSE 0 END AS bit) FROM sys.database_permissions p \
-                 JOIN sys.database_principals pr ON pr.principal_id = p.grantee_principal_id \
-                 JOIN sys.objects o ON o.object_id = p.major_id JOIN sys.schemas s ON s.schema_id = o.schema_id \
-                 WHERE p.class = 1 AND p.permission_name = 'SELECT' AND p.state IN ('G', 'W', 'D')",
-            )
-            .await?;
+            let grants = rows_of(&mut c, GRANTS_SQL).await?;
             let perms: Vec<SelectPermission> = grants
                 .iter()
-                .map(|r| SelectPermission {
-                    grantee: s(r, 0),
-                    schema: s(r, 1),
-                    table: s(r, 2),
-                    columns_only: bit(r, 3),
-                    deny: bit(r, 4),
+                .filter_map(|r| {
+                    SelectPermission::read(&s(r, 0), int_opt(r, 1), &s(r, 2), &s(r, 3), int_opt(r, 4), &s(r, 5))
                 })
                 .collect();
-            readers = table_readers(&perms);
+            let members: Vec<(String, String)> =
+                rows_of(&mut c, MEMBERS_SQL).await?.iter().map(|r| (s(r, 0), s(r, 1))).collect();
+            readers = table_readers(&perms, &members);
         }
         let mut by_table: BTreeMap<(String, String), Vec<ColumnInfo>> = BTreeMap::new();
         for r in &columns {
@@ -372,11 +470,11 @@ impl Connector for SqlServerConnector {
                 enum_values: allowed.remove(&(s(r, 0), s(r, 1), s(r, 2))).unwrap_or_default(),
                 name: s(r, 2),
                 data_type: s(r, 3),
-                nullable: bit(r, 4),
+                nullable: bit(r, 4)?,
                 position: int(r, 5),
                 comment: s(r, 6),
-                primary_key: bit(r, 7),
-                unique: bit(r, 8),
+                primary_key: bit(r, 7)?,
+                unique: bit(r, 8)?,
             });
         }
         let relations: Vec<RelationInfo> = objects
@@ -508,32 +606,98 @@ mod tests {
         assert_eq!(flag(&target("trust_server_certificate=yes"), &trust).unwrap(), Some(true));
         assert_eq!(flag(&target(""), &trust).unwrap(), None);
         assert!(flag(&target("trust_server_certificate=si"), &trust).is_err());
+        // ADO.NET spelling: read, not silently ignored.
+        assert!(encryption(&target("Encrypt=strict")).is_err());
+        assert_eq!(flag(&target("TrustServerCertificate=true"), &trust).unwrap(), Some(true));
+    }
+
+    fn on(grantee: &str, table: &str) -> SelectPermission {
+        let scope = Scope::Table { schema: "dbo".into(), table: table.into(), columns_only: false };
+        SelectPermission { grantee: grantee.into(), scope, deny: false }
+    }
+
+    fn deny(mut p: SelectPermission) -> SelectPermission {
+        p.deny = true;
+        p
+    }
+
+    fn columns(mut p: SelectPermission) -> SelectPermission {
+        if let Scope::Table { columns_only, .. } = &mut p.scope {
+            *columns_only = true;
+        }
+        p
+    }
+
+    fn readers_of(perms: &[SelectPermission], members: &[(&str, &str)], table: &str) -> Vec<String> {
+        let members: Vec<(String, String)> = members.iter().map(|(r, m)| (r.to_string(), m.to_string())).collect();
+        table_readers(perms, &members).get(&("dbo".to_string(), table.to_string())).cloned().unwrap_or_default()
     }
 
     #[test]
-    fn only_table_grants_make_readers_and_a_deny_wins() {
-        let p = |grantee: &str, table: &str, columns_only: bool, deny: bool| SelectPermission {
-            grantee: grantee.into(),
-            schema: "dbo".into(),
-            table: table.into(),
-            columns_only,
-            deny,
-        };
-        let readers = table_readers(&[
-            // GRANT SELECT (id) ON dbo.patients TO public: one column, not the table.
-            p("public", "patients", true, false),
-            p("analysts", "orders", false, false),
-            p("public", "orders", false, false),
-            p("ops", "orders", false, false),
-            p("ops", "orders", true, true),
-            // DENY SELECT ON dbo.salaries TO public next to a GRANT to a role.
-            p("hr", "salaries", false, false),
-            p("public", "salaries", false, true),
-        ]);
-        let of = |t: &str| readers.get(&("dbo".to_string(), t.to_string())).cloned().unwrap_or_default();
-        assert!(of("patients").is_empty(), "a column grant to public is no table grant");
-        assert_eq!(of("orders"), vec!["analysts", "public"], "ops has a DENY on a column");
-        assert!(of("salaries").is_empty(), "a DENY to public reaches everyone");
+    fn only_table_grants_make_readers_and_any_deny_closes_public() {
+        // GRANT SELECT (id) ON dbo.patients TO public: one column, not the table.
+        assert!(readers_of(&[columns(on("public", "patients"))], &[], "patients").is_empty());
+        let open = [on("public", "orders"), on("analysts", "orders")];
+        assert_eq!(readers_of(&open, &[], "orders"), vec!["analysts", "public"]);
+        // GRANT SELECT ON dbo.orders TO public; DENY SELECT (total) ON dbo.orders TO ops:
+        // SQL Server blocks ops, so public cannot stand for "everyone".
+        let ops =
+            [on("public", "orders"), on("analysts", "orders"), on("ops", "orders"), deny(columns(on("ops", "orders")))];
+        assert_eq!(readers_of(&ops, &[], "orders"), vec!["analysts"]);
+        // GRANT SELECT ON dbo.salaries TO public; DENY SELECT ON dbo.salaries TO contractors.
+        let salaries = [on("public", "salaries"), deny(on("contractors", "salaries"))];
+        assert!(readers_of(&salaries, &[], "salaries").is_empty(), "nobody but public was granted");
+        // A DENY to public reaches everyone.
+        assert!(readers_of(&[on("hr", "salaries"), deny(on("public", "salaries"))], &[], "salaries").is_empty());
+    }
+
+    #[test]
+    fn a_deny_wins_through_roles_schemas_and_the_database() {
+        let members =
+            [("contractors", "eve"), ("staff", "eve"), ("staff", "bob"), ("team", "staff"), ("finance", "ann")];
+        let perms = [
+            on("eve", "orders"),
+            on("bob", "orders"),
+            on("staff", "orders"),
+            on("team", "orders"),
+            on("finance", "orders"),
+            deny(on("contractors", "orders")),
+        ];
+        // eve is a contractor; staff, and team through staff, hold eve.
+        assert_eq!(readers_of(&perms, &members, "orders"), vec!["bob", "finance"]);
+        // DENY SELECT ON SCHEMA::dbo TO contractors reaches every table of dbo.
+        let schema = SelectPermission { grantee: "contractors".into(), scope: Scope::Schema("dbo".into()), deny: true };
+        let perms = [on("public", "orders"), on("eve", "orders"), on("bob", "orders"), schema.clone()];
+        assert_eq!(readers_of(&perms, &members, "orders"), vec!["bob"]);
+        let other = SelectPermission { grantee: "contractors".into(), scope: Scope::Schema("hr".into()), deny: true };
+        assert_eq!(readers_of(&[on("public", "orders"), other], &members, "orders"), vec!["public"]);
+        // DENY SELECT TO auditors (the database), and db_denydatareader.
+        let db = SelectPermission { grantee: "auditors".into(), scope: Scope::Database, deny: true };
+        assert_eq!(readers_of(&[on("public", "orders"), on("bob", "orders"), db], &[], "orders"), vec!["bob"]);
+        let reader = [("db_denydatareader", "bob")];
+        assert_eq!(
+            readers_of(&[on("public", "orders"), on("bob", "orders"), on("ann", "orders")], &reader, "orders"),
+            vec!["ann"]
+        );
+    }
+
+    #[test]
+    fn permissions_that_cannot_be_read_fail_closed() {
+        let table = |columns_only| Scope::Table { schema: "dbo".into(), table: "t".into(), columns_only };
+        let read = SelectPermission::read;
+        assert_eq!(read("bob", Some(1), "dbo", "t", Some(0), "G").unwrap().scope, table(false));
+        assert_eq!(
+            read("bob", Some(1), "dbo", "t", None, "G").unwrap().scope,
+            table(true),
+            "no column id: columns only"
+        );
+        assert!(read("bob", Some(1), "dbo", "t", Some(0), "").unwrap().deny, "an unreadable state is a DENY");
+        assert!(read("bob", Some(1), "dbo", "t", Some(0), "X").unwrap().deny);
+        assert_eq!(read("bob", None, "", "", None, "G"), None, "an unreadable GRANT is dropped");
+        let everyone = SelectPermission { grantee: "public".into(), scope: Scope::Database, deny: true };
+        assert_eq!(read("", Some(1), "dbo", "t", Some(0), "D"), Some(everyone.clone()), "a DENY to someone unknown");
+        assert_eq!(read("bob", Some(7), "", "", Some(0), "D"), Some(everyone), "a DENY on something unknown");
+        assert_eq!(read("bob", Some(3), "hr", "", Some(0), "D").unwrap().scope, Scope::Schema("hr".into()));
     }
 
     #[test]

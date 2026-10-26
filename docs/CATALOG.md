@@ -142,10 +142,14 @@ certificates are checked against it. MongoDB always connects directly to that on
 SQL Server: `encrypt` is `true` by default (everything encrypted, failing without TLS); `true`,
 `yes`, `1`, `on`, `mandatory` or `required` keep that, `false`, `no`, `0`, `off` or `optional`
 encrypt the login only, and any other value (`strict` too: TDS 8.0 is not supported yet) is
-refused rather than read as off. `trust_server_certificate` takes `true` or `false` alike. With
-`map_grants`, only a table-level `GRANT SELECT` makes a reader: a column grant does not, and a
-`DENY` to a principal (on the table or a column) removes it. A `DENY` to `public` leaves the table
-with no readers.
+refused rather than read as off. `trust_server_certificate` takes `true` or `false` alike; both
+names are read in any case (`Encrypt`, `TrustServerCertificate`). With `map_grants`, only a
+table-level `GRANT SELECT` makes a reader: a column grant does not, nor (fewer readers, never
+more) a grant on a schema or the database. A `DENY` wins: on the table, a column, its schema or
+the database, or membership in `db_denydatareader`, it blocks the denied principal and everyone in
+it through nested roles. As the ACL only lists readers, it fails closed: once anyone is denied,
+`public` is no reader and neither is a granted role that holds a denied principal. A `DENY` to
+`public` leaves no reader. A permission row that cannot be read counts as a `DENY`.
 
 Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
 CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers

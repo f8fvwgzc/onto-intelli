@@ -143,11 +143,13 @@ async fn mysql_and_mariadb_metadata_feed_the_builder() {
 }
 
 #[cfg(feature = "sqlserver")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sql_server_metadata_feeds_the_builder() {
+type SqlServer = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+/// A SQL Server session on `database`, as the test's admin.
+#[cfg(feature = "sqlserver")]
+async fn sql_server(tpl: &str, database: &str) -> SqlServer {
     use tokio_util::compat::TokioAsyncWriteCompatExt;
-    let Some(tpl) = template("ONTO_TEST_SQLSERVER_URL") else { return };
-    let master = onto_intelli::connectors::restricted::parse(
+    let t = onto_intelli::connectors::restricted::parse(
         "sqlserver",
         &tpl.replace("{db}", "master"),
         &["sqlserver", "mssql"],
@@ -155,23 +157,24 @@ async fn sql_server_metadata_feeds_the_builder() {
         true,
     )
     .unwrap();
-    let connect = |database: String| {
-        let t = master.clone();
-        async move {
-            let mut config = tiberius::Config::new();
-            config.host(&t.host);
-            config.port(t.port);
-            config.authentication(tiberius::AuthMethod::sql_server(&t.user, &t.password));
-            config.database(database);
-            config.trust_cert();
-            let tcp = tokio::net::TcpStream::connect(format!("{}:{}", t.host, t.port)).await.unwrap();
-            tiberius::Client::connect(config, tcp.compat_write()).await.unwrap()
-        }
-    };
+    let mut config = tiberius::Config::new();
+    config.host(&t.host);
+    config.port(t.port);
+    config.authentication(tiberius::AuthMethod::sql_server(&t.user, &t.password));
+    config.database(database);
+    config.trust_cert();
+    let tcp = tokio::net::TcpStream::connect(format!("{}:{}", t.host, t.port)).await.unwrap();
+    tiberius::Client::connect(config, tcp.compat_write()).await.unwrap()
+}
+
+#[cfg(feature = "sqlserver")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_server_metadata_feeds_the_builder() {
+    let Some(tpl) = template("ONTO_TEST_SQLSERVER_URL") else { return };
     let db = unique();
-    let mut m = connect("master".into()).await;
+    let mut m = sql_server(&tpl, "master").await;
     m.simple_query(format!("CREATE DATABASE [{db}]")).await.unwrap().into_results().await.unwrap();
-    let mut c = connect(db.clone()).await;
+    let mut c = sql_server(&tpl, &db).await;
     for stmt in [
         "CREATE TABLE dbo.customers (id INT PRIMARY KEY, name NVARCHAR(80) NOT NULL, email NVARCHAR(120) NULL UNIQUE)",
         "CREATE TABLE dbo.orders (id INT PRIMARY KEY, customer_id INT NOT NULL REFERENCES dbo.customers(id), \
@@ -196,6 +199,79 @@ async fn sql_server_metadata_feeds_the_builder() {
     let conn = onto_intelli::connectors::sqlserver::SqlServerConnector::new(true);
     let ids = pages(&conn, &spec("sqlserver", &url), "dbo.orders", "id").await;
     assert_eq!(ids, [10, 11, 12, 13, 14].map(Value::from));
+    m.simple_query(format!("ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]"))
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "sqlserver")]
+async fn exec(c: &mut SqlServer, stmt: &str) {
+    c.simple_query(stmt).await.unwrap().into_results().await.unwrap();
+}
+
+/// The grants SQL against a real server, with `map_grants`: a column grant
+/// is not a table grant, and a DENY wins through roles and at schema and
+/// database scope, so the table is no longer public.
+#[cfg(feature = "sqlserver")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_server_grants_and_denies_map_to_readers() {
+    let Some(tpl) = template("ONTO_TEST_SQLSERVER_URL") else { return };
+    let db = unique();
+    let mut m = sql_server(&tpl, "master").await;
+    m.simple_query(format!("CREATE DATABASE [{db}]")).await.unwrap().into_results().await.unwrap();
+    let mut c = sql_server(&tpl, &db).await;
+    for stmt in [
+        "CREATE TABLE dbo.open_t (id INT PRIMARY KEY)",
+        "CREATE TABLE dbo.patients (id INT PRIMARY KEY, name NVARCHAR(20))",
+        "CREATE TABLE dbo.orders (id INT PRIMARY KEY, total INT)",
+        "CREATE SCHEMA hr",
+        "CREATE TABLE hr.salaries (id INT PRIMARY KEY)",
+        "CREATE ROLE contractors",
+        "CREATE ROLE staff",
+        "CREATE ROLE analysts",
+        "CREATE USER eve WITHOUT LOGIN",
+        "CREATE USER bob WITHOUT LOGIN",
+        "ALTER ROLE contractors ADD MEMBER eve",
+        "ALTER ROLE staff ADD MEMBER eve",
+        "ALTER ROLE staff ADD MEMBER bob",
+        "GRANT SELECT ON dbo.open_t TO public",
+        "GRANT SELECT (id) ON dbo.patients TO public",
+        "GRANT SELECT ON dbo.orders TO public",
+        "GRANT SELECT ON dbo.orders TO analysts",
+        "GRANT SELECT ON dbo.orders TO staff",
+        "GRANT SELECT ON dbo.orders TO bob",
+        "DENY SELECT (total) ON dbo.orders TO contractors",
+        "GRANT SELECT ON hr.salaries TO public",
+        "GRANT SELECT ON hr.salaries TO analysts",
+        "DENY SELECT ON SCHEMA::hr TO staff",
+    ] {
+        exec(&mut c, stmt).await;
+    }
+    let url = tpl.replace("{db}", &db);
+    let spec: ConnectorSpec = serde_json::from_value(
+        json!({ "name": "shop", "kind": "sqlserver", "url": url, "schemas": ["dbo", "hr"], "map_grants": true }),
+    )
+    .unwrap();
+    let conn = onto_intelli::connectors::sqlserver::SqlServerConnector::new(true);
+    let readers = |snap: &onto_intelli::core::catalog::CatalogSnapshot, schema: &str, table: &str| {
+        let r = snap.relations.iter().find(|r| r.schema == schema && r.name == table).unwrap();
+        (r.public_read, r.readers.clone())
+    };
+    let snap = conn.snapshot(&spec).await.unwrap();
+    assert_eq!(readers(&snap, "dbo", "open_t"), (true, vec![]));
+    assert_eq!(readers(&snap, "dbo", "patients"), (false, vec![]), "a column grant is not the table");
+    // eve (a contractor) is denied a column, so public and staff (which holds eve) are no readers.
+    assert_eq!(readers(&snap, "dbo", "orders"), (false, vec!["analysts".to_string(), "bob".to_string()]));
+    assert_eq!(readers(&snap, "hr", "salaries"), (false, vec!["analysts".to_string()]), "DENY on the schema");
+    // DENY SELECT TO bob: the database, every table.
+    exec(&mut c, "DENY SELECT TO bob").await;
+    let snap = conn.snapshot(&spec).await.unwrap();
+    assert_eq!(readers(&snap, "dbo", "open_t"), (false, vec![]));
+    assert_eq!(readers(&snap, "dbo", "orders"), (false, vec!["analysts".to_string()]));
+    drop(c);
     m.simple_query(format!("ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]"))
         .await
         .unwrap()
