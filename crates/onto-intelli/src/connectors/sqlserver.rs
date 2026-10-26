@@ -65,8 +65,72 @@ pub fn quote_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
 }
 
-fn flag(t: &Target, names: &[&str]) -> Option<bool> {
-    names.iter().find_map(|n| t.params.get(*n)).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+/// The value of the first of `names` that the URL sets.
+fn param<'a>(t: &'a Target, names: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    names.iter().find_map(|n| t.params.get(*n).map(|v| (*n, v.trim())))
+}
+
+/// `encrypt`: absent, `true`, `yes`, `1`, `on`, `mandatory` or `required`
+/// encrypt everything (and fail without TLS); `false`, `no`, `0`, `off` or
+/// `optional` encrypt the login only. Anything else is refused, never read
+/// as "off": `strict` (TDS 8.0) is not supported yet.
+pub fn encryption(t: &Target) -> Result<EncryptionLevel> {
+    let Some((name, v)) = param(t, &["encrypt"]) else { return Ok(EncryptionLevel::Required) };
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" | "mandatory" | "required" => Ok(EncryptionLevel::Required),
+        "false" | "no" | "0" | "off" | "optional" => Ok(EncryptionLevel::Off),
+        "strict" => Err(Error::invalid(format!("{name}=strict (TDS 8.0) is not supported; use {name}=true"))),
+        _ => Err(Error::invalid(format!("{name}={v} is not a value (true, false, mandatory or optional)"))),
+    }
+}
+
+/// A yes-or-no parameter (`trust_server_certificate`); anything else is refused.
+fn flag(t: &Target, names: &[&str]) -> Result<Option<bool>> {
+    let Some((name, v)) = param(t, names) else { return Ok(None) };
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Ok(Some(true)),
+        "false" | "no" | "0" | "off" => Ok(Some(false)),
+        _ => Err(Error::invalid(format!("{name}={v} is not a value (true or false)"))),
+    }
+}
+
+/// One SELECT permission from `sys.database_permissions`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectPermission {
+    pub grantee: String,
+    pub schema: String,
+    pub table: String,
+    /// On some columns only (`minor_id <> 0`), not the table.
+    pub columns_only: bool,
+    /// `DENY` (state `D`), not `GRANT`.
+    pub deny: bool,
+}
+
+/// Who reads each table: the grantees of a table-level GRANT, less every
+/// grantee with a DENY (on the table or any of its columns: that grantee
+/// cannot read the whole table). A column grant is not a table grant. A
+/// DENY to `public` reaches every user, so the table has no readers.
+pub fn table_readers(perms: &[SelectPermission]) -> BTreeMap<(String, String), Vec<String>> {
+    let mut granted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut denied: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for p in perms {
+        let key = (p.schema.clone(), p.table.clone());
+        if p.deny {
+            denied.entry(key).or_default().push(p.grantee.clone());
+        } else if !p.columns_only {
+            granted.entry(key).or_default().push(p.grantee.clone());
+        }
+    }
+    for (key, readers) in granted.iter_mut() {
+        let no = denied.get(key).map(Vec::as_slice).unwrap_or_default();
+        if no.iter().any(|g| g == "public") {
+            readers.clear();
+        }
+        readers.retain(|g| !no.contains(g));
+        readers.sort();
+        readers.dedup();
+    }
+    granted
 }
 
 /// The statement for one page of `req`: `@P1` is the limit, then the
@@ -136,11 +200,9 @@ impl SqlServerConnector {
         if !t.database.is_empty() {
             config.database(&t.database);
         }
-        config.encryption(match flag(&t, &["encrypt"]) {
-            Some(false) => EncryptionLevel::Off,
-            _ => EncryptionLevel::Required,
-        });
-        if flag(&t, &["trust_server_certificate", "trustservercertificate"]).unwrap_or(false) {
+        let bad = |e: Error| Error::invalid(format!("connector {}: {e}", spec.name));
+        config.encryption(encryption(&t).map_err(bad)?);
+        if flag(&t, &["trust_server_certificate", "trustservercertificate"]).map_err(bad)?.unwrap_or(false) {
             config.trust_cert();
         }
         let addr = format!("{}:{}", t.connect_host(), t.port);
@@ -285,15 +347,24 @@ impl Connector for SqlServerConnector {
         if spec.map_grants {
             let grants = rows_of(
                 &mut c,
-                "SELECT pr.name, s.name, o.name FROM sys.database_permissions p \
+                "SELECT pr.name, s.name, o.name, CAST(CASE WHEN p.minor_id = 0 THEN 0 ELSE 1 END AS bit), \
+                 CAST(CASE WHEN p.state = 'D' THEN 1 ELSE 0 END AS bit) FROM sys.database_permissions p \
                  JOIN sys.database_principals pr ON pr.principal_id = p.grantee_principal_id \
                  JOIN sys.objects o ON o.object_id = p.major_id JOIN sys.schemas s ON s.schema_id = o.schema_id \
-                 WHERE p.class = 1 AND p.permission_name = 'SELECT' AND p.state IN ('G', 'W')",
+                 WHERE p.class = 1 AND p.permission_name = 'SELECT' AND p.state IN ('G', 'W', 'D')",
             )
             .await?;
-            for r in &grants {
-                readers.entry((s(r, 1), s(r, 2))).or_default().push(s(r, 0));
-            }
+            let perms: Vec<SelectPermission> = grants
+                .iter()
+                .map(|r| SelectPermission {
+                    grantee: s(r, 0),
+                    schema: s(r, 1),
+                    table: s(r, 2),
+                    columns_only: bit(r, 3),
+                    deny: bit(r, 4),
+                })
+                .collect();
+            readers = table_readers(&perms);
         }
         let mut by_table: BTreeMap<(String, String), Vec<ColumnInfo>> = BTreeMap::new();
         for r in &columns {
@@ -313,9 +384,7 @@ impl Connector for SqlServerConnector {
             .filter(|r| wanted(&s(r, 0)))
             .map(|r| {
                 let key = (s(r, 0), s(r, 1));
-                let mut rd = readers.get(&key).cloned().unwrap_or_default();
-                rd.sort();
-                rd.dedup();
+                let rd = readers.get(&key).cloned().unwrap_or_default();
                 let public_read = rd.iter().any(|g| g == "public");
                 RelationInfo {
                     kind: if s(r, 2) == "V" { RelKind::View } else { RelKind::Table },
@@ -414,6 +483,58 @@ fn s_raw(r: &tiberius::Row, i: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(query: &str) -> Target {
+        let url = format!(
+            "sqlserver://u:p@db.example:1433/sales{}",
+            if query.is_empty() { String::new() } else { format!("?{query}") }
+        );
+        restricted::parse("sqlserver", &url, &SCHEMES, 1433, true).unwrap()
+    }
+
+    #[test]
+    fn encrypt_values_are_read_or_refused_never_turned_off() {
+        for v in ["", "encrypt=true", "encrypt=YES", "encrypt=1", "encrypt=on", "encrypt=mandatory", "encrypt=required"]
+        {
+            assert_eq!(encryption(&target(v)).unwrap(), EncryptionLevel::Required, "{v}");
+        }
+        for v in ["encrypt=false", "encrypt=no", "encrypt=0", "encrypt=off", "encrypt=Optional"] {
+            assert_eq!(encryption(&target(v)).unwrap(), EncryptionLevel::Off, "{v}");
+        }
+        for v in ["encrypt=strict", "encrypt=maybe", "encrypt=enabled", "encrypt=tru"] {
+            assert!(encryption(&target(v)).is_err(), "{v}");
+        }
+        let trust = ["trust_server_certificate", "trustservercertificate"];
+        assert_eq!(flag(&target("trust_server_certificate=yes"), &trust).unwrap(), Some(true));
+        assert_eq!(flag(&target(""), &trust).unwrap(), None);
+        assert!(flag(&target("trust_server_certificate=si"), &trust).is_err());
+    }
+
+    #[test]
+    fn only_table_grants_make_readers_and_a_deny_wins() {
+        let p = |grantee: &str, table: &str, columns_only: bool, deny: bool| SelectPermission {
+            grantee: grantee.into(),
+            schema: "dbo".into(),
+            table: table.into(),
+            columns_only,
+            deny,
+        };
+        let readers = table_readers(&[
+            // GRANT SELECT (id) ON dbo.patients TO public: one column, not the table.
+            p("public", "patients", true, false),
+            p("analysts", "orders", false, false),
+            p("public", "orders", false, false),
+            p("ops", "orders", false, false),
+            p("ops", "orders", true, true),
+            // DENY SELECT ON dbo.salaries TO public next to a GRANT to a role.
+            p("hr", "salaries", false, false),
+            p("public", "salaries", false, true),
+        ]);
+        let of = |t: &str| readers.get(&("dbo".to_string(), t.to_string())).cloned().unwrap_or_default();
+        assert!(of("patients").is_empty(), "a column grant to public is no table grant");
+        assert_eq!(of("orders"), vec!["analysts", "public"], "ops has a DENY on a column");
+        assert!(of("salaries").is_empty(), "a DENY to public reaches everyone");
+    }
 
     #[test]
     fn check_lists_become_allowed_values() {

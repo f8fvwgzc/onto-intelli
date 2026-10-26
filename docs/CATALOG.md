@@ -139,6 +139,14 @@ MySQL with `ssl-mode=VERIFY_IDENTITY` and MongoDB with `tls=true` connect by nam
 certificates are checked against it. MongoDB always connects directly to that one host
 (`directConnection`), so a replica set cannot redirect the crawl.
 
+SQL Server: `encrypt` is `true` by default (everything encrypted, failing without TLS); `true`,
+`yes`, `1`, `on`, `mandatory` or `required` keep that, `false`, `no`, `0`, `off` or `optional`
+encrypt the login only, and any other value (`strict` too: TDS 8.0 is not supported yet) is
+refused rather than read as off. `trust_server_certificate` takes `true` or `false` alike. With
+`map_grants`, only a table-level `GRANT SELECT` makes a reader: a column grant does not, and a
+`DENY` to a principal (on the table or a column) removes it. A `DENY` to `public` leaves the table
+with no readers.
+
 Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
 CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers
 (`crates/onto-intelli/tests/connectors_dbs.rs`; set `ONTO_TEST_MYSQL_URL`, `ONTO_TEST_MARIADB_URL`,
