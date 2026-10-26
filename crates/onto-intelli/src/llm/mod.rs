@@ -15,7 +15,7 @@ use crate::token::TokenUsage;
 
 mod contract;
 mod mock;
-pub use contract::{KeyRef, LlmContract};
+pub use contract::{KeyRef, LlmContract, stray_variables};
 pub use mock::MockProvider;
 
 #[cfg(feature = "http-llm")]

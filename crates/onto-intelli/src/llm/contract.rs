@@ -17,12 +17,15 @@
 //! | `LLM_GATEWAY_TOKEN_FILE` | with the gateway: a file holding its bearer token |
 //!
 //! The contract applies once `LLM_PROVIDER` or `LLM_GATEWAY_URL` is set.
-//! What `[llm]` in the configuration file sets always wins, key by key, and a
-//! project's own provider (the console's bring-your-own LLM) wins over both:
-//! nothing changes for a deployment that does not set the variables. Setting
-//! `LLM_MODEL`, `LLM_BASE_URL` or a key without `LLM_PROVIDER` or
-//! `LLM_GATEWAY_URL` is an error, so a typo does not silently disable the
-//! contract. Errors name the variable. Keys are never logged.
+//! What `[llm]` in the configuration file sets wins, and a project's own
+//! provider (the console's bring-your-own LLM) wins over both: nothing changes
+//! for a deployment that does not set the variables. The connection (provider,
+//! endpoint, credential and model) applies as one, and only when `[llm]` names
+//! no endpoint or credential of its own and no provider of another wire
+//! format, so a key never goes to a host it was not issued for; timeout and
+//! retries apply key by key. `LLM_MODEL`, `LLM_BASE_URL` or a key without
+//! `LLM_PROVIDER` or `LLM_GATEWAY_URL` are ignored, with a warning
+//! ([`stray_variables`]). Errors name the variable. Keys are never logged.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -33,6 +36,30 @@ use crate::config::{LlmConfig, Secret};
 
 /// The wire formats the contract names.
 const PROVIDERS: [&str; 3] = ["anthropic", "openai", "openai-compatible"];
+
+/// The variables that mean nothing without `LLM_PROVIDER` or `LLM_GATEWAY_URL`.
+const NEEDS_PROVIDER: [&str; 6] =
+    ["LLM_BASE_URL", "LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_MODEL", "LLM_MODEL_SMALL", "LLM_GATEWAY_TOKEN_FILE"];
+
+/// The wire format a provider name speaks: `anthropic` (also `claude`),
+/// `openai` (also `openai-compatible`), else the name itself.
+fn wire(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "claude" => "anthropic".into(),
+        "openai-compatible" => "openai".into(),
+        p => p.into(),
+    }
+}
+
+/// `LLM_*` variables that are set although the contract is off (no
+/// `LLM_PROVIDER` or `LLM_GATEWAY_URL`): ignored, and worth a warning.
+pub fn stray_variables(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    let set = |k: &str| get(k).is_some_and(|v| !v.trim().is_empty());
+    if set("LLM_PROVIDER") || set("LLM_GATEWAY_URL") {
+        return Vec::new();
+    }
+    NEEDS_PROVIDER.into_iter().filter(|k| set(k)).collect()
+}
 
 /// What the `LLM_*` variables say, validated.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,7 +98,7 @@ fn invalid(var: &str, why: impl std::fmt::Display) -> Error {
 
 impl LlmContract {
     /// From the process environment; `None` when neither `LLM_PROVIDER` nor
-    /// `LLM_GATEWAY_URL` is set (and no other `LLM_*` either).
+    /// `LLM_GATEWAY_URL` is set (other `LLM_*` are then ignored).
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_vars(|k| std::env::var(k).ok())
     }
@@ -82,11 +109,8 @@ impl LlmContract {
         let provider = var("LLM_PROVIDER").map(|p| p.to_ascii_lowercase());
         let gateway = var("LLM_GATEWAY_URL");
         if provider.is_none() && gateway.is_none() {
-            for k in ["LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_GATEWAY_TOKEN_FILE"] {
-                if var(k).is_some() {
-                    return Err(invalid(k, "is set without LLM_PROVIDER or LLM_GATEWAY_URL"));
-                }
-            }
+            // Off. Other LLM_* alone must not break a deployment that never
+            // used the contract (see stray_variables).
             return Ok(None);
         }
         if let Some(p) = &provider
@@ -157,10 +181,41 @@ impl LlmContract {
         }))
     }
 
-    /// Fill `cfg`'s fields that `[llm]` did not set (`explicit`: the keys
-    /// present in the file's `[llm]` table).
-    pub fn apply(&self, cfg: &mut LlmConfig, explicit: &BTreeSet<String>) {
+    /// Fill `cfg` where `[llm]` left it unset (`explicit`: the keys present
+    /// in the file's `[llm]` table). The connection (provider, endpoint,
+    /// credential, model) applies as one, or not at all when `[llm]` names an
+    /// endpoint or a credential of its own, or a provider of another wire
+    /// format: then the answer says why, for the startup log.
+    pub fn apply(&self, cfg: &mut LlmConfig, explicit: &BTreeSet<String>) -> Option<String> {
         let free = |k: &str| !explicit.contains(k);
+        if free("timeout_secs")
+            && let Some(t) = self.timeout_secs
+        {
+            cfg.timeout_secs = t;
+        }
+        if free("max_retries")
+            && let Some(r) = self.max_retries
+        {
+            cfg.max_retries = r;
+        }
+        let own: Vec<&str> =
+            ["base_url", "api_key", "api_key_env", "api_key_file"].into_iter().filter(|k| !free(k)).collect();
+        let why = if !free("provider") && wire(&cfg.provider) != wire(&self.provider) {
+            Some(format!(
+                "[llm] provider = \"{}\" does not speak the contract's {}",
+                cfg.provider,
+                wire(&self.provider)
+            ))
+        } else if !own.is_empty() {
+            Some(format!("[llm] sets {}", own.join(", ")))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Some(format!(
+                "{why}: the LLM_* connection (provider, endpoint, key and model) is ignored, [llm] applies as written"
+            ));
+        }
         if free("provider") {
             cfg.provider = self.provider.clone();
         }
@@ -172,39 +227,31 @@ impl LlmContract {
         {
             cfg.model_small = m.clone();
         }
-        if free("timeout_secs")
-            && let Some(t) = self.timeout_secs
-        {
-            cfg.timeout_secs = t;
+        match &self.key {
+            Some(KeyRef::File(p)) => cfg.api_key_file = Some(p.clone()),
+            Some(KeyRef::Value(v)) => cfg.api_key = Some(Secret::new(v.clone())),
+            None => {}
         }
-        if free("max_retries")
-            && let Some(r) = self.max_retries
-        {
-            cfg.max_retries = r;
-        }
-        if free("base_url") {
-            match &self.gateway {
+        match &self.gateway {
+            Some(root) => {
                 // Anthropic Messages is at {root}/v1/messages; OpenAI's base includes /v1.
-                Some(root) if cfg.provider == "anthropic" => cfg.base_url = Some(root.clone()),
-                Some(root) => cfg.base_url = Some(format!("{root}/v1")),
-                None if self.base_url.is_some() => cfg.base_url = self.base_url.clone(),
-                None => {}
-            }
-        }
-        // The credential, unless the file names its own.
-        let key_set = ["api_key_env", "api_key_file"].iter().any(|k| explicit.contains(*k));
-        if !key_set {
-            match &self.key {
-                Some(KeyRef::File(p)) => cfg.api_key_file = Some(p.clone()),
-                Some(KeyRef::Value(v)) => cfg.api_key = Some(Secret::new(v.clone())),
-                None => {}
-            }
-            if self.gateway.is_some() {
+                let anthropic = wire(&cfg.provider) == "anthropic";
+                cfg.base_url = Some(if anthropic { root.clone() } else { format!("{root}/v1") });
                 // The gateway token only: no provider key from the environment.
                 cfg.api_key_env = Some(String::new());
                 cfg.bearer_auth = true;
             }
+            None if self.base_url.is_some() => {
+                cfg.base_url = self.base_url.clone();
+                if self.key.is_none() {
+                    // A keyless endpoint: the provider's conventional key
+                    // variable is not for this host.
+                    cfg.api_key_env = Some(String::new());
+                }
+            }
+            _ => {}
         }
+        None
     }
 }
 
@@ -235,9 +282,24 @@ mod tests {
     }
 
     #[test]
+    fn stray_variables_are_ignored_and_named() {
+        let stray = [("LLM_MODEL", "m"), ("LLM_API_KEY", "k"), ("LLM_API_KEY_FILE", "/f"), ("OTHER", "x")];
+        assert_eq!(vars(&stray).unwrap(), None, "the contract is off, and nothing fails");
+        let m: HashMap<&str, &str> = stray.into_iter().collect();
+        let get = |k: &str| m.get(k).map(|v| v.to_string());
+        assert_eq!(stray_variables(get), vec!["LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_MODEL"]);
+        let on: HashMap<&str, &str> = [("LLM_PROVIDER", "openai"), ("LLM_MODEL", "m")].into_iter().collect();
+        assert!(stray_variables(|k| on.get(k).map(|v| v.to_string())).is_empty());
+        // The chart's key file without the optional ConfigMap: onto still starts.
+        let mut cfg = crate::config::Config::from_toml("").unwrap();
+        let before = format!("{:?}", cfg.llm);
+        cfg.apply_llm_contract_from(|k| (k == "LLM_API_KEY_FILE").then(|| "/var/run/secrets/llm/api-key".into()))
+            .unwrap();
+        assert_eq!(format!("{:?}", cfg.llm), before);
+    }
+
+    #[test]
     fn errors_name_the_variable() {
-        assert!(err(&[("LLM_MODEL", "m")]).contains("LLM_MODEL is set without LLM_PROVIDER"));
-        assert!(err(&[("LLM_API_KEY", "k")]).contains("LLM_API_KEY"));
         assert!(err(&[("LLM_PROVIDER", "cohere"), ("LLM_MODEL", "m")]).contains("LLM_PROVIDER is invalid"));
         assert!(err(&[("LLM_PROVIDER", "anthropic")]).contains("LLM_MODEL can't be blank"));
         assert!(err(&[("LLM_PROVIDER", "openai-compatible"), ("LLM_MODEL", "m")]).contains("LLM_BASE_URL is required"));
@@ -274,12 +336,70 @@ mod tests {
         assert!(cfg.api_key.is_none());
         assert_eq!((cfg.model.as_str(), cfg.model_small.as_str()), ("qwen3", "qwen3-small"));
         assert_eq!((cfg.timeout_secs, cfg.max_retries), (30, 2));
-        // What [llm] sets wins, key by key.
-        let mut cfg = LlmConfig { model: "from-file".into(), ..Default::default() };
-        let explicit: BTreeSet<String> = ["model".to_string(), "api_key_env".to_string()].into();
-        c.apply(&mut cfg, &explicit);
+        // What [llm] sets wins.
+        let mut cfg = LlmConfig { model: "from-file".into(), timeout_secs: 9, ..Default::default() };
+        let explicit: BTreeSet<String> = ["model".to_string(), "timeout_secs".to_string()].into();
+        assert_eq!(c.apply(&mut cfg, &explicit), None);
         assert_eq!((cfg.model.as_str(), cfg.provider.as_str()), ("from-file", "openai-compatible"));
-        assert_eq!(cfg.api_key_file, None, "the file named its own key");
+        assert_eq!((cfg.timeout_secs, cfg.max_retries), (9, 2));
+    }
+
+    fn file(toml: &str) -> crate::config::Config {
+        crate::config::Config::from_toml(toml).unwrap()
+    }
+
+    #[test]
+    fn the_connection_applies_as_one_or_not_at_all() {
+        // (a) The file's provider speaks another wire format: the Anthropic
+        // key and model do not go to api.openai.com.
+        let c = vars(&[
+            ("LLM_PROVIDER", "anthropic"),
+            ("LLM_MODEL", "claude-opus-5-5"),
+            ("LLM_API_KEY_FILE", "/var/run/secrets/llm/api-key"),
+            ("LLM_MAX_RETRIES", "4"),
+        ])
+        .unwrap()
+        .unwrap();
+        let cfg = file("[llm]\nprovider = \"openai\"\n");
+        let mut llm = cfg.llm.clone();
+        let why = c.apply(&mut llm, &cfg.llm_explicit).expect("set aside");
+        assert!(why.contains("provider = \"openai\""), "{why}");
+        assert_eq!((llm.provider.as_str(), llm.model.as_str()), ("openai", cfg.llm.model.as_str()));
+        assert_eq!((llm.api_key_file.clone(), llm.base_url.clone()), (None, None));
+        assert_eq!(llm.max_retries, 4, "retries still apply");
+        // (b) The file names its endpoint: the gateway token is not sent there.
+        let gw = vars(&[
+            ("LLM_GATEWAY_URL", "https://gateway:8443"),
+            ("LLM_GATEWAY_TOKEN_FILE", "/var/run/secrets/llm/gateway-token"),
+            ("LLM_MODEL", "claude-opus-5-5"),
+        ])
+        .unwrap()
+        .unwrap();
+        let cfg = file("[llm]\nprovider = \"anthropic\"\nbase_url = \"https://api.anthropic.com\"\n");
+        let mut llm = cfg.llm.clone();
+        assert!(gw.apply(&mut llm, &cfg.llm_explicit).is_some_and(|w| w.contains("sets base_url")));
+        assert_eq!(llm.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!((llm.api_key_file.clone(), llm.bearer_auth), (None, false));
+        // (c) The file names its key: the provider key does not go to the gateway.
+        let cfg = file("[llm]\napi_key_env = \"ANTHROPIC_API_KEY\"\n");
+        let mut llm = cfg.llm.clone();
+        assert!(gw.apply(&mut llm, &cfg.llm_explicit).is_some_and(|w| w.contains("sets api_key_env")));
+        assert_eq!(llm.base_url, None);
+        assert_eq!(llm.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(!llm.bearer_auth);
+        // The same wire format under another name joins the gateway at the right path.
+        let cfg = file("[llm]\nprovider = \"Claude\"\n");
+        let mut llm = cfg.llm.clone();
+        assert_eq!(gw.apply(&mut llm, &cfg.llm_explicit), None);
+        assert_eq!(llm.base_url.as_deref(), Some("https://gateway:8443"), "not {{root}}/v1/v1/messages");
+        assert_eq!(llm.api_key_file, Some(PathBuf::from("/var/run/secrets/llm/gateway-token")));
+        // A contract endpoint without a contract key gets no conventional key either.
+        let keyless = vars(&[("LLM_PROVIDER", "openai"), ("LLM_BASE_URL", "http://vllm:8000/v1"), ("LLM_MODEL", "m")])
+            .unwrap()
+            .unwrap();
+        let mut llm = LlmConfig::default();
+        assert_eq!(keyless.apply(&mut llm, &BTreeSet::new()), None);
+        assert_eq!(llm.api_key_env.as_deref(), Some(""), "OPENAI_API_KEY is not sent to vllm");
     }
 
     #[test]

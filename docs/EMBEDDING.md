@@ -237,9 +237,16 @@ texc-symphony), so one Kubernetes Secret and ConfigMap configure model access ev
 Precedence, highest first: a project's own provider (the console's bring-your-own LLM); the
 keys that the configuration file's `[llm]` table sets; the contract; the defaults. A deployment
 that sets no `LLM_*` variable is unchanged. The contract applies once `LLM_PROVIDER` or
-`LLM_GATEWAY_URL` is set. Setting `LLM_MODEL`, `LLM_BASE_URL` or a key without one of them is
-an error, so a typo does not silently disable it. Errors name the variable (`LLM_MODEL can't
-be blank`, `LLM_PROVIDER is invalid`) and stop `onto serve` at start. Keys are never logged,
+`LLM_GATEWAY_URL` is set. Its connection (provider, endpoint, key and model) applies as one:
+not at all when `[llm]` sets `base_url`, `api_key`, `api_key_env` or `api_key_file`, or a
+`provider` of another wire format (`anthropic`/`claude`, or `openai`/`openai-compatible`).
+Then a warning says so, and `[llm]` applies as written, so a key never reaches a host it was
+not issued for. `LLM_TIMEOUT_SECS` and `LLM_MAX_RETRIES` apply key by key. An endpoint from the
+contract without a key from it gets no key at all (not `OPENAI_API_KEY`). `LLM_MODEL`,
+`LLM_BASE_URL` or a key without `LLM_PROVIDER` or `LLM_GATEWAY_URL` are ignored, with a warning
+(`Ignoring LLM_MODEL without LLM_PROVIDER or LLM_GATEWAY_URL`), as in texc-symphony. An
+invalid value of an active contract is an error that names the variable (`LLM_MODEL can't be
+blank`, `LLM_PROVIDER is invalid`) and stops `onto serve` at start. Keys are never logged,
 and an unreadable key file fails the request with the file's path, not its contents.
 
 In Kubernetes the chart (`deploy/helm/onto-intelli`, `global.llm.enabled = true`) reads the
