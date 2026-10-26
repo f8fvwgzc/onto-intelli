@@ -149,7 +149,17 @@ more) a grant on a schema or the database. A `DENY` wins: on the table, a column
 the database, or membership in `db_denydatareader`, it blocks the denied principal and everyone in
 it through nested roles. As the ACL only lists readers, it fails closed: once anyone is denied,
 `public` is no reader and neither is a granted role that holds a denied principal. A `DENY` to
-`public` leaves no reader. A permission row that cannot be read counts as a `DENY`.
+`public` leaves no reader. A permission row that cannot be read counts as a `DENY`. A `DENY` of
+`CONTROL` counts as one of `SELECT`, which it covers. Windows and Entra ID groups (principal types
+`G` and `X`) are opaque: their members live outside the database, so a `DENY` to one counts as a
+`DENY` to everyone, and once anyone is denied a granted group is no reader.
+
+**`map_grants` on SQL Server needs `VIEW DEFINITION` on the database** (`GRANT VIEW DEFINITION TO
+<crawl user>`). Without it, SQL Server shows the crawl account only its own permission rows and
+role memberships, so a `DENY` to anyone else would look absent. The crawl checks
+(`HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')`) and, without it, maps every table
+as restricted with no readers and says so in the crawl's notes. The crawl account otherwise needs
+only `db_datareader` (or `SELECT` on the crawled schemas).
 
 Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
 CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers
