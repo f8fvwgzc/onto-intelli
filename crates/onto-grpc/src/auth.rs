@@ -565,6 +565,11 @@ pub async fn guard_project_call(
         Some("repo") => onto_control::net::check_git_url(&raw, allow_private).await,
         // The default kind; another kind fails validation later.
         Some("postgres") | None if !raw.is_empty() => onto_control::net::check_pg_url(&raw, allow_private).await,
+        Some("mysql" | "mariadb") => onto_intelli::connectors::mysql::check_url(&raw, allow_private).await.map(drop),
+        Some("sqlserver" | "mssql") => {
+            onto_intelli::connectors::sqlserver::check_url(&raw, allow_private).await.map(drop)
+        }
+        Some("mongodb") => onto_intelli::connectors::mongo::check_url(&raw, allow_private).await.map(drop),
         _ => Ok(()),
     };
     if let Err(e) = checked {
@@ -870,6 +875,39 @@ mod tests {
         ));
         // Without a control plane, keys are just invalid.
         assert_eq!(auth().authenticate(&headers(&[("authorization", &ah)])).await.unwrap_err(), e1);
+    }
+
+    #[tokio::test]
+    async fn project_connectors_to_other_databases_follow_the_same_ssrf_rules() {
+        let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "t".into() };
+        let add = |kind: &str, url: &str| serde_json::json!({ "name": "x", "kind": kind, "url": url });
+        for (kind, public, private, param) in [
+            ("mysql", "mysql://ro@8.8.8.8/shop", "mysql://ro@127.0.0.1/shop", "mysql://ro@8.8.8.8/shop?socket=/tmp/s"),
+            (
+                "sqlserver",
+                "sqlserver://ro@8.8.8.8/shop",
+                "sqlserver://ro@10.0.0.1/shop",
+                "sqlserver://ro@8.8.8.8/shop?server=h",
+            ),
+            (
+                "mongodb",
+                "mongodb://ro@8.8.8.8/shop",
+                "mongodb://169.254.169.254/x",
+                "mongodb://8.8.8.8/x?tlsCAFile=/etc/k",
+            ),
+        ] {
+            let mut input = add(kind, public);
+            guard_project_call(&key, "connector.add", &mut input, false).await.unwrap();
+            assert_eq!(input["restricted"], true, "{kind}");
+            for bad in [private, param, "env:DB_URL"] {
+                let mut input = add(kind, bad);
+                let e = guard_project_call(&key, "connector.add", &mut input, false).await.unwrap_err();
+                assert!(matches!(e, Error::Denied(_)), "{kind} {bad}: {e}");
+            }
+            // Operators are not limited.
+            let mut input = add(kind, private);
+            assert!(guard_project_call(&Credential::Config, "connector.add", &mut input, false).await.is_ok());
+        }
     }
 
     #[tokio::test]

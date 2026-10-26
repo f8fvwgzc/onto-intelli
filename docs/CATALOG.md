@@ -112,6 +112,38 @@ dependencies and CODEOWNERS (section 13 of
 - **Owners.** `owner_map` turns a database role into an `owns` link from a
   team or person. Owners set by hand are never touched.
 
+### Other databases: MySQL and MariaDB, SQL Server, MongoDB
+
+The same registration, crawl, fingerprints, provenance and permissions apply to three more kinds
+(`connector.add` with `kind`, or `POST /v1/catalog/connectors`):
+
+| `kind` | URL | Metadata | Rows of synced types |
+|---|---|---|---|
+| `mysql` (also MariaDB) | `mysql://user:pass@host:3306/db?ssl-mode=REQUIRED` | `information_schema`: databases as schemas, tables, views (definitions; the tables they read on MySQL 8.0.13+), columns with `COLUMN_TYPE`, keys, comments and `ENUM` labels, foreign keys, `SELECT` grants, and the most-run statements of `performance_schema` when readable | `JSON_OBJECT` pages in key order |
+| `sqlserver` | `sqlserver://user:pass@host:1433/db?encrypt=true` | the catalog views of one database: schemas, tables and views (row counts from `sys.partitions`, definitions, dependencies), columns with keys, `MS_Description` comments and column `CHECK` lists, foreign keys, `SELECT` grants | `FOR JSON PATH` pages in key order |
+| `mongodb` | `mongodb://user:pass@host:27017/db?authSource=admin` | databases as schemas, collections as tables, views with their pipeline; fields **inferred from a sample** (`sample_rows`, default 100, at most 1000; `$sample`): the most common BSON type (`mixed(a\|b)` when several), nullable when missing or null in some, nested documents as `a.b`; `_id` is the key; single-field unique indexes; a field `x_id`/`xId` of object ids becomes a foreign key to a collection `x` or `xs` of the same database (a heuristic) | `find` pages in key order (one key field; object ids as their hex text) |
+
+Every connector only reads: a read-only MySQL session with a statement time limit, `SET LOCK_TIMEOUT`
+on SQL Server, `maxTimeMS` on MongoDB. No row is read for the snapshot; rows are read only for synced
+object types, with only the key and mapped columns. The ontology builder (`ontology.draft`) drafts
+object types, states (from `ENUM` labels and `CHECK` lists), properties and links from these
+catalog entities exactly as from PostgreSQL's.
+
+**Restricted connectors** (registered by an API key or a console session) follow the same SSRF rules
+as PostgreSQL's: one TCP host (no socket, no host list, no `mongodb+srv`), a user for the SQL engines,
+only the query parameters each kind allows (`ssl-mode`; `encrypt`, `trust_server_certificate`;
+`authSource`, `authMechanism`, `tls`, `appName`), no `env:` URL, and, unless
+`console.allow_private_urls`, a host that resolves only to public addresses. The connection goes to
+the checked address: for SQL Server the TCP stream is pinned while TLS still verifies the name;
+MySQL with `ssl-mode=VERIFY_IDENTITY` and MongoDB with `tls=true` connect by name, since their
+certificates are checked against it. MongoDB always connects directly to that one host
+(`directConnection`), so a replica set cannot redirect the crawl.
+
+Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
+CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers
+(`crates/onto-intelli/tests/connectors_dbs.rs`; set `ONTO_TEST_MYSQL_URL`, `ONTO_TEST_MARIADB_URL`,
+`ONTO_TEST_SQLSERVER_URL` or `ONTO_TEST_MONGODB_URL` to run them locally).
+
 ## OntoRank
 
 Every crawl, and `onto rank --recompute` (`catalog.rerank`), scores data
