@@ -151,8 +151,10 @@ it through nested roles. As the ACL only lists readers, it fails closed: once an
 `public` is no reader and neither is a granted role that holds a denied principal. A `DENY` to
 `public` leaves no reader. A permission row that cannot be read counts as a `DENY`. A `DENY` of
 `CONTROL` counts as one of `SELECT`, which it covers. Windows and Entra ID groups (principal types
-`G` and `X`) are opaque: their members live outside the database, so a `DENY` to one counts as a
-`DENY` to everyone, and once anyone is denied a granted group is no reader.
+`G` and `X`), and role members of a type that cannot be read, are opaque: their members live
+outside the database. A `DENY` to one counts as a `DENY` to everyone, and so does a `DENY` to a
+role that holds one. Once anyone is denied, a granted principal that holds one (directly or
+through nested roles) is no reader.
 
 **`map_grants` on SQL Server needs `VIEW DEFINITION` on the database** (`GRANT VIEW DEFINITION TO
 <crawl user>`). Without it, SQL Server shows the crawl account only its own permission rows and

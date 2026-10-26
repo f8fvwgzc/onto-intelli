@@ -98,6 +98,32 @@ fn flag(t: &Target, names: &[&str]) -> Result<Option<bool>> {
     }
 }
 
+/// The readers of each table, by (schema, table).
+pub type Readers = BTreeMap<(String, String), Vec<String>>;
+
+/// A principal whose members cannot be listed: a Windows or Entra ID group
+/// (type `G` or `X`) or a type that cannot be read. Users and database roles
+/// (read through `sys.database_role_members`) are not.
+fn opaque(kind: &str) -> bool {
+    !matches!(kind.trim(), "S" | "U" | "R" | "A" | "E" | "C" | "K")
+}
+
+/// A member of a database role, from `sys.database_role_members`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoleMember {
+    pub role: String,
+    pub member: String,
+    /// The member is a Windows or Entra ID group, or of a type that cannot
+    /// be read: whoever is in it is not known.
+    pub group: bool,
+}
+
+impl RoleMember {
+    pub fn read(role: &str, member: &str, kind: &str) -> Self {
+        Self { role: role.to_string(), member: member.to_string(), group: opaque(kind) }
+    }
+}
+
 /// What a SELECT permission covers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scope {
@@ -148,8 +174,7 @@ impl SelectPermission {
             }),
             _ => None,
         };
-        // Users and database roles; any other type is opaque.
-        let group = !matches!(kind.trim(), "S" | "U" | "R" | "A" | "E" | "C" | "K");
+        let group = opaque(kind);
         match (scope, deny) {
             (Some(scope), true) if group => Some(Self { grantee: "public".into(), scope, deny, group }),
             (Some(scope), _) if !grantee.is_empty() => Some(Self { grantee: grantee.to_string(), scope, deny, group }),
@@ -178,12 +203,9 @@ impl SelectPermission {
 /// nor a granted Windows or Entra group (its members cannot be seen); a DENY
 /// to `public` leaves no reader at all. A column grant is not a table grant;
 /// grants on a schema or the database are not read (fewer readers).
-pub fn table_readers(
-    perms: &[SelectPermission],
-    members: &[(String, String)],
-) -> BTreeMap<(String, String), Vec<String>> {
+pub fn table_readers(perms: &[SelectPermission], members: &[RoleMember]) -> Readers {
     let mut deny_all: Vec<SelectPermission> = perms.iter().filter(|p| p.deny).cloned().collect();
-    if members.iter().any(|(role, _)| role == "db_denydatareader") {
+    if members.iter().any(|m| m.role == "db_denydatareader") {
         deny_all.push(SelectPermission {
             grantee: "db_denydatareader".into(),
             scope: Scope::Database,
@@ -196,16 +218,23 @@ pub fn table_readers(
         let mut seen = vec![p.to_string()];
         let mut i = 0;
         while i < seen.len() {
-            for (role, member) in members {
-                if *role == seen[i] && !seen.contains(member) {
-                    seen.push(member.clone());
+            for m in members {
+                if m.role == seen[i] && !seen.contains(&m.member) {
+                    seen.push(m.member.clone());
                 }
             }
             i += 1;
         }
         seen
     };
-    let groups: Vec<&str> = perms.iter().filter(|p| p.group && !p.deny).map(|p| p.grantee.as_str()).collect();
+    // Principals whose members nobody can list: granted groups, and groups
+    // (or members of unknown type) inside roles.
+    let groups: Vec<&str> = perms
+        .iter()
+        .filter(|p| p.group && !p.deny)
+        .map(|p| p.grantee.as_str())
+        .chain(members.iter().filter(|m| m.group).map(|m| m.member.as_str()))
+        .collect();
     let mut granted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for p in perms.iter().filter(|p| !p.deny) {
         if let Scope::Table { schema, table, columns_only: false } = &p.scope {
@@ -224,10 +253,16 @@ pub fn table_readers(
             readers.clear();
             continue;
         }
-        // Everyone a DENY reaches.
+        // Everyone a DENY reaches. A denied role that holds a group reaches
+        // people nobody can list: any reader could be one of them.
         let blocked: Vec<String> = denied.iter().flat_map(|d| within(d)).collect();
+        if blocked.iter().any(|b| groups.contains(&b.as_str())) {
+            readers.clear();
+            continue;
+        }
+        // A reader is kept only if nobody it reaches is denied or unknown.
         readers.retain(|g| {
-            g != "public" && !groups.contains(&g.as_str()) && !within(g).iter().any(|m| blocked.contains(m))
+            g != "public" && !within(g).iter().any(|m| blocked.contains(m) || groups.contains(&m.as_str()))
         });
         readers.sort();
         readers.dedup();
@@ -388,8 +423,24 @@ pub fn sees_all_permissions(answer: Option<i64>) -> bool {
     answer == Some(1)
 }
 
-/// Role membership: (role, member).
-pub const MEMBERS_SQL: &str = "SELECT r.name, m.name FROM sys.database_role_members rm \
+/// The readers of each table, and the crawl note when there are none to
+/// trust: `answer` is [`VISIBILITY_SQL`]'s, and unless the crawl account
+/// sees every permission row (`perms` and `members` may then miss DENYs),
+/// no table has readers.
+pub fn grant_readers(
+    answer: Option<i64>,
+    perms: &[SelectPermission],
+    members: &[RoleMember],
+) -> (Readers, Option<&'static str>) {
+    if sees_all_permissions(answer) {
+        (table_readers(perms, members), None)
+    } else {
+        (BTreeMap::new(), Some(GRANTS_HIDDEN))
+    }
+}
+
+/// Role membership: role, member, the member's type.
+pub const MEMBERS_SQL: &str = "SELECT r.name, m.name, m.type FROM sys.database_role_members rm \
      JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
      JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id";
 
@@ -486,25 +537,27 @@ impl Connector for SqlServerConnector {
         )
         .await?;
         let mut notes = vec!["query statistics are not read from SQL Server (they need VIEW SERVER STATE)".to_string()];
-        // Without grants read, every table is restricted with no readers.
+        // Without grants mapped, every table is restricted with no readers.
         let mut readers: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         if spec.map_grants {
             let answer = rows_of(&mut c, VISIBILITY_SQL).await?.first().and_then(|r| int_opt(r, 0));
-            if sees_all_permissions(answer) {
-                let grants = rows_of(&mut c, GRANTS_SQL).await?;
-                let perms: Vec<SelectPermission> = grants
-                    .iter()
-                    .filter_map(|r| {
-                        let (class, minor_id) = (int_opt(r, 2), int_opt(r, 5));
-                        SelectPermission::read(&s(r, 0), &s(r, 1), class, &s(r, 3), &s(r, 4), minor_id, &s(r, 6))
-                    })
-                    .collect();
-                let members: Vec<(String, String)> =
-                    rows_of(&mut c, MEMBERS_SQL).await?.iter().map(|r| (s(r, 0), s(r, 1))).collect();
-                readers = table_readers(&perms, &members);
-            } else {
-                notes.push(GRANTS_HIDDEN.into());
-            }
+            let perms: Vec<SelectPermission> = rows_of(&mut c, GRANTS_SQL)
+                .await?
+                .iter()
+                .filter_map(|r| {
+                    let (class, minor_id) = (int_opt(r, 2), int_opt(r, 5));
+                    SelectPermission::read(&s(r, 0), &s(r, 1), class, &s(r, 3), &s(r, 4), minor_id, &s(r, 6))
+                })
+                .collect();
+            let members: Vec<RoleMember> = rows_of(&mut c, MEMBERS_SQL)
+                .await?
+                .iter()
+                .map(|r| RoleMember::read(&s(r, 0), &s(r, 1), &s(r, 2)))
+                .collect();
+            // The one place that decides whether grants are trusted.
+            let (mapped, note) = grant_readers(answer, &perms, &members);
+            readers = mapped;
+            notes.extend(note.map(String::from));
         }
         let mut by_table: BTreeMap<(String, String), Vec<ColumnInfo>> = BTreeMap::new();
         for r in &columns {
@@ -670,9 +723,16 @@ mod tests {
         p
     }
 
-    fn readers_of(perms: &[SelectPermission], members: &[(&str, &str)], table: &str) -> Vec<String> {
-        let members: Vec<(String, String)> = members.iter().map(|(r, m)| (r.to_string(), m.to_string())).collect();
+    /// `members` are (role, member, member type).
+    fn readers_in(perms: &[SelectPermission], members: &[(&str, &str, &str)], table: &str) -> Vec<String> {
+        let members: Vec<RoleMember> = members.iter().map(|(r, m, k)| RoleMember::read(r, m, k)).collect();
         table_readers(perms, &members).get(&("dbo".to_string(), table.to_string())).cloned().unwrap_or_default()
+    }
+
+    /// `members` are (role, member) users and roles.
+    fn readers_of(perms: &[SelectPermission], members: &[(&str, &str)], table: &str) -> Vec<String> {
+        let members: Vec<(&str, &str, &str)> = members.iter().map(|(r, m)| (*r, *m, "U")).collect();
+        readers_in(perms, &members, table)
     }
 
     #[test]
@@ -745,6 +805,40 @@ mod tests {
         assert!(sees_all_permissions(Some(1)));
         for answer in [Some(0), None, Some(2)] {
             assert!(!sees_all_permissions(answer), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn a_group_inside_a_granted_or_denied_role_is_opaque() {
+        // analysts holds DOMAIN\Staff, a Windows group: eve may be in it.
+        let perms = [on("analysts", "orders"), deny(on("DOMAIN\\eve", "orders"))];
+        let group = [("analysts", "DOMAIN\\Staff", "G")];
+        assert!(readers_in(&perms, &group, "orders").is_empty());
+        // The same through a nested role, and for a member of unknown type.
+        let nested = [("analysts", "team", "R"), ("team", "AAD Staff", "X")];
+        assert!(readers_in(&perms, &nested, "orders").is_empty());
+        assert!(readers_in(&perms, &[("analysts", "who", "")], "orders").is_empty());
+        // Without a DENY the group stays out of the question: analysts reads.
+        assert_eq!(readers_in(&perms[..1], &group, "orders"), vec!["analysts"]);
+        // A plain user in analysts is seen through: analysts reads.
+        assert_eq!(readers_in(&perms, &[("analysts", "bob", "S")], "orders"), vec!["analysts"]);
+        // A denied role that holds a group reaches people nobody can list.
+        let perms = [on("bob", "orders"), deny(on("contractors", "orders"))];
+        assert!(readers_in(&perms, &[("contractors", "DOMAIN\\Temps", "G")], "orders").is_empty());
+    }
+
+    #[test]
+    fn grants_are_mapped_only_when_every_row_is_visible() {
+        let perms = [on("public", "orders"), on("analysts", "orders")];
+        let key = ("dbo".to_string(), "orders".to_string());
+        let (readers, note) = grant_readers(Some(1), &perms, &[]);
+        assert_eq!((readers[&key].clone(), note), (vec!["analysts".to_string(), "public".to_string()], None));
+        // Without VIEW DEFINITION the same rows (a DENY may be missing) map
+        // to no readers at all, and the crawl says why.
+        for answer in [Some(0), None] {
+            let (readers, note) = grant_readers(answer, &perms, &[]);
+            assert!(readers.is_empty(), "{answer:?}: {readers:?}");
+            assert_eq!(note, Some(GRANTS_HIDDEN));
         }
     }
 
