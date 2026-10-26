@@ -754,29 +754,29 @@ impl Config {
     /// variables) to the `[llm]` keys the file did not set. Project providers
     /// (the console's bring-your-own LLM) are not touched; they win anyway.
     pub fn apply_llm_contract(&mut self) -> Result<()> {
-        self.apply_llm_contract_from(|k| std::env::var(k).ok())
+        self.apply_llm_contract_from(|k| std::env::var(k).ok()).map(|_| ())
     }
 
     /// [`apply_llm_contract`](Self::apply_llm_contract) from any variable
-    /// source; what it ignores is logged as a warning.
-    pub fn apply_llm_contract_from(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<()> {
+    /// source. What it ignores is logged as a warning, and returned.
+    pub fn apply_llm_contract_from(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         match crate::llm::LlmContract::from_vars(&get)? {
-            Some(c) => {
-                if let Some(why) = c.apply(&mut self.llm, &self.llm_explicit) {
-                    tracing::warn!("{why}");
-                }
-            }
+            Some(c) => warnings.extend(c.apply(&mut self.llm, &self.llm_explicit)),
             None => {
                 let stray = crate::llm::stray_variables(&get);
                 if !stray.is_empty() {
-                    tracing::warn!(
+                    warnings.push(format!(
                         "Ignoring {} without LLM_PROVIDER or LLM_GATEWAY_URL (the LLM connection contract is off)",
                         stray.join(", ")
-                    );
+                    ));
                 }
             }
         }
-        Ok(())
+        for w in &warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(warnings)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

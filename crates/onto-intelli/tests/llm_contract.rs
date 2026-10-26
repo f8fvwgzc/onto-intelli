@@ -1,7 +1,7 @@
 //! The LLM connection contract (`LLM_*`) end to end against a local HTTP
 //! server: gateway mode sends the gateway token as a bearer token and no
-//! provider key, a rotated key file applies to the next request, and
-//! retries follow `LLM_MAX_RETRIES`.
+//! provider key, a rotated key file applies to the next request, retries
+//! follow `LLM_MAX_RETRIES`, and the contract's key reaches only its endpoint.
 #![cfg(feature = "http-llm")]
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -149,5 +149,60 @@ async fn retries_stop_at_the_limit_and_the_key_file_is_required() {
         ("LLM_MODEL", "local"),
     ]);
     assert_eq!(llm::build(&cfg).unwrap().complete(&ask()).await.unwrap().text, "hello");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// No contract credential reaches a URL the contract did not name: each file
+/// below sends its requests to server B (its own `base_url`), the contract
+/// names server A, and only the file with no `[llm]` reaches A.
+#[tokio::test]
+async fn the_contract_key_reaches_only_the_contract_endpoint() {
+    let (a, a_seen) = server(vec![(200, OPENAI_OK.into())]).await;
+    let (b, b_seen) = server(vec![(200, OPENAI_OK.into()), (200, OPENAI_OK.into()), (200, ANTHROPIC_OK.into())]).await;
+    let dir = std::env::temp_dir().join(format!("onto-llm-bind-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("gateway-token");
+    std::fs::write(&token, "tok-contract").unwrap();
+    let own = dir.join("file-key");
+    std::fs::write(&own, "sk-file").unwrap();
+    let own = own.to_str().unwrap().replace('\\', "/");
+    let a_v1 = format!("{a}/v1");
+    let vars = |pairs: &[(&str, &str)]| {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        LlmContract::from_vars(|k| m.get(k).cloned()).unwrap().unwrap()
+    };
+    let provider_mode = vars(&[
+        ("LLM_PROVIDER", "openai-compatible"),
+        ("LLM_BASE_URL", &a_v1),
+        ("LLM_API_KEY", "sk-contract"),
+        ("LLM_MODEL", "contract-model"),
+    ]);
+    let gateway = vars(&[
+        ("LLM_GATEWAY_URL", &a),
+        ("LLM_GATEWAY_TOKEN_FILE", token.to_str().unwrap()),
+        ("LLM_MODEL", "contract-model"),
+    ]);
+    let cases = [
+        (&provider_mode, format!("[llm]\nprovider = \"openai-compatible\"\nbase_url = \"{b}/v1\"\n")),
+        (&provider_mode, format!("[llm]\nprovider = \"openai\"\nbase_url = \"{b}/v1\"\napi_key_file = \"{own}\"\n")),
+        (&gateway, format!("[llm]\nprovider = \"anthropic\"\nbase_url = \"{b}\"\napi_key_file = \"{own}\"\n")),
+        (&provider_mode, String::new()),
+    ];
+    for (contract, toml) in cases {
+        let cfg = onto_intelli::config::Config::from_toml(&toml).unwrap();
+        let mut llm = cfg.llm.clone();
+        contract.apply(&mut llm, &cfg.llm_explicit);
+        llm::build(&llm).unwrap().complete(&ask()).await.unwrap_or_else(|e| panic!("{toml}: {e}"));
+    }
+    let b_seen = b_seen.lock().clone();
+    assert_eq!(b_seen.len(), 3, "each file's own endpoint");
+    for (path, h) in &b_seen {
+        assert!(!h.values().any(|v| v.contains("sk-contract") || v.contains("tok-contract")), "{path}: {h:?}");
+    }
+    assert_eq!(b_seen[1].1["authorization"], "Bearer sk-file");
+    assert_eq!(b_seen[2].1["x-api-key"], "sk-file");
+    let a_seen = a_seen.lock().clone();
+    assert_eq!(a_seen.len(), 1, "only the file without [llm] uses the contract");
+    assert_eq!(a_seen[0].1["authorization"], "Bearer sk-contract");
     std::fs::remove_dir_all(&dir).unwrap();
 }

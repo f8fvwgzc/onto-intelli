@@ -238,13 +238,16 @@ Precedence, highest first: a project's own provider (the console's bring-your-ow
 keys that the configuration file's `[llm]` table sets; the contract; the defaults. A deployment
 that sets no `LLM_*` variable is unchanged. The contract applies once `LLM_PROVIDER` or
 `LLM_GATEWAY_URL` is set. Its connection (provider, endpoint, key and model) applies as one:
-not at all when `[llm]` sets `base_url`, `api_key`, `api_key_env` or `api_key_file`, or a
-`provider` of another wire format (`anthropic`/`claude`, or `openai`/`openai-compatible`).
-Then a warning says so, and `[llm]` applies as written, so a key never reaches a host it was
-not issued for. `LLM_TIMEOUT_SECS` and `LLM_MAX_RETRIES` apply key by key. An endpoint from the
-contract without a key from it gets no key at all (not `OPENAI_API_KEY`). `LLM_MODEL`,
-`LLM_BASE_URL` or a key without `LLM_PROVIDER` or `LLM_GATEWAY_URL` are ignored, with a warning
-(`Ignoring LLM_MODEL without LLM_PROVIDER or LLM_GATEWAY_URL`), as in texc-symphony. An
+not at all when `[llm]` sets `base_url`, `api_key`, `api_key_env`, `api_key_file`, `model` or
+`model_small`, or another `provider`. Then a warning says so, and `[llm]` applies as written.
+The key is bound to the endpoint it was issued for: the gateway, `LLM_BASE_URL`, or else the
+default endpoint of `LLM_PROVIDER` itself. With a named endpoint, a file `provider` of the same
+wire format is fine (`anthropic`/`claude`, or `openai`/`openai-compatible`); without one, it
+must be the same provider (`openai-compatible` defaults to a local server, `openai` to
+api.openai.com). `LLM_TIMEOUT_SECS` and `LLM_MAX_RETRIES` apply key by key. An endpoint from
+the contract without a key from it gets no key at all (not `OPENAI_API_KEY`). Other `LLM_*`
+without `LLM_PROVIDER` or `LLM_GATEWAY_URL` are ignored, with a warning (`Ignoring LLM_MODEL
+without LLM_PROVIDER or LLM_GATEWAY_URL`), as in texc-symphony. An
 invalid value of an active contract is an error that names the variable (`LLM_MODEL can't be
 blank`, `LLM_PROVIDER is invalid`) and stops `onto serve` at start. Keys are never logged,
 and an unreadable key file fails the request with the file's path, not its contents.

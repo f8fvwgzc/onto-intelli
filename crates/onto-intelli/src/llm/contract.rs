@@ -21,11 +21,12 @@
 //! provider (the console's bring-your-own LLM) wins over both: nothing changes
 //! for a deployment that does not set the variables. The connection (provider,
 //! endpoint, credential and model) applies as one, and only when `[llm]` names
-//! no endpoint or credential of its own and no provider of another wire
-//! format, so a key never goes to a host it was not issued for; timeout and
-//! retries apply key by key. `LLM_MODEL`, `LLM_BASE_URL` or a key without
-//! `LLM_PROVIDER` or `LLM_GATEWAY_URL` are ignored, with a warning
-//! ([`stray_variables`]). Errors name the variable. Keys are never logged.
+//! no endpoint, credential or model of its own and no other provider, so a key
+//! only ever goes to the endpoint it was issued for: the gateway, `LLM_BASE_URL`,
+//! or else the default endpoint of `LLM_PROVIDER` itself. Timeout and retries
+//! apply key by key. Other `LLM_*` without `LLM_PROVIDER` or `LLM_GATEWAY_URL`
+//! are ignored, with a warning ([`stray_variables`]). Errors name the
+//! variable. Keys are never logged.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -38,14 +39,29 @@ use crate::config::{LlmConfig, Secret};
 const PROVIDERS: [&str; 3] = ["anthropic", "openai", "openai-compatible"];
 
 /// The variables that mean nothing without `LLM_PROVIDER` or `LLM_GATEWAY_URL`.
-const NEEDS_PROVIDER: [&str; 6] =
-    ["LLM_BASE_URL", "LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_MODEL", "LLM_MODEL_SMALL", "LLM_GATEWAY_TOKEN_FILE"];
+const NEEDS_PROVIDER: [&str; 8] = [
+    "LLM_BASE_URL",
+    "LLM_API_KEY",
+    "LLM_API_KEY_FILE",
+    "LLM_MODEL",
+    "LLM_MODEL_SMALL",
+    "LLM_TIMEOUT_SECS",
+    "LLM_MAX_RETRIES",
+    "LLM_GATEWAY_TOKEN_FILE",
+];
+
+/// A provider name as onto reads it: trimmed, lowercase, `claude` is `anthropic`.
+fn canonical(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "claude" => "anthropic".into(),
+        p => p.into(),
+    }
+}
 
 /// The wire format a provider name speaks: `anthropic` (also `claude`),
 /// `openai` (also `openai-compatible`), else the name itself.
 fn wire(provider: &str) -> String {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "claude" => "anthropic".into(),
+    match canonical(provider).as_str() {
         "openai-compatible" => "openai".into(),
         p => p.into(),
     }
@@ -184,8 +200,12 @@ impl LlmContract {
     /// Fill `cfg` where `[llm]` left it unset (`explicit`: the keys present
     /// in the file's `[llm]` table). The connection (provider, endpoint,
     /// credential, model) applies as one, or not at all when `[llm]` names an
-    /// endpoint or a credential of its own, or a provider of another wire
-    /// format: then the answer says why, for the startup log.
+    /// endpoint, a credential or a model of its own, or another provider:
+    /// then the answer says why, for the startup log. The key is bound to the
+    /// contract's endpoint: with the gateway or `LLM_BASE_URL` the file's
+    /// provider need only speak the same wire format; without them the
+    /// endpoint is the provider's default, so the provider must be the same
+    /// (`openai-compatible` defaults to a local server, `openai` does not).
     pub fn apply(&self, cfg: &mut LlmConfig, explicit: &BTreeSet<String>) -> Option<String> {
         let free = |k: &str| !explicit.contains(k);
         if free("timeout_secs")
@@ -198,13 +218,23 @@ impl LlmContract {
         {
             cfg.max_retries = r;
         }
-        let own: Vec<&str> =
-            ["base_url", "api_key", "api_key_env", "api_key_file"].into_iter().filter(|k| !free(k)).collect();
+        let own: Vec<&str> = ["base_url", "api_key", "api_key_env", "api_key_file", "model", "model_small"]
+            .into_iter()
+            .filter(|k| !free(k))
+            .collect();
+        // The endpoint the contract's key was issued for is named (gateway,
+        // LLM_BASE_URL), or it is LLM_PROVIDER's own default.
+        let named = self.gateway.is_some() || self.base_url.is_some();
         let why = if !free("provider") && wire(&cfg.provider) != wire(&self.provider) {
             Some(format!(
                 "[llm] provider = \"{}\" does not speak the contract's {}",
                 cfg.provider,
                 wire(&self.provider)
+            ))
+        } else if !free("provider") && !named && canonical(&cfg.provider) != canonical(&self.provider) {
+            Some(format!(
+                "[llm] provider = \"{}\" has another default endpoint than LLM_PROVIDER={} (and no LLM_BASE_URL names one)",
+                cfg.provider, self.provider
             ))
         } else if !own.is_empty() {
             Some(format!("[llm] sets {}", own.join(", ")))
@@ -290,12 +320,27 @@ mod tests {
         assert_eq!(stray_variables(get), vec!["LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_MODEL"]);
         let on: HashMap<&str, &str> = [("LLM_PROVIDER", "openai"), ("LLM_MODEL", "m")].into_iter().collect();
         assert!(stray_variables(|k| on.get(k).map(|v| v.to_string())).is_empty());
-        // The chart's key file without the optional ConfigMap: onto still starts.
+        // The chart's key file without the optional ConfigMap: onto still
+        // starts, and the startup log names what it ignores.
         let mut cfg = crate::config::Config::from_toml("").unwrap();
         let before = format!("{:?}", cfg.llm);
-        cfg.apply_llm_contract_from(|k| (k == "LLM_API_KEY_FILE").then(|| "/var/run/secrets/llm/api-key".into()))
-            .unwrap();
+        let chart = [("LLM_API_KEY_FILE", "/var/run/secrets/llm/api-key"), ("LLM_MAX_RETRIES", "3")];
+        let m: HashMap<&str, &str> = chart.into_iter().collect();
+        let warned = cfg.apply_llm_contract_from(|k| m.get(k).map(|v| v.to_string())).unwrap();
         assert_eq!(format!("{:?}", cfg.llm), before);
+        assert_eq!(
+            warned,
+            vec![
+                "Ignoring LLM_API_KEY_FILE, LLM_MAX_RETRIES without LLM_PROVIDER or LLM_GATEWAY_URL \
+                 (the LLM connection contract is off)"
+                    .to_string()
+            ]
+        );
+        // A connection set aside is a warning too.
+        let mut cfg = crate::config::Config::from_toml("[llm]\nprovider = \"openai\"\n").unwrap();
+        let on: HashMap<&str, &str> = [("LLM_PROVIDER", "anthropic"), ("LLM_MODEL", "m")].into_iter().collect();
+        let warned = cfg.apply_llm_contract_from(|k| on.get(k).map(|v| v.to_string())).unwrap();
+        assert!(warned.len() == 1 && warned[0].contains("is ignored"), "{warned:?}");
     }
 
     #[test]
@@ -336,12 +381,21 @@ mod tests {
         assert!(cfg.api_key.is_none());
         assert_eq!((cfg.model.as_str(), cfg.model_small.as_str()), ("qwen3", "qwen3-small"));
         assert_eq!((cfg.timeout_secs, cfg.max_retries), (30, 2));
-        // What [llm] sets wins.
-        let mut cfg = LlmConfig { model: "from-file".into(), timeout_secs: 9, ..Default::default() };
-        let explicit: BTreeSet<String> = ["model".to_string(), "timeout_secs".to_string()].into();
+        // What [llm] sets wins: timeout and retries key by key.
+        let mut cfg = LlmConfig { timeout_secs: 9, ..Default::default() };
+        let explicit: BTreeSet<String> = ["timeout_secs".to_string()].into();
         assert_eq!(c.apply(&mut cfg, &explicit), None);
-        assert_eq!((cfg.model.as_str(), cfg.provider.as_str()), ("from-file", "openai-compatible"));
+        assert_eq!((cfg.model.as_str(), cfg.provider.as_str()), ("qwen3", "openai-compatible"));
         assert_eq!((cfg.timeout_secs, cfg.max_retries), (9, 2));
+        // A model of its own sets the whole connection aside: the file's
+        // model is not sent to the contract's provider with its key.
+        let mut cfg = LlmConfig { model: "from-file".into(), ..Default::default() };
+        let explicit: BTreeSet<String> = ["model".to_string()].into();
+        let why = c.apply(&mut cfg, &explicit).expect("set aside");
+        assert!(why.contains("sets model"), "{why}");
+        assert_eq!((cfg.model.as_str(), cfg.provider.as_str()), ("from-file", LlmConfig::default().provider.as_str()));
+        assert_eq!((cfg.api_key_file.clone(), cfg.base_url.clone()), (None, None));
+        assert_eq!(cfg.max_retries, 2, "retries still apply");
     }
 
     fn file(toml: &str) -> crate::config::Config {
@@ -393,6 +447,35 @@ mod tests {
         assert_eq!(gw.apply(&mut llm, &cfg.llm_explicit), None);
         assert_eq!(llm.base_url.as_deref(), Some("https://gateway:8443"), "not {{root}}/v1/v1/messages");
         assert_eq!(llm.api_key_file, Some(PathBuf::from("/var/run/secrets/llm/gateway-token")));
+        // openai-compatible in the file has no base_url, so its endpoint is
+        // the local default (http://localhost:8000/v1): the OpenAI key from
+        // LLM_PROVIDER=openai is not for it.
+        let openai = vars(&[("LLM_PROVIDER", "openai"), ("LLM_MODEL", "gpt-5"), ("LLM_API_KEY_FILE", "/openai-key")])
+            .unwrap()
+            .unwrap();
+        let cfg = file("[llm]\nprovider = \"openai-compatible\"\n");
+        let mut llm = cfg.llm.clone();
+        let why = openai.apply(&mut llm, &cfg.llm_explicit).expect("set aside");
+        assert!(why.contains("another default endpoint"), "{why}");
+        assert_eq!((llm.api_key_file.clone(), llm.api_key.is_none()), (None, true));
+        assert_eq!((llm.provider.as_str(), llm.model.as_str()), ("openai-compatible", cfg.llm.model.as_str()));
+        // The same provider, or a named endpoint, binds the key to its host.
+        let cfg = file("[llm]\nprovider = \"OpenAI\"\n");
+        let mut llm = cfg.llm.clone();
+        assert_eq!(openai.apply(&mut llm, &cfg.llm_explicit), None);
+        assert_eq!(llm.api_key_file, Some(PathBuf::from("/openai-key")));
+        let vllm = vars(&[
+            ("LLM_PROVIDER", "openai-compatible"),
+            ("LLM_BASE_URL", "http://vllm:8000/v1"),
+            ("LLM_API_KEY", "k"),
+            ("LLM_MODEL", "m"),
+        ])
+        .unwrap()
+        .unwrap();
+        let cfg = file("[llm]\nprovider = \"openai\"\n");
+        let mut llm = cfg.llm.clone();
+        assert_eq!(vllm.apply(&mut llm, &cfg.llm_explicit), None);
+        assert_eq!(llm.base_url.as_deref(), Some("http://vllm:8000/v1"), "the key's own endpoint");
         // A contract endpoint without a contract key gets no conventional key either.
         let keyless = vars(&[("LLM_PROVIDER", "openai"), ("LLM_BASE_URL", "http://vllm:8000/v1"), ("LLM_MODEL", "m")])
             .unwrap()

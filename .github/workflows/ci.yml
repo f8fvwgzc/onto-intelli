@@ -105,10 +105,12 @@ jobs:
           grep -q 'key: api-key' <<<"$out" && grep -q 'name: llm-config' <<<"$out"
       - name: The process can read the mounted LLM credentials
         run: |
-          # Secret files are root-owned with mode 0440: uid 10001 reads them only through fsGroup.
-          out=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true)
-          grep -q 'defaultMode: 0440' <<<"$out"
-          grep -q 'fsGroup: 10001' <<<"$out" || { echo "0440 Secret files without fsGroup" >&2; exit 1; }
+          # Secret files are root-owned with mode 0440: uid 10001 reads them only through
+          # fsGroup, in the pod that mounts them (the Deployment).
+          pod=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true \
+            -s templates/deployment.yaml)
+          grep -q 'secretName: llm-credentials' <<<"$pod" && grep -q 'defaultMode: 0440' <<<"$pod"
+          grep -q 'fsGroup: 10001' <<<"$pod" || { echo "0440 Secret files without fsGroup" >&2; exit 1; }
 
   # The release image builds (linux/amd64 here; the release adds arm64) and carries git for the
   # repository connector.
