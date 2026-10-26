@@ -60,31 +60,28 @@ pub struct ServeOptions {
     pub control: Option<Arc<Control>>,
 }
 
-/// The KV namespace of revoked session ids, in each session's tenant.
+/// The KV namespace of revoked session and login ids, in the default tenant.
 pub const REVOKED_NS: &str = "auth.revoked";
 
-/// Revoked session ids in the KV store of the session's tenant (the
-/// default tenant for sessions without one), kept until the session would
-/// have expired: every replica of the tenant sees them.
+/// Revoked session and login ids in the default tenant's KV store, whatever
+/// the sessions' tenants, kept until the sessions would have expired: every
+/// replica sees them.
 struct HubRevocations(std::sync::Weak<Hub>);
 
 impl HubRevocations {
-    async fn store(&self, tenant: Option<&str>) -> Result<Arc<dyn onto_intelli::core::store::Store>> {
+    /// The default tenant's: one place for every tenant's sessions, so a
+    /// revocation never depends on the tenant the caller happened to name.
+    async fn store(&self) -> Result<Arc<dyn onto_intelli::core::store::Store>> {
         let hub = self.0.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
-        let intelli = hub.resolve(tenant).await?;
+        let intelli = hub.resolve(None).await?;
         Ok(intelli.ontology().store().clone())
     }
 }
 
 impl auth::Revocations for HubRevocations {
-    fn revoke<'a>(
-        &'a self,
-        tenant: Option<&'a str>,
-        jti: &'a str,
-        exp: u64,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    fn revoke<'a>(&'a self, jti: &'a str, exp: u64) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let store = self.store(tenant).await?;
+            let store = self.store().await?;
             let (jti, until) = (jti.to_string(), (exp as i64).saturating_mul(1000));
             tokio::task::spawn_blocking(move || {
                 store.kv_put(REVOKED_NS, &jti, &serde_json::json!({ "expires_at": exp }), Some(until))
@@ -94,13 +91,9 @@ impl auth::Revocations for HubRevocations {
         })
     }
 
-    fn is_revoked<'a>(
-        &'a self,
-        tenant: Option<&'a str>,
-        jti: &'a str,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+    fn is_revoked<'a>(&'a self, jti: &'a str) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
-            let store = self.store(tenant).await?;
+            let store = self.store().await?;
             let jti = jti.to_string();
             tokio::task::spawn_blocking(move || store.kv_get(REVOKED_NS, &jti).map(|v| v.is_some()))
                 .await

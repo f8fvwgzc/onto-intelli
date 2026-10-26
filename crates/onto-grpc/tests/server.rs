@@ -910,19 +910,15 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
     // Before, a session minted another one for another hour, and so on forever.
     let renewed = mint(token.clone(), json!({ "ttl_secs": 3600 })).await;
     assert_eq!(renewed["expires_at"], first["expires_at"], "a session cannot outlive the one that minted it");
-    let renewed = renewed["token"].as_str().unwrap().to_string();
+    let (renewed, renewed_sid) = (renewed["token"].as_str().unwrap().to_string(), renewed["sid"].clone());
 
     let whoami = |bearer: String| {
         let (http, base) = (http.clone(), base.clone());
         async move { http.get(format!("{base}/v1/auth/whoami")).bearer_auth(bearer).send().await.unwrap().status() }
     };
     assert_eq!(whoami(renewed.clone()).await, 200);
-    // Sign out revokes the presented session; the other one is untouched.
-    let out = http.delete(format!("{base}/v1/auth/session")).bearer_auth(&renewed).send().await.unwrap();
-    assert_eq!(out.status(), 200);
-    assert_eq!(whoami(renewed).await, 401);
-    assert_eq!(whoami(token.clone()).await, 200);
-    // The service revokes the session it minted, by id.
+    // The service revokes the session it minted, by id; the session minted
+    // from it goes too.
     let r = http
         .post(format!("{base}/v1/auth/session/revoke"))
         .bearer_auth("service-token-for-tests")
@@ -933,6 +929,18 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(whoami(token.clone()).await, 401);
+    assert_eq!(whoami(renewed).await, 401, "a session minted from a revoked one");
+    assert_eq!(renewed_sid, first["jti"], "it was in the same login");
+    // Sign out ends the login: the session and the one it was minted from.
+    let login =
+        mint("service-token-for-tests".into(), json!({ "act_as": "user:9", "roles": ["member"], "tenant": "ws_1" }))
+            .await;
+    let parent = login["token"].as_str().unwrap().to_string();
+    let child = mint(parent.clone(), json!({})).await["token"].as_str().unwrap().to_string();
+    let out = http.delete(format!("{base}/v1/auth/session")).bearer_auth(&child).send().await.unwrap();
+    assert_eq!(out.status(), 200);
+    assert_eq!(whoami(child).await, 401);
+    assert_eq!(whoami(parent).await, 401);
     // A session cannot revoke by id.
     let other =
         mint("service-token-for-tests".into(), json!({ "act_as": "user:8", "roles": ["member"], "tenant": "ws_1" }))
@@ -949,4 +957,63 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
     // A token limited to one tenant mints sessions for that tenant, never the default one.
     let dash = mint("tenant-a-only-token".into(), json!({})).await;
     assert_eq!(dash["tenant"], "ws_a");
+}
+
+#[tokio::test]
+async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revoke_named() {
+    // Two replicas: one hub's storage, one session secret.
+    const SECRET: &str = "ONTO_TEST_SESSION_SECRET_REPLICAS";
+    // SAFETY: set before this test's servers start; no other test reads it.
+    unsafe { std::env::set_var(SECRET, "a-session-secret-of-at-least-32-characters") };
+    let mut cfg = Config::in_memory();
+    cfg.engine.tenancy = "multi".into();
+    cfg.auth.session_secret_env = Some(SECRET.into());
+    cfg.auth.tokens = vec![onto_intelli::config::TokenConfig {
+        token: Some("service-token-for-tests".into()),
+        token_env: None,
+        principal: onto_intelli::Principal::new("svc", vec![onto_intelli::Role::Member], vec!["*".into()]),
+        impersonate: true,
+        impersonate_roles: vec![onto_intelli::Role::Member],
+        tenants: vec!["*".into()],
+    }];
+    let hub = onto_intelli::Hub::open(cfg).await.unwrap();
+    let mut bases = Vec::new();
+    for _ in 0..2 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        bases.push(format!("http://{}", listener.local_addr().unwrap()));
+        let serve = onto_grpc::serve_hub_on(hub.clone(), onto_grpc::ServeOptions::default(), listener, async {
+            std::future::pending::<()>().await
+        });
+        tokio::spawn(serve);
+    }
+    let http = reqwest::Client::new();
+    let status = |base: &str, bearer: &str| {
+        let r = http.get(format!("{base}/v1/auth/whoami")).bearer_auth(bearer);
+        async move { r.send().await.unwrap().status() }
+    };
+    for (n, header) in [(1, None), (2, Some("ws_2"))] {
+        let minted: Value = http
+            .post(format!("{}/v1/auth/session", bases[0]))
+            .bearer_auth("service-token-for-tests")
+            .json(&json!({ "act_as": format!("user:{n}"), "roles": ["member"], "tenant": "ws_1" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = minted["token"].as_str().unwrap();
+        // The tenant the revoke names (none, or another one) and an expiry
+        // in the past do not matter: the session id is revoked everywhere.
+        let mut revoke = http
+            .post(format!("{}/v1/auth/session/revoke", bases[0]))
+            .bearer_auth("service-token-for-tests")
+            .json(&json!({ "jti": minted["jti"], "expires_at": 1 }));
+        if let Some(t) = header {
+            revoke = revoke.header("x-onto-tenant", t);
+        }
+        assert_eq!(revoke.send().await.unwrap().status(), 200);
+        assert_eq!(status(&bases[0], token).await, 401, "{header:?}: this replica");
+        assert_eq!(status(&bases[1], token).await, 401, "{header:?}: the other replica");
+    }
 }

@@ -506,6 +506,13 @@ async fn trace_actions_and_their_access() {
             assert!(l["traces"][0].get("preview").is_none_or(Value::is_null), "{}: {l}", p.id);
             assert_eq!(l["traces"][0]["redacted"], true);
         }
+        // Searching the question would rebuild it: admins only.
+        let found = i.call(p, "trace.list", json!({ "q": "project alpha" })).await;
+        if p.is_privileged() {
+            assert_eq!(found.unwrap()["traces"][0]["id"], json!(id));
+        } else {
+            assert!(matches!(found, Err(Error::Denied(_))), "{}: {found:?}", p.id);
+        }
     }
     let g = i.call(&admin(), "trace.get", json!({ "id": id })).await.unwrap();
     assert_eq!(g["trace"]["input"]["question"], "Who owns Project Alpha?");

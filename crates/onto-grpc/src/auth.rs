@@ -70,21 +70,31 @@ pub const REVOCATION_TTL: Duration = Duration::from_secs(10);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// Where revoked session ids are kept, shared by every replica: the KV
-/// store of the session's tenant (namespace `auth.revoked`, see
-/// [`crate::hub_revocations`]), until the session would have expired anyway.
+/// Where revoked session ids are kept, shared by every replica and by every
+/// tenant (a session id names no tenant): the default tenant's KV store,
+/// namespace [`crate::REVOKED_NS`], until `exp` (Unix seconds).
 pub trait Revocations: Send + Sync {
-    fn revoke<'a>(&'a self, tenant: Option<&'a str>, jti: &'a str, exp: u64) -> BoxFuture<'a, ()>;
-    fn is_revoked<'a>(&'a self, tenant: Option<&'a str>, jti: &'a str) -> BoxFuture<'a, bool>;
+    fn revoke<'a>(&'a self, id: &'a str, exp: u64) -> BoxFuture<'a, ()>;
+    fn is_revoked<'a>(&'a self, id: &'a str) -> BoxFuture<'a, bool>;
 }
 
-/// A session presented with the request: when it expires and its id.
+/// A session presented with the request: when it expires and its ids.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
     /// Unix seconds.
     pub exp: u64,
     /// `None` for sessions minted before sessions had ids.
     pub jti: Option<String>,
+    /// The login the session belongs to: the `jti` of the first session,
+    /// inherited by every session minted from it. Revoking it revokes them all.
+    pub sid: Option<String>,
+}
+
+impl SessionInfo {
+    /// The login: `sid`, or the session's own id.
+    pub fn login(&self) -> Option<&str> {
+        self.sid.as_deref().or(self.jti.as_deref())
+    }
 }
 
 /// The console part of a session token: the user it was issued to.
@@ -113,6 +123,9 @@ pub struct SessionClaims {
     /// The session's id, for revocation. Older tokens have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// The login's id ([`SessionInfo::sid`]); refused once it is revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 const SESSION_PREFIX: &str = "onto1.";
@@ -331,19 +344,21 @@ impl Auth {
         *self.revocations.write() = Some(r);
     }
 
-    /// Revoke a session by id: refused from now on, on every replica within
-    /// [`REVOCATION_TTL`] and on this one at once.
-    pub async fn revoke_session(&self, tenant: Option<&str>, jti: &str, exp: u64) -> Result<()> {
+    /// Revoke a session id or a login id (a `sid`, which is its first
+    /// session's `jti`): refused from now on, on every replica within
+    /// [`REVOCATION_TTL`] and on this one at once. It stays revoked until
+    /// `exp`, and at least as long as any session minted now could live.
+    pub async fn revoke_session(&self, id: &str, exp: u64) -> Result<()> {
         let r = self.revocations.read().clone();
         let Some(r) = r else {
             return Err(Error::Unavailable("this server keeps no session revocations".into()));
         };
-        r.revoke(tenant, jti, exp).await?;
-        self.revoked.lock().insert(jti.to_string(), (true, Instant::now()));
+        r.revoke(id, exp.max(now_secs() + self.session_max_ttl)).await?;
+        self.revoked.lock().insert(id.to_string(), (true, Instant::now()));
         Ok(())
     }
 
-    async fn session_revoked(&self, tenant: Option<&str>, jti: &str) -> std::result::Result<bool, AuthError> {
+    async fn session_revoked(&self, jti: &str) -> std::result::Result<bool, AuthError> {
         let now = Instant::now();
         if let Some((revoked, at)) = self.revoked.lock().get(jti).cloned()
             && (revoked || now.duration_since(at) < REVOCATION_TTL)
@@ -352,8 +367,7 @@ impl Auth {
         }
         let r = self.revocations.read().clone();
         let Some(r) = r else { return Ok(false) };
-        let revoked =
-            r.is_revoked(tenant, jti).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
+        let revoked = r.is_revoked(jti).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
         let mut cache = self.revoked.lock();
         if cache.len() > 100_000 {
             cache.retain(|_, (r, at)| *r || now.duration_since(*at) < REVOCATION_TTL);
@@ -390,61 +404,76 @@ impl Auth {
 
     /// A signed, short-lived token for one principal and tenant.
     pub fn issue_session(&self, principal: Principal, tenant: Option<String>, ttl_secs: u64) -> (String, u64) {
-        let (token, exp, _) = self.issue_session_until(principal, tenant, ttl_secs, None);
-        (token, exp)
+        let (token, s) = self.issue_session_from(principal, tenant, ttl_secs, None);
+        (token, s.exp)
     }
 
-    /// [`issue_session`](Self::issue_session) that expires no later than
-    /// `not_after` (Unix seconds; a session minting a session); also returns its id.
-    pub fn issue_session_until(
+    /// [`issue_session`](Self::issue_session), minted by the session
+    /// `parent` when there is one: it expires no later and belongs to the
+    /// same login. Also returns the new session's ids.
+    pub fn issue_session_from(
         &self,
         principal: Principal,
         tenant: Option<String>,
         ttl_secs: u64,
-        not_after: Option<u64>,
-    ) -> (String, u64, String) {
-        let mut exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
-        if let Some(cap) = not_after {
-            exp = exp.min(cap);
-        }
-        let jti = new_jti();
-        (
-            self.mint(&SessionClaims { principal, tenant, exp, console: None, key: None, jti: Some(jti.clone()) }),
-            exp,
-            jti,
-        )
+        parent: Option<&SessionInfo>,
+    ) -> (String, SessionInfo) {
+        let s = self.next_session(ttl_secs, parent);
+        let claims = SessionClaims {
+            principal,
+            tenant,
+            exp: s.exp,
+            console: None,
+            key: None,
+            jti: s.jti.clone(),
+            sid: s.sid.clone(),
+        };
+        (self.mint(&claims), s)
     }
 
     /// A session minted by an API key: bound to the key's project and valid
     /// only while the key is.
     pub fn issue_key_session(&self, principal: Principal, prefix: &str, project: &str, ttl_secs: u64) -> (String, u64) {
-        let (token, exp, _) = self.issue_key_session_until(principal, prefix, project, ttl_secs, None);
-        (token, exp)
+        let (token, s) = self.issue_key_session_from(principal, prefix, project, ttl_secs, None);
+        (token, s.exp)
     }
 
-    /// [`issue_key_session`](Self::issue_key_session), capped at `not_after`.
-    pub fn issue_key_session_until(
+    /// [`issue_key_session`](Self::issue_key_session), minted by `parent`
+    /// as in [`issue_session_from`](Self::issue_session_from).
+    pub fn issue_key_session_from(
         &self,
         principal: Principal,
         prefix: &str,
         project: &str,
         ttl_secs: u64,
-        not_after: Option<u64>,
-    ) -> (String, u64, String) {
-        let mut exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
-        if let Some(cap) = not_after {
-            exp = exp.min(cap);
-        }
-        let jti = new_jti();
+        parent: Option<&SessionInfo>,
+    ) -> (String, SessionInfo) {
+        let s = self.next_session(ttl_secs, parent);
         let claims = SessionClaims {
             principal,
             tenant: Some(project.to_string()),
-            exp,
+            exp: s.exp,
             console: None,
             key: Some(prefix.to_string()),
-            jti: Some(jti.clone()),
+            jti: s.jti.clone(),
+            sid: s.sid.clone(),
         };
-        (self.mint(&claims), exp, jti)
+        (self.mint(&claims), s)
+    }
+
+    /// A new session's expiry and ids: a session minting a session cannot
+    /// outlive itself, and passes its login on.
+    fn next_session(&self, ttl_secs: u64, parent: Option<&SessionInfo>) -> SessionInfo {
+        let mut exp = now_secs() + ttl_secs.clamp(60, self.session_max_ttl);
+        let jti = new_jti();
+        let mut sid = jti.clone();
+        if let Some(parent) = parent {
+            exp = exp.min(parent.exp);
+            if let Some(login) = parent.login() {
+                sid = login.to_string();
+            }
+        }
+        SessionInfo { exp, jti: Some(jti), sid: Some(sid) }
     }
 
     /// A console session for a user: principal `user:<id>` without roles and
@@ -460,6 +489,7 @@ impl Auth {
             console: Some(ConsoleClaims { user: user.to_string(), iat }),
             key: None,
             jti: None,
+            sid: None,
         };
         (self.mint(&claims), exp)
     }
@@ -528,12 +558,14 @@ impl Auth {
                 (Some(bound), _) => Some(bound.clone()),
                 (None, asked) => asked,
             };
-            if let Some(jti) = &claims.jti
-                && self.session_revoked(claims.tenant.as_deref(), jti).await?
-            {
-                return Err(AuthError::Unauthenticated("session revoked".into()));
+            let session = SessionInfo { exp: claims.exp, jti: claims.jti.clone(), sid: claims.sid.clone() };
+            // The session itself, or the login it belongs to.
+            for id in session.jti.iter().chain(session.sid.iter().filter(|sid| session.jti.as_ref() != Some(*sid))) {
+                if self.session_revoked(id).await? {
+                    return Err(AuthError::Unauthenticated("session revoked".into()));
+                }
             }
-            let session = Some(SessionInfo { exp: claims.exp, jti: claims.jti.clone() });
+            let session = Some(session);
             let credential = match &claims.key {
                 Some(prefix) => {
                     let control = self

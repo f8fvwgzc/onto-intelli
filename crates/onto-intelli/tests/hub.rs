@@ -194,10 +194,19 @@ async fn agents_neither_write_raw_nor_confirm_their_own_risky_actions() {
         ("link.create", json!({ "from": "project:alpha", "rel": "owned_by", "to": "team:platform" })),
         ("graph.apply", json!({ "mutations": [{ "op": "delete", "id": "project:alpha" }] })),
         ("ingest.batch", json!({ "records": [{ "kind": "task", "key": "q", "title": "q" }] })),
+        ("ingest.sheet", json!({ "csv": "id,title\nz,z\n", "kind": "task", "key": "id" })),
     ];
     for (action, input) in raw {
         let err = ws.call(&agent, action, input).await.unwrap_err();
         assert!(matches!(err, onto_intelli::Error::Denied(ref m) if m.contains("agent")), "{action}: {err}");
+    }
+    // Write actions not on the agent list are closed to agents too.
+    for action in ["execution.init_graph", "connector.remove", "catalog.rerank", "learned.certify"] {
+        let err = ws.call(&agent, action, json!({})).await.unwrap_err();
+        assert!(
+            matches!(err, onto_intelli::Error::Denied(ref m) if m.contains("not open to agents")),
+            "{action}: {err}"
+        );
     }
     let admin = Principal::admin("x");
     assert!(ws.call(&admin, "entity.get", json!({ "id": "project:alpha" })).await.is_ok());
@@ -228,4 +237,13 @@ async fn agents_neither_write_raw_nor_confirm_their_own_risky_actions() {
     let hub = Hub::open(cfg).await.unwrap();
     let ws = hub.tenant("t").await.unwrap();
     ws.call(&agent, "entity.upsert", json!({ "id": "task:z", "title": "z" })).await.unwrap();
+}
+
+#[test]
+fn every_write_action_is_classified_for_agents() {
+    use onto_intelli::actions::{ACTIONS, AGENT_WRITES, RAW_WRITES};
+    for name in AGENT_WRITES.iter().chain(RAW_WRITES) {
+        assert!(ACTIONS.iter().any(|a| a.name == *name && a.write), "{name} is not a write action");
+        assert!(!(AGENT_WRITES.contains(name) && RAW_WRITES.contains(name)), "{name} is on both lists");
+    }
 }

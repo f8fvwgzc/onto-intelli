@@ -38,8 +38,10 @@
 //! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
-//!   A session minting a session cannot outlive itself. `DELETE` revokes the presented session.
-//! * `POST /v1/auth/session/revoke`  `{jti, tenant?}`: a config token revokes a session it minted
+//!   A session minting a session cannot outlive itself and belongs to the same login (`sid`).
+//!   `DELETE` signs out: it revokes the presented session's login, every session minted in it.
+//! * `POST /v1/auth/session/revoke`  `{jti}`: a config token revokes a session it minted, and every
+//!   session minted from that one (a `sid` works too), whatever the tenant
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
 //! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits
@@ -413,10 +415,11 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
     };
     let ttl = input.ttl_secs.unwrap_or(3600);
     let principal = c.principal.clone();
-    // A session minting a session cannot outlive itself: renewal ends when
-    // the first session would have.
-    let not_after = c.session.as_ref().map(|si| si.exp);
-    let (token, exp, jti, tenant) = match &c.credential {
+    // A session minting a session cannot outlive itself (renewal ends when
+    // the first session would have) and stays in its login, so revoking the
+    // first one revokes this one too.
+    let parent = c.session.as_ref();
+    let (token, minted, tenant) = match &c.credential {
         Credential::Console { .. } => {
             return error_response(&Error::Denied(
                 "console sessions cannot mint sessions; use the console session itself".into(),
@@ -424,45 +427,56 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
         }
         // The key's delegate: refused once the key is revoked.
         Credential::ApiKey { prefix, project, .. } => {
-            let (t, e, j) = s.auth.issue_key_session_until(principal.clone(), prefix, project, ttl, not_after);
-            (t, e, j, Some(project.clone()))
+            let (t, m) = s.auth.issue_key_session_from(principal.clone(), prefix, project, ttl, parent);
+            (t, m, Some(project.clone()))
         }
         _ => {
             let tenant = c.tenant.clone().or_else(|| Some(s.hub.default_tenant().to_string()));
-            let (t, e, j) = s.auth.issue_session_until(principal.clone(), tenant.clone(), ttl, not_after);
-            (t, e, j, tenant)
+            let (t, m) = s.auth.issue_session_from(principal.clone(), tenant.clone(), ttl, parent);
+            (t, m, tenant)
         }
     };
-    Json(json!({ "token": token, "expires_at": exp, "jti": jti, "principal": principal, "tenant": tenant }))
-        .into_response()
+    Json(json!({
+        "token": token,
+        "expires_at": minted.exp,
+        "jti": minted.jti,
+        "sid": minted.sid,
+        "principal": principal,
+        "tenant": tenant,
+    }))
+    .into_response()
 }
 
-/// Sign out: the presented session is revoked.
+/// Sign out: the presented session's login is revoked, so the session, the
+/// one it was minted from and every other one minted in that login.
 async fn session_logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return auth_error_response(&e),
     };
-    let Some(crate::auth::SessionInfo { exp, jti: Some(jti) }) = c.session else {
+    let Some((login, exp)) = c.session.as_ref().and_then(|si| Some((si.login()?.to_string(), si.exp))) else {
         return error_response(&Error::invalid("DELETE /v1/auth/session revokes a session token: present one"));
     };
-    match s.auth.revoke_session(c.tenant.as_deref(), &jti, exp).await {
-        Ok(()) => Json(json!({ "revoked": jti })).into_response(),
+    match s.auth.revoke_session(&login, exp).await {
+        Ok(()) => Json(json!({ "revoked": login })).into_response(),
         Err(e) => error_response(&e),
     }
 }
 
 #[derive(serde::Deserialize)]
 struct RevokeIn {
+    /// A session's `jti` (which is also the `sid` of the sessions minted
+    /// from it), or a `sid`.
     jti: String,
-    /// Unix seconds the session expires at (from the mint response); until
-    /// then the id stays revoked. Default: the longest session lifetime.
+    /// Unix seconds the session expires at (from the mint response). The id
+    /// stays revoked at least as long as any session could live anyway.
     #[serde(default)]
     expires_at: Option<u64>,
 }
 
-/// A service (a config token) revokes a session it minted for a user,
-/// within the tenants the token may address.
+/// A service (a config token) revokes a session it minted for a user, and
+/// the sessions minted from it. Session ids name no tenant: the revocation
+/// holds whatever tenant the request names.
 async fn session_revoke(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
@@ -477,9 +491,8 @@ async fn session_revoke(State(s): State<AppState>, headers: HeaderMap, body: Opt
     };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let exp = input.expires_at.unwrap_or(now + s.hub.config().auth.session_max_ttl_secs);
-    let tenant = c.tenant.clone().or_else(|| Some(s.hub.default_tenant().to_string()));
-    match s.auth.revoke_session(tenant.as_deref(), &input.jti, exp).await {
-        Ok(()) => Json(json!({ "revoked": input.jti, "tenant": tenant })).into_response(),
+    match s.auth.revoke_session(&input.jti, exp).await {
+        Ok(()) => Json(json!({ "revoked": input.jti })).into_response(),
         Err(e) => error_response(&e),
     }
 }

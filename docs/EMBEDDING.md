@@ -158,10 +158,11 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
 - The backend mints a browser session with `POST /v1/auth/session` (its
   impersonating token plus `{act_as, roles, entity, tenant}`) and hands it to
   the iframe with `postMessage` (`onto:session`). The answer carries the
-  session's `jti`: `POST /v1/auth/session/revoke {jti, expires_at}` (the
-  backend's token) revokes it, `DELETE /v1/auth/session` (the session
-  itself) signs it out, on every replica within 10 seconds. A session may
-  mint another one, which never outlives it.
+  session's `jti`: `POST /v1/auth/session/revoke {jti}` (the backend's
+  token, with or without `x-onto-tenant`) revokes it and every session
+  minted from it, `DELETE /v1/auth/session` (the session itself) signs out
+  its whole login, on every replica within 10 seconds. A session may mint
+  another one, which never outlives it and carries the same `sid`.
 - A token whose `tenants` names some tenants (not `"*"`) never reaches the
   default tenant: with one tenant, a request without `x-onto-tenant`
   addresses that one; with several, it must name one.

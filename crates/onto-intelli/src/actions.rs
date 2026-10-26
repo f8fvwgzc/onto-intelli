@@ -35,7 +35,8 @@ const fn a(name: &'static str, write: bool, description: &'static str) -> Action
 }
 
 /// Actions that change entities and links directly, without an action
-/// type's checks: refused to agents unless `governance.agent_raw_writes`.
+/// type's checks: refused to agents unless `governance.agent_raw_writes`
+/// (`ingest.sheet` with `dry_run` writes nothing and stays allowed).
 pub const RAW_WRITES: &[&str] = &[
     "entity.upsert",
     "entity.patch",
@@ -45,7 +46,58 @@ pub const RAW_WRITES: &[&str] = &[
     "link.delete",
     "graph.apply",
     "ingest.batch",
+    "ingest.sheet",
 ];
+
+/// The write actions agents may call, because each governs itself: action
+/// types (plan, risk, confirmation by a person), proposals instead of
+/// direct schema changes, their own memory and trace scores. Every other
+/// write action of [`ACTIONS`] is refused to agents, so a write action added
+/// later is closed to them until it is listed here.
+pub const AGENT_WRITES: &[&str] = &[
+    "action.apply",
+    "action.undo",
+    "memory.remember",
+    "memory.forget",
+    "memory.consolidate",
+    "event.append",
+    "trace.score",
+    "schema.apply",
+    "schema.undo",
+    "schema.revert",
+    "schema.propose",
+    "schema.revise",
+    "schema.comment",
+    "schema.withdraw",
+    "schema.approve",
+    "schema.reject",
+    "schema.lint_feedback",
+    "schema.lock",
+    "schema.unlock",
+    "pack.install",
+    "ontology.apply_draft",
+    "connector.crawl",
+];
+
+/// May agent `p` run write action `action` with `input`?
+fn agent_may_write(p: &Principal, action: &str, input: &Value, raw_writes: bool) -> Result<()> {
+    let write = ACTIONS.iter().any(|a| a.name == action && a.write);
+    if !p.is_agent() || !write || AGENT_WRITES.contains(&action) {
+        return Ok(());
+    }
+    if action == "ingest.sheet" && input.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    if raw_writes && RAW_WRITES.contains(&action) {
+        return Ok(());
+    }
+    let why = if RAW_WRITES.contains(&action) {
+        "writes the graph directly, which agents may not (use an action type, action.apply; or set governance.agent_raw_writes)"
+    } else {
+        "is not open to agents"
+    };
+    Err(Error::Denied(format!("{} is an agent: {action} {why}", p.id)))
+}
 
 pub const ACTIONS: &[ActionInfo] = &[
     a("entity.upsert", true, "Create or update an entity (merge props). Input: EntityInput."),
@@ -721,13 +773,7 @@ impl Intelli {
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
-        if RAW_WRITES.contains(&action) && p.is_agent() && !onto.options().governance.agent_raw_writes {
-            return Err(Error::Denied(format!(
-                "{} is an agent: {action} writes the graph directly, which agents may not \
-                 (use an action type, action.apply; or set governance.agent_raw_writes)",
-                p.id
-            )));
-        }
+        agent_may_write(p, action, &input, onto.options().governance.agent_raw_writes)?;
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
             return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
@@ -1257,6 +1303,13 @@ impl Intelli {
             "trace.list" => {
                 let mut q: TraceQuery = parse(action, input)?;
                 observe_scope(p, &mut q.workspace)?;
+                // Matching on the question would rebuild it, a guess at a time.
+                if redact && q.q.as_deref().is_some_and(|text| !text.is_empty()) {
+                    return Err(Error::Denied(format!(
+                        "{} may not search trace questions (admins only: they may quote what others cannot read)",
+                        p.id
+                    )));
+                }
                 let mut page = store.trace_list(&q)?;
                 if redact {
                     page.traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
