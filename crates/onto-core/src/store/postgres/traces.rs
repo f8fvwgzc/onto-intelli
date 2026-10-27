@@ -193,6 +193,7 @@ fn trace_row(r: &PgRow, bodies: bool) -> Result<TraceRow> {
         tags: r.try_get("tags")?,
         version: r.try_get("version")?,
         preview: if bodies { None } else { r.try_get("preview")? },
+        redacted: false,
     })
 }
 

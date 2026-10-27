@@ -1191,6 +1191,7 @@ impl Intelli {
             "version": crate::VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
             "ontology": self.onto.stats()?,
+            "estimated_bytes": self.onto.estimated_bytes(),
             "memory": self.memory.stats(),
             "llm": {
                 "provider": llm.name(),

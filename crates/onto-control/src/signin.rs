@@ -48,7 +48,8 @@ const MAX_CLIENTS: usize = 10_000;
 /// The first project of a new user's organization.
 pub const FIRST_PROJECT: &str = "My first project";
 
-/// Opens a new project's tenant (the console passes `hub.tenant(ref)`).
+/// Creates a new project's tenant storage without opening it (the console
+/// passes `hub.provision(ref)`).
 pub type OpenTenant<'a> = &'a (dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync);
 
 /// The query of `GET /v1/console/auth/oidc/{id}/start`.
@@ -284,10 +285,14 @@ impl Control {
             Err(r) => {
                 tracing::warn!(provider = %login.provider, code = r.code, "OIDC sign-in refused: {}", r.message);
                 if r.code != "server_error" {
-                    self.audit(AuditEntry::new("system", "auth.signin_refused").detail(json!({
-                        "provider": login.provider, "reason": r.code,
-                    })))
-                    .await;
+                    let audited = self
+                        .audit(AuditEntry::new("system", "auth.signin_refused").detail(json!({
+                            "provider": login.provider, "reason": r.code,
+                        })))
+                        .await;
+                    if let Err(e) = audited {
+                        return fail(e.into());
+                    }
                 }
                 fail(r)
             }
@@ -389,7 +394,7 @@ impl Control {
                     .target(&user.id)
                     .detail(json!({ "provider": provider })),
             )
-            .await;
+            .await?;
         }
         let mut orgs = self.store.orgs_of(&user.id).await?;
         if orgs.is_empty() && self.config.create_org_on_signup {
@@ -399,19 +404,19 @@ impl Control {
         self.evict_user(&user.id);
         let detail = json!({ "provider": provider, "new_user": new_user, "invitations": joined.len() });
         if orgs.is_empty() {
-            self.audit(AuditEntry::new(&user.id, "auth.signin").target(&user.id).detail(detail.clone())).await;
+            self.audit(AuditEntry::new(&user.id, "auth.signin").target(&user.id).detail(detail.clone())).await?;
         }
         for (org, _) in &orgs {
             self.audit(AuditEntry::new(&user.id, "auth.signin").org(&org.id).target(&user.id).detail(detail.clone()))
-                .await;
+                .await?;
         }
         Ok(user)
     }
 
     /// `"<name>'s team"` (slug from the email's local part and 4 random
     /// characters) with the user as owner, and an empty first project whose
-    /// tenant is opened at once. A project that fails to open is marked
-    /// deleted; the sign-in goes on.
+    /// tenant storage is created at once (it opens on first use). A project
+    /// whose storage cannot be created is marked deleted; the sign-in goes on.
     async fn first_org(&self, user: &User, open: OpenTenant<'_>) -> Result<Org> {
         let local = user.email.as_deref().and_then(|e| e.split('@').next()).filter(|l| !l.is_empty());
         let display = Some(user.name.trim()).filter(|n| !n.is_empty()).or(local);
@@ -438,7 +443,7 @@ impl Control {
                 .target(&org.id)
                 .detail(json!({ "name": org.name, "slug": org.slug, "signup": true })),
         )
-        .await;
+        .await?;
         let project = self.store.create_project(&org.id, FIRST_PROJECT, &user.id).await?;
         match open(project.r#ref.clone()).await {
             Ok(()) => {
@@ -448,7 +453,7 @@ impl Control {
                         .target(&project.r#ref)
                         .detail(json!({ "name": project.name, "signup": true })),
                 )
-                .await;
+                .await?;
             }
             Err(e) => {
                 tracing::error!(project = %project.r#ref, "opening the first project of a new user: {e}");

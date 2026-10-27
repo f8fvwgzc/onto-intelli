@@ -84,7 +84,21 @@ Released migrations never change; a schema change is a new migration.
 
 Each tenant has its own PostgreSQL schema, `{schema_prefix}{tenant}`, reduced
 to `[a-z0-9_]` and at most 63 bytes. One database holds any number of
-tenants; nexc uses one per workspace.
+tenants; nexc uses one per workspace. Ids that differ only in case or in
+`-`, `.` and `_` reduce to the same name: the first id to open a schema
+claims it (`tenant_identity`), and opening or dropping it under any other
+id is refused with `conflict`.
+
+**Open tenants.** A process keeps a PostgreSQL tenant in memory while it is
+used, and closes it (`engine.tenant_idle_secs`, default 1800) when it is not.
+At most `engine.max_open_tenants` (default 512, 0 for no limit) stay open, and
+while the open ones' estimated memory is above `engine.tenant_memory_budget_mb`
+(default 0: no budget) the least recently used close; the one just used
+always stays. A closed tenant opens again on its next request.
+`GET /v1/admin/tenants` (operators) lists the open tenants with their
+`estimated_bytes` (`Ontology::estimated_bytes`, an estimate from their
+contents), and `system.stats` shows a tenant's own. A console sign-up
+creates the first project's schema without opening it.
 
 | table | holds |
 |---|---|
@@ -97,6 +111,7 @@ tenants; nexc uses one per workspace.
 | `commits` | the commit log |
 | `head` | the commit sequence |
 | `schema_migrations` | the migrations applied to this tenant |
+| `tenant_identity` | the tenant id that owns this schema |
 
 ## Vectors
 
@@ -146,8 +161,10 @@ and redirects included) goes through the same steps:
    bounded, then the write fails with `conflict`.
 3. Otherwise the batch is written: entities, links, events, entity and
    link versions, KV, and a commit record `n + 1` listing everything it
-   touched (vectors follow, see above). `NOTIFY` on the tenant's channel is delivered when,
-   and only if, the transaction commits.
+   touched (vectors follow, see above). `NOTIFY` on the shared channel
+   `onto_intelli` (the payload names the schema), and on the tenant's own
+   channel for replicas of older versions, is delivered when, and only if,
+   the transaction commits.
 
 Validation therefore always runs against the latest committed state.
 Concurrent edits from different replicas never overwrite each other blindly:
@@ -164,6 +181,9 @@ same question in memory. Every process runs a follower:
 - It also polls the head every `follow_interval_ms`, in case a notice was
   lost while the LISTEN connection reconnected. A reconnect triggers a
   catch-up on its own.
+- One LISTEN connection per pool serves every tenant on it: a LISTEN holds
+  its connection for as long as it listens, so one per tenant would leave
+  no connection for queries past `max_connections` tenants.
 - A reader too far behind (pruned commits) or a bulk import triggers a full
   reload.
 
@@ -182,7 +202,11 @@ the store, so they are always current.
 **Retention.** Commit records older than the last 100,000 are pruned. A
 follower that falls further behind reloads the whole tenant.
 `PgStore::vacuum(keep_events)` deletes expired KV rows and, optionally,
-events older than a cutoff. It is the only delete the history tables allow.
+events older than a cutoff. It is the only delete the history tables allow:
+`events`, `entity_versions` and `link_versions` refuse `UPDATE`, `DELETE` and
+`TRUNCATE` with triggers (migrations 0003 and 0008), and `vacuum` sets
+`onto.retention` for its own transaction to pass them. The triggers stop
+application bugs and stray statements, not a role that may alter them.
 
 ## Embedding notes
 

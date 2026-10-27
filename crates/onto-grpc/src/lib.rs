@@ -60,6 +60,48 @@ pub struct ServeOptions {
     pub control: Option<Arc<Control>>,
 }
 
+/// The KV namespace of revoked session and login ids, in the default tenant.
+pub const REVOKED_NS: &str = "auth.revoked";
+
+/// Revoked session and login ids in the default tenant's KV store, whatever
+/// the sessions' tenants, kept until the sessions would have expired: every
+/// replica sees them.
+struct HubRevocations(std::sync::Weak<Hub>);
+
+impl HubRevocations {
+    /// The default tenant's: one place for every tenant's sessions, so a
+    /// revocation never depends on the tenant the caller happened to name.
+    async fn store(&self) -> Result<Arc<dyn onto_intelli::core::store::Store>> {
+        let hub = self.0.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
+        let intelli = hub.resolve(None).await?;
+        Ok(intelli.ontology().store().clone())
+    }
+}
+
+impl auth::Revocations for HubRevocations {
+    fn revoke<'a>(&'a self, jti: &'a str, exp: u64) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let store = self.store().await?;
+            let (jti, until) = (jti.to_string(), (exp as i64).saturating_mul(1000));
+            tokio::task::spawn_blocking(move || {
+                store.kv_put(REVOKED_NS, &jti, &serde_json::json!({ "expires_at": exp }), Some(until))
+            })
+            .await
+            .map_err(|e| Error::Other(format!("revoking a session: {e}")))?
+        })
+    }
+
+    fn is_revoked<'a>(&'a self, jti: &'a str) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let store = self.store().await?;
+            let jti = jti.to_string();
+            tokio::task::spawn_blocking(move || store.kv_get(REVOKED_NS, &jti).map(|v| v.is_some()))
+                .await
+                .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
+        })
+    }
+}
+
 /// Build the complete router (gRPC + reflection + health + JSON) for one ontology.
 pub async fn router(intelli: Arc<Intelli>) -> Result<(axum::Router, Arc<RouteTable>)> {
     router_hub(Hub::single(intelli), &ServeOptions::default()).await
@@ -70,6 +112,7 @@ pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Rou
     let cfg = hub.config().clone();
     let table = Arc::new(RouteTable::build(&cfg)?);
     let auth = Arc::new(auth::Auth::from_config_with(&cfg.auth, opts.dev, opts.control.clone())?);
+    auth.set_revocations(Arc::new(HubRevocations(Arc::downgrade(&hub))));
     let mut router = axum::Router::new();
     if cfg.grpc.reflection {
         let builder = || {
