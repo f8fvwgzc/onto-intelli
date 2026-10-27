@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 
 use onto_core::{Error, Result};
 
+use super::openai::send_retrying;
 use super::openai::{describe, truncate};
-use super::{ChatRole, ChunkStream, LlmProvider, LlmRequest, LlmResponse, StreamChunk, api_key, sse};
+use super::{ChatRole, ChunkStream, KeySource, LlmProvider, LlmRequest, LlmResponse, StreamChunk, sse};
 use crate::config::{LlmConfig, Pricing};
 use crate::token::TokenUsage;
 
@@ -29,7 +30,10 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     max_output_tokens: u32,
     base: String,
-    key: Option<String>,
+    key: KeySource,
+    /// `Authorization: Bearer` (a model gateway) instead of `x-api-key`.
+    bearer: bool,
+    max_retries: u32,
     model: String,
     effort: Option<String>,
     fallbacks: bool,
@@ -56,7 +60,7 @@ impl AnthropicProvider {
     /// On `client` when given (its timeout and policies apply), else on a
     /// client with `cfg.timeout_secs`.
     pub fn with_client(cfg: &LlmConfig, client: Option<reqwest::Client>) -> Result<Self> {
-        let (key, var) = api_key(cfg, "ANTHROPIC_API_KEY");
+        let key = KeySource::of(cfg, "ANTHROPIC_API_KEY");
         let model = if cfg.model.is_empty() { DEFAULT_MODEL.to_string() } else { cfg.model.clone() };
         let pricing = if cfg.pricing.input_per_mtok == 0.0 && cfg.pricing.output_per_mtok == 0.0 {
             default_pricing(&model)
@@ -79,8 +83,10 @@ impl AnthropicProvider {
                 .unwrap_or_else(|| "https://api.anthropic.com".into())
                 .trim_end_matches('/')
                 .to_string(),
-            unavailable: key.is_none().then(|| super::missing_key(&var)),
+            unavailable: key.missing(),
             key,
+            bearer: cfg.bearer_auth,
+            max_retries: cfg.max_retries.min(10),
             model,
             effort: cfg.effort.clone(),
             fallbacks: cfg.fallbacks,
@@ -117,19 +123,25 @@ impl AnthropicProvider {
         if let Some(why) = &self.unavailable {
             return Err(Error::Unavailable(format!("anthropic: {why}")));
         }
-        let mut rb = self
-            .client
-            .post(format!("{}/v1/messages", self.base))
-            .header("x-api-key", self.key.as_deref().unwrap_or_default())
-            .header("anthropic-version", API_VERSION)
-            .json(body);
-        if self.fallbacks {
-            rb = rb.header("anthropic-beta", FALLBACK_BETA);
-        }
-        for (k, v) in &self.headers {
-            rb = rb.header(k, v);
-        }
-        let resp = rb.send().await.map_err(|e| Error::Llm(format!("anthropic: {}", describe(&e.without_url()))))?;
+        let key = self.key.get()?.unwrap_or_default();
+        let request = || {
+            let mut rb = self
+                .client
+                .post(format!("{}/v1/messages", self.base))
+                .header("anthropic-version", API_VERSION)
+                .json(body);
+            rb = if self.bearer { rb.bearer_auth(&key) } else { rb.header("x-api-key", &key) };
+            if self.fallbacks {
+                rb = rb.header("anthropic-beta", FALLBACK_BETA);
+            }
+            for (k, v) in &self.headers {
+                rb = rb.header(k, v);
+            }
+            rb
+        };
+        let resp = send_retrying(self.max_retries, request)
+            .await
+            .map_err(|e| Error::Llm(format!("anthropic: {}", describe(&e.without_url()))))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

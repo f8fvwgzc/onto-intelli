@@ -90,6 +90,27 @@ jobs:
           if helm template onto deploy/helm/onto-intelli > /dev/null 2>&1; then
             echo "rendered without existingSecret" >&2; exit 1
           fi
+      - name: The LLM contract mounts no provider key in gateway mode
+        run: |
+          if helm template onto deploy/helm/onto-intelli --set existingSecret=onto | grep -q 'name: LLM_'; then
+            echo "LLM_* without global.llm.enabled" >&2; exit 1
+          fi
+          out=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto \
+            --set global.llm.enabled=true --set global.llm.gatewayUrl=https://gateway:8443 --set global.llm.model=m)
+          grep -q 'key: gateway-token' <<<"$out"
+          if grep -q 'api-key' <<<"$out"; then
+            echo "a provider key is mounted in gateway mode" >&2; exit 1
+          fi
+          out=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true)
+          grep -q 'key: api-key' <<<"$out" && grep -q 'name: llm-config' <<<"$out"
+      - name: The process can read the mounted LLM credentials
+        run: |
+          # Secret files are root-owned with mode 0440: uid 10001 reads them only through
+          # fsGroup, in the pod that mounts them (the Deployment).
+          pod=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true \
+            -s templates/deployment.yaml)
+          grep -q 'secretName: llm-credentials' <<<"$pod" && grep -q 'defaultMode: 0440' <<<"$pod"
+          grep -q 'fsGroup: 10001' <<<"$pod" || { echo "0440 Secret files without fsGroup" >&2; exit 1; }
 
   # The release image builds (linux/amd64 here; the release adds arm64) and carries git for the
   # repository connector.

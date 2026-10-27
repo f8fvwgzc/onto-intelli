@@ -43,6 +43,10 @@ pub struct Config {
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
+    /// The keys the file's `[llm]` table sets: the LLM connection contract
+    /// (`LLM_*`) fills only the others.
+    #[serde(skip)]
+    pub llm_explicit: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,6 +206,12 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     /// Environment variable holding the API key (keys never live in the file).
     pub api_key_env: Option<String>,
+    /// A file holding the API key (a mounted Secret), read on every request
+    /// so a rotated key applies at once. Wins over `api_key_env`.
+    pub api_key_file: Option<PathBuf>,
+    /// Send the key as `Authorization: Bearer` (a model gateway) instead of
+    /// Anthropic's `x-api-key`. OpenAI-compatible servers always get a bearer token.
+    pub bearer_auth: bool,
     /// The API key itself, set in code (a project's decrypted key); used
     /// before `api_key_env`. Never read from or written to a file.
     #[serde(skip)]
@@ -214,6 +224,11 @@ pub struct LlmConfig {
     /// Anthropic server-side refusal fallback (`fallbacks: "default"`).
     pub fallbacks: bool,
     pub timeout_secs: u64,
+    /// Retries of one request after a transport error, 408, 429 or 5xx (0..=10).
+    pub max_retries: u32,
+    /// A small, fast model (`LLM_MODEL_SMALL`). Recorded and reported; onto
+    /// makes no small-model calls today.
+    pub model_small: String,
     pub pricing: Pricing,
     pub headers: BTreeMap<String, String>,
 }
@@ -225,12 +240,16 @@ impl Default for LlmConfig {
             model: String::new(),
             base_url: None,
             api_key_env: None,
+            api_key_file: None,
+            bearer_auth: false,
             api_key: None,
             max_output_tokens: 4096,
             temperature: None,
             effort: None,
             fallbacks: true,
             timeout_secs: 120,
+            max_retries: 0,
+            model_small: String::new(),
             pricing: Pricing::default(),
             headers: BTreeMap::new(),
         }
@@ -733,7 +752,42 @@ fn all_tenants() -> Vec<String> {
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
-        Ok(toml::from_str(text)?)
+        let mut cfg: Self = toml::from_str(text)?;
+        if let Ok(t) = toml::from_str::<toml::Table>(text)
+            && let Some(toml::Value::Table(llm)) = t.get("llm")
+        {
+            cfg.llm_explicit = llm.keys().cloned().collect();
+        }
+        Ok(cfg)
+    }
+
+    /// Apply the platform's LLM connection contract (`LLM_*` environment
+    /// variables) to the `[llm]` keys the file did not set. Project providers
+    /// (the console's bring-your-own LLM) are not touched; they win anyway.
+    pub fn apply_llm_contract(&mut self) -> Result<()> {
+        self.apply_llm_contract_from(|k| std::env::var(k).ok()).map(|_| ())
+    }
+
+    /// [`apply_llm_contract`](Self::apply_llm_contract) from any variable
+    /// source. What it ignores is logged as a warning, and returned.
+    pub fn apply_llm_contract_from(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        match crate::llm::LlmContract::from_vars(&get)? {
+            Some(c) => warnings.extend(c.apply(&mut self.llm, &self.llm_explicit)),
+            None => {
+                let stray = crate::llm::stray_variables(&get);
+                if !stray.is_empty() {
+                    warnings.push(format!(
+                        "Ignoring {} without LLM_PROVIDER or LLM_GATEWAY_URL (the LLM connection contract is off)",
+                        stray.join(", ")
+                    ));
+                }
+            }
+        }
+        for w in &warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(warnings)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -742,6 +796,7 @@ impl Config {
             std::fs::read_to_string(path).map_err(|e| Error::Config(format!("reading {}: {e}", path.display())))?;
         let mut cfg = Self::from_toml(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
         cfg.base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        cfg.apply_llm_contract()?;
         Ok(cfg)
     }
 
@@ -764,7 +819,9 @@ impl Config {
                 return Self::load(&c);
             }
         }
-        Ok(Self::default())
+        let mut cfg = Self::default();
+        cfg.apply_llm_contract()?;
+        Ok(cfg)
     }
 
     /// Volatile config with the offline mock provider: tests and embedding.
