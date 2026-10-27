@@ -235,3 +235,67 @@ async fn the_audit_trail_refuses_delete_except_to_retention() {
     assert_eq!(deleted as i64, before);
     cleanup(&hub, &url, &prefix).await;
 }
+
+/// Streams keep a tenant from going idle (their heartbeats count as use),
+/// never past `max_open_tenants`: the evicted tenant's stream ends
+/// `tenant_closed` and the next request opens the only ontology for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streams_count_as_use_but_never_past_max_open_tenants() {
+    use onto_intelli::changes::{Frame, Start};
+    use onto_intelli::core::changes::ChangeFilter;
+
+    let Some(url) = common::database_url("streams_count_as_use_but_never_past_max_open_tenants") else { return };
+    let prefix = common::unique("ostr_");
+    let mut cfg = config(&url, &prefix);
+    cfg.engine.tenant_idle_secs = 2;
+    cfg.engine.max_open_tenants = 0;
+    cfg.changes.heartbeat_secs = 1;
+    let hub = Hub::open(cfg).await.unwrap();
+    let admin = Principal::admin("x");
+    let streamed = hub.tenant("streamed").await.unwrap();
+    hub.tenant("quiet").await.unwrap();
+    let sub = streamed.subscribe_changes(admin.clone(), ChangeFilter::default(), Start::Now, None).await.unwrap();
+    // Both were last requested now; after the idle time only the one with a stream stays.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    // (The hub's sweeper may have closed the quiet one already.)
+    hub.enforce_limits(None, onto_intelli::core::time::now_ms());
+    assert_eq!(hub.open_tenants(), vec!["streamed"], "the stream's heartbeats keep its tenant from going idle");
+    assert!(streamed.stream_touched() > 0);
+
+    // max_open_tenants judges the last request only.
+    drop(hub);
+    let mut cfg = config(&url, &prefix);
+    cfg.engine.max_open_tenants = 1;
+    cfg.changes.heartbeat_secs = 1;
+    let hub = Hub::open(cfg).await.unwrap();
+    let a = hub.tenant("a").await.unwrap();
+    a.call(&admin, "entity.upsert", json!({ "id": "task:a1", "title": "a" })).await.unwrap();
+    let mut sub_a = a.subscribe_changes(admin.clone(), ChangeFilter::default(), Start::Earliest, None).await.unwrap();
+    let old = Arc::downgrade(&a);
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    hub.tenant("b").await.unwrap();
+    assert_eq!(hub.open_tenants(), vec!["b"], "the stream did not keep a open past max_open_tenants");
+    let code = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_a.recv().await {
+                Some(Frame::End { code, .. }) => return code,
+                Some(_) => {}
+                None => panic!("the stream ended without an end frame"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, "tenant_closed");
+    let t = Instant::now();
+    while old.strong_count() > 0 && t.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(old.strong_count(), 0, "nothing keeps the evicted tenant's ontology alive");
+    let again = hub.tenant("a").await.unwrap();
+    let r = again.call(&admin, "entity.get", json!({ "id": "task:a1" })).await.unwrap();
+    assert_eq!(r["id"], "task:a1");
+    drop(sub);
+    cleanup(&hub, &url, &prefix).await;
+}

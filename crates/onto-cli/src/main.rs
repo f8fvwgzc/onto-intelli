@@ -158,8 +158,10 @@ enum Command {
     },
     /// The change feed: what each commit changed, filtered for you.
     ///
-    /// `--once` prints one page after a cursor and the cursor to resume from
-    /// (`--after`). Following the feed live is not in this version.
+    /// Follows the feed live (from now, `--from earliest` or `--after` a
+    /// cursor) and resumes after the last cursor when the server cuts the
+    /// stream. `--once` prints one page after a cursor and the cursor to
+    /// resume from (`--after`).
     Watch(WatchArgs),
     /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
     Metric {
@@ -887,22 +889,24 @@ impl Backend {
                 let resp = req.send().await.map_err(|e| Error::Unavailable(format!("{base}: {e}")))?;
                 let status = resp.status();
                 let body: Value = resp.json().await.map_err(|e| Error::Other(format!("bad response: {e}")))?;
-                if status.is_success() {
-                    Ok(body)
-                } else {
-                    let msg = body["error"]["message"].as_str().unwrap_or("request failed").to_string();
-                    Err(match body["error"]["code"].as_str() {
-                        Some("not_found") => Error::NotFound(msg),
-                        Some("invalid_argument") => Error::Invalid(msg),
-                        Some("permission_denied") => Error::Denied(msg),
-                        Some("conflict") => Error::Conflict(msg),
-                        Some("resource_exhausted") => Error::Limited(msg),
-                        Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
-                        _ => Error::Other(msg),
-                    })
-                }
+                if status.is_success() { Ok(body) } else { Err(remote_error(&body)) }
             }
         }
+    }
+}
+
+/// A server's error answer as an engine error.
+fn remote_error(body: &Value) -> Error {
+    let msg = body["error"]["message"].as_str().unwrap_or("request failed").to_string();
+    match body["error"]["code"].as_str() {
+        Some("not_found") => Error::NotFound(msg),
+        Some("invalid_argument") => Error::Invalid(msg),
+        Some("permission_denied") => Error::Denied(msg),
+        Some("conflict") => Error::Conflict(msg),
+        Some("resource_exhausted") => Error::Limited(msg),
+        Some("unavailable") => Error::Unavailable(msg),
+        Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
+        _ => Error::Other(msg),
     }
 }
 
@@ -910,16 +914,19 @@ impl Backend {
 
 #[derive(clap::Args)]
 struct WatchArgs {
-    /// Print one page and exit (live following is not in this version).
+    /// Print one page and exit, instead of following the feed live.
     #[arg(long)]
     once: bool,
+    /// Live: stop after this many records.
+    #[arg(long, conflicts_with = "once")]
+    count: Option<usize>,
     /// Resume after this cursor: a previous page's next, like 42.0.
     #[arg(long, conflicts_with = "from")]
     after: Option<String>,
-    /// Without --after: earliest (default) or now.
+    /// Without --after: earliest or now (default: earliest with --once, now live).
     #[arg(long, value_parser = ["earliest", "now"])]
     from: Option<String>,
-    /// Records scanned (default: [changes] page; at most 1000).
+    /// Records scanned per page (default: [changes] page; at most 1000).
     #[arg(long)]
     limit: Option<usize>,
     /// Entity kinds or interfaces (repeat or comma-separate).
@@ -978,6 +985,16 @@ impl WatchArgs {
     }
 }
 
+/// Print one record: a JSON line, or a styled line.
+fn emit(c: &Value, w: &WatchArgs, st: &Style) {
+    if w.json {
+        println!("{}", serde_json::to_string(c).unwrap_or_default());
+    } else {
+        println!("{}", change_line(c, st));
+    }
+    let _ = std::io::stdout().flush();
+}
+
 /// One record as a line: cursor, op, kind, id and what changed.
 fn change_line(c: &Value, st: &Style) -> String {
     let strs = |v: &Value| -> Vec<String> {
@@ -1016,10 +1033,7 @@ fn change_line(c: &Value, st: &Style) -> String {
 
 async fn watch(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
     if !w.once {
-        return Err(Error::invalid(
-            "following the change feed live is not in this version: run onto watch --once, then again with \
-             --after <next>",
-        ));
+        return follow(cli, w, st).await;
     }
     let be = backend(cli).await?;
     let page = be.call("changes.poll", w.poll_input()).await?;
@@ -1050,6 +1064,240 @@ async fn watch(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
         st.dim(&format!("(head {}, floor {}; resume with --after)", page["head"], page["floor"]))
     );
     Ok(())
+}
+
+/// Where a live stream stopped: its `end` or `reset` code, or `None` when
+/// the connection dropped.
+struct Stopped {
+    code: Option<String>,
+    message: String,
+}
+
+/// Where a live watch is: the last cursor received and the records printed.
+struct Follow {
+    cursor: Option<String>,
+    printed: usize,
+}
+
+impl Follow {
+    fn done(&self, w: &WatchArgs) -> bool {
+        w.count.is_some_and(|n| self.printed >= n)
+    }
+}
+
+/// Follow the change feed: print each record, resume after the last cursor
+/// when the server ends the stream for a reason that a reconnect fixes
+/// (`slow_consumer`, `tenant_closed`, `principal_changed`, a dropped
+/// connection with backoff), page with `changes.poll` after
+/// `too_far_behind`, and stop on an expired cursor or a refusal.
+async fn follow(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    let mut at = Follow { cursor: w.after.clone(), printed: 0 };
+    let mut failures = 0u32;
+    loop {
+        let stop = match &be {
+            Backend::Local { intelli, principal } => follow_local(intelli, principal, w, &mut at, st).await?,
+            Backend::Remote { .. } => follow_remote(&be, w, &mut at, st).await?,
+        };
+        if at.done(w) {
+            return Ok(());
+        }
+        let cursor = at.cursor.clone().unwrap_or_else(|| "the start".into());
+        match stop.code.as_deref() {
+            Some("slow_consumer" | "tenant_closed" | "principal_changed") => {
+                eprintln!("{}", st.dim(&format!("{}: resuming after {cursor}", stop.code.unwrap_or_default())));
+                failures = 0;
+            }
+            Some("too_far_behind") => {
+                eprintln!("{}", st.dim(&format!("too far behind: paging from {cursor} with changes.poll")));
+                page_up(&be, w, &mut at, st).await?;
+                if at.done(w) {
+                    return Ok(());
+                }
+            }
+            Some("cursor_expired") => {
+                return Err(Error::Other(format!("cursor {cursor} expired: {}", stop.message)));
+            }
+            Some(code) => return Err(Error::Other(format!("the stream ended ({code}): {}", stop.message))),
+            None if matches!(be, Backend::Local { .. }) => {
+                return Err(Error::Other(format!("the stream ended: {}", stop.message)));
+            }
+            None => {
+                let wait = std::time::Duration::from_millis((500u64 << failures.min(6)).min(30_000));
+                eprintln!("{}", st.dim(&format!("{}; reconnecting in {:.1} s", stop.message, wait.as_secs_f64())));
+                tokio::time::sleep(wait).await;
+                failures += 1;
+            }
+        }
+    }
+}
+
+/// The stream input: the filter, and `from` (default now) without a cursor.
+fn stream_input(w: &WatchArgs, cursor: Option<&str>) -> Value {
+    let mut input = w.poll_input();
+    let m = input.as_object_mut().expect("an object");
+    m.remove("limit");
+    m.remove("after");
+    m.remove("from");
+    if cursor.is_none() {
+        m.insert("from".into(), json!(w.from.as_deref().unwrap_or("now")));
+    }
+    input
+}
+
+async fn follow_local(
+    intelli: &Arc<Intelli>,
+    principal: &Principal,
+    w: &WatchArgs,
+    at: &mut Follow,
+    st: &Style,
+) -> Result<Stopped> {
+    use onto_intelli::changes::{Frame, stream_request};
+    let (filter, start) = stream_request(stream_input(w, at.cursor.as_deref()), at.cursor.as_deref())?;
+    let mut sub = intelli.subscribe_changes(principal.clone(), filter, start, None).await?;
+    while let Some(frame) = sub.recv().await {
+        match frame {
+            Frame::Change(r) => {
+                at.cursor = Some(r.cursor.to_string());
+                emit(&serde_json::to_value(r.as_ref())?, w, st);
+                at.printed += 1;
+                if at.done(w) {
+                    return Ok(Stopped { code: None, message: String::new() });
+                }
+            }
+            Frame::Heartbeat { cursor, .. } => at.cursor = Some(cursor.to_string()),
+            Frame::Reset { code, message, .. } => return Ok(Stopped { code: Some(code.into()), message }),
+            Frame::End { code, cursor, message } => {
+                at.cursor.get_or_insert_with(|| cursor.to_string());
+                return Ok(Stopped { code: Some(code.into()), message });
+            }
+        }
+    }
+    Ok(Stopped { code: None, message: "the stream ended without a reason".into() })
+}
+
+/// One SSE message: event, id and data.
+fn sse_block(block: &str) -> (String, Option<String>, String) {
+    let (mut event, mut id, mut data) = ("message".to_string(), None, Vec::new());
+    for line in block.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let v = v.strip_prefix(' ').unwrap_or(v);
+        match k {
+            "event" => event = v.to_string(),
+            "id" => id = Some(v.to_string()),
+            "data" => data.push(v),
+            _ => {}
+        }
+    }
+    (event, id, data.join("\n"))
+}
+
+async fn follow_remote(be: &Backend, w: &WatchArgs, at: &mut Follow, st: &Style) -> Result<Stopped> {
+    let Backend::Remote { http, base, token, tenant } = be else {
+        return Err(Error::Other("not a remote backend".into()));
+    };
+    let mut req = http
+        .post(format!("{base}/v1/changes/stream"))
+        .header("accept", "text/event-stream")
+        .json(&stream_input(w, at.cursor.as_deref()));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    if let Some(t) = tenant {
+        req = req.header("x-onto-tenant", t);
+    }
+    if let Some(c) = &at.cursor {
+        req = req.header("last-event-id", c);
+    }
+    let mut resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Ok(Stopped { code: None, message: format!("{base}: {e}") }),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(match resp.json::<Value>().await {
+            Ok(body) if body["error"].is_object() => remote_error(&body),
+            _ => Error::Unavailable(format!("{base}/v1/changes/stream answered HTTP {status}")),
+        });
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(Stopped { code: None, message: "the server closed the stream".into() }),
+            Err(e) => return Ok(Stopped { code: None, message: format!("{base}: {e}") }),
+        };
+        buf.extend_from_slice(&chunk);
+        while let Some(at_end) = find_blank_line(&buf) {
+            let block: Vec<u8> = buf.drain(..at_end.1).collect();
+            let text = String::from_utf8_lossy(&block[..at_end.0]).replace("\r\n", "\n");
+            let (event, id, data) = sse_block(&text);
+            let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            match event.as_str() {
+                "change" => {
+                    at.cursor = id.or_else(|| v["cursor"].as_str().map(str::to_string));
+                    emit(&v, w, st);
+                    at.printed += 1;
+                    if at.done(w) {
+                        return Ok(Stopped { code: None, message: String::new() });
+                    }
+                }
+                "heartbeat" => at.cursor = id.or_else(|| v["cursor"].as_str().map(str::to_string)),
+                "reset" | "end" => {
+                    if let Some(c) = v["cursor"].as_str() {
+                        at.cursor.get_or_insert_with(|| c.to_string());
+                    }
+                    let code = v["code"].as_str().unwrap_or(event.as_str()).to_string();
+                    return Ok(Stopped { code: Some(code), message: v["message"].as_str().unwrap_or_default().into() });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The end of the first SSE message in `buf`: (where its text ends, where
+/// the next one starts).
+fn find_blank_line(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, i + 2));
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, i + 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// After `too_far_behind`: page with `changes.poll` up to the head.
+async fn page_up(be: &Backend, w: &WatchArgs, at: &mut Follow, st: &Style) -> Result<()> {
+    loop {
+        let mut input = stream_input(w, Some(""));
+        if let Some(l) = w.limit {
+            input["limit"] = json!(l);
+        }
+        input["after"] = json!(at.cursor.clone().unwrap_or_default());
+        let page = be.call("changes.poll", input).await?;
+        if page["expired"] == true {
+            return Err(Error::Other(format!(
+                "cursor {} expired: {}",
+                at.cursor.as_deref().unwrap_or_default(),
+                page["message"].as_str().unwrap_or_default()
+            )));
+        }
+        for c in page["changes"].as_array().into_iter().flatten() {
+            emit(c, w, st);
+            at.printed += 1;
+            if at.done(w) {
+                return Ok(());
+            }
+        }
+        let next = page["next"].as_str().unwrap_or_default().to_string();
+        let moved = at.cursor.as_deref() != Some(next.as_str());
+        let seq: u64 = next.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        at.cursor = Some(next);
+        if !moved || seq >= page["head"].as_u64().unwrap_or(0) {
+            return Ok(());
+        }
+    }
 }
 
 // ── output helpers ────────────────────────────────────────────────────

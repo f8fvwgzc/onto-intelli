@@ -6,6 +6,11 @@
 //! ```text
 //! cargo run --release -p onto-bench -- --url postgres://onto:onto@127.0.0.1:55445/onto --entities 1000000
 //! ```
+//!
+//! `--changes` runs the change feed scenarios instead (docs/design/EVENTS.md
+//! section 12): commit latency with change capture off and on, and write
+//! latency and delivery lag with 0, 50 and 200 live stream subscribers on
+//! one tenant.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +53,13 @@ struct Args {
     /// then stop and keep the tenant; measure later with --skip-load.
     #[arg(long)]
     load_only: bool,
+    /// Run the change feed scenarios (capture off/on, 0/50/200 subscribers)
+    /// on a small tenant instead of the load benchmark.
+    #[arg(long)]
+    changes: bool,
+    /// Commits per change feed scenario.
+    #[arg(long, default_value_t = 500)]
+    writes: usize,
 }
 
 const WORDS: &[&str] = &[
@@ -329,6 +341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let opts = PgOptions { max_connections: 16, ..Default::default() };
     let shared = PgShared::connect(&args.url, &opts)?;
+    if args.changes {
+        return changes_bench(&args, &shared, &opts).await;
+    }
     let mut report: Vec<String> = Vec::new();
 
     let gen_t = Instant::now();
@@ -559,6 +574,124 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !args.keep {
         shared.tenant(&args.tenant, opts)?.drop_tenant()?;
+    }
+    Ok(())
+}
+
+/// The change feed scenarios on a fresh tenant `<tenant>_changes`: single
+/// entity commits through the engine with capture off and on, then with 0,
+/// 50 and 200 open streams (one principal each, so no two share an
+/// evaluation: the worst case), and how long a commit takes to reach a
+/// subscriber.
+async fn changes_bench(args: &Args, shared: &PgShared, opts: &PgOptions) -> Result<(), Box<dyn std::error::Error>> {
+    use onto_intelli::changes::{Frame, Start};
+    use onto_intelli::core::changes::ChangeFilter;
+
+    let tenant = format!("{}_changes", args.tenant);
+    shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
+    let mut cfg = Config::in_memory();
+    cfg.engine.storage = "postgres".into();
+    cfg.engine.default_workspace = "bench".into();
+    cfg.memory.enabled = false;
+    cfg.cache.enabled = false;
+    cfg.traces.enabled = false;
+    cfg.connectors.background = false;
+    cfg.changes.max_subscribers = 1000;
+    cfg.changes.max_subscribers_process = 1000;
+    let store: Arc<dyn Store> = Arc::new(shared.tenant(&tenant, opts.clone())?);
+    let intelli = Intelli::open_with_store(cfg, store, onto_intelli::llm::build(&Default::default())?).await?;
+    let onto = intelli.ontology().clone();
+    let p = Principal::admin("bench");
+    let ctx = ActionContext::new(p.clone(), "bench");
+    let n = args.writes;
+    let mut seq = 0usize;
+    let mut write = |samples: &mut Vec<f64>| -> Result<(), onto_intelli::Error> {
+        seq += 1;
+        let t = Instant::now();
+        onto.upsert(&ctx, EntityInput::new("task", format!("c{seq}"), format!("change bench {seq}")))?;
+        samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
+    };
+    // Warm the connection pool and the plan cache.
+    let mut warm = Vec::new();
+    for _ in 0..50 {
+        write(&mut warm)?;
+    }
+
+    let mut stats: Vec<Stat> = Vec::new();
+    for on in [false, true] {
+        onto.set_capture(&ctx, on)?;
+        let mut s = Stat {
+            name: if on { "commit, capture on" } else { "commit, capture off" },
+            detail: "one entity upsert through the engine (PostgreSQL)".into(),
+            samples: Vec::new(),
+        };
+        for _ in 0..n {
+            write(&mut s.samples)?;
+        }
+        stats.push(s);
+    }
+
+    let mut lag =
+        Stat { name: "delivery lag", detail: "commit start → frame at 1 subscriber".into(), samples: Vec::new() };
+    for subscribers in [0usize, 50, 200] {
+        let mut drains = Vec::new();
+        for k in 0..subscribers {
+            let who = Principal::admin(format!("bench-{k}"));
+            let mut sub = intelli.subscribe_changes(who, ChangeFilter::default(), Start::Now, None).await?;
+            drains.push(tokio::spawn(async move { while sub.recv().await.is_some() {} }));
+        }
+        let name = match subscribers {
+            0 => "commit, 0 streams",
+            50 => "commit, 50 streams",
+            _ => "commit, 200 streams",
+        };
+        let mut s =
+            Stat { name, detail: format!("capture on, {subscribers} subscribers draining"), samples: Vec::new() };
+        for _ in 0..n {
+            write(&mut s.samples)?;
+        }
+        stats.push(s);
+        if subscribers == 50 {
+            // Lag: one more subscriber, timed from the commit to its frame.
+            let mut sub = intelli
+                .subscribe_changes(Principal::admin("bench-lag"), ChangeFilter::default(), Start::Now, None)
+                .await?;
+            for _ in 0..100 {
+                let mut one = Vec::new();
+                let t = Instant::now();
+                write(&mut one)?;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), sub.recv()).await {
+                        Ok(Some(Frame::Change(_))) => break,
+                        Ok(Some(_)) => {}
+                        _ => return Err("no frame within 10 s".into()),
+                    }
+                }
+                lag.samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        let ring = intelli.changes().bytes();
+        eprintln!("{subscribers} subscribers: ring {} records, {ring} bytes", intelli.changes().ring_len());
+        // Drop the subscriptions; their producers stop on the closed channels.
+        for d in drains {
+            d.abort();
+        }
+        let t = Instant::now();
+        while intelli.changes().subscribers() > 0 && t.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    stats.push(lag);
+
+    println!("## Change feed ({n} commits per row)\n");
+    println!("| Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |\n|---|---|---:|---:|---:|---:|---:|");
+    for s in &mut stats {
+        println!("{}", s.row());
+    }
+    drop(intelli);
+    if !args.keep {
+        shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
     }
     Ok(())
 }

@@ -709,22 +709,69 @@ impl TracesConfig {
 #[serde(default)]
 pub struct ChangesConfig {
     /// Records scanned per `changes.poll` page when the call gives no
-    /// `limit` (1 to 1000).
+    /// `limit`, and per stream page (1 to 1000).
     pub page: usize,
+    /// Records kept in memory per tenant while it has streams (the ring;
+    /// allocated only while subscribed and counted in the memory budget).
+    pub ring: usize,
+    /// Milliseconds one stream page may spend filtering before it is split.
+    pub eval_budget_ms: u64,
+    /// A stream sends a heartbeat (the last cursor scanned) this often.
+    pub heartbeat_secs: u64,
+    /// A stream whose client reads nothing for this long ends `slow_consumer`.
+    pub stall_timeout_secs: u64,
+    /// Commits (seqs) a stream may be behind the head before it ends
+    /// `too_far_behind` (page with `changes.poll`, then stream again).
+    pub max_backfill_seqs: u64,
+    /// Streams authenticate their request again this often; a revoked
+    /// credential or a changed principal ends the stream.
+    pub reauth_secs: u64,
+    /// Streams per tenant in this process.
+    pub max_subscribers: usize,
+    /// Streams per principal id per tenant in this process.
+    pub max_subscribers_per_principal: usize,
+    /// Streams in this process, all tenants together.
+    pub max_subscribers_process: usize,
 }
 
 impl Default for ChangesConfig {
     fn default() -> Self {
-        Self { page: 500 }
+        Self {
+            page: 500,
+            ring: 4096,
+            eval_budget_ms: 50,
+            heartbeat_secs: 15,
+            stall_timeout_secs: 60,
+            max_backfill_seqs: 100_000,
+            reauth_secs: 60,
+            max_subscribers: 200,
+            max_subscribers_per_principal: 20,
+            max_subscribers_process: 2000,
+        }
     }
 }
 
 impl ChangesConfig {
-    /// `page` is 1 to [`onto_core::changes::MAX_PAGE`].
+    /// `page` is 1 to [`onto_core::changes::MAX_PAGE`]; times, the ring and
+    /// the limits are at least 1.
     pub fn check(&self) -> Result<()> {
         let max = onto_core::changes::MAX_PAGE;
         if self.page == 0 || self.page > max {
             return Err(Error::Config(format!("changes.page = {} (1 to {max})", self.page)));
+        }
+        let at_least_one = [
+            ("ring", self.ring as u64),
+            ("eval_budget_ms", self.eval_budget_ms),
+            ("heartbeat_secs", self.heartbeat_secs),
+            ("stall_timeout_secs", self.stall_timeout_secs),
+            ("max_backfill_seqs", self.max_backfill_seqs),
+            ("reauth_secs", self.reauth_secs),
+            ("max_subscribers", self.max_subscribers as u64),
+            ("max_subscribers_per_principal", self.max_subscribers_per_principal as u64),
+            ("max_subscribers_process", self.max_subscribers_process as u64),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("changes.{name} = {v} (at least 1)")));
         }
         Ok(())
     }

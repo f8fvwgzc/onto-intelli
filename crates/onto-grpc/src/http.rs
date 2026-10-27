@@ -40,6 +40,10 @@
 //!   comma-separated `kinds`, `ops`, `workspaces`, `ids`, `rels`, `props`, `sources`, `fields`,
 //!   `include_migrations`)
 //! * `GET  /v1/changes/head`    the feed's cursor, head, floor and whether capture is on
+//! * `GET|POST /v1/changes/stream`  the change feed as Server-Sent Events: the filter keys of
+//!   `GET /v1/changes` as a query (GET) or a JSON body (POST), `after` or `from=now|earliest`
+//!   (default now); `Last-Event-ID` wins over `after`. Events `change`, `heartbeat`, then one
+//!   `reset` or `end`.
 //! * `POST /v1/changes/capture` `{on}`: record changes or not (admins of every workspace)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
@@ -138,6 +142,7 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/changes", get(changes_poll))
         .route("/v1/changes/head", get(changes_head))
         .route("/v1/changes/capture", post(changes_capture))
+        .route("/v1/changes/stream", get(changes_stream_get).post(changes_stream_post))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -854,6 +859,78 @@ async fn changes_head(State(s): State<AppState>, headers: HeaderMap) -> Response
 
 async fn changes_capture(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     run(&s, &headers, "changes.capture", body_or_empty(body)).await
+}
+
+async fn changes_stream_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    changes_stream(s, headers, changes_query(q)).await
+}
+
+async fn changes_stream_post(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    changes_stream(s, headers, body_or_empty(body)).await
+}
+
+/// How long a client waits before reconnecting (the SSE `retry:` field).
+const STREAM_RETRY: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// The change feed as Server-Sent Events. A stream is not an action, so this
+/// does what `run` and `dispatch` do before one: authenticate, guard project
+/// credentials, and `Intelli::admit`. Every `changes.reauth_secs` the stream
+/// authenticates these headers again and ends when the credential is revoked
+/// or the principal changed.
+async fn changes_stream(s: AppState, headers: HeaderMap, input: Value) -> Response {
+    const ACTION: &str = "changes.stream";
+    let (c, intelli) = match caller_full(&s, &headers).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let mut input = input;
+    if let Err(e) = guard_project_call(&c.credential, ACTION, &mut input, s.auth.allow_private_urls()).await {
+        return error_response(&e);
+    }
+    if let Err(e) = intelli.admit(&c.principal, ACTION, &input) {
+        return error_response(&e);
+    }
+    let last_event_id = headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (filter, start) = match onto_intelli::changes::stream_request(input, last_event_id.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+    let reauth: onto_intelli::changes::Reauth = {
+        let (auth, headers) = (s.auth.clone(), headers.clone());
+        Arc::new(move || {
+            let (auth, headers) = (auth.clone(), headers.clone());
+            Box::pin(async move {
+                use onto_intelli::changes::ReauthError;
+                match auth.authenticate(&headers).await {
+                    Ok(c) => Ok(c.principal),
+                    Err(AuthError::Unauthenticated(m)) => Err(ReauthError::Unauthenticated(m)),
+                    Err(AuthError::Forbidden(m)) => Err(ReauthError::Denied(m)),
+                    Err(AuthError::Unavailable(m)) => Err(ReauthError::Unavailable(m)),
+                }
+            })
+        })
+    };
+    let sub = match intelli.subscribe_changes(c.principal, filter, start, Some(reauth)).await {
+        Ok(sub) => sub,
+        Err(e) => return error_response(&e),
+    };
+    // The stream holds the tenant weakly: an evicted tenant ends it.
+    drop(intelli);
+    let first = futures::stream::once(async { Ok(SseEvent::default().retry(STREAM_RETRY)) });
+    let frames = sub.into_stream().map(|f| {
+        let mut ev = SseEvent::default().event(f.event()).data(f.data().to_string());
+        if let Some(id) = f.id() {
+            ev = ev.id(id.to_string());
+        }
+        Ok::<_, Infallible>(ev)
+    });
+    let events: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
+        Box::pin(first.chain(frames));
+    Sse::new(events).into_response()
 }
 
 async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {

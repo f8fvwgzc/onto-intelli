@@ -1,7 +1,9 @@
-//! `onto watch --once`: one page of the change feed through `changes.poll`.
-//! The in-memory runs are one process each (an empty store with its schema
-//! bootstrap); the PostgreSQL run seeds a tenant of its own in one process
-//! and reads its changes from others (skipped without `DATABASE_URL`).
+//! `onto watch`: one page of the change feed through `changes.poll`
+//! (`--once`), or the feed followed live, in process or from a server over
+//! SSE. The in-memory runs are one process each (an empty store with its
+//! schema bootstrap); the PostgreSQL run seeds a tenant of its own in one
+//! process and reads its changes from others (skipped without
+//! `DATABASE_URL`); the remote run follows a server started in the test.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -71,10 +73,13 @@ fn watch_once_prints_a_page_and_the_cursor_to_resume_from() {
     assert!(out.stdout.contains("No changes you may see"), "{}", out.stdout);
     assert!(out.stdout.contains("next:") && out.stdout.contains("resume with --after"), "{}", out.stdout);
 
-    // Live following is not in this version: said, not faked.
-    let out = onto_env(&["--config", cfg, "watch"], &[]);
-    assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("--once"), "{}", out.stderr);
+    // Live: the schema bootstrap's record from the start, then stop after one.
+    let out = onto_env(&["--config", cfg, "watch", "--from", "earliest", "--count", "1", "--json"], &[]);
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let line: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_else(|e| panic!("{e}: {}", out.stdout));
+    assert_eq!(line["op"], "schema.change", "{line}");
+    let out = onto_env(&["--config", cfg, "watch", "--once", "--count", "1"], &[]);
+    assert_eq!(out.code, 2, "--count is for live following: {}", out.stderr);
     // Bad input is refused by the engine or by the parser.
     let out = onto_env(&["--config", cfg, "watch", "--once", "--after", "soon"], &[]);
     assert_eq!(out.code, 1);
@@ -176,4 +181,82 @@ fn watch_once_reads_what_another_process_wrote_on_postgres() {
     assert!(text.stdout.contains("entity.create") && text.stdout.contains("project:alpha"), "{}", text.stdout);
     let next = page["next"].as_str().unwrap();
     assert!(text.stdout.contains(&format!("next: {next}")), "{}", text.stdout);
+}
+
+/// `onto --remote … watch` follows a server's SSE stream: records written
+/// after it starts, in order, until `--count`.
+#[test]
+fn watch_follows_a_server_live() {
+    const TOKEN: &str = "operator-token-for-watch-tests";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (base, _stop) = rt.block_on(async {
+        let mut cfg = onto_intelli::Config::in_memory();
+        cfg.engine.default_workspace = "acme".into();
+        cfg.auth.tokens = vec![onto_intelli::config::TokenConfig {
+            token: Some(TOKEN.into()),
+            token_env: None,
+            principal: onto_intelli::Principal::admin("ops"),
+            impersonate: false,
+            impersonate_roles: Vec::new(),
+            tenants: vec!["*".into()],
+        }];
+        let hub = onto_intelli::Hub::open(cfg).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(onto_grpc::serve_hub_on(hub, onto_grpc::ServeOptions::default(), listener, async {
+            let _ = rx.await;
+        }));
+        (format!("http://{addr}"), tx)
+    });
+    let watcher = {
+        let base = base.clone();
+        std::thread::spawn(move || {
+            onto_env(
+                &[
+                    "--remote",
+                    &base,
+                    "--token",
+                    TOKEN,
+                    "watch",
+                    "--kinds",
+                    "task",
+                    "--ops",
+                    "entity.create",
+                    "--count",
+                    "2",
+                    "--json",
+                ],
+                &[],
+            )
+        })
+    };
+    // Write until the watcher has seen two creates (it may connect after the first writes).
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        for n in 0..200 {
+            if watcher.is_finished() {
+                break;
+            }
+            let r = client
+                .post(format!("{base}/v1/call/entity.upsert"))
+                .bearer_auth(TOKEN)
+                .json(&serde_json::json!({ "id": format!("task:w{n}"), "title": "watched" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+    let out = watcher.join().unwrap();
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let lines: Vec<Value> = out.stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    assert!(lines.iter().all(|l| l["op"] == "entity.create" && l["kind"] == "task"), "{}", out.stdout);
+    let cursor = |l: &Value| -> (u64, u32) {
+        let (a, b) = l["cursor"].as_str().unwrap().split_once('.').unwrap();
+        (a.parse().unwrap(), b.parse().unwrap())
+    };
+    assert!(cursor(&lines[0]) < cursor(&lines[1]), "in cursor order: {}", out.stdout);
 }

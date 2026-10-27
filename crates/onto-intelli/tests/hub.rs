@@ -322,3 +322,53 @@ fn every_write_action_is_classified_for_agents() {
         assert!(!(AGENT_WRITES.contains(name) && RAW_WRITES.contains(name)), "{name} is on both lists");
     }
 }
+
+#[tokio::test]
+async fn an_evicted_tenant_ends_its_streams_and_leaves_one_ontology() {
+    use onto_intelli::changes::{Frame, Start};
+    use onto_intelli::core::changes::ChangeFilter;
+
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let t = hub.tenant("t").await.unwrap();
+    let admin = Principal::admin("x");
+    let mut sub = t.subscribe_changes(admin.clone(), ChangeFilter::default(), Start::Now, None).await.unwrap();
+    t.call(&admin, "entity.upsert", json!({ "id": "task:live", "title": "live" })).await.unwrap();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await.unwrap() {
+        Some(Frame::Change(r)) => assert_eq!(r.id, "task:live"),
+        other => panic!("expected the record: {other:?}"),
+    }
+    // The ring holds the record and counts toward the tenant's memory.
+    assert!(t.changes().bytes() > 0);
+    assert_eq!(t.estimated_bytes(), t.ontology().estimated_bytes() + t.changes().bytes() as u64);
+    let stats = hub.tenant_stats();
+    assert_eq!((stats[0].streams, stats[0].ring_bytes), (1, t.changes().bytes() as u64), "{stats:?}");
+
+    let old = std::sync::Arc::downgrade(&t);
+    drop(t);
+    assert!(hub.evict("t"));
+    let last = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match sub.recv().await {
+                Some(Frame::End { code, .. }) => return code,
+                Some(_) => {}
+                None => panic!("the stream ended without an end frame"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(last, "tenant_closed");
+    assert!(sub.recv().await.is_none(), "end is the last frame");
+    // Nothing keeps the evicted tenant alive: the next request opens the only one.
+    for _ in 0..100 {
+        if old.strong_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(old.strong_count(), 0, "the stream released the evicted tenant");
+    let again = hub.tenant("t").await.unwrap();
+    assert!(!again.is_closing());
+    assert_eq!(again.changes().subscribers(), 0);
+    assert_eq!(hub.open_tenants(), vec!["t"]);
+}

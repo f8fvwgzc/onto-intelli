@@ -1,7 +1,7 @@
 """A Server-Sent Events parser (the WHATWG EventSource framing) over byte
-chunks: ``event:``, ``data:`` (joined with newlines), ``id:``, comments, and
-events ended by a blank line. Chunks may split anywhere, including inside a
-multi-byte character or between ``\\r`` and ``\\n``."""
+chunks: ``event:``, ``data:`` (joined with newlines), ``id:``, ``retry:``,
+comments, and events ended by a blank line. Chunks may split anywhere,
+including inside a multi-byte character or between ``\\r`` and ``\\n``."""
 
 from __future__ import annotations
 
@@ -13,12 +13,18 @@ from typing import Dict, Iterable, Iterator, List, Optional, TypedDict
 _EOL = re.compile(r"\r\n|\r|\n")
 
 
-class SseMessage(TypedDict):
-    """One message; ``event`` is ``message`` when the stream names none."""
-
+class _SseFields(TypedDict):
     event: str
     data: str
     id: Optional[str]
+
+
+class SseMessage(_SseFields, total=False):
+    """One message; ``event`` is ``message`` when the stream names none.
+    ``retry`` (milliseconds) is present when the stream set a reconnection
+    time (``retry:``) before this message."""
+
+    retry: int
 
 
 def parse_sse(chunks: Iterable[bytes]) -> Iterator[SseMessage]:
@@ -26,6 +32,7 @@ def parse_sse(chunks: Iterable[bytes]) -> Iterator[SseMessage]:
     decoder = codecs.getincrementaldecoder("utf-8")()
     buf = ""
     state = {"event": "", "id": None}  # type: Dict[str, Optional[str]]
+    retry = [None]  # type: List[Optional[int]]
     data = []  # type: List[str]
     saw = [False]
 
@@ -34,6 +41,8 @@ def parse_sse(chunks: Iterable[bytes]) -> Iterator[SseMessage]:
             out = None  # type: Optional[SseMessage]
             if saw[0]:
                 out = {"event": state["event"] or "message", "data": "\n".join(data), "id": state["id"]}  # type: SseMessage
+                if retry[0] is not None:
+                    out["retry"] = retry[0]
             state["event"] = ""
             del data[:]
             saw[0] = False
@@ -50,6 +59,8 @@ def parse_sse(chunks: Iterable[bytes]) -> Iterator[SseMessage]:
             saw[0] = True
         elif field == "id":
             state["id"] = value
+        elif field == "retry" and value.isascii() and value.isdigit():
+            retry[0] = int(value)
         return None
 
     def drain(final: bool) -> Iterator[SseMessage]:

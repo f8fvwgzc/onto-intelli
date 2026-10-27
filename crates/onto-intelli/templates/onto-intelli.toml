@@ -241,8 +241,18 @@ flush_ms = 500
 flush_records = 200
 queue = 10000                      # records waiting; beyond this they are dropped and counted
 
-# The change feed (changes.poll, changes.head): records of what each commit
-# changed, filtered per reader. Whether commits record changes is a tenant
-# property, switched with the changes.capture action (admins of every workspace).
+# The change feed (changes.poll, changes.head, GET|POST /v1/changes/stream):
+# records of what each commit changed, filtered per reader. Whether commits
+# record changes is a tenant property, switched with the changes.capture action
+# (admins of every workspace).
 [changes]
-page = 500                         # records scanned per changes.poll page without a limit (1..1000)
+page = 500                         # records scanned per changes.poll or stream page without a limit (1..1000)
+ring = 4096                        # records per tenant in memory, only while it has streams (counted in the memory budget)
+eval_budget_ms = 50                # filtering time per stream page before the page is split
+heartbeat_secs = 15                # streams send the last cursor scanned this often
+stall_timeout_secs = 60            # a client that reads nothing this long is cut (slow_consumer)
+max_backfill_seqs = 100000         # commits behind the head before a stream ends too_far_behind
+reauth_secs = 60                   # streams re-authenticate their request this often
+max_subscribers = 200              # streams per tenant per process
+max_subscribers_per_principal = 20
+max_subscribers_process = 2000

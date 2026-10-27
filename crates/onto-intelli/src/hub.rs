@@ -96,12 +96,16 @@ impl Slot {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TenantStat {
     pub tenant: String,
-    /// [`Ontology::estimated_bytes`](onto_core::Ontology::estimated_bytes).
+    /// [`Intelli::estimated_bytes`]: the ontology plus the change stream ring.
     pub estimated_bytes: u64,
     pub entities: usize,
     pub links: usize,
     /// Milliseconds since the last request.
     pub idle_ms: i64,
+    /// Open change streams in this process.
+    pub streams: usize,
+    /// Memory of the change stream ring (0 without streams).
+    pub ring_bytes: u64,
 }
 
 pub struct Hub {
@@ -289,6 +293,11 @@ impl Hub {
     /// `max_open_tenants` are open or their estimated memory is over the
     /// budget. `keep` (the tenant just opened) and the most recently used
     /// tenant stay, whatever the budget. Returns those closed.
+    ///
+    /// An open change stream keeps its tenant from going idle (its
+    /// heartbeats count as use), but not past `max_open_tenants` or the
+    /// memory budget: those judge the last request only, and the stream
+    /// ends `tenant_closed`.
     pub fn enforce_limits(&self, keep: Option<&str>, now: i64) -> Vec<String> {
         if !self.evicts() {
             return Vec::new();
@@ -304,8 +313,7 @@ impl Hub {
             .collect();
         // Oldest first.
         open.sort_by_key(|(k, used, _)| (*used, k.clone()));
-        let mut bytes: u64 =
-            if budget > 0 { open.iter().map(|(_, _, i)| i.ontology().estimated_bytes()).sum() } else { 0 };
+        let mut bytes: u64 = if budget > 0 { open.iter().map(|(_, _, i)| i.estimated_bytes()).sum() } else { 0 };
         let mut count = open.len();
         let newest = open.last().map(|(k, _, _)| k.clone());
         let mut closed = Vec::new();
@@ -313,7 +321,7 @@ impl Hub {
             if Some(id.as_str()) == keep {
                 continue;
             }
-            let idle = idle_ms > 0 && now - used >= idle_ms;
+            let idle = idle_ms > 0 && now - (*used).max(intelli.stream_touched()) >= idle_ms;
             if !idle && Some(id) == newest.as_ref() {
                 continue;
             }
@@ -325,7 +333,7 @@ impl Hub {
             if self.close_if_unused_since(id, *used) {
                 count -= 1;
                 if budget > 0 {
-                    bytes = bytes.saturating_sub(intelli.ontology().estimated_bytes());
+                    bytes = bytes.saturating_sub(intelli.estimated_bytes());
                 }
                 closed.push(id.clone());
             }
@@ -336,15 +344,22 @@ impl Hub {
         closed
     }
 
-    /// Forget a tenant unless a request used it after `used`.
+    /// Forget a tenant unless a request used it after `used`, and close it
+    /// (its streams end `tenant_closed`).
     fn close_if_unused_since(&self, id: &str, used: i64) -> bool {
-        let mut tenants = self.tenants.lock();
-        match tenants.get(id) {
-            Some(s) if s.last_used.load(Ordering::Relaxed) <= used && s.cell.initialized() => {
-                tenants.remove(id);
+        let removed = {
+            let mut tenants = self.tenants.lock();
+            match tenants.get(id) {
+                Some(s) if s.last_used.load(Ordering::Relaxed) <= used && s.cell.initialized() => tenants.remove(id),
+                _ => None,
+            }
+        };
+        match removed {
+            Some(slot) => {
+                close_slot(&slot);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -404,9 +419,16 @@ impl Hub {
         let mut out: Vec<TenantStat> = open
             .into_iter()
             .map(|(tenant, used, i)| {
-                let onto = i.ontology();
-                let (entities, links) = onto.counts();
-                TenantStat { tenant, estimated_bytes: onto.estimated_bytes(), entities, links, idle_ms: now - used }
+                let (entities, links) = i.ontology().counts();
+                TenantStat {
+                    tenant,
+                    estimated_bytes: i.estimated_bytes(),
+                    entities,
+                    links,
+                    idle_ms: now - used,
+                    streams: i.changes().subscribers(),
+                    ring_bytes: i.changes().bytes() as u64,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes).then_with(|| a.tenant.cmp(&b.tenant)));
@@ -443,9 +465,11 @@ impl Hub {
     }
 
     /// Forget an open tenant: the next request opens it again. Requests in
-    /// flight keep the ontology they hold. Returns whether it was known.
+    /// flight keep the ontology they hold; its change streams end
+    /// `tenant_closed`. Returns whether it was known.
     pub fn evict(&self, tenant: &str) -> bool {
-        self.tenants.lock().remove(tenant).is_some()
+        let removed = self.tenants.lock().remove(tenant);
+        removed.inspect(|slot| close_slot(slot)).is_some()
     }
 
     /// Evict a tenant and delete its data: `DROP SCHEMA {prefix}{tenant}
@@ -496,6 +520,13 @@ impl Hub {
         let intelli = Intelli::open_with_store(cfg, store, llm).await?;
         self.apply(&intelli, settings);
         Ok(intelli)
+    }
+}
+
+/// Tell a forgotten tenant's streams and workers to end.
+fn close_slot(slot: &Slot) {
+    if let Some(i) = slot.cell.get() {
+        i.close();
     }
 }
 

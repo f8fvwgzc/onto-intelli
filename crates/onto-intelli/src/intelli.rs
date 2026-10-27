@@ -1,13 +1,13 @@
 //! The orchestrator: deterministic retrieval first, the LLM only for reasoning.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use onto_core::store::{MemoryStore, Store};
 use onto_core::time::new_id;
@@ -18,6 +18,7 @@ use onto_core::{
 
 use crate::answer;
 use crate::cache::TtlCache;
+use crate::changes::{ChangeHub, Reauth, Start, Subscription};
 use crate::config::Config;
 use crate::context::{self, ContextInput, ContextPack};
 use crate::conversation::{Conversation, Conversations};
@@ -199,6 +200,12 @@ pub struct Intelli {
     ingest: IngestQueue,
     asks: AtomicUsize,
     started: Instant,
+    /// Live change streams of this tenant in this process.
+    changes: Arc<ChangeHub>,
+    /// Set when the hub closes this tenant: streams and workers end.
+    closing: watch::Sender<bool>,
+    /// When an open stream last sent a heartbeat (ms; 0 = never).
+    stream_touch: AtomicI64,
 }
 
 impl Intelli {
@@ -244,7 +251,11 @@ impl Intelli {
         let c = &config.cache;
         let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
         let crawl = config.connectors.clone();
+        let changes = ChangeHub::new(&onto, config.changes.clone());
         let me = Arc::new(Self {
+            changes,
+            closing: watch::Sender::new(false),
+            stream_touch: AtomicI64::new(0),
             answers: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             resolutions: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             completions: TtlCache::new(c.max_entries, Duration::from_secs(c.llm_ttl_secs)),
@@ -325,6 +336,55 @@ impl Intelli {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The tenant's change streams.
+    pub fn changes(&self) -> &Arc<ChangeHub> {
+        &self.changes
+    }
+
+    /// Open a live change stream for `p` (see [`ChangeHub::subscribe`]).
+    /// The stream holds only a weak reference to this tenant: it ends
+    /// `tenant_closed` when the tenant closes. `reauth` re-derives the
+    /// caller's principal every `changes.reauth_secs`.
+    pub async fn subscribe_changes(
+        self: &Arc<Self>,
+        p: Principal,
+        f: onto_core::changes::ChangeFilter,
+        start: Start,
+        reauth: Option<Reauth>,
+    ) -> Result<Subscription> {
+        self.changes.subscribe(Arc::downgrade(self), p, f, start, reauth).await
+    }
+
+    /// Close this tenant for streams and background work: they end (streams
+    /// with `tenant_closed`). The hub calls it when it forgets the tenant.
+    pub fn close(&self) {
+        self.closing.send_replace(true);
+    }
+
+    pub fn is_closing(&self) -> bool {
+        *self.closing.borrow()
+    }
+
+    pub(crate) fn closing_signal(&self) -> watch::Receiver<bool> {
+        self.closing.subscribe()
+    }
+
+    /// An open stream is alive (it counts toward the idle timer, never
+    /// toward the open-tenant count or the memory budget).
+    pub fn touch_stream(&self) {
+        self.stream_touch.store(onto_core::time::now_ms(), Ordering::Relaxed);
+    }
+
+    /// When an open stream last sent a heartbeat (Unix ms; 0 = never).
+    pub fn stream_touched(&self) -> i64 {
+        self.stream_touch.load(Ordering::Relaxed)
+    }
+
+    /// Estimated memory: the ontology plus the change stream ring.
+    pub fn estimated_bytes(&self) -> u64 {
+        self.onto.estimated_bytes() + self.changes.bytes() as u64
     }
 
     pub fn ontology(&self) -> &Ontology {
@@ -1192,7 +1252,13 @@ impl Intelli {
             "version": crate::VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
             "ontology": self.onto.stats()?,
-            "estimated_bytes": self.onto.estimated_bytes(),
+            "estimated_bytes": self.estimated_bytes(),
+            "changes": {
+                "subscribers": self.changes.subscribers(),
+                "subscribers_process": ChangeHub::process_subscribers(),
+                "ring_records": self.changes.ring_len(),
+                "ring_bytes": self.changes.bytes(),
+            },
             "memory": self.memory.stats(),
             "llm": {
                 "provider": llm.name(),

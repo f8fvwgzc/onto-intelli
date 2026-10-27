@@ -10,6 +10,8 @@
 //! was written without records arrives as a `gap` record. Consistent resync
 //! is not offered: after an expiry or a gap, re-read with `entity.find`; the
 //! result is not pinned to a cursor.
+//!
+//! Live streams ([`stream`]) take the same filter keys ([`stream_request`]).
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +21,10 @@ use onto_core::{Access, Error, Principal, Result, one_or_many};
 
 use crate::actions::{parse, to_json};
 use crate::intelli::Intelli;
+
+pub mod stream;
+
+pub use stream::{ChangeHub, Frame, Reauth, ReauthError, Start, Subscription};
 
 /// The change feed actions, dispatched by [`Intelli::changes_call`].
 pub const CALLS: &[&str] = &["changes.poll", "changes.head", "changes.capture"];
@@ -117,6 +123,46 @@ struct PollIn {
     limit: Option<usize>,
     #[serde(flatten)]
     filter: FilterIn,
+}
+
+/// The input of a change stream (`GET|POST /v1/changes/stream`): the
+/// filter keys of `changes.poll` plus where to start.
+#[derive(Deserialize)]
+struct StreamIn {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(flatten)]
+    filter: FilterIn,
+}
+
+/// The filter and start of a stream request. `last_event_id` (the SSE
+/// `Last-Event-ID` header of a reconnect) wins over `after`; without either,
+/// `from` is `now` (default) or `earliest`. Giving `after` and `from` is
+/// refused.
+pub fn stream_request(input: Value, last_event_id: Option<&str>) -> Result<(ChangeFilter, Start)> {
+    const ACTION: &str = "changes.stream";
+    let input = if input.is_null() { json!({}) } else { input };
+    let i: StreamIn = parse(ACTION, input)?;
+    let f = i.filter.into_filter().map_err(|e| prefixed(ACTION, e))?;
+    let nonempty = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let after = nonempty(i.after.as_deref());
+    let from = nonempty(i.from.as_deref());
+    if let Some(id) = nonempty(last_event_id) {
+        let c: Cursor = id.parse().map_err(|e| prefixed(ACTION, e))?;
+        return Ok((f, Start::After(c)));
+    }
+    let start = match (after, from) {
+        (Some(_), Some(_)) => return Err(Error::invalid("changes.stream: give after or from, not both")),
+        (Some(a), None) => Start::After(a.parse().map_err(|e| prefixed(ACTION, e))?),
+        (None, None) => Start::Now,
+        (None, Some(f)) => match f.parse::<StartAt>().map_err(|e| prefixed(ACTION, e))? {
+            StartAt::Now => Start::Now,
+            StartAt::Earliest => Start::Earliest,
+        },
+    };
+    Ok((f, start))
 }
 
 #[derive(Deserialize)]
@@ -236,6 +282,22 @@ mod tests {
         assert!(filter(json!({ "include_migrations": true, "exclude_migrations": true })).is_err());
         let ids: Vec<String> = (0..1001).map(|n| format!("issue:{n}")).collect();
         assert!(filter(json!({ "ids": ids })).unwrap_err().to_string().contains("1000"));
+    }
+
+    #[test]
+    fn stream_requests_start_now_unless_told_otherwise() {
+        let (f, start) = stream_request(json!({ "kinds": "issue" }), None).unwrap();
+        assert_eq!((f.kinds, start), (vec!["issue".to_string()], Start::Now));
+        assert_eq!(stream_request(Value::Null, None).unwrap().1, Start::Now);
+        assert_eq!(stream_request(json!({ "from": "earliest" }), None).unwrap().1, Start::Earliest);
+        assert_eq!(stream_request(json!({ "after": "7.2" }), None).unwrap().1, Start::After(Cursor::new(7, 2)));
+        // A reconnect's Last-Event-ID wins over after and from.
+        let (_, s) = stream_request(json!({ "after": "7.2", "from": "now" }), Some("9.0")).unwrap();
+        assert_eq!(s, Start::After(Cursor::new(9, 0)));
+        assert!(stream_request(json!({ "after": "7.2", "from": "now" }), None).is_err());
+        let e = stream_request(json!({ "after": "x" }), None).unwrap_err();
+        assert!(e.to_string().starts_with("invalid: changes.stream"), "{e}");
+        assert!(stream_request(json!({ "ops": "nope" }), None).is_err());
     }
 
     #[test]

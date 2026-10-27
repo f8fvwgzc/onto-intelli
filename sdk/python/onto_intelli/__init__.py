@@ -30,6 +30,7 @@ from .client import (
     TracePage,
     TraceRow,
 )
+from .changes import Changes
 from .errors import OntoError
 from .sse import SseMessage, parse_sse
 
@@ -41,6 +42,7 @@ __all__ = [
     "AskRequest",
     "AskResponse",
     "AskTrace",
+    "Changes",
     "Entity",
     "MintedSession",
     "Onto",
