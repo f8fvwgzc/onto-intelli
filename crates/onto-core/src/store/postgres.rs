@@ -398,9 +398,45 @@ pub struct PgStore {
     sys_ready: SysReady,
 }
 
+/// Unique violations are conflicts (a duplicate is final, never retried);
+/// a pool that cannot hand out a connection, a lost connection and a server
+/// shutting down are `unavailable` (worth retrying later); everything else
+/// is a storage error.
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
-        Error::Storage(format!("postgres: {e}"))
+        match error_class(&e) {
+            ErrorClass::Conflict => Error::Conflict(format!("postgres: {e}")),
+            ErrorClass::Unavailable => Error::Unavailable(format!("postgres: {e}")),
+            ErrorClass::Storage => Error::Storage(format!("postgres: {e}")),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorClass {
+    Conflict,
+    Unavailable,
+    Storage,
+}
+
+fn error_class(e: &sqlx::Error) -> ErrorClass {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::WorkerCrashed => {
+            ErrorClass::Unavailable
+        }
+        sqlx::Error::Database(d) => sqlstate_class(d.code().as_deref()),
+        _ => ErrorClass::Storage,
+    }
+}
+
+/// `23505` unique_violation → conflict; class `08` (connection exception),
+/// `53300` too_many_connections and `57P01`-`57P03` (shutdown, cannot connect
+/// now) → unavailable.
+fn sqlstate_class(code: Option<&str>) -> ErrorClass {
+    match code {
+        Some("23505") => ErrorClass::Conflict,
+        Some(c) if c.starts_with("08") || matches!(c, "53300" | "57P01" | "57P02" | "57P03") => ErrorClass::Unavailable,
+        _ => ErrorClass::Storage,
     }
 }
 
@@ -2401,6 +2437,53 @@ mod tests {
         let long = tenant_schema("onto_", &"x".repeat(100)).unwrap();
         assert!(long.len() <= 63 && long.starts_with("onto_xxx"));
         assert!(tenant_schema("onto_", "").is_err());
+    }
+
+    #[test]
+    fn sqlx_errors_map_to_conflict_unavailable_or_storage() {
+        use super::{ErrorClass, sql, sqlstate_class};
+        use crate::Error;
+        use crate::sqlx;
+        assert_eq!(sqlstate_class(Some("23505")), ErrorClass::Conflict);
+        for c in ["08006", "08001", "53300", "57P01", "57P03"] {
+            assert_eq!(sqlstate_class(Some(c)), ErrorClass::Unavailable, "{c}");
+        }
+        for c in [Some("42P01"), Some("23503"), Some("40001"), None] {
+            assert_eq!(sqlstate_class(c), ErrorClass::Storage, "{c:?}");
+        }
+        assert!(matches!(Error::from(sqlx::Error::PoolTimedOut), Error::Unavailable(_)));
+        assert!(matches!(Error::from(sqlx::Error::PoolClosed), Error::Unavailable(_)));
+        assert!(matches!(Error::from(sqlx::Error::Io(std::io::Error::other("reset"))), Error::Unavailable(_)));
+        assert!(matches!(Error::from(sqlx::Error::RowNotFound), Error::Storage(_)));
+        // Against a real server (behind DATABASE_URL): a duplicate key and a pool timeout.
+        let Some(url) = ["ONTO_TEST_DATABASE_URL", "DATABASE_URL"]
+            .iter()
+            .find_map(|v| std::env::var(v).ok().filter(|u| !u.trim().is_empty()))
+        else {
+            eprintln!("skipped the PostgreSQL half: set DATABASE_URL");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_millis(200))
+                .connect(&url)
+                .await
+                .unwrap();
+            let mut c = pool.acquire().await.unwrap();
+            sqlx::raw_sql(sql("CREATE TEMP TABLE dup (k INT PRIMARY KEY); INSERT INTO dup VALUES (1)".into()))
+                .execute(&mut *c)
+                .await
+                .unwrap();
+            let e = sqlx::raw_sql(sql("INSERT INTO dup VALUES (1)".into())).execute(&mut *c).await.unwrap_err();
+            assert!(matches!(Error::from(e), Error::Conflict(ref m) if m.contains("duplicate")));
+            // The only connection is held, so the pool times out.
+            let e = pool.acquire().await.unwrap_err();
+            assert!(matches!(Error::from(e), Error::Unavailable(_)));
+            drop(c);
+            pool.close().await;
+        });
     }
 
     #[test]

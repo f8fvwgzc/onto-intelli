@@ -74,7 +74,7 @@ pub use live_schema::{
 pub use locks::{LockViolation, SchemaLock};
 pub use model::*;
 pub use packs::{InstallMode, PackDetail, PackInfo, PackInstallOptions, PackInstalled, PackMeta};
-pub use policy::{Access, Principal, Role};
+pub use policy::{Access, Principal, Role, ScopePrincipal};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use reason::{
     Attested, BindingReport, BindingVerdict, Certificate, Closure, ClosureDiff, Derivation, Fact, QueryAnswer,

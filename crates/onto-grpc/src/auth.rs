@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use onto_control::{Control, OrgRole, User};
 use onto_intelli::config::AuthConfig;
+use onto_intelli::core::policy::is_reserved_id;
 use onto_intelli::{Error, Principal, Result, Role};
 
 pub const ACT_AS: &str = "x-onto-act-as";
@@ -207,6 +208,16 @@ pub fn presented(h: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
+/// Console users (`user:<id>`) and API keys (`key:<prefix>`) can never carry
+/// a reserved service principal id; checked anyway, so a future id scheme
+/// cannot start issuing them unnoticed.
+fn not_reserved(p: Principal) -> std::result::Result<Principal, AuthError> {
+    if is_reserved_id(&p.id) {
+        return Err(AuthError::Forbidden(format!("{} is a reserved service principal id", p.id)));
+    }
+    Ok(p)
+}
+
 /// The `x-onto-act-*` principal of a call, or `base` when none is named.
 /// `limit_roles`: only `allowed_roles` may be granted (off in dev mode).
 fn act_for(
@@ -221,6 +232,11 @@ fn act_for(
     };
     if !may_impersonate {
         return Err(AuthError::Forbidden(format!("{} may not act for other principals", base.id)));
+    }
+    if is_reserved_id(act_as) {
+        return Err(AuthError::Forbidden(format!(
+            "{act_as} is a reserved service principal id (automation:, webhook:, connector:, system); no credential may act as it"
+        )));
     }
     let roles: Vec<Role> = match header(h, ACT_ROLES) {
         Some(v) => list(v)
@@ -281,6 +297,13 @@ impl Auth {
         };
         let mut tokens = Vec::new();
         for t in &cfg.tokens {
+            if is_reserved_id(&t.principal.id) {
+                return Err(Error::Config(format!(
+                    "auth token principal {} is a reserved service principal id (automation:, webhook:, connector:, system): \
+                     choose another id",
+                    t.principal.id
+                )));
+            }
             let value = match (&t.token_env, &t.token) {
                 (Some(var), _) => std::env::var(var).ok(),
                 (None, Some(tok)) => Some(tok.clone()),
@@ -627,7 +650,8 @@ impl Auth {
         let Some((project, role)) = control.membership(&user.id, &r).await.map_err(unavailable)? else {
             return Err(AuthError::Forbidden(format!("user {} is not a member of project {r}", user.id)));
         };
-        let principal = Principal::new(format!("user:{}", user.id), role.principal_roles(), vec!["*".into()]);
+        let principal =
+            not_reserved(Principal::new(format!("user:{}", user.id), role.principal_roles(), vec!["*".into()]))?;
         Ok(Caller {
             principal,
             tenant: Some(project.r#ref),
@@ -658,7 +682,7 @@ impl Auth {
         // impersonate_roles ⊆ the key's roles is checked when the key is
         // created; checked again here so an edited row cannot widen it.
         let allowed: Vec<Role> = key.impersonate_roles.iter().filter(|r| roles.contains(r)).cloned().collect();
-        let base = Principal::new(format!("key:{}", key.prefix), roles, key.workspaces.clone());
+        let base = not_reserved(Principal::new(format!("key:{}", key.prefix), roles, key.workspaces.clone()))?;
         let principal = act_for(base, h, key.impersonate, &allowed, true)?;
         Ok(Caller {
             principal,
@@ -1070,6 +1094,64 @@ mod tests {
         ));
         // Without a control plane, keys are just invalid.
         assert_eq!(auth().authenticate(&headers(&[("authorization", &ah)])).await.unwrap_err(), e1);
+    }
+
+    #[tokio::test]
+    async fn nobody_acts_as_a_reserved_service_principal() {
+        let reserved = ["automation:payroll", "webhook:hook1", "connector:crm", "system", "System:x"];
+        // A config token with impersonate.
+        let a = auth();
+        for who in reserved {
+            let err = a
+                .authenticate(&headers(&[
+                    ("authorization", "Bearer svc-secret-0123456789"),
+                    (ACT_AS, who),
+                    (ACT_ROLES, "member"),
+                ]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthError::Forbidden(ref m) if m.contains("reserved")), "{who}: {err}");
+        }
+        // Dev mode, where any other act-as goes.
+        let dev = Auth::from_config(&AuthConfig::default(), true).unwrap();
+        assert!(matches!(
+            dev.authenticate(&headers(&[(ACT_AS, "automation:x")])).await,
+            Err(AuthError::Forbidden(ref m)) if m.contains("reserved")
+        ));
+        assert_eq!(dev.authenticate(&headers(&[(ACT_AS, "user:x")])).await.unwrap().principal.id, "user:x");
+        // An API key with impersonate.
+        let (a, control, s) = with_control().await;
+        let project = s.adopted.iter().find(|p| p.r#ref == "t1").unwrap().clone();
+        let req = KeyRequest {
+            name: "svc".into(),
+            scopes: vec![KeyScope::Read, KeyScope::Write],
+            impersonate: true,
+            impersonate_roles: vec![Role::Viewer, Role::Member],
+            ..Default::default()
+        };
+        let (_, secret) = control.create_key(&project, req, &s.user.id).await.unwrap();
+        let bearer = format!("Bearer {secret}");
+        for who in reserved {
+            let err = a.authenticate(&headers(&[("authorization", &bearer), (ACT_AS, who)])).await.unwrap_err();
+            assert!(matches!(err, AuthError::Forbidden(ref m) if m.contains("reserved")), "{who}: {err}");
+        }
+        assert!(a.authenticate(&headers(&[("authorization", &bearer), (ACT_AS, "user:7")])).await.is_ok());
+        // A configured token cannot carry a reserved id either: a config error at startup.
+        for id in ["system", "automation:nightly", "connector:crm"] {
+            let cfg = AuthConfig {
+                tokens: vec![TokenConfig {
+                    token: Some("reserved-secret-0123456789".into()),
+                    token_env: None,
+                    principal: Principal::admin(id),
+                    impersonate: false,
+                    impersonate_roles: Vec::new(),
+                    tenants: vec!["*".into()],
+                }],
+                ..Default::default()
+            };
+            let err = Auth::from_config(&cfg, false).err().unwrap();
+            assert!(matches!(err, Error::Config(ref m) if m.contains("reserved")), "{id}: {err}");
+        }
     }
 
     #[tokio::test]

@@ -775,3 +775,36 @@ async fn streams_filter_per_reader() {
         }
     }
 }
+
+/// Service principal ids (`automation:`, `webhook:`, `connector:`,
+/// `system`) are refused in `x-onto-act-as` before a principal is built, so
+/// no change record can carry a forged `cause.actor` of an automation,
+/// webhook or connector.
+#[tokio::test]
+async fn reserved_service_ids_cannot_be_acted_as() {
+    let (addr, _stop) = start_hub().await;
+    let h = Http { base: format!("http://{addr}"), http: reqwest::Client::new() };
+    let (_, head) = h.get("/v1/changes/head", OPS, "ws_a", None).await;
+    let start = head["cursor"].as_str().unwrap().to_string();
+    for who in ["automation:payroll", "webhook:hook1", "connector:crm", "system", "SYSTEM"] {
+        let (st, v) = h.get("/v1/auth/whoami", SVC, "ws_a", Some((who, "member", "person:x"))).await;
+        assert_eq!(st, 403, "{who}: {v}");
+        assert!(v.to_string().contains("reserved"), "{who}: {v}");
+        let (st, v) = h
+            .post(
+                "/v1/call/entity.upsert",
+                SVC,
+                "ws_a",
+                Some((who, "member", "person:x")),
+                json!({ "id": "issue:forged", "title": "Forged" }),
+            )
+            .await;
+        assert_eq!(st, 403, "{who}: {v}");
+    }
+    // An ordinary user id still works, and nothing was written by the refused calls.
+    let (st, v) = h.get("/v1/auth/whoami", SVC, "ws_a", Some(("user:kenji", "member", "person:kenji"))).await;
+    assert_eq!((st, v["principal"]["id"].as_str()), (200, Some("user:kenji")), "{v}");
+    let (st, page) = h.get(&format!("/v1/changes?after={start}"), OPS, "ws_a", None).await;
+    assert_eq!(st, 200, "{page}");
+    assert_eq!(ids(&page), Vec::<(String, String)>::new(), "{page}");
+}
