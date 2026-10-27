@@ -239,11 +239,23 @@ async fn agents_neither_write_raw_nor_confirm_their_own_risky_actions() {
     ws.call(&agent, "entity.upsert", json!({ "id": "task:z", "title": "z" })).await.unwrap();
 }
 
-#[test]
-fn every_write_action_is_classified_for_agents() {
+#[tokio::test]
+async fn every_write_action_is_classified_for_agents() {
     use onto_intelli::actions::{ACTIONS, AGENT_WRITES, RAW_WRITES};
     for name in AGENT_WRITES.iter().chain(RAW_WRITES) {
         assert!(ACTIONS.iter().any(|a| a.name == *name && a.write), "{name} is not a write action");
         assert!(!(AGENT_WRITES.contains(name) && RAW_WRITES.contains(name)), "{name} is on both lists");
+    }
+    // Every write action an agent calls is decided by those lists: refused
+    // unless it is on AGENT_WRITES (where it may still fail on its input).
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let ws = hub.tenant("t").await.unwrap();
+    let agent = Principal::named("agent:bot", &["member", "agent"], &["*"]).unwrap();
+    for a in ACTIONS.iter().filter(|a| a.write) {
+        let refused = match ws.call(&agent, a.name, json!({})).await {
+            Err(onto_intelli::Error::Denied(m)) => m.contains(&format!("is an agent: {} ", a.name)),
+            _ => false,
+        };
+        assert_eq!(refused, !AGENT_WRITES.contains(&a.name), "{}", a.name);
     }
 }

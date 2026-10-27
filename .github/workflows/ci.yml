@@ -122,6 +122,8 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - run: npm ci
         working-directory: ui
+      - run: npm test
+        working-directory: ui
       - run: npm run build
         working-directory: ui
       - name: The committed build matches the sources

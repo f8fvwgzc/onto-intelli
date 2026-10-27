@@ -954,9 +954,53 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
         .unwrap();
     assert_eq!(r.status(), 403);
 
+    let revoke = |bearer: &'static str, jti: Value| {
+        let (http, base) = (http.clone(), base.clone());
+        async move {
+            let r = http
+                .post(format!("{base}/v1/auth/session/revoke"))
+                .bearer_auth(bearer)
+                .json(&json!({ "jti": jti }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            r.json::<Value>().await.unwrap()
+        }
+    };
+    // Only the first session of a login mints, so revoking any session's id
+    // leaves no session minted from it behind.
+    let root =
+        mint("service-token-for-tests".into(), json!({ "act_as": "user:5", "roles": ["member"], "tenant": "ws_1" }))
+            .await;
+    let derived = mint(root["token"].as_str().unwrap().to_string(), json!({})).await;
+    let r = http
+        .post(format!("{base}/v1/auth/session"))
+        .bearer_auth(derived["token"].as_str().unwrap())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a session minted from a session mints none");
+    revoke("service-token-for-tests", derived["jti"].clone()).await;
+    assert_eq!(whoami(derived["token"].as_str().unwrap().to_string()).await, 401);
+    assert_eq!(whoami(root["token"].as_str().unwrap().to_string()).await, 200, "the session it came from stays");
+
     // A token limited to one tenant mints sessions for that tenant, never the default one.
     let dash = mint("tenant-a-only-token".into(), json!({})).await;
     assert_eq!(dash["tenant"], "ws_a");
+    // It revokes by id for its own tenants only: another tenant's session survives.
+    let other =
+        mint("service-token-for-tests".into(), json!({ "act_as": "user:6", "roles": ["member"], "tenant": "ws_1" }))
+            .await;
+    let r = revoke("tenant-a-only-token", other["jti"].clone()).await;
+    assert_eq!(whoami(other["token"].as_str().unwrap().to_string()).await, 200, "a ws_1 session");
+    assert_eq!(r["tenants"], json!(["ws_a"]), "{r}");
+    revoke("tenant-a-only-token", dash["jti"].clone()).await;
+    assert_eq!(whoami(dash["token"].as_str().unwrap().to_string()).await, 401, "a ws_a session");
+    // A token for every tenant still revokes it, without naming the tenant.
+    revoke("service-token-for-tests", other["jti"].clone()).await;
+    assert_eq!(whoami(other["token"].as_str().unwrap().to_string()).await, 401);
 }
 
 #[tokio::test]

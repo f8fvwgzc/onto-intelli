@@ -162,14 +162,30 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
   token, with or without `x-onto-tenant`) revokes it and every session
   minted from it, `DELETE /v1/auth/session` (the session itself) signs out
   its whole login, on every replica within 10 seconds. A session may mint
-  another one, which never outlives it and carries the same `sid`.
+  another one, which never outlives it and carries the same `sid`; that
+  one mints no further sessions (403). A token limited to some tenants
+  revokes an id for the sessions of those tenants only (the answer lists
+  them). The id carries the session's expiry, so the revocation lasts
+  exactly as long as the session would have, whatever
+  `auth.session_max_ttl_secs` is set to later; `expires_at` matters only
+  for ids without one (minted by earlier builds).
+- Signing out from any session of a login ends the whole login (the
+  session it was minted from and its other sessions too): the user signs
+  out, not one copy of a token, and every session of a login is the same
+  principal in the same tenant anyway.
+- Revocations of every tenant's sessions live in the default tenant's KV
+  store (namespace `auth.revoked`), so session authentication reads the
+  default tenant: it is in the same database as every tenant, a failed read
+  refuses the session (503) rather than accepting it, and reads are cached
+  (an id read as not revoked is read again after 10 seconds).
 - A token whose `tenants` names some tenants (not `"*"`) never reaches the
   default tenant: with one tenant, a request without `x-onto-tenant`
   addresses that one; with several, it must name one.
 - `GET /livez` and `GET /readyz` (one query on PostgreSQL) answer without a
   token, for probes; `/healthz` needs one.
 - Agents (role `agent`) change the graph through action types only:
-  `entity.upsert`, `link.create`, `graph.apply` and the other raw writes are
+  `entity.upsert`, `link.create`, `graph.apply` and the other raw writes
+  (`pack.install` with `sample` too: the sample's entities and links) are
   refused to them unless `[governance] agent_raw_writes = true`, and an
   agent's `confirm=true` does not confirm a high-risk or irreversible action
   (a person applies it).

@@ -351,10 +351,18 @@ async fn packs_install_by_role() {
     let m = packs["items"].as_array().unwrap().iter().find(|p| p["id"] == "manufacturing").unwrap().clone();
     assert_eq!(m["installed"], false, "a proposal changes nothing");
 
-    let done = ok(&i, &admin(), "pack.install", json!({ "id": "manufacturing", "sample": true })).await;
+    let done = ok(&i, &admin(), "pack.install", json!({ "id": "manufacturing" })).await;
     assert_eq!(done["mode"], "apply", "{done}");
     assert!(done["version"].is_object(), "{done}");
-    assert!(done["sample_entities"].as_u64().unwrap() > 0, "{done}");
+    // With its schema in force, the sample writes entities and links
+    // directly: a raw write, refused to agents.
+    let bot = Principal::named("agent:bot", &["member", "agent"], &["*"]).unwrap();
+    let before = i.ontology().revision();
+    let refused = err(&i, &bot, "pack.install", json!({ "id": "manufacturing", "sample": true })).await;
+    assert!(refused.to_string().contains("is an agent: pack.install"), "{refused}");
+    assert_eq!(i.ontology().revision(), before, "the agent wrote nothing");
+    let sampled = ok(&i, &admin(), "pack.install", json!({ "id": "manufacturing", "sample": true })).await;
+    assert!(sampled["sample_entities"].as_u64().unwrap() > 0, "{sampled}");
     let packs = ok(&i, &admin(), "pack.list", json!({})).await;
     let m = packs["items"].as_array().unwrap().iter().find(|p| p["id"] == "manufacturing").unwrap().clone();
     assert_eq!(m["installed"], true);

@@ -65,7 +65,16 @@ pub const REVOKED_NS: &str = "auth.revoked";
 
 /// Revoked session and login ids in the default tenant's KV store, whatever
 /// the sessions' tenants, kept until the sessions would have expired: every
-/// replica sees them.
+/// replica sees them. A revocation for every tenant is keyed by the id; one
+/// for the sessions of some tenants (a service token limited to them) by
+/// `<id>@<tenant>`, once per tenant.
+///
+/// Session authentication in every tenant therefore reads the default
+/// tenant. That is kept on purpose: every tenant lives in the same database,
+/// so the default tenant is as reachable as the session's own; a failed read
+/// refuses the session (503) rather than accepting it; and reads are cached
+/// ([`auth::REVOCATION_TTL`]), one indexed KV read per session id at most
+/// every 10 seconds.
 struct HubRevocations(std::sync::Weak<Hub>);
 
 impl HubRevocations {
@@ -79,25 +88,43 @@ impl HubRevocations {
 }
 
 impl auth::Revocations for HubRevocations {
-    fn revoke<'a>(&'a self, jti: &'a str, exp: u64) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    fn revoke<'a>(
+        &'a self,
+        id: &'a str,
+        tenants: Option<&'a [String]>,
+        exp: u64,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let store = self.store().await?;
-            let (jti, until) = (jti.to_string(), (exp as i64).saturating_mul(1000));
+            let keys: Vec<String> = match tenants {
+                None => vec![id.to_string()],
+                Some(tenants) => tenants.iter().map(|t| auth::scoped_id(id, Some(t))).collect(),
+            };
+            let until = (exp as i64).saturating_mul(1000);
             tokio::task::spawn_blocking(move || {
-                store.kv_put(REVOKED_NS, &jti, &serde_json::json!({ "expires_at": exp }), Some(until))
+                keys.iter().try_for_each(|key| {
+                    store.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
+                })
             })
             .await
             .map_err(|e| Error::Other(format!("revoking a session: {e}")))?
         })
     }
 
-    fn is_revoked<'a>(&'a self, jti: &'a str) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+    fn is_revoked<'a>(
+        &'a self,
+        id: &'a str,
+        tenant: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let store = self.store().await?;
-            let jti = jti.to_string();
-            tokio::task::spawn_blocking(move || store.kv_get(REVOKED_NS, &jti).map(|v| v.is_some()))
-                .await
-                .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
+            let (id, scoped) = (id.to_string(), auth::scoped_id(id, tenant));
+            // One read for both: the id, and the id for this tenant.
+            tokio::task::spawn_blocking(move || {
+                store.kv_scan(REVOKED_NS, &id).map(|rows| rows.iter().any(|(key, _)| *key == id || *key == scoped))
+            })
+            .await
+            .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
         })
     }
 }
