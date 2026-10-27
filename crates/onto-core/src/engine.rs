@@ -425,6 +425,20 @@ impl Ontology {
         self.inner.capture.load(Ordering::SeqCst)
     }
 
+    /// Re-read the tenant's capture setting from the store (followers do this
+    /// when another process switches it). Returns the setting now in effect.
+    pub fn refresh_capture(&self) -> Result<bool> {
+        let store = &self.inner.store;
+        if !store.keeps_changes() {
+            return Ok(self.capture_enabled());
+        }
+        // A commit racing this read records with the old setting: extra
+        // records, or a gap from the store, never a silent hole.
+        let on = store.changes_meta()?.capture;
+        self.inner.capture.store(on, Ordering::SeqCst);
+        Ok(on)
+    }
+
     /// Turn change capture on or off for the tenant (admins and the system;
     /// never agents). Turning it on after a period off expires every older
     /// cursor: nothing was recorded meanwhile. Audited as `changes.capture`.

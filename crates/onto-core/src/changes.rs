@@ -476,6 +476,38 @@ pub struct ChangesMeta {
     pub head: Cursor,
 }
 
+/// How long a store keeps change records ([`crate::store::Store::vacuum_changes`]).
+/// Retention removes whole commits and raises the floor in the same
+/// transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeRetention {
+    /// Remove records older than this many milliseconds (`None`: no age limit).
+    pub keep_ms: Option<i64>,
+    /// Keep at most this many records (`None`: no count limit). Whole commits
+    /// are removed, so slightly fewer may remain.
+    pub keep_rows: Option<u64>,
+}
+
+impl ChangeRetention {
+    /// The default age limit: 7 days.
+    pub const DEFAULT_KEEP_MS: i64 = 7 * 24 * 3_600_000;
+}
+
+impl Default for ChangeRetention {
+    fn default() -> Self {
+        Self { keep_ms: Some(Self::DEFAULT_KEEP_MS), keep_rows: None }
+    }
+}
+
+/// What one retention pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeVacuum {
+    /// Records removed.
+    pub deleted: u64,
+    /// The floor after the pass (unchanged when nothing was removed).
+    pub floor: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldMode {

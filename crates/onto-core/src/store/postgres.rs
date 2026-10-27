@@ -37,8 +37,11 @@ use sqlx::{AssertSqlSafe, Row};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 use super::{
-    CommitRecord, EmbedFn, NoticeFn, REPLICATED_KV, Snapshot, Store, StoreNotice, StoreStats, VectorFilter,
-    VersionRecord, WriteBatch,
+    CHANGES_META_NOTICE, CommitRecord, EmbedFn, NoticeFn, REPLICATED_KV, Snapshot, Store, StoreNotice, StoreStats,
+    VectorFilter, VersionRecord, WriteBatch,
+};
+use crate::changes::{
+    ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, Cursor, Gap, GapReason, StoredChange, StoredPage,
 };
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
@@ -64,7 +67,12 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (6, "trace_otel", include_str!("../../migrations/0006_trace_otel.sql")),
     (7, "tenant_identity", include_str!("../../migrations/0007_tenant_identity.sql")),
     (8, "audit_no_delete", include_str!("../../migrations/0008_audit_no_delete.sql")),
+    (9, "changes", include_str!("../../migrations/0009_changes.sql")),
 ];
+/// This build's writer version. A tenant whose `head.min_writer` is higher
+/// refuses this build's writes (builds before this one never read it; the
+/// gap trigger covers them).
+pub const WRITER_VERSION: i32 = 1;
 /// Above this many entities without vectors, a backfill drops the HNSW
 /// index and builds it once at the end (much faster than row by row).
 const REBUILD_INDEX_ABOVE: i64 = 20_000;
@@ -427,6 +435,36 @@ fn sql(s: String) -> AssertSqlSafe<String> {
     AssertSqlSafe(s)
 }
 
+/// Lock the commit head for a state-changing write and return its sequence.
+/// A tenant that requires a newer writer than this build is refused.
+async fn lock_head(tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>, head: &str) -> Result<i64> {
+    let (seq, min_writer): (i64, i32) =
+        sqlx::query_as(sql(format!("SELECT seq, min_writer FROM {head} WHERE id = 1 FOR UPDATE")))
+            .fetch_one(&mut **tx)
+            .await?;
+    if min_writer > WRITER_VERSION {
+        return Err(Error::Unavailable(format!(
+            "tenant requires a newer onto-intelli (writer version {min_writer}; this build writes as {WRITER_VERSION})"
+        )));
+    }
+    Ok(seq)
+}
+
+/// The change log's settings and head, read on `conn`.
+async fn changes_meta_on<'c, E>(conn: E, t: &Tables) -> Result<ChangesMeta>
+where
+    E: sqlx::executor::Executor<'c, Database = sqlx::Postgres>,
+{
+    let (head, floor, capture, n): (i64, i64, bool, Option<i32>) = sqlx::query_as(sql(format!(
+        "SELECT h.seq, m.floor, m.capture, (SELECT max(c.n) FROM {} c WHERE c.seq = h.seq) \
+         FROM {} h CROSS JOIN {} m WHERE h.id = 1",
+        t.changes, t.head, t.changes_meta
+    )))
+    .fetch_one(conn)
+    .await?;
+    Ok(ChangesMeta { capture, floor: floor as u64, head: Cursor::new(head as u64, n.unwrap_or(0) as u32) })
+}
+
 impl PgStore {
     /// Connect with a URL (a pool of its own, on a runtime of its own).
     pub fn connect(url: &str, tenant: &str, opts: PgOptions) -> Result<Self> {
@@ -575,6 +613,8 @@ impl PgStore {
     }
 
     /// Delete expired KV rows and events older than `keep_events_ms`.
+    /// Change records have their own pass ([`Store::vacuum_changes`]), which
+    /// also moves the floor.
     pub fn vacuum(&self, keep_events_ms: Option<i64>) -> Result<(u64, u64)> {
         let pool = self.pool.clone();
         let (kv, ev) = (self.t("kv"), self.t("events"));
@@ -637,13 +677,19 @@ impl PgStore {
         }
         let pool = self.pool.clone();
         let (te, tl, th, tc) = (self.t("entities"), self.t("links"), self.t("head"), self.t("commits"));
+        let (tch, tm) = (self.t("changes"), self.t("changes_meta"));
         let origin = self.origin.clone();
         let channel = self.channel();
+        // The import's gap record lists what it wrote.
+        let mut gap_entities: Vec<Id> = entities.iter().map(|e| e.id.clone()).collect();
+        gap_entities.sort();
+        gap_entities.dedup();
+        let mut gap_links: Vec<LinkKey> = links.iter().map(|l| (l.from.clone(), l.rel.clone(), l.to.clone())).collect();
+        gap_links.sort();
+        gap_links.dedup();
         self.block(async move {
             let mut tx = pool.begin().await?;
-            let head: i64 = sqlx::query_scalar(sql(format!("SELECT seq FROM {th} WHERE id = 1 FOR UPDATE")))
-                .fetch_one(&mut *tx)
-                .await?;
+            let head = lock_head(&mut tx, &th).await?;
             sqlx::query("CREATE TEMP TABLE onto_import_e (id TEXT, kind TEXT, workspace TEXT, doc JSONB, updated_at BIGINT) ON COMMIT DROP")
                 .execute(&mut *tx)
                 .await?;
@@ -704,7 +750,16 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
             let seq = head + 1;
-            let rec = CommitRecord { seq: seq as u64, ts: now_ms(), origin: origin.clone(), reload: true, ..Default::default() };
+            // Captured: this commit writes its own gap record (below), so the
+            // trigger leaves it alone.
+            let rec = CommitRecord {
+                seq: seq as u64,
+                ts: now_ms(),
+                origin: origin.clone(),
+                reload: true,
+                captured: true,
+                ..Default::default()
+            };
             sqlx::query(sql(format!("INSERT INTO {tc} (seq, ts, origin, doc) VALUES ($1, $2, $3, $4::jsonb)")))
                 .bind(seq)
                 .bind(rec.ts)
@@ -712,6 +767,24 @@ impl PgStore {
                 .bind(serde_json::to_string(&rec)?)
                 .execute(&mut *tx)
                 .await?;
+            let gap = Gap {
+                reason: GapReason::BulkImport,
+                origin: origin.clone(),
+                entities: gap_entities,
+                links: gap_links,
+                hidden: 0,
+            };
+            let gap =
+                StoredChange { record: ChangeRecord::gap(seq as u64, rec.ts, gap), before_vis: None, rev_after: None };
+            sqlx::query(sql(format!(
+                "INSERT INTO {tch} (seq, n, ts, workspace, kind, op, target, doc) \
+                 SELECT $1, 0, $2, '', '', 'gap', '', $3::jsonb WHERE (SELECT capture FROM {tm})"
+            )))
+            .bind(seq)
+            .bind(rec.ts)
+            .bind(serde_json::to_string(&gap)?)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(sql(format!("UPDATE {th} SET seq = $1 WHERE id = 1"))).bind(seq).execute(&mut *tx).await?;
             send_notice(&mut tx, &channel, json!({ "t": "c", "seq": seq, "o": origin })).await?;
             tx.commit().await?;
@@ -910,15 +983,33 @@ impl Store for PgStore {
             b.kv.iter()
                 .map(|(n, k, v)| Ok((n.clone(), k.clone(), serde_json::to_string(v)?)))
                 .collect::<Result<_>>()?;
+        // Change records; the commit's seq is stamped into their cursor in SQL.
+        let changes: Vec<ChangeRow> = if bumps && b.captured {
+            b.changes
+                .iter()
+                .map(|c| {
+                    let r = &c.record;
+                    Ok(ChangeRow {
+                        n: r.cursor.n as i32,
+                        ts: r.ts,
+                        workspace: r.workspace.clone(),
+                        kind: r.kind.clone(),
+                        op: r.op.as_str().to_string(),
+                        target: r.id.clone(),
+                        doc: serde_json::to_string(c)?,
+                    })
+                })
+                .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
         let del_e = b.del_entities.clone();
         let del_l = b.del_links.clone();
         self.block(async move {
             let mut tx = pool.begin().await?;
             let mut seq: i64 = 0;
             if bumps {
-                seq = sqlx::query_scalar(sql(format!("SELECT seq FROM {} WHERE id = 1 FOR UPDATE", tables.head)))
-                    .fetch_one(&mut *tx)
-                    .await?;
+                seq = lock_head(&mut tx, &tables.head).await?;
                 if let Some(expected) = expect
                     && expected as i64 != seq
                 {
@@ -1042,6 +1133,9 @@ impl Store for PgStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            // The commit about to be made (`seq + 1`) is known once the head
+            // is locked: versions carry it, so change records join them.
+            let change_seq = bumps.then_some(seq + 1);
             for chunk in versions.chunks(CHUNK) {
                 let mut c: (Vec<String>, Vec<i64>, Vec<i64>, Vec<String>) = Default::default();
                 for (id, rev, ts, doc) in chunk.iter().cloned() {
@@ -1051,8 +1145,9 @@ impl Store for PgStore {
                     c.3.push(doc);
                 }
                 sqlx::query(sql(format!(
-                    "INSERT INTO {} (id, revision, ts, doc) \
-                     SELECT id, rev, ts, doc::jsonb FROM UNNEST($1::text[], $2::bigint[], $3::bigint[], $4::text[]) \
+                    "INSERT INTO {} (id, revision, ts, doc, change_seq) \
+                     SELECT id, rev, ts, doc::jsonb, $5::bigint FROM \
+                     UNNEST($1::text[], $2::bigint[], $3::bigint[], $4::text[]) \
                      WITH ORDINALITY AS v(id, rev, ts, doc, n) ORDER BY n",
                     tables.versions
                 )))
@@ -1060,6 +1155,37 @@ impl Store for PgStore {
                 .bind(c.1)
                 .bind(c.2)
                 .bind(c.3)
+                .bind(change_seq)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for chunk in changes.chunks(CHUNK) {
+                let mut c: ChangeColumns = Default::default();
+                for r in chunk.iter().cloned() {
+                    c.0.push(r.n);
+                    c.1.push(r.ts);
+                    c.2.push(r.workspace);
+                    c.3.push(r.kind);
+                    c.4.push(r.op);
+                    c.5.push(r.target);
+                    c.6.push(r.doc);
+                }
+                sqlx::query(sql(format!(
+                    "INSERT INTO {} (seq, n, ts, workspace, kind, op, target, doc) \
+                     SELECT $1::bigint, n, ts, ws, kind, op, target, \
+                     jsonb_set(doc::jsonb, '{{cursor}}', to_jsonb(($1::bigint)::text || '.' || n::text)) FROM \
+                     UNNEST($2::int[], $3::bigint[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[]) \
+                     AS c(n, ts, ws, kind, op, target, doc)",
+                    tables.changes
+                )))
+                .bind(seq + 1)
+                .bind(c.0)
+                .bind(c.1)
+                .bind(c.2)
+                .bind(c.3)
+                .bind(c.4)
+                .bind(c.5)
+                .bind(c.6)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1378,6 +1504,149 @@ impl Store for PgStore {
         self.copy_import(entities.to_vec(), links.to_vec())
     }
 
+    fn keeps_changes(&self) -> bool {
+        true
+    }
+
+    /// One read-only snapshot: the head and floor, then the records after
+    /// `after`, each create and update joined with the entity version its
+    /// commit wrote (`entity_versions.change_seq`).
+    fn changes_since(&self, after: Cursor, limit: usize) -> Result<StoredPage> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        // `n` is an INT column: past i32::MAX means "after the whole commit".
+        let n = after.n.min(i32::MAX as u32) as i32;
+        let limit = limit.clamp(1, 10_000) as i64;
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;
+            let meta = changes_meta_on(&mut *tx, &t).await?;
+            let rows: Vec<(i64, i32, String, Option<String>)> = sqlx::query_as(sql(format!(
+                "SELECT c.seq, c.n, c.doc::text, v.entity::text FROM {} c \
+                 LEFT JOIN LATERAL (SELECT x.doc->'doc' AS entity FROM {} x \
+                     WHERE c.op IN ('entity.create', 'entity.update') AND x.id = c.target AND x.change_seq = c.seq \
+                     ORDER BY x.seq DESC LIMIT 1) v ON true \
+                 WHERE (c.seq, c.n) > ($1, $2) ORDER BY c.seq, c.n LIMIT $3",
+                t.changes, t.versions
+            )))
+            .bind(after.seq as i64)
+            .bind(n)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            let mut changes = Vec::with_capacity(rows.len());
+            for (seq, n, doc, entity) in rows {
+                let mut c: StoredChange = parse(&doc)?;
+                c.record.cursor = Cursor::new(seq as u64, n as u32);
+                let entity: Option<Entity> = match entity {
+                    Some(e) => parse(&e)?,
+                    None => None,
+                };
+                changes.push((c, entity));
+            }
+            Ok(StoredPage { changes, head: meta.head, floor: meta.floor })
+        })
+    }
+
+    fn changes_meta(&self) -> Result<ChangesMeta> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move { changes_meta_on(&pool, &t).await })
+    }
+
+    /// Locks the head, so no commit straddles the switch: commits after it
+    /// see the new setting in the gap trigger. Turning capture on after a
+    /// period off raises the floor to the head. Other processes hear of it
+    /// through a notice and re-read the setting.
+    fn set_capture(&self, on: bool) -> Result<()> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (channel, origin) = (self.channel(), self.origin.clone());
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            let head = lock_head(&mut tx, &t.head).await?;
+            sqlx::query(sql(format!(
+                "UPDATE {} SET floor = CASE WHEN $1 AND NOT capture THEN GREATEST(floor, $2) ELSE floor END, \
+                 capture = $1",
+                t.changes_meta
+            )))
+            .bind(on)
+            .bind(head)
+            .execute(&mut *tx)
+            .await?;
+            send_notice(
+                &mut tx,
+                &channel,
+                json!({ "t": "kv", "ns": CHANGES_META_NOTICE, "key": "capture", "o": origin }),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Deletes whole commits below the new floor and writes the floor in the
+    /// same transaction (the only DELETE the table accepts, as for events).
+    /// The floor never passes the head.
+    fn vacuum_changes(&self, keep: &ChangeRetention) -> Result<ChangeVacuum> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let keep = *keep;
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SELECT set_config('onto.retention', 'on', true)").execute(&mut *tx).await?;
+            // One retention pass at a time per tenant.
+            let old: i64 = sqlx::query_scalar(sql(format!("SELECT floor FROM {} FOR UPDATE", t.changes_meta)))
+                .fetch_one(&mut *tx)
+                .await?;
+            let mut floor = old;
+            if let Some(ms) = keep.keep_ms {
+                let newest_old: Option<i64> =
+                    sqlx::query_scalar(sql(format!("SELECT max(seq) FROM {} WHERE ts < $1", t.changes)))
+                        .bind(now_ms().saturating_sub(ms))
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if let Some(seq) = newest_old {
+                    floor = floor.max(seq + 1);
+                }
+            }
+            if let Some(rows) = keep.keep_rows {
+                // The newest record past the ones kept: its commit and older go.
+                let cut: Option<i64> = sqlx::query_scalar(sql(format!(
+                    "SELECT seq FROM {} ORDER BY seq DESC, n DESC OFFSET $1 LIMIT 1",
+                    t.changes
+                )))
+                .bind(rows.min(i64::MAX as u64) as i64)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(seq) = cut {
+                    floor = floor.max(seq + 1);
+                }
+            }
+            // Never above the head: the head cursor stays valid, so a reader
+            // told to resume from it is not reset again. The newest commit's
+            // records are therefore always kept.
+            let head: i64 =
+                sqlx::query_scalar(sql(format!("SELECT seq FROM {} WHERE id = 1", t.head))).fetch_one(&mut *tx).await?;
+            let floor = floor.min(head).max(old);
+            let mut deleted = 0;
+            if floor > old {
+                deleted = sqlx::query(sql(format!("DELETE FROM {} WHERE seq < $1", t.changes)))
+                    .bind(floor)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                sqlx::query(sql(format!("UPDATE {} SET floor = $1", t.changes_meta)))
+                    .bind(floor)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(ChangeVacuum { deleted, floor: floor as u64 })
+        })
+    }
+
     fn indexes_vectors(&self) -> bool {
         true
     }
@@ -1644,7 +1913,23 @@ struct Tables {
     link_versions: String,
     kv: String,
     commits: String,
+    changes: String,
+    changes_meta: String,
 }
+
+/// One change record to insert (its seq is the commit's).
+#[derive(Clone)]
+struct ChangeRow {
+    n: i32,
+    ts: i64,
+    workspace: String,
+    kind: String,
+    op: String,
+    target: String,
+    doc: String,
+}
+
+type ChangeColumns = (Vec<i32>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<String>);
 
 impl Tables {
     fn of(s: &PgStore) -> Self {
@@ -1657,6 +1942,8 @@ impl Tables {
             link_versions: s.t("link_versions"),
             kv: s.t("kv"),
             commits: s.t("commits"),
+            changes: s.t("changes"),
+            changes_meta: s.t("changes_meta"),
         }
     }
 }

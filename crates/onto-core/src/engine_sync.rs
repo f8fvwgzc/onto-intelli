@@ -12,7 +12,7 @@ use crate::graph::{Graph, LinkKey};
 use crate::live_schema;
 use crate::model::{Id, Mutation, MutationResult};
 use crate::similarity::VectorIndex;
-use crate::store::StoreNotice;
+use crate::store::{CHANGES_META_NOTICE, StoreNotice};
 use crate::text::TextIndex;
 use crate::{Error, Result};
 
@@ -326,7 +326,15 @@ pub(crate) fn spawn_vectorizer(inner: &Arc<Inner>) -> Result<()> {
 /// ends when the ontology is dropped.
 pub(crate) fn spawn_follower(inner: &Arc<Inner>, interval: Duration) -> Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
+    let meta = Arc::downgrade(inner);
     inner.store.subscribe(Arc::new(move |n: StoreNotice| {
+        // Another process switched change capture (or notices were lost):
+        // re-read the tenant's setting.
+        if (matches!(&n, StoreNotice::Kv { ns, .. } if ns == CHANGES_META_NOTICE) || matches!(n, StoreNotice::Resync))
+            && let Some(inner) = meta.upgrade()
+        {
+            let _ = Ontology { inner }.refresh_capture();
+        }
         if !matches!(n, StoreNotice::Kv { .. }) {
             let _ = tx.send(());
         }

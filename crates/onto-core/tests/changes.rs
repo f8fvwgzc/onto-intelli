@@ -1,6 +1,9 @@
-//! The change feed on the in-memory store: records commit with their
-//! writes, readers see what they may, gaps and the floor say what is
-//! missing, and replaying the feed reaches later snapshots.
+//! The change feed on the in-memory store and on PostgreSQL (`pg`, when a
+//! test database is set; see `common`): records commit with their writes,
+//! readers see what they may, gaps and the floor say what is missing, and
+//! replaying the feed reaches later snapshots.
+
+mod common;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -57,7 +60,10 @@ fn ops(records: &[ChangeRecord]) -> Vec<(ChangeOp, String)> {
 
 #[test]
 fn records_commit_only_with_their_commit() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    records_commit_only_with_their_commit_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn records_commit_only_with_their_commit_on(o: &Ontology) {
     let head = o.change_head().unwrap();
     let member = ActionContext::new(Principal::member("mia", "ws1"), "ws1");
     let err = o
@@ -72,10 +78,10 @@ fn records_commit_only_with_their_commit() {
         .unwrap_err();
     assert!(matches!(err, Error::Denied(_)), "{err:?}");
     assert_eq!(o.change_head().unwrap(), head);
-    assert!(feed(&o, &admin(), head, &ChangeFilter::default()).is_empty());
+    assert!(feed(o, &admin(), head, &ChangeFilter::default()).is_empty());
 
     o.apply(&member, vec![Mutation::Upsert(issue("1", "ws1").state("open"))]).unwrap();
-    let records = feed(&o, &admin(), head, &ChangeFilter::default());
+    let records = feed(o, &admin(), head, &ChangeFilter::default());
     assert_eq!(ops(&records), vec![(ChangeOp::EntityCreate, "issue:1".into())]);
     let r = &records[0];
     assert_eq!(r.cursor.seq, o.seq());
@@ -86,7 +92,10 @@ fn records_commit_only_with_their_commit() {
 
 #[test]
 fn readers_see_what_they_may() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    readers_see_what_they_may_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn readers_see_what_they_may_on(o: &Ontology) {
     let head = o.change_head().unwrap();
     o.apply(
         &ctx("ws1"),
@@ -108,9 +117,9 @@ fn readers_see_what_they_may() {
     )
     .unwrap();
 
-    let all = feed(&o, &admin(), head, &ChangeFilter::default());
+    let all = feed(o, &admin(), head, &ChangeFilter::default());
     assert_eq!(all.len(), 6);
-    let seen = feed(&o, &viewer(), head, &ChangeFilter::default());
+    let seen = feed(o, &viewer(), head, &ChangeFilter::default());
     assert_eq!(
         ops(&seen),
         vec![
@@ -127,7 +136,7 @@ fn readers_see_what_they_may() {
 
     // A filter and ids-only payloads.
     let f = ChangeFilter { props: vec!["priority".into()], fields: FieldMode::Ids, ..Default::default() };
-    let only = feed(&o, &viewer(), at, &f);
+    let only = feed(o, &viewer(), at, &f);
     assert_eq!(
         ops(&only),
         vec![(ChangeOp::EntityUpdate, "issue:1".into()), (ChangeOp::LinkCreate, "issue:1|depends_on|issue:2".into())]
@@ -143,14 +152,17 @@ fn readers_see_what_they_may() {
 
 #[test]
 fn schema_changes_carry_renames_and_migrations_are_marked() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    schema_changes_carry_renames_and_migrations_are_marked_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn schema_changes_carry_renames_and_migrations_are_marked_on(o: &Ontology) {
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(EntityInput::new("task", "3", "Write docs"))]).unwrap();
     let head = o.change_head().unwrap();
     let set: SchemaChangeSet =
         serde_json::from_value(json!({ "changes": [ { "op": "rename_object_type", "from": "task", "to": "chore" } ] }))
             .unwrap();
     o.schema_apply(&ctx("ws1"), set).unwrap();
-    let records = feed(&o, &admin(), head, &ChangeFilter::default());
+    let records = feed(o, &admin(), head, &ChangeFilter::default());
     let schema = records.iter().find(|r| r.op == ChangeOp::SchemaChange).expect("a schema.change record");
     let mv = schema.schema.as_ref().unwrap();
     assert_eq!(mv.version, o.schema_version());
@@ -161,12 +173,15 @@ fn schema_changes_carry_renames_and_migrations_are_marked() {
     assert!(migrated.iter().any(|r| r.op == ChangeOp::EntityCreate && r.id == "chore:3"));
     // Automations leave migrations out but still see the schema change.
     let f = ChangeFilter { include_migrations: false, ..Default::default() };
-    assert_eq!(ops(&feed(&o, &admin(), head, &f)), vec![(ChangeOp::SchemaChange, schema.id.clone())]);
+    assert_eq!(ops(&feed(o, &admin(), head, &f)), vec![(ChangeOp::SchemaChange, schema.id.clone())]);
 }
 
 #[test]
 fn run_cause_and_listener_seq() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    run_cause_and_listener_seq_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn run_cause_and_listener_seq_on(o: &Ontology) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s = seen.clone();
     o.on_change(move |c| s.lock().push(c.seq));
@@ -175,18 +190,21 @@ fn run_cause_and_listener_seq() {
     c.cause = Some(RunCause { automation: "triage".into(), run: "run_7".into(), depth: 1 });
     o.apply(&c, vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
     assert_eq!(*seen.lock(), vec![o.seq()]);
-    let r = &feed(&o, &admin(), head, &ChangeFilter::default())[0];
+    let r = &feed(o, &admin(), head, &ChangeFilter::default())[0];
     assert_eq!(
         (r.cause.automation.as_deref(), r.cause.run.as_deref(), r.cause.depth),
         (Some("triage"), Some("run_7"), 1)
     );
     let f = ChangeFilter { sources: vec!["!automation:*".into()], ..Default::default() };
-    assert!(feed(&o, &admin(), head, &f).is_empty());
+    assert!(feed(o, &admin(), head, &f).is_empty());
 }
 
 #[test]
 fn forks_record_nothing() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    forks_record_nothing_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn forks_record_nothing_on(o: &Ontology) {
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
     let head = o.change_head().unwrap();
     let fork = o.fork();
@@ -349,8 +367,31 @@ fn expired_cursor_at_the_retention_edge() {
 }
 
 #[test]
+fn retention_removes_whole_commits_below_the_head() {
+    let store = Arc::new(MemoryStore::default());
+    let o = Ontology::open(Schema::enterprise(), store.clone(), OntologyOptions::default()).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1")), Mutation::Upsert(issue("2", "ws1"))]).unwrap();
+    let s1 = o.seq();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("3", "ws1"))]).unwrap();
+    let s2 = o.seq();
+    let keep = |keep_ms, keep_rows| onto_core::changes::ChangeRetention { keep_ms, keep_rows };
+    let v = store.vacuum_changes(&keep(None, Some(2))).unwrap();
+    // Two kept rows would split s1: the whole of s1 goes.
+    assert_eq!(v.floor, s2);
+    assert_eq!(store.changes_since(Cursor::default(), 10).unwrap().changes.len(), 1);
+    // Everything older than now: the head commit's records stay.
+    let v = store.vacuum_changes(&keep(Some(-60_000), None)).unwrap();
+    assert_eq!((v.deleted, v.floor), (0, s2));
+    assert!(o.changes_page(&admin(), Cursor::new(s1, 1), &ChangeFilter::default(), 10).unwrap().expired);
+    assert!(!o.changes_page(&admin(), o.change_head().unwrap(), &ChangeFilter::default(), 10).unwrap().expired);
+}
+
+#[test]
 fn capture_off_then_on_expires_old_cursors() {
-    let o = Ontology::in_memory(Schema::enterprise());
+    capture_off_then_on_expires_old_cursors_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn capture_off_then_on_expires_old_cursors_on(o: &Ontology) {
     assert!(o.capture_enabled());
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
     let before = o.change_head().unwrap();
@@ -368,7 +409,7 @@ fn capture_off_then_on_expires_old_cursors() {
     assert!(!o.capture_enabled());
     assert!(!o.store().changes_meta().unwrap().capture);
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("2", "ws1"))]).unwrap();
-    assert!(feed(&o, &admin(), before, &ChangeFilter::default()).is_empty(), "nothing recorded, no gap");
+    assert!(feed(o, &admin(), before, &ChangeFilter::default()).is_empty(), "nothing recorded, no gap");
     let during = o.change_head().unwrap();
 
     o.set_capture(&ctx("ws1"), true).unwrap();
@@ -379,7 +420,7 @@ fn capture_off_then_on_expires_old_cursors() {
     assert!(!o.changes_page(&admin(), during, &ChangeFilter::default(), 10).unwrap().expired);
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("3", "ws1"))]).unwrap();
     assert_eq!(
-        ops(&feed(&o, &admin(), during, &ChangeFilter::default())),
+        ops(&feed(o, &admin(), during, &ChangeFilter::default())),
         vec![(ChangeOp::EntityCreate, "issue:3".into())]
     );
     let audit =
@@ -401,11 +442,16 @@ struct Snap {
     viewer: View,
 }
 
-fn snapshot(o: &Ontology) -> Snap {
+/// What `o` holds, as of its own commit sequence (every record of that
+/// commit included). `None` when the store moved on while the snapshot was
+/// taken: a follower that caught up from current documents may then hold
+/// documents newer than its sequence, so the snapshot would not be the
+/// state at one cursor.
+fn try_snapshot(o: &Ontology) -> Option<Snap> {
     o.read(|g, _| {
-        // Writers hold the graph write lock across the store write, so the
-        // head read here matches the graph.
-        let head = o.store().changes_meta().unwrap().head;
+        // Writers of this process hold the graph write lock across the store
+        // write, so the sequence read here matches the graph.
+        let seq = o.seq();
         let view = |p: &Principal| View {
             entities: g
                 .entities()
@@ -420,8 +466,21 @@ fn snapshot(o: &Ontology) -> Snap {
                 .map(|l| ((l.from.clone(), l.rel.clone(), l.to.clone()), l.props.clone()))
                 .collect(),
         };
-        Snap { head, admin: view(&admin()), viewer: view(&viewer()) }
+        let snap = Snap { head: Cursor::new(seq, u32::MAX), admin: view(&admin()), viewer: view(&viewer()) };
+        // Checked after reading the graph: no commit after `seq` existed then.
+        (o.store().head().unwrap() == seq).then_some(snap)
     })
+}
+
+fn snapshot(o: &Ontology) -> Snap {
+    for _ in 0..50 {
+        o.sync().unwrap();
+        if let Some(s) = try_snapshot(o) {
+            return s;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no consistent snapshot: the store kept moving");
 }
 
 /// What a mirror does with the records it gets.
@@ -500,24 +559,33 @@ fn random_batch(rng: &mut fastrand::Rng) -> Vec<Mutation> {
 
 #[test]
 fn replaying_the_feed_from_a_snapshot_reaches_a_later_one() {
+    replay_property(&[Ontology::in_memory(Schema::enterprise())], 80);
+}
+
+/// Eight threads of random batches spread over `writers` (instances on one
+/// store), snapshots along the way, then replaying the visible feed from a
+/// snapshot A reaches every later snapshot B.
+fn replay_property(writers: &[Ontology], rounds: usize) {
     let seed = std::env::var("ONTO_TEST_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| fastrand::u64(..));
     eprintln!("seed {seed} (ONTO_TEST_SEED reruns it)");
-    let o = Ontology::in_memory(Schema::enterprise());
-    let snaps = Mutex::new(vec![snapshot(&o)]);
+    let o = &writers[0];
+    let snaps = Mutex::new(vec![snapshot(o)]);
     let committed = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
         for t in 0..8u64 {
-            let (o, snaps, committed) = (o.clone(), &snaps, &committed);
+            let (o, snaps, committed) = (writers[t as usize % writers.len()].clone(), &snaps, &committed);
             s.spawn(move || {
                 let mut rng = fastrand::Rng::with_seed(seed.wrapping_add(t));
                 let ws = if t % 2 == 0 { "ws1" } else { "ws2" };
-                for i in 0..80 {
+                for i in 0..rounds {
                     // Missing ends and deleted targets fail the whole batch: fine.
                     if o.apply(&ctx(ws), random_batch(&mut rng)).is_ok() {
                         committed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if i % 8 == 0 {
-                        snaps.lock().push(snapshot(&o));
+                    if i % 8 == 0
+                        && let Some(snap) = try_snapshot(&o)
+                    {
+                        snaps.lock().push(snap);
                     }
                     if i % 20 == 0 {
                         std::thread::sleep(Duration::from_millis(1));
@@ -527,13 +595,17 @@ fn replaying_the_feed_from_a_snapshot_reaches_a_later_one() {
         }
     });
     let mut snaps = snaps.into_inner();
-    snaps.push(snapshot(&o));
+    for w in writers {
+        snaps.push(snapshot(w));
+    }
     snaps.sort_by_key(|s| s.head);
-    assert!(committed.into_inner() > 100, "the random batches should mostly commit");
+    let committed = committed.into_inner();
+    eprintln!("{committed} batches committed, {} consistent snapshots", snaps.len());
+    assert!(committed > 100, "the random batches should mostly commit");
 
     let mut feeds: HashMap<String, Vec<ChangeRecord>> = HashMap::new();
     for (name, p) in [("admin", admin()), ("viewer", viewer())] {
-        feeds.insert(name.into(), feed(&o, &p, snaps[0].head, &ChangeFilter::default()));
+        feeds.insert(name.into(), feed(o, &p, snaps[0].head, &ChangeFilter::default()));
     }
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut pairs: Vec<(usize, usize)> = vec![(0, snaps.len() - 1)];
@@ -578,5 +650,427 @@ fn replaying_the_feed_from_a_snapshot_reaches_a_later_one() {
             "viewer replay from {} to {} (seed {seed})",
             sa.head, sb.head
         );
+    }
+}
+
+// ── PostgreSQL ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "postgres")]
+mod pg {
+    use std::time::Instant;
+
+    use onto_core::changes::{ChangeRetention, Gap};
+    use onto_core::store::postgres::tenant_schema;
+
+    use super::*;
+    use crate::common::TestTenant;
+
+    fn open(pg: &TestTenant) -> Ontology {
+        pg.open(Schema::enterprise(), OntologyOptions::default())
+    }
+
+    /// Run SQL on the tenant's schema (`%S%` names it), outside the store.
+    fn exec(pg: &TestTenant, body: &str) -> std::result::Result<(), String> {
+        let schema = format!("\"{}\"", tenant_schema("onto_", &pg.tenant).unwrap());
+        let body = body.replace("%S%", &schema);
+        let url = pg.url.clone();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let pool = onto_core::sqlx::PgPool::connect(&url).await.map_err(|e| e.to_string())?;
+            let r = onto_core::sqlx::raw_sql(onto_core::sqlx::AssertSqlSafe(body)).execute(&pool).await;
+            pool.close().await;
+            r.map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
+
+    /// A commit the way a build before migration 0009 writes it: the head
+    /// locked, the rows written, a commit document without `captured`, no
+    /// change rows and no `change_seq`.
+    fn old_build_commit(pg: &TestTenant, write: &str, commit: &str) {
+        exec(
+            pg,
+            &format!(
+                "BEGIN; SELECT seq FROM %S%.head WHERE id = 1 FOR UPDATE; {write} \
+                 INSERT INTO %S%.commits (seq, ts, origin, doc) SELECT seq + 1, 1, 'proc_old', \
+                 jsonb_build_object('seq', seq + 1, 'ts', 1, 'origin', 'proc_old') || '{commit}'::jsonb \
+                 FROM %S%.head WHERE id = 1; UPDATE %S%.head SET seq = seq + 1 WHERE id = 1; COMMIT;"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn gaps(records: &[ChangeRecord]) -> Vec<&Gap> {
+        assert!(records.iter().all(|r| r.op == ChangeOp::Gap), "{records:?}");
+        records.iter().map(|r| r.gap.as_ref().unwrap()).collect()
+    }
+
+    #[test]
+    fn records_commit_only_with_their_commit() {
+        let Some(pg) = TestTenant::new("chg_commit") else { return };
+        super::records_commit_only_with_their_commit_on(&open(&pg));
+    }
+
+    #[test]
+    fn readers_see_what_they_may() {
+        let Some(pg) = TestTenant::new("chg_readers") else { return };
+        super::readers_see_what_they_may_on(&open(&pg));
+    }
+
+    #[test]
+    fn schema_changes_carry_renames_and_migrations_are_marked() {
+        let Some(pg) = TestTenant::new("chg_schema") else { return };
+        super::schema_changes_carry_renames_and_migrations_are_marked_on(&open(&pg));
+    }
+
+    #[test]
+    fn run_cause_and_listener_seq() {
+        let Some(pg) = TestTenant::new("chg_cause") else { return };
+        super::run_cause_and_listener_seq_on(&open(&pg));
+    }
+
+    #[test]
+    fn forks_record_nothing() {
+        let Some(pg) = TestTenant::new("chg_fork") else { return };
+        super::forks_record_nothing_on(&open(&pg));
+    }
+
+    #[test]
+    fn capture_off_then_on_expires_old_cursors() {
+        let Some(pg) = TestTenant::new("chg_capture") else { return };
+        super::capture_off_then_on_expires_old_cursors_on(&open(&pg));
+    }
+
+    #[test]
+    fn create_and_update_join_the_version_their_commit_wrote() {
+        let Some(pg) = TestTenant::new("chg_join") else { return };
+        let o = open(&pg);
+        let head = o.change_head().unwrap();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1").state("open"))]).unwrap();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1").state("resolved"))]).unwrap();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1").prop("priority", "high"))]).unwrap();
+        let records = feed(&o, &admin(), head, &ChangeFilter::default());
+        let states: Vec<(ChangeOp, Option<u64>, Option<String>)> =
+            records.iter().map(|r| (r.op, r.revision, r.entity.as_ref().and_then(|e| e.state.clone()))).collect();
+        assert_eq!(
+            states,
+            vec![
+                (ChangeOp::EntityCreate, Some(1), Some("open".into())),
+                (ChangeOp::EntityUpdate, Some(2), Some("resolved".into())),
+                (ChangeOp::EntityUpdate, Some(3), Some("resolved".into())),
+            ],
+            "each record carries the document its own commit wrote, not the current one"
+        );
+        assert_eq!(records[1].before["state"], json!("open"));
+        assert_eq!(records[1].state.as_ref().unwrap().to.as_deref(), Some("resolved"));
+        assert!(records.iter().all(|r| !r.entity_missing));
+    }
+
+    #[test]
+    fn writers_that_do_not_capture_leave_gaps() {
+        let Some(pg) = TestTenant::new("chg_rolling") else { return };
+        let o = open(&pg);
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1")), Mutation::Upsert(issue("2", "ws1"))]).unwrap();
+        let head = o.change_head().unwrap();
+
+        // A replica still on a build before 0009 updates an entity...
+        old_build_commit(
+            &pg,
+            "UPDATE %S%.entities SET doc = jsonb_set(doc, '{title}', '\"Renamed by the old build\"') \
+             WHERE id = 'issue:1';",
+            r#"{"entities": ["issue:1"], "links": [], "kv": []}"#,
+        );
+        // ...writes KV only (nothing for the feed)...
+        old_build_commit(
+            &pg,
+            "INSERT INTO %S%.kv (ns, key, value) VALUES ('memory', 'k', '1');",
+            r#"{"kv": [["memory", "k"]]}"#,
+        );
+        // ...and bulk-imports (a reload commit).
+        old_build_commit(&pg, "", r#"{"reload": true}"#);
+        let old_head = o.store().head().unwrap();
+        // A writer of this build that goes around the engine.
+        let e = o.get(&admin(), "issue:2").unwrap();
+        o.store().write(&WriteBatch { put_entities: vec![e], ..Default::default() }).unwrap();
+
+        let records = feed(&o, &admin(), head, &ChangeFilter { kinds: vec!["service".into()], ..Default::default() });
+        let g = gaps(&records);
+        assert_eq!(g.len(), 3, "{records:?}");
+        assert_eq!((g[0].reason, g[0].origin.as_str()), (GapReason::UncapturedWriter, "proc_old"));
+        assert_eq!(g[0].entities, vec!["issue:1"]);
+        assert_eq!(records[0].cursor, Cursor::new(head.seq + 1, 0));
+        assert_eq!(g[1].reason, GapReason::BulkImport);
+        assert_eq!(records[1].cursor, Cursor::new(old_head, 0));
+        assert_eq!((g[2].reason, g[2].entities.clone()), (GapReason::UncapturedWriter, vec!["issue:2".to_string()]));
+        // The viewer of another workspace learns that something changed, not what.
+        let other = feed(&o, &Principal::viewer("w", "ws3"), head, &ChangeFilter::default());
+        assert_eq!(gaps(&other)[0].hidden, 1);
+        assert!(gaps(&other)[0].entities.is_empty());
+
+        // The follower still converges on what the old build wrote.
+        o.sync().unwrap();
+        assert_eq!(o.get(&admin(), "issue:1").unwrap().title, "Renamed by the old build");
+    }
+
+    #[test]
+    fn bulk_imports_record_one_gap() {
+        let Some(pg) = TestTenant::new("chg_import") else { return };
+        let o = open(&pg);
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+        let template = o.get(&admin(), "issue:1").unwrap();
+        let mut a = template.clone();
+        a.id = "issue:8".into();
+        let mut b = template.clone();
+        b.id = "issue:7".into();
+        let link = onto_core::Link {
+            from: "issue:8".into(),
+            rel: "depends_on".into(),
+            to: "issue:7".into(),
+            workspace: "ws1".into(),
+            props: Map::new(),
+            created_at: 1,
+        };
+        let head = o.change_head().unwrap();
+        o.store().bulk_import(&[a.clone(), b.clone()], std::slice::from_ref(&link)).unwrap();
+        // A gap lists the ids the reader can see in the current graph.
+        o.sync().unwrap();
+        let records = feed(&o, &admin(), head, &ChangeFilter::default());
+        let g = gaps(&records);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].reason, GapReason::BulkImport);
+        assert_eq!(g[0].entities, vec!["issue:7", "issue:8"]);
+        assert_eq!(g[0].links, vec![("issue:8".to_string(), "depends_on".to_string(), "issue:7".to_string())]);
+
+        // With capture off, an import records nothing (and turning capture on
+        // again expires the cursors from before).
+        o.set_capture(&ctx("ws1"), false).unwrap();
+        let off = o.change_head().unwrap();
+        a.id = "issue:6".into();
+        o.store().bulk_import(&[a], &[]).unwrap();
+        assert!(o.changes_page(&admin(), off, &ChangeFilter::default(), 10).unwrap().changes.is_empty());
+        o.set_capture(&ctx("ws1"), true).unwrap();
+        assert!(o.changes_page(&admin(), off, &ChangeFilter::default(), 10).unwrap().expired);
+    }
+
+    #[test]
+    fn expired_cursor_at_the_retention_edge() {
+        let Some(pg) = TestTenant::new("chg_edge") else { return };
+        let o = open(&pg);
+        let lease = || assert!(o.try_lease("job", "me", 60_000).unwrap());
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1")), Mutation::Upsert(issue("2", "ws1"))]).unwrap();
+        let s2 = o.seq();
+        lease(); // a commit without records
+        let s3 = o.seq();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("3", "ws1")), Mutation::Upsert(issue("4", "ws1"))]).unwrap();
+        let s4 = o.seq();
+        lease();
+        let s5 = o.seq();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("5", "ws1"))]).unwrap();
+        let s6 = o.seq();
+        assert_eq!((s3, s4, s5, s6), (s2 + 1, s2 + 2, s2 + 3, s2 + 4));
+
+        // Keep three records: s6.0, s4.1 and s4.0. The next one is s2's, so
+        // s2 and everything older goes; the floor is s3, a seq without
+        // records, with another such seq (s5) above it.
+        let keep = ChangeRetention { keep_ms: None, keep_rows: Some(3) };
+        let v = o.store().vacuum_changes(&keep).unwrap();
+        assert_eq!(v.floor, s3);
+        assert!(v.deleted >= 2, "{v:?}");
+        assert_eq!(
+            o.store().vacuum_changes(&keep).unwrap(),
+            onto_core::changes::ChangeVacuum { deleted: 0, floor: s3 }
+        );
+        let meta = o.store().changes_meta().unwrap();
+        assert_eq!((meta.floor, meta.head), (s3, Cursor::new(s6, 0)));
+
+        let page =
+            |after: Cursor| -> ChangePage { o.changes_page(&admin(), after, &ChangeFilter::default(), 100).unwrap() };
+        for old in [Cursor::default(), Cursor::new(s2, 0)] {
+            let p = page(old);
+            assert!(p.expired && p.changes.is_empty(), "{old}");
+            assert_eq!(p.floor, s3);
+        }
+        // Fully caught up on s2 = floor - 1: still reported expired (a false
+        // reset at the exact edge, never a silent gap).
+        assert!(page(Cursor::new(s2, 1)).expired);
+        let at_floor = page(Cursor::new(s3, 0));
+        assert!(!at_floor.expired);
+        assert_eq!(
+            at_floor.changes.iter().map(|r| r.cursor).collect::<Vec<_>>(),
+            vec![Cursor::new(s4, 0), Cursor::new(s4, 1), Cursor::new(s6, 0)]
+        );
+        let above = page(Cursor::new(s5, 0));
+        assert_eq!(ops(&above.changes), vec![(ChangeOp::EntityCreate, "issue:5".into())]);
+        assert_eq!(above.head, s6);
+    }
+
+    #[test]
+    fn retention_by_age_and_the_table_is_append_only() {
+        let Some(pg) = TestTenant::new("chg_age") else { return };
+        let o = open(&pg);
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+        let head = o.change_head().unwrap();
+        assert!(o.store().changes_since(Cursor::default(), 10).unwrap().changes.len() >= 2);
+
+        for (stmt, refused) in [
+            ("UPDATE %S%.changes SET op = 'gap'", "append-only"),
+            ("DELETE FROM %S%.changes", "append-only"),
+            ("TRUNCATE %S%.changes", "append-only"),
+        ] {
+            let err = exec(&pg, stmt).unwrap_err();
+            assert!(err.contains(refused), "{stmt}: {err}");
+        }
+
+        // A week's default keeps everything just written.
+        assert_eq!(o.store().vacuum_changes(&ChangeRetention::default()).unwrap().deleted, 0);
+        // A cutoff in the future removes every record except the newest
+        // commit's: the floor stops at the head, so the head cursor stays
+        // valid. A reader fully caught up on the commit before it is
+        // reported expired (the documented false reset at the edge).
+        let before = Cursor::new(head.seq - 1, u32::MAX);
+        let v = o.store().vacuum_changes(&ChangeRetention { keep_ms: Some(-60_000), keep_rows: None }).unwrap();
+        assert_eq!(v.floor, head.seq);
+        let left = o.store().changes_since(Cursor::default(), 10).unwrap().changes;
+        assert_eq!(left.iter().map(|(c, _)| c.record.cursor).collect::<Vec<_>>(), vec![head]);
+        assert!(o.changes_page(&admin(), before, &ChangeFilter::default(), 10).unwrap().expired);
+        assert!(!o.changes_page(&admin(), head, &ChangeFilter::default(), 10).unwrap().expired);
+        // Keeping no rows still keeps the head commit's.
+        let none = o.store().vacuum_changes(&ChangeRetention { keep_ms: None, keep_rows: Some(0) }).unwrap();
+        assert_eq!(none, onto_core::changes::ChangeVacuum { deleted: 0, floor: head.seq });
+        // A reset reader resumes from the head.
+        let resume = o.change_head().unwrap();
+        assert!(!o.changes_page(&admin(), resume, &ChangeFilter::default(), 10).unwrap().expired);
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("2", "ws1"))]).unwrap();
+        assert_eq!(
+            ops(&feed(&o, &admin(), resume, &ChangeFilter::default())),
+            vec![(ChangeOp::EntityCreate, "issue:2".into())]
+        );
+    }
+
+    #[test]
+    fn capture_switches_reach_other_processes() {
+        let Some(pg) = TestTenant::new("chg_switch") else { return };
+        let (a, b) = (open(&pg), open(&pg));
+        assert!(a.capture_enabled() && b.capture_enabled());
+        a.set_capture(&ctx("ws1"), false).unwrap();
+        eventually("b hears that capture is off", || !b.capture_enabled());
+        let off = b.change_head().unwrap();
+        b.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+        assert!(a.changes_page(&admin(), off, &ChangeFilter::default(), 10).unwrap().changes.is_empty(), "no gap");
+
+        a.set_capture(&ctx("ws1"), true).unwrap();
+        eventually("b hears that capture is on", || b.capture_enabled());
+        let on = b.change_head().unwrap();
+        b.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("2", "ws1"))]).unwrap();
+        assert_eq!(
+            ops(&feed(&a, &admin(), on, &ChangeFilter::default())),
+            vec![(ChangeOp::EntityCreate, "issue:2".into())]
+        );
+        // A process that missed the notice still reads the setting on demand.
+        assert!(b.refresh_capture().unwrap());
+    }
+
+    #[test]
+    fn a_tenant_that_needs_a_newer_writer_refuses_writes() {
+        let Some(pg) = TestTenant::new("chg_writer") else { return };
+        let o = open(&pg);
+        exec(&pg, "UPDATE %S%.head SET min_writer = 1000").unwrap();
+        let err = o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap_err();
+        assert!(matches!(&err, Error::Unavailable(m) if m.contains("newer onto-intelli")), "{err:?}");
+        let e = Entity { id: "issue:9".into(), ..blank() };
+        let err = o.store().bulk_import(&[e], &[]).unwrap_err();
+        assert!(matches!(&err, Error::Unavailable(m) if m.contains("newer onto-intelli")), "{err:?}");
+        exec(&pg, "UPDATE %S%.head SET min_writer = 0").unwrap();
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+    }
+
+    fn blank() -> Entity {
+        Entity {
+            id: String::new(),
+            kind: "issue".into(),
+            workspace: "ws1".into(),
+            title: "x".into(),
+            state: None,
+            props: Map::new(),
+            aliases: Vec::new(),
+            provenance: None,
+            created_at: 1,
+            updated_at: 1,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn a_populated_tenant_from_before_0009_migrates_and_captures() {
+        let Some(pg) = TestTenant::new("chg_pre0009") else { return };
+        {
+            let o = open(&pg);
+            o.apply(
+                &ctx("ws1"),
+                vec![
+                    Mutation::Upsert(issue("1", "ws1")),
+                    Mutation::Upsert(issue("2", "ws1")),
+                    Mutation::Link(LinkInput::new("issue:1", "depends_on", "issue:2")),
+                ],
+            )
+            .unwrap();
+        }
+        // Take the tenant back to migration 0008, as a build before this one
+        // left it.
+        exec(
+            &pg,
+            "BEGIN; DROP TRIGGER commits_capture ON %S%.commits; DROP FUNCTION %S%.changes_gap(); \
+             DROP FUNCTION %S%.commit_touches_schema(jsonb); DROP TABLE %S%.changes; DROP TABLE %S%.changes_meta; \
+             DROP INDEX %S%.entity_versions_change; ALTER TABLE %S%.entity_versions DROP COLUMN change_seq; \
+             ALTER TABLE %S%.head DROP COLUMN min_writer; DELETE FROM %S%.schema_migrations WHERE version >= 9; \
+             COMMIT;",
+        )
+        .unwrap();
+        old_build_commit(
+            &pg,
+            "UPDATE %S%.entities SET doc = jsonb_set(doc, '{state}', '\"blocked\"') WHERE id = 'issue:2';",
+            r#"{"entities": ["issue:2"]}"#,
+        );
+
+        let store = pg.store();
+        assert_eq!(
+            store.migrations().unwrap().last().map(|m| m.0),
+            onto_core::store::postgres::MIGRATIONS.last().map(|m| m.0)
+        );
+        let before = store.head().unwrap();
+        let meta = store.changes_meta().unwrap();
+        assert!(meta.capture);
+        assert_eq!(meta.floor, before, "nothing before the migration was recorded");
+        let o = Ontology::open(Schema::enterprise(), Arc::new(store), OntologyOptions::default()).unwrap();
+        assert!(o.capture_enabled());
+        assert_eq!(o.get(&admin(), "issue:2").unwrap().state.as_deref(), Some("blocked"));
+        assert_eq!(o.neighbors(&admin(), "issue:1", Some("depends_on")).unwrap().len(), 1);
+        assert_eq!(o.history(&admin(), "issue:1", 10).unwrap().len(), 1, "versions without change_seq still read");
+
+        // Older cursors are expired, not silently empty.
+        assert!(o.changes_page(&admin(), Cursor::default(), &ChangeFilter::default(), 10).unwrap().expired);
+        // The first commit afterwards is captured, with its document joined.
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("2", "ws1").state("open"))]).unwrap();
+        let records = feed(&o, &admin(), Cursor::new(before, 0), &ChangeFilter::default());
+        assert_eq!(ops(&records), vec![(ChangeOp::EntityUpdate, "issue:2".into())]);
+        assert_eq!(records[0].before["state"], json!("blocked"));
+        assert_eq!(records[0].entity.as_ref().unwrap().state.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn replaying_the_feed_across_two_processes() {
+        let Some(pg) = TestTenant::new("chg_replay") else { return };
+        let (a, b) = (open(&pg), open(&pg));
+        replay_property(&[a, b], 60);
     }
 }

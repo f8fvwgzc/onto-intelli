@@ -23,7 +23,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::changes::{ChangeOp, ChangeRecord, ChangesMeta, Cursor, Gap, GapReason, StoredChange, StoredPage};
+use crate::changes::{
+    ChangeOp, ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, Cursor, Gap, GapReason, StoredChange,
+    StoredPage,
+};
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::now_ms;
@@ -42,6 +45,11 @@ pub use postgres::{PgOptions, PgShared, PgStore};
 /// (their readers keep them in memory). Everything committed inside a
 /// [`WriteBatch`] is in the commit log anyway.
 pub const REPLICATED_KV: &[&str] = &["memory"];
+
+/// The namespace of the [`StoreNotice::Kv`] a shared store sends when the
+/// tenant's change capture is switched: followers re-read
+/// [`Store::changes_meta`].
+pub const CHANGES_META_NOTICE: &str = "changes_meta";
 
 #[derive(Debug, Default)]
 pub struct Snapshot {
@@ -304,6 +312,13 @@ pub trait Store: Send + Sync {
     /// Turn capture on or off for the tenant. Turning it on after a period
     /// off raises the floor to the head: nothing was recorded meanwhile.
     fn set_capture(&self, _on: bool) -> Result<()> {
+        Err(no_change_log())
+    }
+    /// Remove records past `keep` (whole commits) and raise the floor above
+    /// them in the same step, so their cursors read as expired. The floor
+    /// never passes the head, so the newest commit's records are always kept
+    /// and a reader resuming from the head is not reset again.
+    fn vacuum_changes(&self, _keep: &ChangeRetention) -> Result<ChangeVacuum> {
         Err(no_change_log())
     }
 
@@ -581,6 +596,34 @@ impl Store for MemoryStore {
         }
         inner.capture_off = !on;
         Ok(())
+    }
+
+    fn vacuum_changes(&self, keep: &ChangeRetention) -> Result<ChangeVacuum> {
+        let mut inner = self.inner.lock();
+        let mut floor = inner.floor;
+        if let Some(ms) = keep.keep_ms {
+            let cutoff = now_ms().saturating_sub(ms);
+            if let Some(seq) =
+                inner.changes.iter().filter(|(c, _)| c.record.ts < cutoff).map(|(c, _)| c.record.cursor.seq).max()
+            {
+                floor = floor.max(seq + 1);
+            }
+        }
+        if let Some(rows) = keep.keep_rows
+            && inner.changes.len() as u64 > rows
+        {
+            let (c, _) = &inner.changes[inner.changes.len() - rows as usize - 1];
+            floor = floor.max(c.record.cursor.seq + 1);
+        }
+        // Never above the head (see the trait method).
+        let floor = floor.min(inner.seq).max(inner.floor);
+        let mut deleted = 0;
+        while inner.changes.front().is_some_and(|(c, _)| c.record.cursor.seq < floor) {
+            inner.changes.pop_front();
+            deleted += 1;
+        }
+        inner.floor = floor;
+        Ok(ChangeVacuum { deleted, floor })
     }
 
     fn head(&self) -> Result<u64> {
