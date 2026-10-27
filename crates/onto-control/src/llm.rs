@@ -348,7 +348,7 @@ impl Control {
             "monthly_budget_usd": s.monthly_budget_usd, "monthly_token_budget": s.monthly_token_budget,
             "asks_per_minute": s.asks_per_minute, "headers": s.headers.keys().collect::<Vec<_>>(),
         })))
-        .await;
+        .await?;
         Ok(s)
     }
 
@@ -358,7 +358,7 @@ impl Control {
         let had = self.store.delete_llm(&project.id).await?;
         self.set_llm_error(&project.id, None);
         if had {
-            self.audit(AuditEntry::new(by, "llm.delete").project(project).target(&project.r#ref)).await;
+            self.audit(AuditEntry::new(by, "llm.delete").project(project).target(&project.r#ref)).await?;
         }
         Ok(had)
     }

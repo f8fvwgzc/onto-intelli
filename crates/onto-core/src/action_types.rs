@@ -1039,6 +1039,17 @@ impl Ontology {
             ));
             return Ok(receipt);
         }
+        // An agent cannot confirm its own risky action: a person (any
+        // principal that is not an agent) applies it with confirm=true.
+        if receipt.plan.needs_confirmation && ctx.principal.is_agent() {
+            receipt.reason = Some(format!(
+                "risk {:?}{}: {} is an agent and cannot confirm it; a person must apply it with confirm=true",
+                receipt.plan.risk,
+                if receipt.plan.reversible { "" } else { ", not reversible" },
+                ctx.principal.id
+            ));
+            return Ok(receipt);
+        }
         let mut muts = receipt.plan.mutations.clone();
         muts.push(Mutation::Event(EventInput {
             action: format!("action.{name}"),

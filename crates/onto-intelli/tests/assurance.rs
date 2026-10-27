@@ -267,6 +267,13 @@ async fn sheets_induce_and_ingest() {
     assert_eq!(i.ontology().revision(), before, "a dry run writes nothing");
     let denied = err(&i, &viewer(), "ingest.sheet", json!({ "csv": csv, "mapping": mapping })).await;
     assert_eq!(denied.code(), "permission_denied");
+    // An agent may dry-run a sheet, but writing it is a raw write.
+    let bot = Principal::named("agent:bot", &["member", "agent"], &["*"]).unwrap();
+    let dry = ok(&i, &bot, "ingest.sheet", json!({ "csv": csv, "mapping": mapping, "dry_run": true })).await;
+    assert_eq!(dry["upserts"], 2, "{dry}");
+    let refused = err(&i, &bot, "ingest.sheet", json!({ "csv": csv, "mapping": mapping })).await;
+    assert!(refused.to_string().contains("is an agent"), "{refused}");
+    assert_eq!(i.ontology().revision(), before, "the agent wrote nothing");
     let done = ok(&i, &member(), "ingest.sheet", json!({ "csv": csv, "mapping": mapping })).await;
     assert_eq!(done["upserts"], 2, "{done}");
     assert!(i.ontology().revision() > before);

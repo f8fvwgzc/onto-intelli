@@ -11,14 +11,19 @@
 //! * Writes commit optimistically against the commit head (`head` row
 //!   locked `FOR UPDATE`); a writer that is behind gets `Error::Stale`, the
 //!   engine catches up from `commits` and retries.
-//! * Every state-changing commit sends `NOTIFY` on the tenant's channel
-//!   after it is durable; followers in other processes catch up at once.
-//!   A periodic poll covers notices lost while a listener reconnects.
+//! * Every state-changing commit sends `NOTIFY` after it is durable, on the
+//!   shared channel `onto_intelli` (and the tenant's own, for older
+//!   replicas); followers in other processes catch up at once. One LISTEN
+//!   connection per pool serves every tenant ([`notifier`]). A periodic
+//!   poll covers notices lost while the listener reconnects.
 //! * The engine is synchronous: queries run on a Tokio runtime (an own one,
 //!   or the runtime of a pool handed in by the embedding application) and
 //!   the caller waits, yielding its worker thread when it is on one.
 
+mod notifier;
 mod traces;
+
+pub use notifier::SHARED_CHANNEL;
 
 use std::future::Future;
 use std::sync::{Arc, mpsc};
@@ -27,7 +32,7 @@ use std::time::Duration;
 use crate::sqlx;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
@@ -57,6 +62,8 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (4, "hot_updates", include_str!("../../migrations/0004_hot_updates.sql")),
     (5, "traces", include_str!("../../migrations/0005_traces.sql")),
     (6, "trace_otel", include_str!("../../migrations/0006_trace_otel.sql")),
+    (7, "tenant_identity", include_str!("../../migrations/0007_tenant_identity.sql")),
+    (8, "audit_no_delete", include_str!("../../migrations/0008_audit_no_delete.sql")),
 ];
 /// Above this many entities without vectors, a backfill drops the HNSW
 /// index and builds it once at the end (much faster than row by row).
@@ -147,8 +154,8 @@ pub struct PgOptions {
     pub schema_prefix: String,
     pub max_connections: u32,
     pub connect_timeout: Duration,
-    /// Run a LISTEN connection that tells followers about other processes'
-    /// commits (otherwise they only poll).
+    /// Listen for other processes' commits (one LISTEN connection per pool,
+    /// shared by every tenant); otherwise followers only poll.
     pub listen: bool,
 }
 
@@ -198,6 +205,7 @@ pub struct PgShared {
     pool: PgPool,
     exec: Exec,
     vector: Arc<VectorExt>,
+    notifier: Arc<notifier::Notifier>,
 }
 
 impl PgShared {
@@ -223,7 +231,12 @@ impl PgShared {
                 return Err(e);
             }
         };
-        Ok(Self { pool, exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))), vector: Arc::new(vector) })
+        Ok(Self {
+            notifier: notifier::Notifier::new(pool.clone()),
+            pool,
+            exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))),
+            vector: Arc::new(vector),
+        })
     }
 
     /// Use the application's pool (e.g. its `sqlx::PgPool`). Must be called
@@ -234,7 +247,12 @@ impl PgShared {
         })?;
         let p = pool.clone();
         let vector = run_on(&handle, true, async move { prepare(&p).await })?;
-        Ok(Self { pool, exec: Exec::Shared(handle), vector: Arc::new(vector) })
+        Ok(Self {
+            notifier: notifier::Notifier::new(pool.clone()),
+            pool,
+            exec: Exec::Shared(handle),
+            vector: Arc::new(vector),
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -243,19 +261,34 @@ impl PgShared {
 
     /// The store of one tenant (its own PostgreSQL schema), created if missing.
     pub fn tenant(&self, tenant: &str, opts: PgOptions) -> Result<PgStore> {
-        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone(), self.vector.clone())
+        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone(), self.vector.clone(), self.notifier.clone())
     }
 
-    /// Drop a tenant's schema and everything in it (`DROP SCHEMA … CASCADE`).
-    /// Stores already open on it fail from then on.
-    pub fn drop_tenant(&self, prefix: &str, tenant: &str) -> Result<()> {
-        let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&tenant_schema(prefix, tenant)?));
+    /// One query (`SELECT 1`): the database answers.
+    pub fn ping(&self) -> Result<()> {
         let pool = self.pool.clone();
         let (h, shared) = self.exec.handle();
         run_on(&h, shared, async move {
-            sqlx::query(sql(stmt)).execute(&pool).await?;
+            sqlx::query("SELECT 1").execute(&pool).await?;
             Ok(())
         })
+    }
+
+    /// Stores listening for other processes' commits through this pool's one
+    /// LISTEN connection.
+    pub fn listening_stores(&self) -> usize {
+        self.notifier.subscribers()
+    }
+
+    /// Drop a tenant's schema and everything in it (`DROP SCHEMA … CASCADE`).
+    /// Stores already open on it fail from then on. A schema another tenant
+    /// id owns (a look-alike id) is refused.
+    pub fn drop_tenant(&self, prefix: &str, tenant: &str) -> Result<()> {
+        let s = quote_ident(&tenant_schema(prefix, tenant)?);
+        let pool = self.pool.clone();
+        let (h, shared) = self.exec.handle();
+        let tenant = tenant.to_string();
+        run_on(&h, shared, async move { drop_schema(&pool, &s, &tenant).await })
     }
 
     /// Tenants with a schema under `prefix`.
@@ -285,15 +318,9 @@ pub struct PgStore {
     vector: Arc<VectorExt>,
     opts: PgOptions,
     subscribers: Arc<Mutex<Vec<NoticeFn>>>,
-    listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl Drop for PgStore {
-    fn drop(&mut self) {
-        if let Some(h) = self.listener.lock().take() {
-            h.abort();
-        }
-    }
+    notifier: Arc<notifier::Notifier>,
+    /// Set once something subscribed; dropping it unsubscribes.
+    listener: Mutex<Option<notifier::Subscription>>,
 }
 
 impl From<sqlx::Error> for Error {
@@ -347,6 +374,51 @@ pub fn tenant_schema(prefix: &str, tenant: &str) -> Result<String> {
     Ok(name)
 }
 
+/// `NOTIFY` a change on the shared channel (the payload names the schema)
+/// and on the tenant's own channel, which replicas of older versions listen
+/// on. Delivered when, and only if, the transaction commits.
+async fn send_notice(
+    tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>,
+    schema: &str,
+    mut payload: Value,
+) -> Result<()> {
+    let own = payload.to_string();
+    payload["s"] = Value::String(schema.to_string());
+    sqlx::query("SELECT pg_notify($1, $2), pg_notify($3, $4)")
+        .bind(schema)
+        .bind(own)
+        .bind(SHARED_CHANNEL)
+        .bind(payload.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn collision(tenant: &str, owner: &str, schema: &str) -> Error {
+    Error::Conflict(format!(
+        "tenant id '{tenant}' maps to schema {schema}, which belongs to tenant '{owner}' \
+         (ids differing only in case or '-', '.', '_' share a schema name): use another id"
+    ))
+}
+
+/// `DROP SCHEMA … CASCADE`, unless another tenant id owns the schema.
+async fn drop_schema(pool: &PgPool, schema: &str, tenant: &str) -> Result<()> {
+    let claimed: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(format!("{schema}.tenant_identity"))
+        .fetch_one(pool)
+        .await?;
+    let owner: Option<String> = if claimed {
+        sqlx::query_scalar(sql(format!("SELECT tenant FROM {schema}.tenant_identity"))).fetch_optional(pool).await?
+    } else {
+        None
+    };
+    if let Some(owner) = owner.filter(|o| o != tenant) {
+        return Err(collision(tenant, &owner, schema));
+    }
+    sqlx::query(sql(format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))).execute(pool).await?;
+    Ok(())
+}
+
 fn parse<T: serde::de::DeserializeOwned>(doc: &str) -> Result<T> {
     serde_json::from_str(doc).map_err(|e| Error::Storage(format!("corrupt row: {e}")))
 }
@@ -367,7 +439,14 @@ impl PgStore {
         PgShared::from_pool(pool)?.tenant(tenant, opts)
     }
 
-    fn finish(pool: PgPool, tenant: &str, opts: PgOptions, exec: Exec, vector: Arc<VectorExt>) -> Result<Self> {
+    fn finish(
+        pool: PgPool,
+        tenant: &str,
+        opts: PgOptions,
+        exec: Exec,
+        vector: Arc<VectorExt>,
+        notifier: Arc<notifier::Notifier>,
+    ) -> Result<Self> {
         let store = Self {
             schema: tenant_schema(&opts.schema_prefix, tenant)?,
             tenant: tenant.to_string(),
@@ -377,6 +456,7 @@ impl PgStore {
             vector,
             opts,
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            notifier,
             listener: Mutex::new(None),
         };
         store.migrate()?;
@@ -413,12 +493,14 @@ impl PgStore {
         format!("\"{}\".{table}", self.schema)
     }
 
-    /// Apply the embedded migrations this tenant schema has not had yet.
+    /// Apply the embedded migrations this tenant schema has not had yet, and
+    /// claim the schema for this tenant id (or refuse one it does not belong to).
     fn migrate(&self) -> Result<()> {
         let pool = self.pool.clone();
         let s = quote_ident(&self.schema);
         let v = self.vector.schema.clone();
         let lock_key = self.schema.clone();
+        let tenant = self.tenant.clone();
         self.block(async move {
             let mut tx = pool.begin().await?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(&lock_key).execute(&mut *tx).await?;
@@ -457,6 +539,17 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            let owner: String = sqlx::query_scalar(sql(format!(
+                "INSERT INTO {s}.tenant_identity (tenant, claimed_at) VALUES ($1, $2) \
+                 ON CONFLICT (one) DO UPDATE SET tenant = {s}.tenant_identity.tenant RETURNING tenant"
+            )))
+            .bind(&tenant)
+            .bind(now_ms())
+            .fetch_one(&mut *tx)
+            .await?;
+            if owner != tenant {
+                return Err(collision(&tenant, &owner, &s));
+            }
             tx.commit().await?;
             Ok(())
         })
@@ -476,11 +569,9 @@ impl PgStore {
     /// Drop the tenant's schema and everything in it (tests, offboarding).
     pub fn drop_tenant(&self) -> Result<()> {
         let pool = self.pool.clone();
-        let stmt = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema);
-        self.block(async move {
-            sqlx::query(sql(stmt)).execute(&pool).await?;
-            Ok(())
-        })
+        let s = quote_ident(&self.schema);
+        let tenant = self.tenant.clone();
+        self.block(async move { drop_schema(&pool, &s, &tenant).await })
     }
 
     /// Delete expired KV rows and events older than `keep_events_ms`.
@@ -495,11 +586,18 @@ impl PgStore {
                 .await?
                 .rows_affected();
             let b = match keep_events_ms {
-                Some(keep) => sqlx::query(sql(format!("DELETE FROM {ev} WHERE ts < $1")))
-                    .bind(now - keep)
-                    .execute(&pool)
-                    .await?
-                    .rows_affected(),
+                Some(keep) => {
+                    // The events table refuses DELETE except to retention (0008).
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("SELECT set_config('onto.retention', 'on', true)").execute(&mut *tx).await?;
+                    let n = sqlx::query(sql(format!("DELETE FROM {ev} WHERE ts < $1")))
+                        .bind(now - keep)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                    tx.commit().await?;
+                    n
+                }
                 None => 0,
             };
             Ok((a, b))
@@ -511,7 +609,8 @@ impl PgStore {
     }
 
     fn start_listener(&self) {
-        if !self.opts.listen || self.listener.lock().is_some() {
+        let mut listener = self.listener.lock();
+        if !self.opts.listen || listener.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel::<StoreNotice>();
@@ -525,60 +624,8 @@ impl PgStore {
                 }
             }
         });
-        let pool = self.pool.clone();
-        let channel = self.channel();
-        let me = self.origin.clone();
         let (h, _) = self.handle();
-        let task = h.spawn(async move {
-            loop {
-                let mut listener = match PgListener::connect_with(&pool).await {
-                    Ok(l) => l,
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-                if listener.listen(&channel).await.is_err() {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                // Anything committed while we were not listening is caught up now.
-                if tx.send(StoreNotice::Resync).is_err() {
-                    return;
-                }
-                loop {
-                    match listener.try_recv().await {
-                        Ok(Some(n)) => {
-                            let Ok(v) = serde_json::from_str::<Value>(n.payload()) else { continue };
-                            let origin = v["o"].as_str().unwrap_or_default().to_string();
-                            if origin == me {
-                                continue;
-                            }
-                            let notice = match v["t"].as_str() {
-                                Some("kv") => StoreNotice::Kv {
-                                    ns: v["ns"].as_str().unwrap_or_default().into(),
-                                    key: v["key"].as_str().unwrap_or_default().into(),
-                                    origin,
-                                },
-                                _ => StoreNotice::Commit { seq: v["seq"].as_u64().unwrap_or(0), origin },
-                            };
-                            if tx.send(notice).is_err() {
-                                return;
-                            }
-                        }
-                        // Connection lost; notices may be missing until it is back.
-                        Ok(None) => {
-                            if tx.send(StoreNotice::Resync).is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
-        *self.listener.lock() = Some(task);
+        *listener = Some(self.notifier.subscribe(&h, &self.channel(), &self.origin, tx));
     }
 
     /// Bulk-load through COPY (fast imports and benchmarks): no events and no
@@ -666,11 +713,7 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await?;
             sqlx::query(sql(format!("UPDATE {th} SET seq = $1 WHERE id = 1"))).bind(seq).execute(&mut *tx).await?;
-            sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(&channel)
-                .bind(json!({ "t": "c", "seq": seq, "o": origin }).to_string())
-                .execute(&mut *tx)
-                .await?;
+            send_notice(&mut tx, &channel, json!({ "t": "c", "seq": seq, "o": origin })).await?;
             tx.commit().await?;
             Ok(seq as u64)
         })
@@ -1085,11 +1128,7 @@ impl Store for PgStore {
                         .await?;
                 }
                 // Delivered to listeners when (and only if) the transaction commits.
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(&channel)
-                    .bind(json!({ "t": "c", "seq": seq, "o": rec.origin }).to_string())
-                    .execute(&mut *tx)
-                    .await?;
+                send_notice(&mut tx, &channel, json!({ "t": "c", "seq": seq, "o": rec.origin })).await?;
             }
             tx.commit().await?;
             Ok(seq as u64)
@@ -1161,11 +1200,7 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await?;
             if let Some((channel, origin)) = notify {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(channel)
-                    .bind(json!({ "t": "kv", "ns": ns, "key": key, "o": origin }).to_string())
-                    .execute(&mut *tx)
-                    .await?;
+                send_notice(&mut tx, &channel, json!({ "t": "kv", "ns": ns, "key": key, "o": origin })).await?;
             }
             tx.commit().await?;
             Ok(())
@@ -1210,11 +1245,7 @@ impl Store for PgStore {
                 .execute(&mut *tx)
                 .await?;
             if let Some((channel, origin)) = notify {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(channel)
-                    .bind(json!({ "t": "kv", "ns": ns, "key": key, "o": origin }).to_string())
-                    .execute(&mut *tx)
-                    .await?;
+                send_notice(&mut tx, &channel, json!({ "t": "kv", "ns": ns, "key": key, "o": origin })).await?;
             }
             tx.commit().await?;
             Ok(())

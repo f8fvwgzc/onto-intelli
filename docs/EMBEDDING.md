@@ -157,7 +157,24 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
 - `[ui] embed_origins` lists nexc's origins.
 - The backend mints a browser session with `POST /v1/auth/session` (its
   impersonating token plus `{act_as, roles, entity, tenant}`) and hands it to
-  the iframe with `postMessage` (`onto:session`).
+  the iframe with `postMessage` (`onto:session`). The answer carries the
+  session's `jti`: `POST /v1/auth/session/revoke {jti}` (the backend's
+  token, with or without `x-onto-tenant`) revokes it and every session
+  minted from it, `DELETE /v1/auth/session` (the session itself) signs out
+  its whole login, on every replica within 10 seconds. A session may mint
+  another one, which never outlives it and carries the same `sid`.
+- A token whose `tenants` names some tenants (not `"*"`) never reaches the
+  default tenant: with one tenant, a request without `x-onto-tenant`
+  addresses that one; with several, it must name one.
+- `GET /livez` and `GET /readyz` (one query on PostgreSQL) answer without a
+  token, for probes; `/healthz` needs one.
+- Agents (role `agent`) change the graph through action types only:
+  `entity.upsert`, `link.create`, `graph.apply` and the other raw writes are
+  refused to them unless `[governance] agent_raw_writes = true`, and an
+  agent's `confirm=true` does not confirm a high-risk or irreversible action
+  (a person applies it).
+- `member_of` links grant access to restricted entities (their `acl`), so
+  only admins create or delete them.
 - Deep links preselect the workspace and the focus:
   `#/map?workspace=main&focus=<id>`.
 

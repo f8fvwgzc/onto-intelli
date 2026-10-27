@@ -50,12 +50,12 @@ spec:
           env:
             {{- include "onto-intelli.llmEnv" . | trim | nindent 12 }}
           {{- end }}
-          # grpc.health.v1 (grpc.health = true in the config) answers without a token.
+          # Both answer without a token: /readyz runs one query on PostgreSQL.
           readinessProbe:
-            grpc: { port: {{ .Values.port }} }
+            httpGet: { path: /readyz, port: grpc }
             periodSeconds: 5
           livenessProbe:
-            tcpSocket: { port: grpc }
+            httpGet: { path: /livez, port: grpc }
             initialDelaySeconds: 30
             periodSeconds: 15
           resources:

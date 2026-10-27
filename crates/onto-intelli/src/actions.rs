@@ -34,6 +34,71 @@ const fn a(name: &'static str, write: bool, description: &'static str) -> Action
     ActionInfo { name, description, write }
 }
 
+/// Actions that change entities and links directly, without an action
+/// type's checks: refused to agents unless `governance.agent_raw_writes`
+/// (`ingest.sheet` with `dry_run` writes nothing and stays allowed).
+pub const RAW_WRITES: &[&str] = &[
+    "entity.upsert",
+    "entity.patch",
+    "entity.delete",
+    "entity.merge",
+    "link.create",
+    "link.delete",
+    "graph.apply",
+    "ingest.batch",
+    "ingest.sheet",
+];
+
+/// The write actions agents may call, because each governs itself: action
+/// types (plan, risk, confirmation by a person), proposals instead of
+/// direct schema changes, their own memory and trace scores. Every other
+/// write action of [`ACTIONS`] is refused to agents, so a write action added
+/// later is closed to them until it is listed here.
+pub const AGENT_WRITES: &[&str] = &[
+    "action.apply",
+    "action.undo",
+    "memory.remember",
+    "memory.forget",
+    "memory.consolidate",
+    "event.append",
+    "trace.score",
+    "schema.apply",
+    "schema.undo",
+    "schema.revert",
+    "schema.propose",
+    "schema.revise",
+    "schema.comment",
+    "schema.withdraw",
+    "schema.approve",
+    "schema.reject",
+    "schema.lint_feedback",
+    "schema.lock",
+    "schema.unlock",
+    "pack.install",
+    "ontology.apply_draft",
+    "connector.crawl",
+];
+
+/// May agent `p` run write action `action` with `input`?
+fn agent_may_write(p: &Principal, action: &str, input: &Value, raw_writes: bool) -> Result<()> {
+    let write = ACTIONS.iter().any(|a| a.name == action && a.write);
+    if !p.is_agent() || !write || AGENT_WRITES.contains(&action) {
+        return Ok(());
+    }
+    if action == "ingest.sheet" && input.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    if raw_writes && RAW_WRITES.contains(&action) {
+        return Ok(());
+    }
+    let why = if RAW_WRITES.contains(&action) {
+        "writes the graph directly, which agents may not (use an action type, action.apply; or set governance.agent_raw_writes)"
+    } else {
+        "is not open to agents"
+    };
+    Err(Error::Denied(format!("{} is an agent: {action} {why}", p.id)))
+}
+
 pub const ACTIONS: &[ActionInfo] = &[
     a("entity.upsert", true, "Create or update an entity (merge props). Input: EntityInput."),
     a(
@@ -708,6 +773,7 @@ impl Intelli {
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
+        agent_may_write(p, action, &input, onto.options().governance.agent_raw_writes)?;
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
             return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
@@ -1230,16 +1296,33 @@ impl Intelli {
             )));
         }
         let store = self.ontology().store();
+        // Questions, answers and error texts may quote entities the observer
+        // cannot read (restricted ones): only admins see them.
+        let redact = !p.is_privileged();
         match action {
             "trace.list" => {
                 let mut q: TraceQuery = parse(action, input)?;
                 observe_scope(p, &mut q.workspace)?;
-                to_json(&store.trace_list(&q)?)
+                // Matching on the question would rebuild it, a guess at a time.
+                if redact && q.q.as_deref().is_some_and(|text| !text.is_empty()) {
+                    return Err(Error::Denied(format!(
+                        "{} may not search trace questions (admins only: they may quote what others cannot read)",
+                        p.id
+                    )));
+                }
+                let mut page = store.trace_list(&q)?;
+                if redact {
+                    page.traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
+                }
+                to_json(&page)
             }
             "trace.get" => {
                 let i: IdIn = parse(action, input)?;
-                let d = self.find_trace(&i.id)?;
+                let mut d = self.find_trace(&i.id)?;
                 check_trace_workspace(p, &d)?;
+                if redact {
+                    d.redact();
+                }
                 to_json(&d)
             }
             "trace.metrics" => {
@@ -1250,12 +1333,19 @@ impl Intelli {
             "trace.sessions" => {
                 let mut q: SessionQuery = parse(action, input)?;
                 observe_scope(p, &mut q.workspace)?;
-                to_json(&store.trace_sessions(&q)?)
+                let mut page = store.trace_sessions(&q)?;
+                if redact {
+                    page.sessions.iter_mut().for_each(|s| s.preview = None);
+                }
+                to_json(&page)
             }
             "trace.session" => {
                 let i: SessionIn = parse(action, input)?;
                 let traces = store.trace_session(&i.id, i.limit.unwrap_or(onto_core::trace::DEFAULT_LIST))?;
-                let traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                let mut traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                if redact {
+                    traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
+                }
                 if traces.is_empty() {
                     return Err(Error::not_found(format!("session {}", i.id)));
                 }

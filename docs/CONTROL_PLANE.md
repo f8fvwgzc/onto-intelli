@@ -208,7 +208,8 @@ Environment variables:
 | `ONTO_SESSION_SECRET` | Signs `onto1.` sessions (existing). Required with the console when more than one replica runs. |
 | `ONTO_MASTER_KEY` | 32 bytes, base64 or 64 hex characters. Encrypts project LLM keys. Without it, storing an LLM key is refused. |
 | `ONTO_MASTER_KEY_PREVIOUS` | The previous master key during a rotation (decrypt only). |
-| `ONTO_KEY_PEPPER` | At least 32 characters, mixed into API key hashes. Without it, the pepper is derived from `ONTO_MASTER_KEY` (HMAC-SHA256 with the label `onto api key pepper v1`). Without either, API keys cannot be created (except with the memory control store, which uses a random per-process pepper). |
+| `ONTO_KEY_PEPPER` | At least 32 characters, mixed into API key hashes; a secret of its own, apart from `ONTO_MASTER_KEY`, so rotating the master key never breaks a key. Required with the PostgreSQL control store (the server refuses to start without it); the memory control store uses a random per-process pepper. |
+| `ONTO_KEY_PEPPER_PREVIOUS` | The previous pepper while it rotates: hashes made under it still verify and are rewritten under `ONTO_KEY_PEPPER` on their next use. |
 | `ONTO_ADMIN_TOKEN` | Bootstrap admin sign-in (name set by `console.bootstrap_token_env`). |
 | `ONTO_OIDC_<ID>_SECRET` | OIDC client secrets (names set per provider). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` | Optional OTLP/HTTP export of traces (section 9.6). **Not built**: the variables are not read. |
@@ -606,7 +607,11 @@ maps its identities onto it:
 `developer` and `observer` are custom roles (`Role::Custom`). Reading
 traces, sessions and metrics needs `Principal::can_observe()`: `admin`,
 `system`, `developer` or `observer`. An API key therefore reads traces only
-with the `admin` scope. Governance (`[governance]`) applies as before: by
+with the `admin` scope. Only `admin` and `system` see trace content: for
+developers and observers, the question, answer and span bodies, the list
+preview and error texts are removed (`"redacted": true`), since they may
+quote restricted entities those principals cannot read. Timings, names,
+token counts and costs stay. Governance (`[governance]`) applies as before: by
 default admins apply schema changes, members and agents propose.
 
 ## 6. API keys
@@ -622,8 +627,14 @@ onto_sk_7f3k9q2m_Vb1wQ9…(43 characters, base64url of 32 random bytes)
 * `prefix` = `onto_sk_` + 8 characters of `[a-z0-9]`, unique (retry on
   collision). Lists, logs, traces and the audit log show only the prefix.
   The fixed `onto_sk_` start lets secret scanners recognise leaked keys.
-* `hash` = lowercase hex of `SHA-256(pepper || full_key)`; the pepper is
-  `ONTO_KEY_PEPPER` or derived from `ONTO_MASTER_KEY` (section 3).
+* `hash` = `<pepper id>:` and lowercase hex of `SHA-256(pepper || full_key)`;
+  the pepper is `ONTO_KEY_PEPPER`, and the id (8 hex characters of
+  `SHA-256("onto pepper id" || pepper)`) says which pepper made it. A key is
+  checked against the pepper its id names: `ONTO_KEY_PEPPER` or
+  `ONTO_KEY_PEPPER_PREVIOUS`. Hashes without an id were made by earlier
+  versions with a pepper derived from `ONTO_MASTER_KEY`; they verify while
+  `ONTO_MASTER_KEY` or `ONTO_MASTER_KEY_PREVIOUS` still holds that master key,
+  and are rewritten under `ONTO_KEY_PEPPER` on their first use.
 * The full key is returned once, by the create and rotate routes. It cannot
   be shown again.
 
@@ -678,8 +689,8 @@ Validation when a key is created: a name of 1 to 100 printable characters,
 at least one scope, workspaces non-empty names without commas (default
 `["*"]`), `expires_at` (Unix ms) in the future, `impersonate_roles` only
 with `impersonate = true` and not empty then, each one a role of the key's
-scopes. Without a pepper the route answers `400 invalid: neither
-ONTO_KEY_PEPPER nor ONTO_MASTER_KEY is set; refusing to create API keys`.
+scopes. Without a pepper the route answers `400 invalid: ONTO_KEY_PEPPER
+is not set; refusing to create API keys`.
 A prefix collision retries with a new prefix (at most 5 times). Rotation
 keeps `expires_at`; rotating a revoked or expired key is a conflict.
 

@@ -72,6 +72,14 @@ pub struct EngineConfig {
     /// `multi`: requests choose a tenant (`x-onto-tenant`); each tenant is
     /// its own PostgreSQL schema, opened on first use.
     pub tenancy: String,
+    /// PostgreSQL tenants kept open at once (0: no limit); past it, the
+    /// least recently used is closed. It opens again on its next request.
+    pub max_open_tenants: usize,
+    /// Close a PostgreSQL tenant nobody used for this many seconds (0: never).
+    pub tenant_idle_secs: u64,
+    /// Close the least recently used PostgreSQL tenants while the open ones'
+    /// estimated memory (`estimated_bytes`) is above this many MiB (0: no budget).
+    pub tenant_memory_budget_mb: u64,
     pub postgres: PostgresConfig,
 }
 
@@ -85,6 +93,9 @@ impl Default for EngineConfig {
             read_consistency: "eventual".into(),
             follow_interval_ms: 1_000,
             tenancy: "single".into(),
+            max_open_tenants: 512,
+            tenant_idle_secs: 1800,
+            tenant_memory_budget_mb: 0,
             postgres: PostgresConfig::default(),
         }
     }
