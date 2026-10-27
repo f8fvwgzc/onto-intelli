@@ -22,8 +22,11 @@
 
 mod notifier;
 mod traces;
+mod wake;
 
 pub use notifier::SHARED_CHANNEL;
+use wake::{ScanJob, due_tenants, scan};
+pub use wake::{WakeFn, WakeScanner};
 
 use std::future::Future;
 use std::sync::{Arc, mpsc};
@@ -44,6 +47,7 @@ use crate::changes::{
     ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, Cursor, Gap, GapReason, StoredChange, StoredPage,
 };
 use crate::graph::LinkKey;
+use crate::leases::{Fence, Lease, Timer, Wake, lease_lost};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::{new_id, now_ms};
 use crate::{Error, Result};
@@ -68,6 +72,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (7, "tenant_identity", include_str!("../../migrations/0007_tenant_identity.sql")),
     (8, "audit_no_delete", include_str!("../../migrations/0008_audit_no_delete.sql")),
     (9, "changes", include_str!("../../migrations/0009_changes.sql")),
+    (10, "leases", include_str!("../../migrations/0010_leases.sql")),
 ];
 /// This build's writer version. A tenant whose `head.min_writer` is higher
 /// refuses this build's writes (builds before this one never read it; the
@@ -214,7 +219,12 @@ pub struct PgShared {
     exec: Exec,
     vector: Arc<VectorExt>,
     notifier: Arc<notifier::Notifier>,
+    /// Shared schemas ([`sys_schema`]) known to exist.
+    sys_ready: SysReady,
 }
+
+/// Names of the shared schemas this pool created or found.
+type SysReady = Arc<Mutex<std::collections::HashSet<String>>>;
 
 impl PgShared {
     /// Connect with a URL; queries run on a small runtime owned by the pool.
@@ -244,6 +254,7 @@ impl PgShared {
             pool,
             exec: Exec::Own(Arc::new(OwnedRuntime(Mutex::new(Some(rt))))),
             vector: Arc::new(vector),
+            sys_ready: SysReady::default(),
         })
     }
 
@@ -260,6 +271,7 @@ impl PgShared {
             pool,
             exec: Exec::Shared(handle),
             vector: Arc::new(vector),
+            sys_ready: SysReady::default(),
         })
     }
 
@@ -269,7 +281,58 @@ impl PgShared {
 
     /// The store of one tenant (its own PostgreSQL schema), created if missing.
     pub fn tenant(&self, tenant: &str, opts: PgOptions) -> Result<PgStore> {
-        PgStore::finish(self.pool.clone(), tenant, opts, self.exec.clone(), self.vector.clone(), self.notifier.clone())
+        PgStore::finish(self, tenant, opts)
+    }
+
+    /// Create the deployment's shared schema for `prefix` ([`sys_schema`])
+    /// with its `wake` table, if missing. Returns its name. Stores create it
+    /// themselves the first time they bump a wake row.
+    pub fn ensure_sys(&self, prefix: &str) -> Result<String> {
+        let sys = sys_schema(prefix);
+        if self.sys_ready.lock().contains(&sys) {
+            return Ok(sys);
+        }
+        let (pool, name) = (self.pool.clone(), sys.clone());
+        let (h, shared) = self.exec.handle();
+        run_on(&h, shared, async move { create_sys(&pool, &name).await })?;
+        self.sys_ready.lock().insert(sys.clone());
+        Ok(sys)
+    }
+
+    /// Tenants under `prefix` whose background work is due by the database
+    /// clock, earliest first, at most `limit` (none while no wake table exists).
+    pub fn wake_due(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let pool = self.pool.clone();
+        let sys = sys_schema(prefix);
+        let (h, shared) = self.exec.handle();
+        run_on(&h, shared, async move { due_tenants(&pool, &sys, limit).await })
+    }
+
+    /// Start this process's candidate for the deployment's one wake scanner
+    /// of `prefix` (docs/design/EVENTS.md section 10). It runs on the pool's
+    /// runtime: it tries `pg_try_advisory_lock(hashtext('<sys>.wake'))` on a
+    /// connection of its own (outside the pool) every `poll`; once elected it
+    /// LISTENs on [`wake_channel`] and, on each notice (at most one scan per
+    /// 200 ms) or every `poll`, calls `on_due` with the tenants due by the
+    /// database clock. Losing the lock connection ends the term; the next
+    /// candidate takes over within `poll`. Dropping the handle stops it and
+    /// releases the lock.
+    pub fn spawn_wake_scanner(&self, prefix: &str, poll: Duration, on_due: WakeFn) -> WakeScanner {
+        let elected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let sys = sys_schema(prefix);
+        let job = ScanJob {
+            pool: self.pool.clone(),
+            lock_key: format!("{sys}.wake"),
+            sys,
+            channel: wake_channel(prefix),
+            poll: poll.max(Duration::from_millis(100)),
+            elected: elected.clone(),
+            on_due,
+        };
+        let (h, _) = self.exec.handle();
+        h.spawn(scan(job, stopped));
+        WakeScanner { elected, stop }
     }
 
     /// One query (`SELECT 1`): the database answers.
@@ -295,8 +358,8 @@ impl PgShared {
         let s = quote_ident(&tenant_schema(prefix, tenant)?);
         let pool = self.pool.clone();
         let (h, shared) = self.exec.handle();
-        let tenant = tenant.to_string();
-        run_on(&h, shared, async move { drop_schema(&pool, &s, &tenant).await })
+        let (tenant, sys) = (tenant.to_string(), sys_schema(prefix));
+        run_on(&h, shared, async move { drop_schema(&pool, &s, &tenant, &sys).await })
     }
 
     /// Tenants with a schema under `prefix`.
@@ -329,6 +392,10 @@ pub struct PgStore {
     notifier: Arc<notifier::Notifier>,
     /// Set once something subscribed; dropping it unsubscribes.
     listener: Mutex<Option<notifier::Subscription>>,
+    /// The deployment's shared schema ([`sys_schema`]) and its wake channel.
+    sys: String,
+    wake_channel: String,
+    sys_ready: SysReady,
 }
 
 impl From<sqlx::Error> for Error {
@@ -358,28 +425,98 @@ where
 }
 
 /// `onto_` + the tenant, reduced to `[a-z0-9_]` (63 bytes at most, hashed when cut).
+/// A tenant id whose schema would be the deployment's shared one
+/// ([`sys_schema`]) is refused.
 pub fn tenant_schema(prefix: &str, tenant: &str) -> Result<String> {
     if tenant.is_empty() {
         return Err(Error::Config("postgres tenant must not be empty".into()));
     }
-    let mut name: String = format!("{prefix}{tenant}")
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-        .collect();
+    let name = safe_ident(&format!("{prefix}{tenant}"), tenant);
+    if name == sys_schema(prefix) {
+        return Err(Error::invalid(format!(
+            "tenant id '{tenant}' is reserved: its schema {name} is the deployment's shared schema"
+        )));
+    }
+    Ok(name)
+}
+
+/// `raw` reduced to `[a-z0-9_]`, starting with a letter or `_`; past 63
+/// bytes cut and suffixed with a hash of `key`.
+fn safe_ident(raw: &str, key: &str) -> String {
+    let mut name: String =
+        raw.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
     if !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
         name.insert(0, '_');
     }
     if name.len() > 63 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in tenant.bytes() {
+        for b in key.bytes() {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         name.truncate(46);
         name.push_str(&format!("_{h:016x}"));
     }
-    Ok(name)
+    name
+}
+
+/// The deployment's shared schema for tenants under `prefix` (`onto_sys`
+/// for `onto_`): the `wake` table, which holds tenant ids and times only.
+pub fn sys_schema(prefix: &str) -> String {
+    let base = prefix.trim_end_matches('_');
+    safe_ident(&format!("{base}_sys"), prefix)
+}
+
+/// The channel wake bumps are announced on (`onto_wake` for `onto_`).
+pub fn wake_channel(prefix: &str) -> String {
+    format!("{}_wake", prefix.trim_end_matches('_'))
+}
+
+/// SQL error codes of a relation, schema or function that does not exist.
+fn undefined(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|d| d.code()).is_some_and(|c| matches!(c.as_ref(), "42P01" | "3F000" | "42883"))
+}
+
+/// Create `{prefix}_sys` and its `wake` table if missing. Idempotent; one
+/// creator at a time.
+async fn create_sys(pool: &PgPool, sys: &str) -> Result<()> {
+    let q = quote_ident(sys);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(sys).execute(&mut *tx).await?;
+    sqlx::raw_sql(sql(format!(
+        "CREATE SCHEMA IF NOT EXISTS {q}; \
+         CREATE TABLE IF NOT EXISTS {q}.wake (tenant TEXT PRIMARY KEY, due_at BIGINT, bumped BIGINT NOT NULL DEFAULT 0); \
+         CREATE INDEX IF NOT EXISTS wake_due ON {q}.wake (due_at) WHERE due_at IS NOT NULL; \
+         CREATE OR REPLACE FUNCTION {q}.now_ms() RETURNS BIGINT LANGUAGE sql VOLATILE AS \
+         $$ SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint $$;"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Bump `tenant`'s wake row to be due `delay_ms` from now (keeping an
+/// earlier due time) and announce it on `channel`, inside `tx`.
+async fn bump_wake(
+    tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>,
+    sys: &str,
+    channel: &str,
+    tenant: &str,
+    delay_ms: i64,
+) -> Result<()> {
+    let q = quote_ident(sys);
+    sqlx::query(sql(format!(
+        "INSERT INTO {q}.wake (tenant, due_at, bumped) VALUES ($1, {q}.now_ms() + $2, 1) \
+         ON CONFLICT (tenant) DO UPDATE SET due_at = LEAST({q}.wake.due_at, EXCLUDED.due_at), \
+         bumped = {q}.wake.bumped + 1"
+    )))
+    .bind(tenant)
+    .bind(delay_ms.max(0))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("SELECT pg_notify($1, $2)").bind(channel).bind(tenant).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// `NOTIFY` a change on the shared channel (the payload names the schema)
@@ -409,8 +546,9 @@ fn collision(tenant: &str, owner: &str, schema: &str) -> Error {
     ))
 }
 
-/// `DROP SCHEMA … CASCADE`, unless another tenant id owns the schema.
-async fn drop_schema(pool: &PgPool, schema: &str, tenant: &str) -> Result<()> {
+/// `DROP SCHEMA … CASCADE`, unless another tenant id owns the schema, and
+/// forget the tenant's wake row (a dropped tenant is never woken).
+async fn drop_schema(pool: &PgPool, schema: &str, tenant: &str, sys: &str) -> Result<()> {
     let claimed: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("{schema}.tenant_identity"))
         .fetch_one(pool)
@@ -424,7 +562,14 @@ async fn drop_schema(pool: &PgPool, schema: &str, tenant: &str) -> Result<()> {
         return Err(collision(tenant, &owner, schema));
     }
     sqlx::query(sql(format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))).execute(pool).await?;
-    Ok(())
+    let forget = sqlx::query(sql(format!("DELETE FROM {}.wake WHERE tenant = $1", quote_ident(sys))))
+        .bind(tenant)
+        .execute(pool)
+        .await;
+    match forget {
+        Err(e) if !undefined(&e) => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 fn parse<T: serde::de::DeserializeOwned>(doc: &str) -> Result<T> {
@@ -448,6 +593,25 @@ async fn lock_head(tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>, 
         )));
     }
     Ok(seq)
+}
+
+/// Refuse unless `f`'s holder has the lease at its epoch by the database
+/// clock. `FOR SHARE` keeps the row: a takeover waits until this
+/// transaction ends, so no fenced write commits after a new holder took over.
+async fn check_fence(tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>, t: &Tables, f: &Fence) -> Result<()> {
+    let held: Option<i32> = sqlx::query_scalar(sql(format!(
+        "SELECT 1 FROM {} WHERE name = $1 AND holder = $2 AND epoch = $3 AND until >= {} FOR SHARE",
+        t.leases, t.now
+    )))
+    .bind(&f.name)
+    .bind(&f.holder)
+    .bind(f.epoch as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if held.is_none() {
+        return Err(lease_lost(f));
+    }
+    Ok(())
 }
 
 /// The change log's settings and head, read on `conn`.
@@ -477,24 +641,20 @@ impl PgStore {
         PgShared::from_pool(pool)?.tenant(tenant, opts)
     }
 
-    fn finish(
-        pool: PgPool,
-        tenant: &str,
-        opts: PgOptions,
-        exec: Exec,
-        vector: Arc<VectorExt>,
-        notifier: Arc<notifier::Notifier>,
-    ) -> Result<Self> {
+    fn finish(shared: &PgShared, tenant: &str, opts: PgOptions) -> Result<Self> {
         let store = Self {
             schema: tenant_schema(&opts.schema_prefix, tenant)?,
             tenant: tenant.to_string(),
             origin: new_id("proc"),
-            pool,
-            exec,
-            vector,
+            pool: shared.pool.clone(),
+            exec: shared.exec.clone(),
+            vector: shared.vector.clone(),
+            sys: sys_schema(&opts.schema_prefix),
+            wake_channel: wake_channel(&opts.schema_prefix),
+            sys_ready: shared.sys_ready.clone(),
             opts,
             subscribers: Arc::new(Mutex::new(Vec::new())),
-            notifier,
+            notifier: shared.notifier.clone(),
             listener: Mutex::new(None),
         };
         store.migrate()?;
@@ -608,8 +768,8 @@ impl PgStore {
     pub fn drop_tenant(&self) -> Result<()> {
         let pool = self.pool.clone();
         let s = quote_ident(&self.schema);
-        let tenant = self.tenant.clone();
-        self.block(async move { drop_schema(&pool, &s, &tenant).await })
+        let (tenant, sys) = (self.tenant.clone(), self.sys.clone());
+        self.block(async move { drop_schema(&pool, &s, &tenant, &sys).await })
     }
 
     /// Delete expired KV rows and events older than `keep_events_ms`.
@@ -646,6 +806,17 @@ impl PgStore {
 
     fn channel(&self) -> String {
         self.schema.clone()
+    }
+
+    /// Create the deployment's shared schema the first time this pool needs it.
+    fn ensure_sys(&self) -> Result<()> {
+        if self.sys_ready.lock().contains(&self.sys) {
+            return Ok(());
+        }
+        let (pool, sys) = (self.pool.clone(), self.sys.clone());
+        self.block(async move { create_sys(&pool, &sys).await })?;
+        self.sys_ready.lock().insert(self.sys.clone());
+        Ok(())
     }
 
     fn start_listener(&self) {
@@ -1005,8 +1176,20 @@ impl Store for PgStore {
         };
         let del_e = b.del_entities.clone();
         let del_l = b.del_links.clone();
+        let fence = b.fence.clone();
+        let wake = match b.wake {
+            Some(delay) => {
+                self.ensure_sys()?;
+                Some((self.sys.clone(), self.wake_channel.clone(), self.tenant.clone(), delay))
+            }
+            None => None,
+        };
         self.block(async move {
             let mut tx = pool.begin().await?;
+            // First, so a lost lease writes nothing and a takeover waits for this commit.
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &tables, f).await?;
+            }
             let mut seq: i64 = 0;
             if bumps {
                 seq = lock_head(&mut tx, &tables.head).await?;
@@ -1255,6 +1438,9 @@ impl Store for PgStore {
                 }
                 // Delivered to listeners when (and only if) the transaction commits.
                 send_notice(&mut tx, &channel, json!({ "t": "c", "seq": seq, "o": rec.origin })).await?;
+            }
+            if let Some((sys, chan, tenant, delay)) = &wake {
+                bump_wake(&mut tx, sys, chan, tenant, *delay).await?;
             }
             tx.commit().await?;
             Ok(seq as u64)
@@ -1647,6 +1833,229 @@ impl Store for PgStore {
         })
     }
 
+    fn fences(&self) -> bool {
+        true
+    }
+
+    fn clock_ms(&self) -> Result<i64> {
+        let pool = self.pool.clone();
+        let now = Tables::of(self).now;
+        self.block(async move { Ok(sqlx::query_scalar(sql(format!("SELECT {now}"))).fetch_one(&pool).await?) })
+    }
+
+    /// One statement (docs/design/EVENTS.md section 9): insert, or take over
+    /// an expired lease (epoch + 1), or renew one's own (same epoch).
+    fn lease(&self, name: &str, holder: &str, ttl_ms: i64) -> Result<Option<u64>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (name, holder) = (name.to_string(), holder.to_string());
+        self.block(async move {
+            let epoch: Option<i64> = sqlx::query_scalar(sql(format!(
+                "INSERT INTO {l} AS l (name, holder, epoch, until) VALUES ($1, $2, 1, {now} + $3) \
+                 ON CONFLICT (name) DO UPDATE SET \
+                 epoch = CASE WHEN l.holder = EXCLUDED.holder THEN l.epoch ELSE l.epoch + 1 END, \
+                 holder = EXCLUDED.holder, until = EXCLUDED.until \
+                 WHERE l.until < {now} OR l.holder = EXCLUDED.holder \
+                 RETURNING epoch",
+                l = t.leases,
+                now = t.now
+            )))
+            .bind(&name)
+            .bind(&holder)
+            .bind(ttl_ms.max(0))
+            .fetch_optional(&pool)
+            .await?;
+            Ok(epoch.map(|e| e as u64))
+        })
+    }
+
+    fn release(&self, name: &str, holder: &str) -> Result<bool> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (name, holder) = (name.to_string(), holder.to_string());
+        self.block(async move {
+            let n = sqlx::query(sql(format!(
+                "UPDATE {l} SET until = {now} - 1 WHERE name = $1 AND holder = $2 AND until >= {now}",
+                l = t.leases,
+                now = t.now
+            )))
+            .bind(&name)
+            .bind(&holder)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            Ok(n > 0)
+        })
+    }
+
+    fn lease_get(&self, name: &str) -> Result<Option<Lease>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let name = name.to_string();
+        self.block(async move {
+            let row: Option<(String, i64, i64, bool)> = sqlx::query_as(sql(format!(
+                "SELECT holder, epoch, until, until >= {} FROM {} WHERE name = $1",
+                t.now, t.leases
+            )))
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await?;
+            Ok(row.map(|(holder, epoch, until, held)| Lease { name, holder, epoch: epoch as u64, until, held }))
+        })
+    }
+
+    fn consumer_get(&self, name: &str) -> Result<Option<Cursor>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let name = name.to_string();
+        self.block(async move {
+            let row: Option<(i64, i32)> =
+                sqlx::query_as(sql(format!("SELECT seq, n FROM {} WHERE name = $1", t.consumers)))
+                    .bind(&name)
+                    .fetch_optional(&pool)
+                    .await?;
+            Ok(row.map(|(seq, n)| Cursor::new(seq as u64, n as u32)))
+        })
+    }
+
+    fn consumer_set(&self, name: &str, cursor: Cursor, fence: Option<&Fence>) -> Result<()> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (name, fence) = (name.to_string(), fence.cloned());
+        let n = cursor.n.min(i32::MAX as u32) as i32;
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &t, f).await?;
+            }
+            sqlx::query(sql(format!(
+                "INSERT INTO {c} (name, seq, n, updated_at) VALUES ($1, $2, $3, {now}) \
+                 ON CONFLICT (name) DO UPDATE SET seq = EXCLUDED.seq, n = EXCLUDED.n, updated_at = EXCLUDED.updated_at",
+                c = t.consumers,
+                now = t.now
+            )))
+            .bind(&name)
+            .bind(cursor.seq as i64)
+            .bind(n)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// The timer and the tenant's wake row move in one transaction.
+    fn timers_set(&self, name: &str, delay_ms: i64, doc: &Value) -> Result<i64> {
+        self.ensure_sys()?;
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (sys, chan, tenant) = (self.sys.clone(), self.wake_channel.clone(), self.tenant.clone());
+        let (name, doc) = (name.to_string(), serde_json::to_string(doc)?);
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            let due: i64 = sqlx::query_scalar(sql(format!(
+                "INSERT INTO {tm} (name, due_at, doc) VALUES ($1, {now} + $2, $3::jsonb) \
+                 ON CONFLICT (name) DO UPDATE SET due_at = EXCLUDED.due_at, doc = EXCLUDED.doc RETURNING due_at",
+                tm = t.timers,
+                now = t.now
+            )))
+            .bind(&name)
+            .bind(delay_ms)
+            .bind(&doc)
+            .fetch_one(&mut *tx)
+            .await?;
+            bump_wake(&mut tx, &sys, &chan, &tenant, delay_ms).await?;
+            tx.commit().await?;
+            Ok(due)
+        })
+    }
+
+    fn timers_due(&self, limit: usize) -> Result<Vec<Timer>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            let rows: Vec<(String, i64, String)> = sqlx::query_as(sql(format!(
+                "SELECT name, due_at, doc::text FROM {} WHERE due_at <= {} ORDER BY due_at, name LIMIT $1",
+                t.timers, t.now
+            )))
+            .bind(limit.clamp(1, 10_000) as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.into_iter().map(|(name, due_at, doc)| Ok(Timer { name, due_at, doc: parse(&doc)? })).collect()
+        })
+    }
+
+    fn timers_next(&self) -> Result<Option<i64>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            Ok(sqlx::query_scalar(sql(format!("SELECT min(due_at) FROM {}", t.timers))).fetch_one(&pool).await?)
+        })
+    }
+
+    fn timers_delete(&self, name: &str, due_at: Option<i64>) -> Result<bool> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let name = name.to_string();
+        self.block(async move {
+            let n = sqlx::query(sql(format!(
+                "DELETE FROM {} WHERE name = $1 AND ($2::bigint IS NULL OR due_at = $2)",
+                t.timers
+            )))
+            .bind(&name)
+            .bind(due_at)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            Ok(n > 0)
+        })
+    }
+
+    fn wake_get(&self) -> Result<Option<Wake>> {
+        let pool = self.pool.clone();
+        let (sys, tenant) = (quote_ident(&self.sys), self.tenant.clone());
+        self.block(async move {
+            let row = sqlx::query_as::<_, (Option<i64>, i64)>(sql(format!(
+                "SELECT due_at, bumped FROM {sys}.wake WHERE tenant = $1"
+            )))
+            .bind(&tenant)
+            .fetch_optional(&pool)
+            .await;
+            match row {
+                Ok(r) => Ok(r.map(|(due_at, bumped)| Wake { due_at, bumped: bumped as u64 })),
+                Err(e) if undefined(&e) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    /// `UPDATE … WHERE bumped = $seen` as an upsert: a row bumped since
+    /// `seen` was read is left alone (false), so that bump is not lost.
+    fn wake_settle(&self, seen: u64, next_due: Option<i64>) -> Result<bool> {
+        if next_due.is_some() {
+            self.ensure_sys()?;
+        }
+        let pool = self.pool.clone();
+        let (sys, tenant) = (quote_ident(&self.sys), self.tenant.clone());
+        self.block(async move {
+            let n = sqlx::query(sql(format!(
+                "INSERT INTO {sys}.wake AS w (tenant, due_at, bumped) VALUES ($1, $2, $3) \
+                 ON CONFLICT (tenant) DO UPDATE SET due_at = EXCLUDED.due_at WHERE w.bumped = $3"
+            )))
+            .bind(&tenant)
+            .bind(next_due)
+            .bind(seen as i64)
+            .execute(&pool)
+            .await;
+            match n {
+                Ok(r) => Ok(r.rows_affected() > 0),
+                // No wake table yet and nothing due: nothing to settle.
+                Err(e) if undefined(&e) => Ok(true),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn indexes_vectors(&self) -> bool {
         true
     }
@@ -1915,6 +2324,11 @@ struct Tables {
     commits: String,
     changes: String,
     changes_meta: String,
+    leases: String,
+    consumers: String,
+    timers: String,
+    /// The tenant schema's `now_ms()` (the database clock).
+    now: String,
 }
 
 /// One change record to insert (its seq is the commit's).
@@ -1944,6 +2358,10 @@ impl Tables {
             commits: s.t("commits"),
             changes: s.t("changes"),
             changes_meta: s.t("changes_meta"),
+            leases: s.t("leases"),
+            consumers: s.t("consumers"),
+            timers: s.t("timers"),
+            now: s.t("now_ms()"),
         }
     }
 }
@@ -1960,7 +2378,7 @@ fn split3(keys: &[LinkKey]) -> (Vec<String>, Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_pgvector, check_server, halfvec_text, tenant_schema};
+    use super::{check_pgvector, check_server, halfvec_text, sys_schema, tenant_schema, wake_channel};
 
     #[test]
     fn old_servers_and_old_pgvector_are_refused() {
@@ -1983,5 +2401,20 @@ mod tests {
         let long = tenant_schema("onto_", &"x".repeat(100)).unwrap();
         assert!(long.len() <= 63 && long.starts_with("onto_xxx"));
         assert!(tenant_schema("onto_", "").is_err());
+    }
+
+    #[test]
+    fn the_shared_schema_is_no_tenant_s() {
+        assert_eq!(sys_schema("onto_"), "onto_sys");
+        assert_eq!(sys_schema("onto"), "onto_sys");
+        assert_eq!(sys_schema("o120_ab12"), "o120_ab12_sys");
+        assert_eq!(wake_channel("onto_"), "onto_wake");
+        for t in ["sys", "SYS", "Sys"] {
+            let e = tenant_schema("onto_", t).unwrap_err().to_string();
+            assert!(e.contains("reserved") && e.contains("onto_sys"), "{e}");
+        }
+        assert!(tenant_schema("onto", "_sys").is_err(), "onto + _sys is onto_sys too");
+        assert_eq!(tenant_schema("onto_", "sysops").unwrap(), "onto_sysops");
+        assert_eq!(tenant_schema("onto_", "_sys").unwrap(), "onto__sys");
     }
 }

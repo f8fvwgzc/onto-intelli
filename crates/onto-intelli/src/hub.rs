@@ -9,6 +9,11 @@
 //! first); the next request opens them again. In-memory tenants stay open:
 //! their data lives only there.
 //!
+//! On PostgreSQL, one process per deployment can be the elected **wake
+//! scanner** ([`Hub::start_wake_scanner`]): tenants with background work due
+//! bump a row in the deployment's shared `wake` table at write time, and the
+//! scanner opens the closed ones, so closed tenants are never polled.
+//!
 //! An application with workspaces maps each workspace to a tenant and passes
 //! the caller's principal on every call:
 //!
@@ -117,6 +122,9 @@ pub struct Hub {
     hooks: RwLock<Option<Arc<dyn TenantHooks>>>,
     me: Weak<Hub>,
     sweeping: AtomicBool,
+    /// This process's wake scanner candidate (stopped when the hub goes away).
+    #[cfg(feature = "postgres")]
+    wake: Mutex<Option<onto_core::store::WakeScanner>>,
 }
 
 /// `[A-Za-z0-9_.-]`, 1–128 characters.
@@ -164,6 +172,8 @@ impl Hub {
             config,
             me: me.clone(),
             sweeping: AtomicBool::new(false),
+            #[cfg(feature = "postgres")]
+            wake: Mutex::new(None),
         })
     }
 
@@ -177,6 +187,8 @@ impl Hub {
             backend,
             me: me.clone(),
             sweeping: AtomicBool::new(false),
+            #[cfg(feature = "postgres")]
+            wake: Mutex::new(None),
         })
     }
 
@@ -381,6 +393,73 @@ impl Hub {
                 hub.enforce_limits(None, now_ms());
             }
         });
+    }
+
+    /// Stand for election as the deployment's wake scanner (docs/design/EVENTS.md
+    /// section 10): PostgreSQL only, and not with `engine.wake_poll_secs = 0`.
+    /// Every process may stand; one at a time is elected (an advisory lock on a
+    /// connection of its own). The elected one opens, in this process, the
+    /// tenants whose background work is due by the database clock and that are
+    /// not open here (open tenants' own workers see their work). Another
+    /// candidate takes over within `wake_poll_secs` when the elected process
+    /// goes away. Returns whether a candidate runs in this process. `onto
+    /// serve` calls it; one-shot CLI commands do not.
+    pub fn start_wake_scanner(&self) -> bool {
+        #[cfg(feature = "postgres")]
+        if let Backend::Postgres(shared) = &self.backend {
+            let poll = self.config.engine.wake_poll_secs;
+            let Ok(rt) = tokio::runtime::Handle::try_current() else { return false };
+            if poll == 0 {
+                return false;
+            }
+            let mut slot = self.wake.lock();
+            if slot.is_some() {
+                return true;
+            }
+            let me = self.me.clone();
+            let on_due: onto_core::store::WakeFn = Arc::new(move |tenants: Vec<String>| {
+                let me = me.clone();
+                rt.spawn(async move {
+                    for t in tenants {
+                        let Some(hub) = me.upgrade() else { return };
+                        hub.wake_tenant(&t).await;
+                    }
+                });
+            });
+            *slot = Some(shared.spawn_wake_scanner(
+                &self.config.engine.postgres.schema_prefix,
+                Duration::from_secs(poll),
+                on_due,
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// This process is the deployment's elected wake scanner right now.
+    pub fn wake_scanner_elected(&self) -> bool {
+        #[cfg(feature = "postgres")]
+        {
+            self.wake.lock().as_ref().is_some_and(|w| w.elected())
+        }
+        #[cfg(not(feature = "postgres"))]
+        false
+    }
+
+    /// Open a tenant the wake scanner found due, unless it is open here
+    /// already or this hub does not serve it.
+    #[cfg(feature = "postgres")]
+    async fn wake_tenant(&self, id: &str) {
+        if !valid_tenant(id) || (!self.multi_tenant() && id != self.default_tenant) {
+            return;
+        }
+        if self.tenants.lock().get(id).is_some_and(|s| s.cell.initialized()) {
+            return;
+        }
+        match self.tenant(id).await {
+            Ok(_) => tracing::debug!(tenant = id, "opened a tenant with background work due"),
+            Err(e) => tracing::warn!(tenant = id, error = %e, "could not open a tenant with background work due"),
+        }
     }
 
     /// The backend answers: one query on PostgreSQL. For readiness probes.

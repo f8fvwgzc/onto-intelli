@@ -299,3 +299,91 @@ async fn streams_count_as_use_but_never_past_max_open_tenants() {
     drop(sub);
     cleanup(&hub, &url, &prefix).await;
 }
+
+/// Poll `f` every 50 ms for up to `secs`.
+async fn eventually(secs: u64, f: impl Fn() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+/// Another process gives `tenant` a timer due `delay_ms` from now: its wake
+/// row is bumped in the same transaction.
+async fn work_due(url: &str, prefix: &str, tenant: &str, delay_ms: i64) {
+    let (url, prefix, tenant) = (url.to_string(), prefix.to_string(), tenant.to_string());
+    tokio::task::spawn_blocking(move || {
+        use onto_intelli::core::store::{PgOptions, PgStore, Store};
+        let store =
+            PgStore::connect(&url, &tenant, PgOptions { schema_prefix: prefix, listen: false, ..Default::default() })
+                .unwrap();
+        store.timers_set("retry:t", delay_ms, &json!({})).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// Of two hubs standing for the deployment's wake scanner, exactly one is
+/// elected. It opens a closed tenant whose work is due (not one due later);
+/// the other opens nothing. When the elected hub goes away, the other is
+/// elected and opens the next due tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_wake_scanner_per_deployment_opens_due_tenants() {
+    let Some(url) = common::database_url("one_wake_scanner_per_deployment_opens_due_tenants") else { return };
+    let prefix = common::unique("owake_");
+    let mut cfg = config(&url, &prefix);
+    cfg.engine.wake_poll_secs = 1;
+    assert!(!Hub::open(Config::in_memory()).await.unwrap().start_wake_scanner(), "memory tenants never close");
+    let mut off = cfg.clone();
+    off.engine.wake_poll_secs = 0;
+    assert!(!Hub::open(off).await.unwrap().start_wake_scanner(), "wake_poll_secs = 0: no scanner");
+
+    let h1 = Hub::open(cfg.clone()).await.unwrap();
+    let h2 = Hub::open(cfg.clone()).await.unwrap();
+    assert!(h1.start_wake_scanner() && h2.start_wake_scanner());
+    assert!(h1.start_wake_scanner(), "standing twice is one candidate");
+    let elected = |a: &Hub, b: &Hub| u8::from(a.wake_scanner_elected()) + u8::from(b.wake_scanner_elected());
+    assert!(eventually(10, || elected(&h1, &h2) == 1).await, "one scanner is elected");
+    // Both keep standing every poll; the lock keeps it at one.
+    for _ in 0..30 {
+        assert_eq!(elected(&h1, &h2), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (winner, loser) = if h1.wake_scanner_elected() { (h1, h2) } else { (h2, h1) };
+
+    work_due(&url, &prefix, "sleepy", 0).await;
+    work_due(&url, &prefix, "later", 600_000).await;
+    assert!(
+        eventually(10, || winner.open_tenants().contains(&"sleepy".to_string())).await,
+        "the elected scanner opened the tenant with work due: {:?}",
+        winner.open_tenants()
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(winner.open_tenants(), vec!["sleepy"], "not the tenant due in ten minutes");
+    assert!(loser.open_tenants().is_empty(), "only the elected scanner opens tenants");
+
+    // The elected process goes away: its lock goes with its session.
+    drop(winner);
+    assert!(eventually(10, || loser.wake_scanner_elected()).await, "the other candidate takes over");
+    work_due(&url, &prefix, "sleepy2", 0).await;
+    assert!(
+        eventually(10, || loser.open_tenants().contains(&"sleepy2".to_string())).await,
+        "{:?}",
+        loser.open_tenants()
+    );
+
+    cleanup(&loser, &url, &prefix).await;
+    drop(loser);
+    let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    let sys = onto_intelli::core::store::postgres::sys_schema(&prefix);
+    onto_intelli::core::sqlx::query(onto_intelli::core::sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS \"{sys}\" CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+}

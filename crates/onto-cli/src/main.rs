@@ -1628,6 +1628,8 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 cfg.engine.postgres.tenant = t.clone();
             }
             let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            // Stand for the deployment's wake scanner (PostgreSQL; one process is elected).
+            hub.start_wake_scanner();
             // Open the default tenant now: configuration problems show at startup.
             let intelli = hub.tenant(hub.default_tenant()).await?;
             let control = if cfg.console.enabled { Some(open_control(&cfg).await?) } else { None };

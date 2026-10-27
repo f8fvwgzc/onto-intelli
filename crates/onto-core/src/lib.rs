@@ -31,6 +31,7 @@ pub mod export;
 pub mod graph;
 pub mod induce;
 pub mod learn;
+pub mod leases;
 pub mod lint;
 pub mod live_schema;
 pub mod locks;

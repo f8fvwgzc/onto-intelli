@@ -195,6 +195,10 @@ pub(crate) struct Extra {
     pub reindex: Vec<String>,
     /// Renames made by the schema change (`schema`), for its change record.
     pub renames: Vec<crate::changes::Rename>,
+    /// Commit only while this lease is held at its epoch ([`WriteBatch::fence`]).
+    pub fence: Option<crate::leases::Fence>,
+    /// Background work is due this many milliseconds after the commit ([`WriteBatch::wake`]).
+    pub wake: Option<i64>,
 }
 
 impl Extra {
@@ -1225,6 +1229,20 @@ impl Ontology {
         self.apply_inner(ctx, muts, Extra::default())
     }
 
+    /// [`apply`](Self::apply) for a background worker holding a lease: the
+    /// commit happens only while `fence`'s holder still has the lease at its
+    /// epoch (store clock). Otherwise it fails with `Error::Unavailable("lease
+    /// lost …")` and nothing is written; a store that cannot fence refuses
+    /// every fenced write.
+    pub fn apply_fenced(
+        &self,
+        ctx: &ActionContext,
+        fence: &crate::leases::Fence,
+        muts: Vec<Mutation>,
+    ) -> Result<MutationResult> {
+        self.apply_inner(ctx, muts, Extra { fence: Some(fence.clone()), ..Default::default() })
+    }
+
     pub(crate) fn apply_inner(&self, ctx: &ActionContext, muts: Vec<Mutation>, extra: Extra) -> Result<MutationResult> {
         if muts.is_empty() && extra.is_empty() {
             return Ok(MutationResult { revision: self.revision(), ..Default::default() });
@@ -1358,6 +1376,16 @@ impl Ontology {
         if self.inner.store.tracks_commits() {
             staged.batch.expect_seq = Some(self.inner.seq.load(Ordering::SeqCst));
         }
+        if let Some(fence) = extra.fence {
+            if !self.inner.store.fences() {
+                return Err(Error::Unavailable(format!(
+                    "this store cannot fence writes, so a write under lease {} is refused",
+                    fence.name
+                )));
+            }
+            staged.batch.fence = Some(fence);
+        }
+        staged.batch.wake = extra.wake;
         let seq = self.inner.store.write(&staged.batch)?;
         if staged.batch.changes_state() {
             self.inner.seq.store(seq, Ordering::SeqCst);

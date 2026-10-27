@@ -3657,6 +3657,7 @@ impl Ontology {
                 schema: Some((Arc::new(schema), version)),
                 reindex: planned.reindex.clone(),
                 renames: renames_of(&set.changes),
+                ..Default::default()
             };
             Ok((planned.mutations, extra, (SchemaVersionInfo::from(&sv), planned.plan)))
         })?;

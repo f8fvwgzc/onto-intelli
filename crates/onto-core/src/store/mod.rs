@@ -28,6 +28,7 @@ use crate::changes::{
     StoredPage,
 };
 use crate::graph::LinkKey;
+use crate::leases::{Fence, Lease, Timer, Wake, lease_lost, no_leases};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::now_ms;
 use crate::trace::{
@@ -39,7 +40,7 @@ use crate::{Error, Result};
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
-pub use postgres::{PgOptions, PgShared, PgStore};
+pub use postgres::{PgOptions, PgShared, PgStore, WakeFn, WakeScanner};
 
 /// KV namespaces whose standalone writes other processes are told about
 /// (their readers keep them in memory). Everything committed inside a
@@ -150,6 +151,14 @@ pub struct WriteBatch {
     /// The writer computed `changes` (possibly none). A state-changing batch
     /// that is not captured gets a `gap` record from a store that keeps changes.
     pub captured: bool,
+    /// Commit only while this lease is still held at this epoch (by the
+    /// store's clock); otherwise refuse with `Error::Unavailable("lease
+    /// lost …")` and write nothing. Only stores that [fence](Store::fences).
+    pub fence: Option<Fence>,
+    /// Background work of the tenant is due this many milliseconds after the
+    /// commit (store clock): a store with a shared wake table bumps the
+    /// tenant's row in the same transaction ([`crate::leases`]).
+    pub wake: Option<i64>,
 }
 
 impl WriteBatch {
@@ -322,6 +331,75 @@ pub trait Store: Send + Sync {
         Err(no_change_log())
     }
 
+    // ── leases, consumers, timers and wake-ups (docs/design/EVENTS.md D12, section 9) ──
+    // Times are the store's clock (the database clock on PostgreSQL). Stores
+    // without them refuse; none of them goes through the commit log.
+
+    /// Does [`write`](Self::write) honour [`WriteBatch::fence`]? The engine
+    /// refuses fenced writes to a store that does not.
+    fn fences(&self) -> bool {
+        false
+    }
+    /// The store's clock in milliseconds (the database clock on PostgreSQL).
+    fn clock_ms(&self) -> Result<i64> {
+        Ok(now_ms())
+    }
+    /// Take or renew the lease `name` for `ttl_ms` of the store's clock.
+    /// Returns its epoch, or `None` while another holder has it. The epoch
+    /// grows whenever the holder changes; a holder renewing keeps it.
+    fn lease(&self, _name: &str, _holder: &str, _ttl_ms: i64) -> Result<Option<u64>> {
+        Err(no_leases())
+    }
+    /// Give the lease back if `holder` has it (it expires now; the epoch is
+    /// kept, so the next holder's is higher). Returns whether it did.
+    fn release(&self, _name: &str, _holder: &str) -> Result<bool> {
+        Err(no_leases())
+    }
+    /// The lease row, if the lease was ever taken.
+    fn lease_get(&self, _name: &str) -> Result<Option<Lease>> {
+        Err(no_leases())
+    }
+    /// Where the consumer `name` resumes (after this cursor).
+    fn consumer_get(&self, _name: &str) -> Result<Option<Cursor>> {
+        Err(no_leases())
+    }
+    /// Move the consumer `name` to `cursor`; with a fence, only while that
+    /// lease is held at its epoch (otherwise "lease lost" and nothing moves).
+    fn consumer_set(&self, _name: &str, _cursor: Cursor, _fence: Option<&Fence>) -> Result<()> {
+        Err(no_leases())
+    }
+    /// Set (or move) the timer `name` to `delay_ms` from now by the store's
+    /// clock, with `doc`. Returns its due time. Bumps the tenant's wake row
+    /// where there is one.
+    fn timers_set(&self, _name: &str, _delay_ms: i64, _doc: &Value) -> Result<i64> {
+        Err(no_leases())
+    }
+    /// Timers due by the store's clock, earliest first, at most `limit`.
+    fn timers_due(&self, _limit: usize) -> Result<Vec<Timer>> {
+        Err(no_leases())
+    }
+    /// The earliest due time of any timer.
+    fn timers_next(&self) -> Result<Option<i64>> {
+        Err(no_leases())
+    }
+    /// Delete the timer `name`; with `due_at`, only if it is still due then
+    /// (a timer moved meanwhile stays). Returns whether it deleted one.
+    fn timers_delete(&self, _name: &str, _due_at: Option<i64>) -> Result<bool> {
+        Err(no_leases())
+    }
+    /// The tenant's wake row (`None`: the store has no wake table, or the
+    /// tenant was never bumped).
+    fn wake_get(&self) -> Result<Option<Wake>> {
+        Ok(None)
+    }
+    /// After draining, set the tenant's next due time (store clock; `None`:
+    /// nothing due) unless the row was bumped since `seen` was read. Returns
+    /// false when it was: drain again. Stores without a wake table have
+    /// nothing to settle.
+    fn wake_settle(&self, _seen: u64, _next_due: Option<i64>) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Newest first.
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>>;
     fn kv_put(&self, ns: &str, key: &str, value: &Value, expires_at: Option<i64>) -> Result<()>;
@@ -452,6 +530,26 @@ struct MemInner {
     /// Records of commits below the floor are gone.
     floor: u64,
     capture_off: bool,
+    leases: HashMap<String, MemLease>,
+    consumers: HashMap<String, Cursor>,
+    /// name -> (due_at, doc)
+    timers: HashMap<String, (i64, Value)>,
+}
+
+struct MemLease {
+    holder: String,
+    epoch: u64,
+    until: i64,
+}
+
+impl MemInner {
+    /// The fence's lease is held by its holder at its epoch right now.
+    fn check_fence(&self, f: &Fence) -> Result<()> {
+        match self.leases.get(&f.name) {
+            Some(l) if l.holder == f.holder && l.epoch == f.epoch && l.until >= now_ms() => Ok(()),
+            _ => Err(lease_lost(f)),
+        }
+    }
 }
 
 impl Default for MemoryStore {
@@ -479,6 +577,11 @@ impl MemoryStore {
 
     fn write_as(&self, batch: &WriteBatch, uncaptured: GapReason) -> Result<u64> {
         let mut inner = self.inner.lock();
+        // Checked under the lock that serializes writes and leases: nothing
+        // is written when the fence is lost.
+        if let Some(f) = &batch.fence {
+            inner.check_fence(f)?;
+        }
         for e in &batch.events {
             if inner.events.len() >= self.max_events {
                 inner.events.pop_front();
@@ -628,6 +731,104 @@ impl Store for MemoryStore {
 
     fn head(&self) -> Result<u64> {
         Ok(self.inner.lock().seq)
+    }
+
+    fn fences(&self) -> bool {
+        true
+    }
+
+    fn lease(&self, name: &str, holder: &str, ttl_ms: i64) -> Result<Option<u64>> {
+        let mut inner = self.inner.lock();
+        let now = now_ms();
+        let until = now.saturating_add(ttl_ms.max(0));
+        match inner.leases.get_mut(name) {
+            None => {
+                inner.leases.insert(name.to_string(), MemLease { holder: holder.to_string(), epoch: 1, until });
+                Ok(Some(1))
+            }
+            Some(l) if l.holder == holder => {
+                l.until = until;
+                Ok(Some(l.epoch))
+            }
+            Some(l) if l.until < now => {
+                l.holder = holder.to_string();
+                l.epoch += 1;
+                l.until = until;
+                Ok(Some(l.epoch))
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
+    fn release(&self, name: &str, holder: &str) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let now = now_ms();
+        match inner.leases.get_mut(name) {
+            Some(l) if l.holder == holder && l.until >= now => {
+                l.until = now - 1;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn lease_get(&self, name: &str) -> Result<Option<Lease>> {
+        let now = now_ms();
+        Ok(self.inner.lock().leases.get(name).map(|l| Lease {
+            name: name.to_string(),
+            holder: l.holder.clone(),
+            epoch: l.epoch,
+            until: l.until,
+            held: l.until >= now,
+        }))
+    }
+
+    fn consumer_get(&self, name: &str) -> Result<Option<Cursor>> {
+        Ok(self.inner.lock().consumers.get(name).copied())
+    }
+
+    fn consumer_set(&self, name: &str, cursor: Cursor, fence: Option<&Fence>) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if let Some(f) = fence {
+            inner.check_fence(f)?;
+        }
+        inner.consumers.insert(name.to_string(), cursor);
+        Ok(())
+    }
+
+    fn timers_set(&self, name: &str, delay_ms: i64, doc: &Value) -> Result<i64> {
+        let due = now_ms().saturating_add(delay_ms);
+        self.inner.lock().timers.insert(name.to_string(), (due, doc.clone()));
+        Ok(due)
+    }
+
+    fn timers_due(&self, limit: usize) -> Result<Vec<Timer>> {
+        let now = now_ms();
+        let inner = self.inner.lock();
+        let mut due: Vec<Timer> = inner
+            .timers
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(name, (at, doc))| Timer { name: name.clone(), due_at: *at, doc: doc.clone() })
+            .collect();
+        due.sort_by(|a, b| a.due_at.cmp(&b.due_at).then_with(|| a.name.cmp(&b.name)));
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    fn timers_next(&self) -> Result<Option<i64>> {
+        Ok(self.inner.lock().timers.values().map(|(at, _)| *at).min())
+    }
+
+    fn timers_delete(&self, name: &str, due_at: Option<i64>) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        match inner.timers.get(name) {
+            Some((at, _)) if due_at.is_none_or(|d| d == *at) => {
+                inner.timers.remove(name);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>> {

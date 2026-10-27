@@ -15,6 +15,8 @@ ingest_queue = 1024           # async ingestion backpressure
 # max_open_tenants = 512        # least recently used close past this (0: no limit)
 # tenant_idle_secs = 1800       # unused this long (0: never)
 # tenant_memory_budget_mb = 0   # least recently used close while the open ones' estimate is above it (0: none)
+# One process per deployment (elected) opens closed tenants whose background work is due; `onto serve` stands:
+# wake_poll_secs = 20           # its fallback poll when no wake notice arrives (0: this process never scans)
 
 # [engine.postgres]
 # tenant = "acme"               # one PostgreSQL schema per tenant: {schema_prefix}{tenant}

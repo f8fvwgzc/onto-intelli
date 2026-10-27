@@ -83,6 +83,9 @@ pub struct EngineConfig {
     /// Close the least recently used PostgreSQL tenants while the open ones'
     /// estimated memory (`estimated_bytes`) is above this many MiB (0: no budget).
     pub tenant_memory_budget_mb: u64,
+    /// The deployment's wake scanner (PostgreSQL, `Hub::start_wake_scanner`)
+    /// polls this often when no wake notice arrives (0: no scanner here).
+    pub wake_poll_secs: u64,
     pub postgres: PostgresConfig,
 }
 
@@ -99,6 +102,7 @@ impl Default for EngineConfig {
             max_open_tenants: 512,
             tenant_idle_secs: 1800,
             tenant_memory_budget_mb: 0,
+            wake_poll_secs: 20,
             postgres: PostgresConfig::default(),
         }
     }
