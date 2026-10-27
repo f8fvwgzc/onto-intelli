@@ -30,6 +30,14 @@ use crate::{Error, Result};
 
 /// Most entity ids one filter may name.
 pub const MAX_FILTER_IDS: usize = 1000;
+/// Most kinds, workspaces, relations or properties one filter may name (each).
+pub const MAX_FILTER_NAMES: usize = 100;
+/// Most `ops` one filter may name.
+pub const MAX_FILTER_OPS: usize = 16;
+/// Most source globs one filter may hold.
+pub const MAX_FILTER_SOURCES: usize = 20;
+/// Longest kind, workspace, relation, property or source glob, in bytes.
+pub const MAX_FILTER_NAME_LEN: usize = 256;
 /// Most records scanned per page.
 pub const MAX_PAGE: usize = 1000;
 
@@ -294,6 +302,30 @@ pub struct Gap {
     /// Ids and links this reader may not see (they are left out above).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub hidden: u64,
+    /// The commit touched more than [`MAX_GAP_IDS`] entities and links: the
+    /// lists hold only the first ones, `total` counts them all.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Entities and links the commit touched (set when `truncated`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total: u64,
+}
+
+/// Most entity ids and link keys one gap record lists; the rest are counted.
+pub const MAX_GAP_IDS: usize = 1000;
+
+impl Gap {
+    /// A gap listing at most [`MAX_GAP_IDS`] entities and links (entities
+    /// first), with `truncated` and `total` when there were more.
+    pub fn listing(reason: GapReason, origin: String, mut entities: Vec<Id>, mut links: Vec<LinkKey>) -> Self {
+        let total = entities.len() + links.len();
+        let truncated = total > MAX_GAP_IDS;
+        if truncated {
+            entities.truncate(MAX_GAP_IDS);
+            links.truncate(MAX_GAP_IDS - entities.len());
+        }
+        Gap { reason, origin, entities, links, hidden: 0, truncated, total: if truncated { total as u64 } else { 0 } }
+    }
 }
 
 /// Automation run that caused a write (Part C), carried on the [`ActionContext`].
@@ -565,12 +597,41 @@ impl Default for ChangeFilter {
 }
 
 impl ChangeFilter {
+    /// Refuse filters too large to evaluate cheaply: filtering runs for
+    /// every record a reader scans, and readers need only a read role.
     pub fn check(&self) -> Result<()> {
+        let too_many = |what: &str, n: usize, max: usize| {
+            Error::invalid(format!("a change filter names at most {max} {what} ({n} given)"))
+        };
         if self.ids.len() > MAX_FILTER_IDS {
-            return Err(Error::invalid(format!(
-                "a change filter names at most {MAX_FILTER_IDS} ids ({} given)",
-                self.ids.len()
-            )));
+            return Err(too_many("ids", self.ids.len(), MAX_FILTER_IDS));
+        }
+        if self.ops.len() > MAX_FILTER_OPS {
+            return Err(too_many("ops", self.ops.len(), MAX_FILTER_OPS));
+        }
+        if self.sources.len() > MAX_FILTER_SOURCES {
+            return Err(too_many("sources", self.sources.len(), MAX_FILTER_SOURCES));
+        }
+        for (what, list) in
+            [("kinds", &self.kinds), ("workspaces", &self.workspaces), ("rels", &self.rels), ("props", &self.props)]
+        {
+            if list.len() > MAX_FILTER_NAMES {
+                return Err(too_many(what, list.len(), MAX_FILTER_NAMES));
+            }
+        }
+        for (what, list) in [
+            ("kinds", &self.kinds),
+            ("workspaces", &self.workspaces),
+            ("rels", &self.rels),
+            ("props", &self.props),
+            ("sources", &self.sources),
+        ] {
+            if let Some(long) = list.iter().find(|v| v.len() > MAX_FILTER_NAME_LEN) {
+                return Err(Error::invalid(format!(
+                    "a change filter's {what} are at most {MAX_FILTER_NAME_LEN} bytes each ({} given)",
+                    long.len()
+                )));
+            }
         }
         Ok(())
     }
@@ -786,79 +847,185 @@ pub(crate) fn capture(
 
 // ── filtering and visibility ─────────────────────────────────────────────
 
-fn source_matches(patterns: &[String], source: Option<&str>) -> bool {
-    let text = source.unwrap_or("");
-    if patterns.iter().filter_map(|p| p.strip_prefix('!')).any(|p| source.is_some() && crate::modeling::glob(p, text)) {
-        return false;
-    }
-    let mut includes = patterns.iter().filter(|p| !p.starts_with('!')).peekable();
-    includes.peek().is_none() || source.is_some_and(|s| includes.any(|p| crate::modeling::glob(p, s)))
+/// A source glob, lowercased and split into characters once per filter.
+struct SourceGlob {
+    exclude: bool,
+    pattern: Vec<char>,
 }
 
-/// Does a stored record pass the filter? (Visibility is [`view`]'s job.)
+/// A [`ChangeFilter`] ready to evaluate many records: its source globs are
+/// parsed once, not once per record.
+pub struct FilterEval<'a> {
+    pub filter: &'a ChangeFilter,
+    sources: Vec<SourceGlob>,
+}
+
+impl<'a> FilterEval<'a> {
+    pub fn new(filter: &'a ChangeFilter) -> Self {
+        let sources = filter
+            .sources
+            .iter()
+            .map(|p| match p.strip_prefix('!') {
+                Some(x) => SourceGlob { exclude: true, pattern: x.to_lowercase().chars().collect() },
+                None => SourceGlob { exclude: false, pattern: p.to_lowercase().chars().collect() },
+            })
+            .collect();
+        Self { filter, sources }
+    }
+
+    fn source_matches(&self, source: Option<&str>) -> bool {
+        if self.sources.is_empty() {
+            return true;
+        }
+        let text: Vec<char> = source.unwrap_or("").to_lowercase().chars().collect();
+        if source.is_some() && self.sources.iter().any(|g| g.exclude && crate::modeling::glob_chars(&g.pattern, &text))
+        {
+            return false;
+        }
+        let mut includes = self.sources.iter().filter(|g| !g.exclude).peekable();
+        includes.peek().is_none()
+            || source.is_some() && includes.any(|g| crate::modeling::glob_chars(&g.pattern, &text))
+    }
+
+    /// Does `r`, the record a reader receives (after [`view`]), pass the
+    /// filter? See [`matches`].
+    pub fn matches(&self, schema: &Schema, r: &ChangeRecord) -> bool {
+        let f = self.filter;
+        if r.op == ChangeOp::Gap {
+            return true;
+        }
+        let op_ok = f.ops.is_empty()
+            || f.ops.contains(&r.op)
+            // A reader asking for updates also gets the ones that hid the entity.
+            || (r.op == ChangeOp::EntityHidden && f.ops.contains(&ChangeOp::EntityUpdate));
+        if !op_ok {
+            return false;
+        }
+        // `entity.hidden` carries no cause: the source and migration
+        // dimensions do not apply to it, so a filter cannot probe them.
+        if r.op != ChangeOp::EntityHidden && !self.source_matches(r.cause.source.as_deref()) {
+            return false;
+        }
+        if r.op == ChangeOp::SchemaChange {
+            return true;
+        }
+        if r.cause.migration && !f.include_migrations {
+            return false;
+        }
+        let link = r.link.as_ref();
+        if !f.kinds.is_empty() {
+            let mut kinds: Vec<&str> = match link {
+                Some(l) => l.ends.iter().map(|s| s.kind.as_str()).collect(),
+                None => vec![r.kind.as_str()],
+            };
+            if let Some(k) = r.moved.as_ref().and_then(|m| m.kind.as_ref()) {
+                kinds.push(&k.from);
+            }
+            if !kinds.iter().any(|k| f.kinds.iter().any(|want| schema.kind_is(k, want))) {
+                return false;
+            }
+        }
+        if !f.workspaces.is_empty() {
+            let old = r.moved.as_ref().and_then(|m| m.workspace.as_ref()).map(|w| w.from.as_str());
+            if !f.workspaces.iter().any(|w| *w == r.workspace || Some(w.as_str()) == old) {
+                return false;
+            }
+        }
+        if !f.ids.is_empty() {
+            let hit = match link {
+                Some(l) => f.ids.iter().any(|id| *id == l.from || *id == l.to),
+                None => f.ids.contains(&r.id),
+            };
+            if !hit {
+                return false;
+            }
+        }
+        if !f.rels.is_empty() {
+            let Some(l) = link else { return false };
+            if !f.rels.iter().any(|name| schema.resolve_rel_lenient(name).0 == l.rel) {
+                return false;
+            }
+        }
+        // On the viewed record: a `became_visible` update carries no changed
+        // fields, so a `props` filter does not match it (and cannot probe
+        // what changed while the reader could not see the entity).
+        if !f.props.is_empty()
+            && matches!(r.op, ChangeOp::EntityUpdate | ChangeOp::LinkUpdate)
+            && !r.changed.iter().any(|c| f.props.contains(c))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// A cheap test on the stored record, without the graph: `false` only
+    /// when the reader's record certainly fails the filter. Exact for every
+    /// op whose record no reader sees differently (deletes, links, schema,
+    /// gaps); for creates and updates, which [`view`] may turn into
+    /// `entity.hidden` or a `became_visible` upsert, only the op and id are
+    /// checked here (they do not change), the rest after [`view`].
+    pub fn may_match(&self, schema: &Schema, r: &ChangeRecord) -> bool {
+        let f = self.filter;
+        match r.op {
+            ChangeOp::EntityCreate | ChangeOp::EntityUpdate => {
+                let op_ok = f.ops.is_empty()
+                    || f.ops.contains(&r.op)
+                    || (r.op == ChangeOp::EntityUpdate && f.ops.contains(&ChangeOp::EntityHidden));
+                op_ok && (f.ids.is_empty() || f.ids.contains(&r.id))
+            }
+            _ => self.matches(schema, r),
+        }
+    }
+
+    /// The record `p` receives for `stored` (joined with `entity`), or none:
+    /// [`view`] first, then the filter on what the reader would receive
+    /// (never on fields the view leaves out), then [`redact`].
+    pub fn reader_record(
+        &self,
+        p: &Principal,
+        schema: &Schema,
+        g: &Graph,
+        stored: &StoredChange,
+        entity: Option<Entity>,
+    ) -> Option<ChangeRecord> {
+        if !self.may_match(schema, &stored.record) {
+            return None;
+        }
+        self.view_and_match(p, schema, g, stored, entity)
+    }
+
+    /// [`reader_record`](Self::reader_record) for a record that already
+    /// passed [`may_match`](Self::may_match) (checked outside the graph lock).
+    pub fn view_and_match(
+        &self,
+        p: &Principal,
+        schema: &Schema,
+        g: &Graph,
+        stored: &StoredChange,
+        entity: Option<Entity>,
+    ) -> Option<ChangeRecord> {
+        let record = stored.joined(entity);
+        let mut v = view(p, &record, stored.before_vis.as_ref(), g)?;
+        if !self.matches(schema, &v) {
+            return None;
+        }
+        redact(&mut v, self.filter.fields);
+        Some(v)
+    }
+}
+
+/// Does `r`, the record a reader receives (after [`view`]), pass the filter?
+/// Visibility is [`view`]'s job; filter the viewed record, so a filter can
+/// never test a field the reader is not given ([`FilterEval::reader_record`]
+/// does both in order).
 ///
 /// `gap` records always match. `schema.change` is tenant-wide: it passes the
 /// kind, workspace, id, relation and property dimensions and is not counted
-/// as a migration record.
+/// as a migration record. `entity.hidden` matches on its op (or
+/// `entity.update`), id, kind and workspace only. `props` needs one of its
+/// fields in the viewed record's `changed` (empty for `became_visible`).
 pub fn matches(f: &ChangeFilter, schema: &Schema, r: &ChangeRecord) -> bool {
-    if r.op == ChangeOp::Gap {
-        return true;
-    }
-    let op_ok = f.ops.is_empty()
-        || f.ops.contains(&r.op)
-        // Updates may reach a reader as `entity.hidden`.
-        || (f.ops.contains(&ChangeOp::EntityHidden)
-            && matches!(r.op, ChangeOp::EntityCreate | ChangeOp::EntityUpdate));
-    if !op_ok || !source_matches(&f.sources, r.cause.source.as_deref()) {
-        return false;
-    }
-    if r.op == ChangeOp::SchemaChange {
-        return true;
-    }
-    if r.cause.migration && !f.include_migrations {
-        return false;
-    }
-    let link = r.link.as_ref();
-    if !f.kinds.is_empty() {
-        let mut kinds: Vec<&str> = match link {
-            Some(l) => l.ends.iter().map(|s| s.kind.as_str()).collect(),
-            None => vec![r.kind.as_str()],
-        };
-        if let Some(k) = r.moved.as_ref().and_then(|m| m.kind.as_ref()) {
-            kinds.push(&k.from);
-        }
-        if !kinds.iter().any(|k| f.kinds.iter().any(|want| schema.kind_is(k, want))) {
-            return false;
-        }
-    }
-    if !f.workspaces.is_empty() {
-        let old = r.moved.as_ref().and_then(|m| m.workspace.as_ref()).map(|w| w.from.as_str());
-        if !f.workspaces.iter().any(|w| *w == r.workspace || Some(w.as_str()) == old) {
-            return false;
-        }
-    }
-    if !f.ids.is_empty() {
-        let hit = match link {
-            Some(l) => f.ids.iter().any(|id| *id == l.from || *id == l.to),
-            None => f.ids.contains(&r.id),
-        };
-        if !hit {
-            return false;
-        }
-    }
-    if !f.rels.is_empty() {
-        let Some(l) = link else { return false };
-        if !f.rels.iter().any(|name| schema.resolve_rel_lenient(name).0 == l.rel) {
-            return false;
-        }
-    }
-    if !f.props.is_empty()
-        && matches!(r.op, ChangeOp::EntityUpdate | ChangeOp::LinkUpdate)
-        && !r.changed.iter().any(|c| f.props.contains(c))
-    {
-        return false;
-    }
-    true
+    FilterEval::new(f).matches(schema, r)
 }
 
 fn stub_visible(p: &Principal, s: &VisStub, g: &Graph) -> bool {
@@ -883,8 +1050,8 @@ fn reads_tenant(p: &Principal) -> bool {
 /// membership in `acl` is judged on it).
 ///
 /// Create or update: visible after and before → the record with `before`;
-/// visible only after → without `before`, old state or move, with
-/// `became_visible` (updates); visible only before → `entity.hidden` with
+/// visible only after → without `before`, `changed`, old state or move,
+/// with `became_visible` (updates); visible only before → `entity.hidden` with
 /// the old id, kind and workspace and nothing else. Deletes carry id, kind
 /// and workspace. Links need both ends visible. `schema.change` and `gap`
 /// go to every reader; a gap lists only what the reader can see now and
@@ -902,6 +1069,9 @@ pub fn view(p: &Principal, r: &ChangeRecord, before_vis: Option<&VisStub>, g: &G
                 (true, false) => {
                     let mut v = r.clone();
                     v.before.clear();
+                    // Which fields changed while the reader could not see
+                    // the entity is not theirs to know either.
+                    v.changed.clear();
                     v.moved = None;
                     if let Some(s) = &mut v.state {
                         s.from = None;
@@ -973,8 +1143,9 @@ pub fn redact(r: &mut ChangeRecord, mode: FieldMode) {
 impl Ontology {
     /// Records after `after` that `p` may see and `f` wants, at most `limit`
     /// scanned (≤ [`MAX_PAGE`]). Refuses with `unavailable` when the store
-    /// keeps no change log. An `after` older than the floor returns no
-    /// records and `expired = true`.
+    /// keeps no change log. An `after` older than the floor, or ahead of the
+    /// head (a cursor from before a restart or restore), returns no records
+    /// and `expired = true`.
     pub fn changes_page(&self, p: &Principal, after: Cursor, f: &ChangeFilter, limit: usize) -> Result<ChangePage> {
         self.changes_page_valid_from(p, after, after.seq, f, limit)
     }
@@ -1006,28 +1177,42 @@ impl Ontology {
         }
         let page = self.store().changes_since(after, limit.clamp(1, MAX_PAGE))?;
         let (head, floor) = (page.head.seq, page.floor);
-        if valid_from < floor {
+        // Older than the floor, or ahead of the head: a cursor from before
+        // the store restarted, was provisioned again or restored from an
+        // older backup. Either way records may be missing; never skip them
+        // silently.
+        if valid_from < floor || after > page.head {
             return Ok(ChangePage { changes: Vec::new(), next: after, head, floor, expired: true });
         }
         if page.changes.is_empty() {
             // Nothing after `after` up to the head (read in the same
             // snapshot): resume from the head, so a reader that started
             // before the floor's commit is not reported expired next time.
+            // (Commits made while capture is off leave no records; turning
+            // it on again writes a gap after the head, so a reader moved
+            // here meanwhile is told.)
             return Ok(ChangePage { changes: Vec::new(), next: after.max(page.head), head, floor, expired: false });
         }
         let schema = self.schema();
-        let g = self.reader(p)?;
-        let mut changes = Vec::new();
+        let eval = FilterEval::new(f);
         let mut next = after;
-        for (stored, entity) in page.changes {
-            next = stored.record.cursor;
-            if !matches(f, &schema, &stored.record) {
-                continue;
-            }
-            let record = stored.joined(entity);
-            if let Some(mut v) = view(p, &record, stored.before_vis.as_ref(), &g) {
-                redact(&mut v, f.fields);
-                changes.push(v);
+        // The filter's graph-free part runs before the graph read lock is
+        // taken, so a writer waits only for the visibility checks.
+        let candidates: Vec<_> = page
+            .changes
+            .into_iter()
+            .filter(|(stored, _)| {
+                next = stored.record.cursor;
+                eval.may_match(&schema, &stored.record)
+            })
+            .collect();
+        let mut changes = Vec::new();
+        if !candidates.is_empty() {
+            let g = self.reader(p)?;
+            for (stored, entity) in candidates {
+                if let Some(v) = eval.view_and_match(p, &schema, &g, &stored, entity) {
+                    changes.push(v);
+                }
             }
         }
         Ok(ChangePage { changes, next, head, floor, expired: false })
@@ -1348,7 +1533,19 @@ mod tests {
         // ops
         assert!(matches(&f(json!({"ops": ["entity.update"]})), &s, &issue));
         assert!(!matches(&f(json!({"ops": ["entity.update"]})), &s, &svc));
-        assert!(matches(&f(json!({"ops": ["entity.hidden"]})), &s, &issue), "updates can become entity.hidden");
+        // A stored update may reach a reader as entity.hidden: it passes the
+        // graph-free check, and the viewed record decides.
+        let hidden_only = f(json!({"ops": ["entity.hidden"]}));
+        assert!(FilterEval::new(&hidden_only).may_match(&s, &issue), "updates can become entity.hidden");
+        assert!(!matches(&hidden_only, &s, &issue), "a visible update is not entity.hidden");
+        let mut hid = rec(ChangeOp::EntityHidden, "issue", "issue:1");
+        hid.cause.source = Some("api".into());
+        assert!(matches(&hidden_only, &s, &hid));
+        assert!(matches(&f(json!({"ops": ["entity.update"]})), &s, &hid), "asked for updates: hidden ones too");
+        assert!(!matches(&f(json!({"ops": ["entity.create"]})), &s, &hid));
+        // entity.hidden ignores props and sources (it carries neither).
+        assert!(matches(&f(json!({"sources": ["cli"], "props": ["salary"]})), &s, &hid));
+        assert!(!FilterEval::new(&f(json!({"ops": ["entity.create"]}))).may_match(&s, &issue));
         // ids
         assert!(matches(&f(json!({"ids": ["issue:1"]})), &s, &issue));
         assert!(!matches(&f(json!({"ids": ["issue:2"]})), &s, &issue));
@@ -1399,6 +1596,8 @@ mod tests {
                 entities: vec![],
                 links: vec![],
                 hidden: 0,
+                truncated: false,
+                total: 0,
             },
         );
         assert!(matches(
@@ -1524,6 +1723,8 @@ mod tests {
                 entities: vec!["issue:1".into(), "issue:2".into(), "issue:3".into()],
                 links: vec![("issue:1".into(), "depends_on".into(), "issue:2".into())],
                 hidden: 0,
+                truncated: false,
+                total: 0,
             },
         );
         let v = view(&viewer(), &r, None, &g).unwrap();

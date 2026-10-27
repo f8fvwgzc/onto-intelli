@@ -162,7 +162,9 @@ pub struct ChangeRecord {
     pub became_visible: bool,           // the reader could not see it before this change
     pub link: Option<LinkChange>,       // {from, rel, to, props, ends: [VisStub; 2]}
     pub schema: Option<SchemaMove>,     // {version, renames: [{what: kind|rel, from, to}]}
-    pub gap: Option<Gap>,               // {reason: uncaptured_writer|bulk_import|capture_enabled, origin, entities, links}
+    pub gap: Option<Gap>,               // {reason: uncaptured_writer|bulk_import|capture_enabled, origin, entities, links,
+                                        //  hidden, truncated, total}: at most 1000 ids and links listed (MAX_GAP_IDS);
+                                        //  past that `truncated` and `total` (a bulk import is one gap of any size)
     pub cause: Cause,
 }
 
@@ -184,7 +186,9 @@ pub struct ChangeFilter {               // streams, poll, webhook endpoints, aut
     pub sources: Vec<String>,           // glob on cause.source; "!x" excludes
     pub include_migrations: bool,       // default true (streams, poll, webhooks); automations default false
     pub fields: FieldMode,              // full | ids
-}
+}   // check(): ≤ 100 kinds, workspaces, rels and props each, ≤ 16 ops, ≤ 20 sources, names ≤ 256 bytes
+    // (filtering runs per record for any reader); filters apply to the record the reader receives
+    // (after `view`), so they cannot probe fields `entity.hidden` or `became_visible` leave out
 
 pub struct ChangePage { pub changes: Vec<ChangeRecord>, pub next: Cursor, pub head: u64,
                         pub floor: u64, pub expired: bool }
@@ -287,7 +291,10 @@ run retention.
 A cursor is expired iff `cursor.seq < floor`. A client fully caught up on seq `F - 1` is also
 reported expired: that is a false `reset` at the exact retention edge, never a silent gap.
 `changes.capture {on: true}` after a period off sets `floor` to the new head, so every older cursor
-is expired (nothing was recorded while capture was off).
+is expired (nothing was recorded while capture was off), and appends a `gap` (reason
+`capture_enabled`) after every cursor at the head, because a reader that kept polling or streaming
+while capture was off was moved to the head over the unrecorded commits. A cursor ahead of the head
+(from before a restart, a re-provisioned tenant or a restore) is expired too.
 
 Consistent resync is not offered in phase 1: there is no snapshot pinned to a cursor, and
 `entity.find` paging is not consistent with any cursor. `reset` and `gap` say so in their `message`
@@ -311,7 +318,7 @@ impl ChangeHub {
     pub(crate) fn install(intelli: &Arc<Intelli>) -> Arc<Self>;
     pub fn subscribe(&self, intelli: Weak<Intelli>, p: Principal, f: ChangeFilter, start: Start)
         -> Result<Subscription>;                   // Subscription { rx: mpsc::Receiver<Frame>, cursor }
-    pub fn bytes(&self) -> usize;                  // ring size, for Intelli::estimated_bytes
+    pub fn bytes(&self) -> usize;                  // ring plus cached group pages, for Intelli::estimated_bytes
 }
 pub enum Start { Now, Earliest, After(Cursor) }
 pub enum Frame { Change(Box<ChangeRecord>), Heartbeat { cursor: Cursor, head: u64 },
@@ -350,7 +357,9 @@ One producer task per subscription, one bounded `mpsc::channel(64)`:
 6. Every `heartbeat_secs` (15): `Heartbeat { cursor = last scanned }`.
 7. Every `reauth_secs` (60): re-authenticate the original headers and re-derive the principal. A
    revoked credential ends with `unauthenticated`; a different `scope_key()` ends with
-   `principal_changed`; the client reconnects with its new scope.
+   `principal_changed`; the client reconnects with its new scope. A check that cannot be made (the
+   control store is unreachable) is retried at the next period; two in a row end the stream with
+   `unavailable`, so an unchecked stream runs at most two periods.
 
 Limits: `max_subscribers` per tenant per process (200), `max_subscribers_per_principal` (20) and
 `max_subscribers_process` (2000); over a limit, `subscribe` fails with `Error::Limited` (HTTP 429).
@@ -408,7 +417,10 @@ head, floor, expired}`; `changes.head {}` → `{cursor, head, floor, capture}`; 
   `follow_interval_ms` poll), so a lost notice delays, never drops.
 - Writers that do not capture (a replica still on the old build during a rolling deploy, the default
   `bulk_import`, any future path around `commit_locked`) produce `gap` records through the trigger or
-  `MemoryStore::write`. Subscribers see the gap; nothing is skipped silently.
+  `MemoryStore::write`. Subscribers see the gap; nothing is skipped silently. An old-build replica
+  writes only to tenants it already has open: once a tenant is migrated it cannot open it again (after
+  idle or limit eviction), so drain old replicas or hold their tenants open for the roll
+  (docs/STORAGE.md, upgrades and rollbacks).
 - Gaps in `seq` are normal (KV-only commits); the cursor is an order, not a count.
 
 ### A.8 SDK helpers
@@ -1062,7 +1074,8 @@ tenant ids and times only. `tenant_schema` refuses tenant ids that map to `{pref
   that enqueues outbox rows, schedules a retry, or commits changes while the tenant has enabled
   endpoints or automations upserts `wake.due_at = LEAST(due_at, $due), bumped = bumped + 1`. One
   scanner per deployment, elected with `pg_try_advisory_lock(hashtext('<prefix>_sys.wake'))`,
-  wakes on `LISTEN <prefix>_wake` (NOTIFY sent with the upsert) or every `wake_poll_secs`, selects
+  wakes on `LISTEN "<prefix>-wake"` (NOTIFY sent with the upsert; the `-` keeps the channel apart from tenant
+  notice channels, which are schema names) or every `wake_poll_secs`, selects
   `due_at <= now_ms()`, and opens those tenants on its replica (affinity: the scanner replica does
   background work for otherwise-closed tenants). When a tenant's workers drain, they set the next due
   time with `UPDATE … WHERE bumped = $seen` (compare-and-set, so a concurrent upsert is not lost).

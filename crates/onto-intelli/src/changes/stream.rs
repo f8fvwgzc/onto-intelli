@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tracing::Instrument;
 
-use onto_core::changes::{ChangeFilter, ChangeRecord, ChangesMeta, Cursor, StoredChange, matches, redact, view};
+use onto_core::changes::{ChangeFilter, ChangeRecord, ChangesMeta, Cursor, FilterEval, StoredChange};
 use onto_core::{Access, Entity, Error, Ontology, Principal, Result};
 
 use crate::config::ChangesConfig;
@@ -55,6 +55,12 @@ pub const BACKFILL_READS: usize = 4;
 const SLICE: usize = 64;
 /// Evaluated pages a group keeps for members at the same cursor.
 const GROUP_PAGES: usize = 8;
+/// Most memory (approximate) one group's evaluated pages may hold.
+const GROUP_CACHE_BYTES: usize = 8 << 20;
+/// Re-authentications in a row that may fail as `unavailable` before the
+/// stream ends: a stream runs unchecked for less than this many
+/// `reauth_secs` periods past the last successful check.
+pub const REAUTH_UNAVAILABLE_LIMIT: u32 = 2;
 
 /// Streams open in this process, all tenants together.
 static PROCESS_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
@@ -78,7 +84,8 @@ pub enum Frame {
     Change(Arc<ChangeRecord>),
     /// Nothing more for this reader up to `cursor` (the last one scanned).
     Heartbeat { cursor: Cursor, head: u64 },
-    /// The cursor is older than the floor: records may be missing.
+    /// The cursor is older than the floor (or ahead of the head): records
+    /// may be missing.
     Reset { code: &'static str, floor: u64, head: u64, message: String },
     /// The stream ended; reconnect after `cursor` (unless the code says otherwise).
     End { code: &'static str, cursor: Cursor, message: String },
@@ -130,7 +137,9 @@ pub enum ReauthError {
     /// It authenticates but may no longer use this tenant: the stream ends.
     Denied(String),
     /// Authentication could not be checked now: the stream goes on and
-    /// tries again next time.
+    /// tries again next time, at most [`REAUTH_UNAVAILABLE_LIMIT`] times in a
+    /// row; then it ends `unavailable` (the client reconnects, and its new
+    /// request is admitted or refused like any other).
     Unavailable(String),
 }
 
@@ -170,7 +179,8 @@ struct Ring {
     last: Cursor,
     head: Cursor,
     floor: u64,
-    records: VecDeque<Arc<Row>>,
+    /// Each record with its approximate size (measured once, on append).
+    records: VecDeque<(Arc<Row>, usize)>,
     bytes: usize,
 }
 
@@ -189,25 +199,165 @@ impl Ring {
 
     /// Records after `c`, at most `limit`.
     fn after(&self, c: Cursor, limit: usize) -> Vec<Arc<Row>> {
-        let start = self.records.partition_point(|r| r.0.record.cursor <= c);
-        self.records.range(start..).take(limit).cloned().collect()
+        let start = self.records.partition_point(|r| r.0.0.record.cursor <= c);
+        self.records.range(start..).take(limit).map(|(r, _)| r.clone()).collect()
     }
+}
+
+/// Approximate memory of a JSON value (walked, not serialized).
+fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::String(s) => 24 + s.len(),
+        Value::Array(a) => 24 + a.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(o) => 48 + o.iter().map(|(k, v)| 24 + k.len() + value_bytes(v)).sum::<usize>(),
+        _ => 16,
+    }
+}
+
+/// Approximate memory of an entity.
+fn entity_bytes(e: &Entity) -> usize {
+    256 + e.id.len()
+        + e.kind.len()
+        + e.workspace.len()
+        + e.title.len()
+        + e.aliases.iter().map(|a| 24 + a.len()).sum::<usize>()
+        + e.props.iter().map(|(k, v)| 24 + k.len() + value_bytes(v)).sum::<usize>()
+}
+
+/// Approximate memory of one change record (with its entity, when joined).
+fn record_bytes(r: &ChangeRecord) -> usize {
+    let gap = r.gap.as_ref().map_or(0, |g| {
+        g.entities.iter().map(|id| 24 + id.len()).sum::<usize>()
+            + g.links.iter().map(|(a, b, c)| 72 + a.len() + b.len() + c.len()).sum::<usize>()
+    });
+    256 + r.id.len()
+        + r.kind.len()
+        + r.workspace.len()
+        + r.changed.iter().map(|c| 24 + c.len()).sum::<usize>()
+        + r.before.iter().map(|(k, v)| 24 + k.len() + value_bytes(v)).sum::<usize>()
+        + r.entity.as_ref().map_or(0, entity_bytes)
+        + r.link.as_ref().map_or(0, |l| 128 + l.props.iter().map(|(k, v)| 24 + k.len() + value_bytes(v)).sum::<usize>())
+        + gap
 }
 
 /// Approximate memory of one ring record.
 fn row_bytes(r: &Row) -> usize {
-    let doc = serde_json::to_string(&r.0).map_or(0, |s| s.len());
-    let entity = r.1.as_ref().and_then(|e| serde_json::to_string(e).ok()).map_or(0, |s| s.len());
-    128 + doc + entity
+    record_bytes(&r.0.record) + r.1.as_ref().map_or(0, entity_bytes)
 }
 
 /// Subscribers that see the same records: same principal scope, same
 /// filter. They share evaluated pages.
 type GroupKey = (String, Option<String>, String);
 
-#[derive(Default)]
+///
+/// Evaluated pages are kept only while another member may still ask for
+/// them: never for a group of one, and only pages starting at or after the
+/// slowest member's cursor, at most [`GROUP_PAGES`] and
+/// [`GROUP_CACHE_BYTES`]. Their size is counted in [`ChangeHub::bytes`].
 struct Group {
     pages: tokio::sync::Mutex<VecDeque<Evaluated>>,
+    /// Each member's cursor (by member id).
+    members: Mutex<HashMap<u64, Cursor>>,
+    /// Bytes of `pages`, also added to the hub's `cache_bytes`.
+    bytes: AtomicUsize,
+    hub_bytes: Arc<AtomicUsize>,
+}
+
+impl Group {
+    fn new(hub_bytes: Arc<AtomicUsize>) -> Self {
+        Group {
+            pages: tokio::sync::Mutex::new(VecDeque::new()),
+            members: Mutex::new(HashMap::new()),
+            bytes: AtomicUsize::new(0),
+            hub_bytes,
+        }
+    }
+
+    /// The slowest member's cursor and the number of members.
+    fn slowest(&self) -> (Option<Cursor>, usize) {
+        let m = self.members.lock();
+        (m.values().min().copied(), m.len())
+    }
+
+    fn push(&self, pages: &mut VecDeque<Evaluated>, e: Evaluated) {
+        self.bytes.fetch_add(e.bytes, Ordering::AcqRel);
+        self.hub_bytes.fetch_add(e.bytes, Ordering::AcqRel);
+        pages.push_back(e);
+    }
+
+    fn pop(&self, pages: &mut VecDeque<Evaluated>) {
+        if let Some(e) = pages.pop_front() {
+            self.bytes.fetch_sub(e.bytes, Ordering::AcqRel);
+            self.hub_bytes.fetch_sub(e.bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Drop pages no member will ask for (they start before the slowest
+    /// member's cursor, or the group has one member left), then trim to the
+    /// count and byte caps.
+    fn trim(&self, pages: &mut VecDeque<Evaluated>) {
+        let (slowest, members) = self.slowest();
+        if members <= 1 {
+            while !pages.is_empty() {
+                self.pop(pages);
+            }
+            return;
+        }
+        let keep_from = slowest.unwrap_or_default();
+        let old = pages.len();
+        let mut kept = VecDeque::with_capacity(old);
+        while let Some(e) = pages.pop_front() {
+            if e.from < keep_from {
+                self.bytes.fetch_sub(e.bytes, Ordering::AcqRel);
+                self.hub_bytes.fetch_sub(e.bytes, Ordering::AcqRel);
+            } else {
+                kept.push_back(e);
+            }
+        }
+        *pages = kept;
+        while pages.len() > GROUP_PAGES || (pages.len() > 1 && self.bytes.load(Ordering::Acquire) > GROUP_CACHE_BYTES) {
+            self.pop(pages);
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.hub_bytes.fetch_sub(*self.bytes.get_mut(), Ordering::AcqRel);
+    }
+}
+
+/// One subscriber's place in its group; leaves the group when dropped.
+struct Member {
+    group: Arc<Group>,
+    id: u64,
+}
+
+impl Member {
+    fn join(group: Arc<Group>, cursor: Cursor) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        group.members.lock().insert(id, cursor);
+        Member { group, id }
+    }
+
+    /// Record this member's cursor, and drop cached pages every member has
+    /// passed (when no evaluation holds the cache right now).
+    fn moved(&self, cursor: Cursor) {
+        self.group.members.lock().insert(self.id, cursor);
+        if let Ok(mut pages) = self.group.pages.try_lock() {
+            self.group.trim(&mut pages);
+        }
+    }
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        self.group.members.lock().remove(&self.id);
+        if let Ok(mut pages) = self.group.pages.try_lock() {
+            self.group.trim(&mut pages);
+        }
+    }
 }
 
 /// One evaluated page: the records after `from` up to `to` this group sees.
@@ -215,6 +365,7 @@ struct Evaluated {
     from: Cursor,
     to: Cursor,
     records: Arc<Vec<Arc<ChangeRecord>>>,
+    bytes: usize,
 }
 
 #[derive(Default)]
@@ -235,6 +386,8 @@ pub struct ChangeHub {
     generation: AtomicU64,
     backfill: Semaphore,
     groups: Mutex<HashMap<GroupKey, Weak<Group>>>,
+    /// Bytes of every group's evaluated pages.
+    cache_bytes: Arc<AtomicUsize>,
     counts: Mutex<Counts>,
     me: Weak<ChangeHub>,
 }
@@ -261,14 +414,21 @@ impl ChangeHub {
             generation: AtomicU64::new(0),
             backfill: Semaphore::new(BACKFILL_READS),
             groups: Mutex::new(HashMap::new()),
+            cache_bytes: Arc::new(AtomicUsize::new(0)),
             counts: Mutex::new(Counts::default()),
             me: me.clone(),
         })
     }
 
-    /// Memory of the ring (0 without subscribers), for the memory budget.
+    /// Memory of the ring (0 without subscribers) and of the evaluated
+    /// pages groups keep for their members, for the memory budget.
     pub fn bytes(&self) -> usize {
-        self.ring.read().as_ref().map_or(0, |r| r.bytes)
+        self.ring.read().as_ref().map_or(0, |r| r.bytes) + self.cache_bytes()
+    }
+
+    /// Memory of the evaluated pages groups keep (part of [`bytes`](Self::bytes)).
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes.load(Ordering::Acquire)
     }
 
     /// Open streams of this tenant in this process.
@@ -321,11 +481,17 @@ impl ChangeHub {
             Start::Earliest => (Cursor::new(meta.floor - 1, u32::MAX), meta.floor),
             Start::After(c) => (c, c.seq),
         };
+        // A cursor ahead of the store's head comes from before a restart or
+        // restore: the stream resets at once rather than skip what the new
+        // head has not reached yet. (The store's head is shared by every
+        // replica and only moves forward, so a cursor any replica gave out
+        // is never ahead of it.)
+        let ahead = cursor > meta.head;
         let guard = Guard::admit(&me, &p.id)?;
         if let Some(generation) = self.ensure_ring(&meta) {
             spawn_tail(Arc::downgrade(&me), intelli.clone(), generation, closing.clone());
         }
-        let group = self.group(&p, &f);
+        let member = Member::join(self.group(&p, &f), cursor);
         let (tx, rx) = mpsc::channel(CHANNEL);
         let (last_tx, last_rx) = oneshot::channel();
         let span = tracing::info_span!("changes.subscribe", principal = %p.id, cursor = %cursor);
@@ -335,12 +501,14 @@ impl ChangeHub {
             closing,
             p,
             f: Arc::new(f),
-            group,
+            member,
             cursor,
             valid_from,
+            ahead,
             tx,
             last: Some(last_tx),
             reauth,
+            reauth_unavailable: 0,
             _guard: guard,
         };
         tokio::spawn(producer.run().instrument(span));
@@ -367,7 +535,7 @@ impl ChangeHub {
         if let Some(g) = groups.get(&key).and_then(Weak::upgrade) {
             return g;
         }
-        let g = Arc::new(Group::default());
+        let g = Arc::new(Group::new(self.cache_bytes.clone()));
         groups.insert(key, Arc::downgrade(&g));
         g
     }
@@ -384,11 +552,12 @@ impl ChangeHub {
                     continue;
                 }
                 ring.last = row.0.record.cursor;
-                ring.bytes += row_bytes(&row);
-                ring.records.push_back(Arc::new(row));
+                let size = row_bytes(&row);
+                ring.bytes += size;
+                ring.records.push_back((Arc::new(row), size));
                 while ring.records.len() > self.cfg.ring {
-                    if let Some(old) = ring.records.pop_front() {
-                        ring.bytes = ring.bytes.saturating_sub(row_bytes(&old));
+                    if let Some((old, size)) = ring.records.pop_front() {
+                        ring.bytes = ring.bytes.saturating_sub(size);
                         ring.covered_from = old.0.record.cursor;
                     }
                 }
@@ -539,7 +708,7 @@ enum Next {
     Rows(Vec<Arc<Row>>),
     /// Nothing after the cursor up to `at` (resume there).
     Caught(Cursor),
-    /// The cursor is older than the floor.
+    /// The cursor is older than the floor or ahead of the head.
     Expired { floor: u64, head: u64 },
 }
 
@@ -552,13 +721,17 @@ struct Producer {
     closing: watch::Receiver<bool>,
     p: Principal,
     f: Arc<ChangeFilter>,
-    group: Arc<Group>,
+    member: Member,
     cursor: Cursor,
     /// Records before this seq were promised: expired iff it is below the floor.
     valid_from: u64,
+    /// The start cursor was ahead of the store's head: reset at once.
+    ahead: bool,
     tx: mpsc::Sender<Frame>,
     last: Option<oneshot::Sender<Frame>>,
     reauth: Option<Reauth>,
+    /// Re-authentications in a row that could not be checked.
+    reauth_unavailable: u32,
     _guard: Guard,
 }
 
@@ -634,6 +807,9 @@ impl Producer {
             return Err(Some(Stop(self.tenant_closed())));
         }
         let (head, floor) = self.hub.position();
+        if self.ahead {
+            return Err(Some(Stop(self.reset(floor, head))));
+        }
         if self.valid_from.max(self.cursor.seq) < floor {
             return Err(Some(Stop(self.reset(floor, head))));
         }
@@ -663,6 +839,7 @@ impl Producer {
             Next::Expired { floor, head } => return Err(Some(Stop(self.reset(floor, head)))),
             Next::Caught(at) => {
                 self.cursor = self.cursor.max(at);
+                self.member.moved(self.cursor);
                 return Ok(true);
             }
             Next::Rows(rows) => rows,
@@ -681,6 +858,7 @@ impl Producer {
             self.send(Frame::Change(r.clone()), cfg).await?;
         }
         self.cursor = to;
+        self.member.moved(to);
         Ok(false)
     }
 
@@ -720,7 +898,7 @@ impl Producer {
         let page = tokio::task::spawn_blocking(move || store.changes_since(after, limit))
             .await
             .map_err(|e| Error::Other(format!("reading the change feed: {e}")))??;
-        if self.valid_from.max(self.cursor.seq) < page.floor {
+        if self.valid_from.max(self.cursor.seq) < page.floor || self.cursor > page.head {
             return Ok(Next::Expired { floor: page.floor, head: page.head.seq });
         }
         if page.changes.is_empty() {
@@ -739,7 +917,8 @@ impl Producer {
         cfg: &ChangesConfig,
     ) -> Result<(Arc<Vec<Arc<ChangeRecord>>>, Cursor)> {
         let from = self.cursor;
-        let mut pages = self.group.pages.lock().await;
+        let group = &self.member.group;
+        let mut pages = group.pages.lock().await;
         if let Some(e) = pages.iter().find(|e| e.from == from) {
             return Ok((e.records.clone(), e.to));
         }
@@ -753,10 +932,12 @@ impl Producer {
             .await
             .map_err(|e| Error::Other(format!("filtering the change feed: {e}")))?;
         let records = Arc::new(records);
-        pages.push_back(Evaluated { from, to, records: records.clone() });
-        while pages.len() > GROUP_PAGES {
-            pages.pop_front();
+        // Kept only for other members still behind or at this page.
+        if group.slowest().1 > 1 {
+            let bytes = 64 + records.iter().map(|r| 16 + record_bytes(r)).sum::<usize>();
+            group.push(&mut pages, Evaluated { from, to, records: records.clone(), bytes });
         }
+        group.trim(&mut pages);
         Ok((records, to))
     }
 
@@ -766,8 +947,13 @@ impl Producer {
     /// entity) `principal_changed`.
     async fn reauthenticate(&mut self) -> std::result::Result<(), Stop> {
         let Some(reauth) = self.reauth.clone() else { return Ok(()) };
-        let end = |code: &'static str, message: String| Stop(Frame::End { code, cursor: self.cursor, message });
-        match reauth().await {
+        let cursor = self.cursor;
+        let end = move |code: &'static str, message: String| Stop(Frame::End { code, cursor, message });
+        let result = reauth().await;
+        if !matches!(result, Err(ReauthError::Unavailable(_))) {
+            self.reauth_unavailable = 0;
+        }
+        match result {
             Ok(p) if p.scope_key() != self.p.scope_key() || p.entity != self.p.entity => Err(end(
                 "principal_changed",
                 "the caller's roles, workspaces or entity changed; reconnect to stream with the new scope".into(),
@@ -779,6 +965,17 @@ impl Producer {
             }
             Err(ReauthError::Denied(m)) => Err(end("permission_denied", m)),
             Err(ReauthError::Unavailable(m)) => {
+                self.reauth_unavailable += 1;
+                if self.reauth_unavailable >= REAUTH_UNAVAILABLE_LIMIT {
+                    return Err(end(
+                        "unavailable",
+                        format!(
+                            "the credential could not be re-checked {} times in a row ({m}); reconnect with \
+                             Last-Event-ID to resume",
+                            self.reauth_unavailable
+                        ),
+                    ));
+                }
                 tracing::warn!("change stream re-authentication could not be checked: {m}");
                 Ok(())
             }
@@ -798,23 +995,26 @@ fn evaluate_rows(
     budget: Duration,
 ) -> (Vec<Arc<ChangeRecord>>, Cursor) {
     let started = Instant::now();
+    let eval = FilterEval::new(f);
+    let schema = onto.schema();
     let mut out = Vec::new();
     let mut to = from;
     for slice in rows.chunks(SLICE) {
-        onto.read(|g, schema| {
-            for row in slice {
-                let (stored, entity) = row.as_ref();
-                to = stored.record.cursor;
-                if !matches(f, schema, &stored.record) {
-                    continue;
+        // The graph-free part of the filter runs before the read lock.
+        let candidates: Vec<&Row> =
+            slice.iter().map(|r| r.as_ref()).filter(|(stored, _)| eval.may_match(&schema, &stored.record)).collect();
+        if let Some(last) = slice.last() {
+            to = last.0.record.cursor;
+        }
+        if !candidates.is_empty() {
+            onto.read(|g, schema| {
+                for (stored, entity) in candidates {
+                    if let Some(v) = eval.view_and_match(p, schema, g, stored, entity.clone()) {
+                        out.push(Arc::new(v));
+                    }
                 }
-                let record = stored.joined(entity.clone());
-                if let Some(mut v) = view(p, &record, stored.before_vis.as_ref(), g) {
-                    redact(&mut v, f.fields);
-                    out.push(Arc::new(v));
-                }
-            }
-        });
+            });
+        }
         if started.elapsed() >= budget {
             break;
         }

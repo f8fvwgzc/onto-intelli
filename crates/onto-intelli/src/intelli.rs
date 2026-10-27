@@ -281,6 +281,9 @@ impl Intelli {
         if me.traces.is_some() {
             spawn_trace_retention(&me);
         }
+        if me.onto.store().keeps_changes() {
+            spawn_change_retention(&me);
+        }
         Ok(me)
     }
 
@@ -520,6 +523,14 @@ impl Intelli {
     pub fn vacuum_traces(&self) -> Result<u64> {
         let before = onto_core::time::now_ms() - i64::from(self.trace_retention_days()) * 86_400_000;
         self.onto.store().trace_vacuum(before, Duration::from_secs(60))
+    }
+
+    /// Remove change records past `[changes] retain_days` and
+    /// `retain_max_rows` (whole commits) and raise the floor over them in the
+    /// same step, so their cursors read as expired, never as a silent skip.
+    /// Blocking: the retention task runs it on the blocking pool.
+    pub fn vacuum_changes(&self) -> Result<onto_core::changes::ChangeVacuum> {
+        self.onto.store().vacuum_changes(&self.config.changes.retention())
     }
 
     pub fn default_workspace(&self) -> &str {
@@ -1292,6 +1303,28 @@ fn spawn_trace_retention(me: &Arc<Intelli>) {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!("trace retention: {e}"),
                 Err(e) => tracing::warn!("trace retention: {e}"),
+            }
+        }
+    });
+}
+
+/// Trim the change feed ([`Intelli::vacuum_changes`]) 5 minutes after the
+/// tenant opens, then hourly, for as long as it is open. Every process with
+/// the tenant open runs it; a pass is one transaction that locks the floor,
+/// so passes from several replicas only repeat the same trim.
+fn spawn_change_retention(me: &Arc<Intelli>) {
+    let weak = Arc::downgrade(me);
+    tokio::spawn(async move {
+        let mut wait = Duration::from_secs(300);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = Duration::from_secs(3600);
+            let Some(me) = weak.upgrade() else { break };
+            match tokio::task::spawn_blocking(move || me.vacuum_changes()).await {
+                Ok(Ok(v)) if v.deleted > 0 => tracing::info!(rows = v.deleted, floor = v.floor, "change retention"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("change retention: {e}"),
+                Err(e) => tracing::warn!("change retention: {e}"),
             }
         }
     });

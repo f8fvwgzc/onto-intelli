@@ -421,18 +421,19 @@ fn earliest_starts_at_the_floor_on(o: &Ontology) {
         vec![(ChangeOp::EntityCreate, "issue:3".into()), (ChangeOp::EntityCreate, "issue:4".into())]
     );
 
-    // Capture off, a write, capture on: the floor is the head commit, which
-    // has no records. Earliest is empty and resumes from the head without
-    // a reset.
+    // Capture off, a write, capture on: the floor is the head commit, whose
+    // only record is the capture_enabled gap. Earliest gets that gap and
+    // resumes from the head without a reset.
     o.set_capture(&ctx("ws1"), false).unwrap();
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("5", "ws1"))]).unwrap();
     o.set_capture(&ctx("ws1"), true).unwrap();
-    let empty = o.changes_page_earliest(&admin(), &f, 100).unwrap();
-    assert!(!empty.expired && empty.changes.is_empty(), "{empty:?}");
-    assert_eq!(empty.next, o.change_head().unwrap());
-    assert!(!o.changes_page(&admin(), empty.next, &f, 100).unwrap().expired);
+    let first = o.changes_page_earliest(&admin(), &f, 100).unwrap();
+    assert!(!first.expired, "{first:?}");
+    assert_eq!(only_gap(&first.changes).reason, GapReason::CaptureEnabled);
+    assert_eq!(first.next, o.change_head().unwrap());
+    assert!(!o.changes_page(&admin(), first.next, &f, 100).unwrap().expired);
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("6", "ws1"))]).unwrap();
-    assert_eq!(ops(&feed(o, &admin(), empty.next, &f)), vec![(ChangeOp::EntityCreate, "issue:6".into())]);
+    assert_eq!(ops(&feed(o, &admin(), first.next, &f)), vec![(ChangeOp::EntityCreate, "issue:6".into())]);
     // A reader without a read role is refused.
     assert!(o.changes_page_earliest(&Principal::new("x", vec![], vec!["ws1".into()]), &f, 10).is_err());
 }
@@ -467,16 +468,230 @@ fn capture_off_then_on_expires_old_cursors_on(o: &Ontology) {
     assert!(o.capture_enabled());
     let p = o.changes_page(&admin(), before, &ChangeFilter::default(), 10).unwrap();
     assert!(p.expired, "a write went unrecorded after this cursor");
-    // A cursor taken while capture was off missed nothing.
+    // A cursor at the head while capture was off cannot tell whether writes
+    // came after it unrecorded: it is not expired, but gets the
+    // capture_enabled gap first.
     assert!(!o.changes_page(&admin(), during, &ChangeFilter::default(), 10).unwrap().expired);
     o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("3", "ws1"))]).unwrap();
-    assert_eq!(
-        ops(&feed(o, &admin(), during, &ChangeFilter::default())),
-        vec![(ChangeOp::EntityCreate, "issue:3".into())]
-    );
+    let after_on = feed(o, &admin(), during, &ChangeFilter::default());
+    assert_eq!(ops(&after_on), vec![(ChangeOp::Gap, String::new()), (ChangeOp::EntityCreate, "issue:3".into())]);
+    assert_eq!(after_on[0].gap.as_ref().unwrap().reason, GapReason::CaptureEnabled);
+    // Turning it on again while on changes nothing.
+    let head = o.change_head().unwrap();
+    o.set_capture(&ctx("ws1"), true).unwrap();
+    assert_eq!(o.change_head().unwrap(), head);
     let audit =
         o.events(&admin(), &EventFilter { action: Some("changes.capture".into()), ..Default::default() }).unwrap();
-    assert_eq!(audit.len(), 2);
+    assert_eq!(audit.len(), 3, "off, on, on again: each audited");
+}
+
+/// Review C1: a reader that keeps polling while capture is off is moved to
+/// the head by empty pages; turning capture on again must not let it skip
+/// the unrecorded commits silently.
+#[test]
+fn polling_through_capture_off_never_skips_silently() {
+    polling_through_capture_off_never_skips_silently_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn polling_through_capture_off_never_skips_silently_on(o: &Ontology) {
+    let f = ChangeFilter::default();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+    let mut cursor = o.change_head().unwrap();
+    let stale = cursor; // a reader that stops polling here
+    o.set_capture(&ctx("ws1"), false).unwrap();
+    for n in 2..5 {
+        o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue(&n.to_string(), "ws1"))]).unwrap();
+        let page = o.changes_page(&admin(), cursor, &f, 100).unwrap();
+        assert!(!page.expired && page.changes.is_empty(), "{page:?}");
+        cursor = page.next; // moved to the head over an unrecorded commit
+    }
+    assert_eq!(cursor.seq, o.seq());
+    o.set_capture(&ctx("ws1"), true).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("9", "ws1"))]).unwrap();
+
+    let page = o.changes_page(&admin(), cursor, &f, 100).unwrap();
+    assert!(!page.expired);
+    assert_eq!(page.changes.len(), 2, "{page:?}");
+    let gap = page.changes[0].gap.as_ref().expect("the capture_enabled gap comes first");
+    assert_eq!(gap.reason, GapReason::CaptureEnabled);
+    assert_eq!((page.changes[1].op, page.changes[1].id.as_str()), (ChangeOp::EntityCreate, "issue:9"));
+    // Every reader of the tenant gets it, whatever its filter.
+    let tasks = ChangeFilter { kinds: vec!["task".into()], ..Default::default() };
+    let only = o.changes_page(&viewer(), cursor, &tasks, 100).unwrap();
+    assert_eq!(ops(&only.changes), vec![(ChangeOp::Gap, String::new())]);
+    // The reader that stopped before capture went off is expired.
+    assert!(o.changes_page(&admin(), stale, &f, 100).unwrap().expired);
+    // A reader that starts after capture is on sees no gap.
+    let now = o.change_head().unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("10", "ws1"))]).unwrap();
+    assert_eq!(ops(&feed(o, &admin(), now, &f)), vec![(ChangeOp::EntityCreate, "issue:10".into())]);
+}
+
+/// Review C2: a cursor ahead of the head (from before a restart, a
+/// re-provisioned tenant or a restore) is expired, never silently served.
+#[test]
+fn a_cursor_ahead_of_the_head_is_expired() {
+    let f = ChangeFilter::default();
+    let old = Ontology::in_memory(Schema::enterprise());
+    for n in 0..5 {
+        old.apply(&ctx("ws1"), vec![Mutation::Upsert(issue(&n.to_string(), "ws1"))]).unwrap();
+    }
+    let held = old.change_head().unwrap();
+    drop(old);
+    let o = Ontology::in_memory(Schema::enterprise());
+    assert!(o.change_head().unwrap() < held);
+    let page = o.changes_page(&admin(), held, &f, 100).unwrap();
+    assert!(page.expired && page.changes.is_empty(), "{page:?}");
+    assert_eq!(page.next, held);
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("new1", "ws1"))]).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("new2", "ws1"))]).unwrap();
+    assert!(o.changes_page(&admin(), held, &f, 100).unwrap().expired, "still behind the held cursor");
+    // Past the head commit's last record, too.
+    let head = o.change_head().unwrap();
+    assert!(o.changes_page(&admin(), Cursor::new(head.seq, head.n + 1), &f, 100).unwrap().expired);
+    assert!(!o.changes_page(&admin(), head, &f, 100).unwrap().expired);
+}
+
+/// Review C3: evicting the change log never raises the floor above the
+/// head, even when one commit holds more records than the capacity.
+#[test]
+fn eviction_keeps_the_newest_commit_and_the_head_valid() {
+    let store = Arc::new(MemoryStore::default().with_change_capacity(2));
+    let o = Ontology::open(Schema::enterprise(), store.clone(), OntologyOptions::default()).unwrap();
+    let f = ChangeFilter::default();
+    o.apply(
+        &ctx("ws1"),
+        vec![
+            Mutation::Upsert(issue("1", "ws1")),
+            Mutation::Upsert(issue("2", "ws1")),
+            Mutation::Upsert(issue("3", "ws1")),
+        ],
+    )
+    .unwrap();
+    let s = o.seq();
+    let meta = store.changes_meta().unwrap();
+    assert!(meta.floor <= meta.head.seq, "{meta:?}");
+    assert_eq!(meta.floor, s, "the older commit went");
+    let head = o.change_head().unwrap();
+    assert!(!o.changes_page(&admin(), head, &f, 10).unwrap().expired, "a reader at the head is not reset");
+    let first = o.changes_page_earliest(&admin(), &f, 10).unwrap();
+    assert!(!first.expired);
+    assert_eq!(first.changes.len(), 3, "the newest commit is kept whole");
+    assert!(!o.changes_page(&admin(), first.next, &f, 10).unwrap().expired);
+    // The next commit evicts it.
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("4", "ws1"))]).unwrap();
+    let meta = store.changes_meta().unwrap();
+    assert_eq!(meta.floor, s + 1);
+    assert!(o.changes_page(&admin(), first.next, &f, 10).unwrap().expired);
+    let rest = o.changes_page_earliest(&admin(), &f, 10).unwrap();
+    assert!(!rest.expired);
+    assert_eq!(ops(&rest.changes), vec![(ChangeOp::EntityCreate, "issue:4".into())]);
+}
+
+/// Review SEC-2: filters too large to evaluate cheaply are refused.
+#[test]
+fn oversized_filters_are_refused() {
+    use onto_core::changes::{MAX_FILTER_NAME_LEN, MAX_FILTER_NAMES, MAX_FILTER_OPS, MAX_FILTER_SOURCES};
+    let o = Ontology::in_memory(Schema::enterprise());
+    let names = |n: usize| (0..n).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let ok = ChangeFilter { kinds: names(MAX_FILTER_NAMES), sources: names(MAX_FILTER_SOURCES), ..Default::default() };
+    assert!(o.changes_page(&viewer(), Cursor::default(), &ok, 10).is_ok());
+    let refused = [
+        ChangeFilter { kinds: names(MAX_FILTER_NAMES + 1), ..Default::default() },
+        ChangeFilter { workspaces: names(MAX_FILTER_NAMES + 1), ..Default::default() },
+        ChangeFilter { rels: names(MAX_FILTER_NAMES + 1), ..Default::default() },
+        ChangeFilter { props: names(MAX_FILTER_NAMES + 1), ..Default::default() },
+        ChangeFilter { sources: names(MAX_FILTER_SOURCES + 1), ..Default::default() },
+        ChangeFilter { ops: vec![ChangeOp::EntityCreate; MAX_FILTER_OPS + 1], ..Default::default() },
+        ChangeFilter { ids: names(1001), ..Default::default() },
+        ChangeFilter { kinds: vec!["k".repeat(MAX_FILTER_NAME_LEN + 1)], ..Default::default() },
+        ChangeFilter { sources: vec!["*".repeat(MAX_FILTER_NAME_LEN + 1)], ..Default::default() },
+    ];
+    for f in refused {
+        let e = o.changes_page(&viewer(), Cursor::default(), &f, 10).unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{e}");
+        assert!(o.changes_page_earliest(&viewer(), &f, 10).is_err());
+    }
+}
+
+/// Review SEC-3: a filter is applied to what the reader receives, so it
+/// cannot probe fields `entity.hidden` or a `became_visible` update leave out.
+#[test]
+fn filters_cannot_probe_what_a_view_leaves_out() {
+    let o = Ontology::in_memory(Schema::enterprise());
+    let api = ActionContext::new(admin(), "ws1").with_source("api");
+    o.apply(&api, vec![Mutation::Upsert(issue("9", "ws1").prop("salary", 100))]).unwrap();
+    let at = o.change_head().unwrap();
+    o.apply(
+        &api,
+        vec![Mutation::Upsert(
+            issue("9", "ws1").prop("visibility", "restricted").prop("acl", json!(["user:boss"])).prop("salary", 999),
+        )],
+    )
+    .unwrap();
+    let probe = |f: ChangeFilter| ops(&o.changes_page(&viewer(), at, &f, 10).unwrap().changes);
+    let hidden = vec![(ChangeOp::EntityHidden, "issue:9".to_string())];
+    assert_eq!(probe(ChangeFilter::default()), hidden);
+    for props in [vec!["salary"], vec!["title"]] {
+        let f = ChangeFilter { props: props.iter().map(|p| p.to_string()).collect(), ..Default::default() };
+        assert_eq!(probe(f), hidden, "props {props:?}: the same answer");
+    }
+    for sources in [vec!["api"], vec!["cli"], vec!["!api"]] {
+        let f = ChangeFilter { sources: sources.iter().map(|p| p.to_string()).collect(), ..Default::default() };
+        assert_eq!(probe(f), hidden, "sources {sources:?}: the same answer");
+    }
+    // Updates asked for: the update that hid it still arrives (as hidden).
+    assert_eq!(probe(ChangeFilter { ops: vec![ChangeOp::EntityUpdate], ..Default::default() }), hidden);
+    assert!(probe(ChangeFilter { ops: vec![ChangeOp::EntityCreate], ..Default::default() }).is_empty());
+
+    // Back to public with an edit made in the same commit: the reader gets
+    // the entity without `changed`, so props filters cannot tell what changed.
+    let at = o.change_head().unwrap();
+    o.apply(&api, vec![Mutation::Upsert(issue("9", "ws1").prop("visibility", "public").prop("secret_codename", "x"))])
+        .unwrap();
+    let page = o.changes_page(&viewer(), at, &ChangeFilter::default(), 10).unwrap();
+    let r = &page.changes[0];
+    assert!(r.became_visible && r.changed.is_empty() && r.before.is_empty(), "{r:?}");
+    for props in ["secret_codename", "title"] {
+        let f = ChangeFilter { props: vec![props.into()], ..Default::default() };
+        assert!(o.changes_page(&viewer(), at, &f, 10).unwrap().changes.is_empty(), "{props}");
+    }
+    // An admin, who could see it all along, gets the changed fields.
+    let all = o.changes_page(&admin(), at, &ChangeFilter::default(), 10).unwrap();
+    assert!(all.changes[0].changed.contains(&"secret_codename".to_string()));
+}
+
+/// Review CP-4: a bulk import is one gap listing at most MAX_GAP_IDS ids.
+#[test]
+fn large_gaps_list_a_bounded_number_of_ids() {
+    use onto_core::changes::MAX_GAP_IDS;
+    let store = Arc::new(MemoryStore::default());
+    let o = Ontology::open(Schema::enterprise(), store.clone(), OntologyOptions::default()).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+    let head = o.change_head().unwrap();
+    let e = o.get(&admin(), "issue:1").unwrap();
+    let many: Vec<Entity> = (0..MAX_GAP_IDS + 500)
+        .map(|n| {
+            let mut x = e.clone();
+            x.id = format!("issue:b{n:05}");
+            x
+        })
+        .collect();
+    // The stored gap (readers get the listed ids they can see in the graph).
+    let stored_gap = |after: Cursor| {
+        let page = store.changes_since(after, 10).unwrap();
+        assert_eq!(page.changes.len(), 1);
+        page.changes[0].0.record.gap.clone().unwrap()
+    };
+    store.bulk_import(&many, &[]).unwrap();
+    let gap = stored_gap(head);
+    assert_eq!((gap.entities.len(), gap.truncated, gap.total), (MAX_GAP_IDS, true, (MAX_GAP_IDS + 500) as u64));
+    assert_eq!(only_gap(&feed(&o, &admin(), head, &ChangeFilter::default())).reason, GapReason::BulkImport);
+    // A small one is listed whole.
+    let head = store.changes_meta().unwrap().head;
+    store.bulk_import(&many[..3], &[]).unwrap();
+    let gap = stored_gap(head);
+    assert_eq!((gap.entities.len(), gap.truncated, gap.total), (3, false, 0));
 }
 
 // ── model-based property test ────────────────────────────────────────────
@@ -800,6 +1015,12 @@ mod pg {
     fn earliest_starts_at_the_floor() {
         let Some(pg) = TestTenant::new("chg_earliest") else { return };
         super::earliest_starts_at_the_floor_on(&open(&pg));
+    }
+
+    #[test]
+    fn polling_through_capture_off_never_skips_silently() {
+        let Some(pg) = TestTenant::new("changes_capture_poll") else { return };
+        super::polling_through_capture_off_never_skips_silently_on(&open(&pg));
     }
 
     #[test]

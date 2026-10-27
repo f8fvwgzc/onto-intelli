@@ -319,7 +319,10 @@ pub trait Store: Send + Sync {
         Err(no_change_log())
     }
     /// Turn capture on or off for the tenant. Turning it on after a period
-    /// off raises the floor to the head: nothing was recorded meanwhile.
+    /// off raises the floor to the head (nothing was recorded meanwhile, so
+    /// older cursors are expired) and appends a `capture_enabled` gap after
+    /// every cursor at the head, so a reader that was moved to the head
+    /// while capture was off is told rather than silently skipped.
     fn set_capture(&self, _on: bool) -> Result<()> {
         Err(no_change_log())
     }
@@ -623,23 +626,47 @@ impl MemoryStore {
                 }
             } else if !inner.capture_off && batch.touches_feed() {
                 let rec = batch.commit_record(seq, "");
-                let gap =
-                    Gap { reason: uncaptured, origin: rec.origin, entities: rec.entities, links: rec.links, hidden: 0 };
+                let gap = Gap::listing(uncaptured, rec.origin, rec.entities, rec.links);
                 inner.changes.push_back((
                     StoredChange { record: ChangeRecord::gap(seq, rec.ts, gap), before_vis: None, rev_after: None },
                     None,
                 ));
             }
-            while inner.changes.len() > self.max_changes {
-                let Some(oldest) = inner.changes.front().map(|(c, _)| c.record.cursor.seq) else { break };
-                while inner.changes.front().is_some_and(|(c, _)| c.record.cursor.seq == oldest) {
-                    inner.changes.pop_front();
-                }
-                inner.floor = inner.floor.max(oldest + 1);
-            }
+            self.evict_changes(&mut inner);
         }
         Ok(inner.seq)
     }
+
+    /// Evict whole commits, oldest first, past `max_changes`, raising the
+    /// floor over them. The newest commit's records are never evicted (as in
+    /// `vacuum_changes`), so the floor never passes the head and a reader at
+    /// the head is never reset; a single commit larger than the capacity is
+    /// kept whole until the next one.
+    fn evict_changes(&self, inner: &mut MemInner) {
+        let newest = inner.seq;
+        while inner.changes.len() > self.max_changes {
+            let Some(oldest) = inner.changes.front().map(|(c, _)| c.record.cursor.seq) else { break };
+            if oldest >= newest {
+                break;
+            }
+            while inner.changes.front().is_some_and(|(c, _)| c.record.cursor.seq == oldest) {
+                inner.changes.pop_front();
+            }
+            inner.floor = inner.floor.max(oldest + 1);
+        }
+    }
+}
+
+/// The `capture_enabled` gap written when capture is turned on again: after
+/// every cursor a reader can hold at the head commit `seq` (`<seq>.0` or its
+/// last record), so a reader that kept polling while capture was off (and so
+/// was moved to the head) receives it instead of silently missing what was
+/// written meanwhile. `last_n` is the last record's `n` at `seq`, if any.
+pub(crate) fn capture_enabled_gap(seq: u64, last_n: Option<u32>, origin: &str) -> StoredChange {
+    let gap = Gap::listing(GapReason::CaptureEnabled, origin.to_string(), Vec::new(), Vec::new());
+    let mut record = ChangeRecord::gap(seq, now_ms(), gap);
+    record.cursor.n = last_n.map_or(1, |n| n.saturating_add(1));
+    StoredChange { record, before_vis: None, rev_after: None }
 }
 
 fn head_cursor(inner: &MemInner) -> Cursor {
@@ -695,7 +722,14 @@ impl Store for MemoryStore {
     fn set_capture(&self, on: bool) -> Result<()> {
         let mut inner = self.inner.lock();
         if on && inner.capture_off {
-            inner.floor = inner.floor.max(inner.seq);
+            let seq = inner.seq;
+            inner.floor = inner.floor.max(seq);
+            if seq > 0 {
+                let last_n =
+                    inner.changes.back().filter(|(c, _)| c.record.cursor.seq == seq).map(|(c, _)| c.record.cursor.n);
+                inner.changes.push_back((capture_enabled_gap(seq, last_n, ""), None));
+                self.evict_changes(&mut inner);
+            }
         }
         inner.capture_off = !on;
         Ok(())

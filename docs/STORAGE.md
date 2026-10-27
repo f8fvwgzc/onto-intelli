@@ -80,6 +80,42 @@ TLS is rustls with aws-lc-rs and needs no system library.
 
 Released migrations never change; a schema change is a new migration.
 
+### Upgrades and rollbacks
+
+The newer-schema refusal applies to every replica, at every open. A
+replica still on the old build keeps writing to tenants it already has open
+(its commits reach the change feed as `gap` records), but it cannot open a
+tenant again once a newer build has migrated it, and replicas re-open
+tenants routinely (after `engine.tenant_idle_secs`, or when
+`engine.max_open_tenants` or the memory budget closes one). During a rolling
+deploy, either drain the old replicas before the new ones open tenants, or
+raise `tenant_idle_secs` and `max_open_tenants` on the old replicas for the
+duration of the roll. Otherwise some requests on old replicas fail with a
+request to upgrade until the roll finishes.
+
+Rolling back past `0009_changes` and `0010_leases` (the change feed and
+leases): both are additive for older writers and idempotent (`IF NOT
+EXISTS`, `OR REPLACE`, `ON CONFLICT DO NOTHING`). To start an older build on
+a migrated tenant, delete its `schema_migrations` rows with `version >= 9`
+first. The tables and the gap trigger stay; the older build ignores the
+tables, and the trigger turns each of its state-changing commits into a
+`gap` record, so change-feed readers see what they missed. A later upgrade
+applies the migrations again, and its first commit records changes again.
+
+**Reserved tenant ids.** Since the change feed, `{prefix}_sys` (`onto_sys`)
+is the deployment's shared schema (the `wake` table), so the tenant ids
+`sys` and `_sys` (any case) are refused. A tenant created under such an id
+by an earlier version must be renamed before upgrading. The new build
+refuses to create the shared schema inside it and says how. Example for
+`onto_`:
+
+```sql
+ALTER SCHEMA onto_sys RENAME TO onto_sys_tenant;
+UPDATE onto_sys_tenant.tenant_identity SET tenant = 'sys_tenant';
+```
+
+After the rename, the tenant is addressed as `sys_tenant`.
+
 ## Tenants and tables
 
 Each tenant has its own PostgreSQL schema, `{schema_prefix}{tenant}`, reduced

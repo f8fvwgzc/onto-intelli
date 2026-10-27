@@ -248,6 +248,8 @@ queue = 10000                      # records waiting; beyond this they are dropp
 # record changes is a tenant property, switched with the changes.capture action
 # (admins of every workspace).
 [changes]
+retain_days = 7                    # change records older than this are removed hourly, whole commits (0: no age limit)
+retain_max_rows = 5000000          # and at most this many are kept per tenant (0: no count limit)
 page = 500                         # records scanned per changes.poll or stream page without a limit (1..1000)
 ring = 4096                        # records per tenant in memory, only while it has streams (counted in the memory budget)
 eval_budget_ms = 50                # filtering time per stream page before the page is split

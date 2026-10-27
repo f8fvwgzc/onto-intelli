@@ -337,3 +337,42 @@ fn pg_wake_settle_is_compare_and_set() {
     shared.drop_tenant("onto_", &pg.tenant).unwrap();
     assert!(!shared.wake_due("onto_", 10_000).unwrap().contains(&pg.tenant));
 }
+
+/// Review CP-5: a tenant named `sys` by an earlier version owns the schema
+/// the shared `wake` table now lives in. The new build refuses to put the
+/// table inside that tenant's data and says how to rename it; the tenant id
+/// itself is refused with a pointer to the same note.
+#[test]
+fn pg_shared_schema_refuses_an_old_tenant_of_that_name() {
+    let Some(url) = common::database_url() else {
+        eprintln!("skipped pg_shared_schema_refuses_an_old_tenant_of_that_name: set DATABASE_URL");
+        return;
+    };
+    let prefix = format!("zzsys{}_", &onto_core::time::new_id("x")[2..10]).to_ascii_lowercase();
+    let sys = onto_core::store::postgres::sys_schema(&prefix);
+    let sql = |body: String| {
+        let url = url.clone();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let pool = onto_core::sqlx::PgPool::connect(&url).await.unwrap();
+            onto_core::sqlx::raw_sql(onto_core::sqlx::AssertSqlSafe(body)).execute(&pool).await.unwrap();
+            pool.close().await;
+        })
+    };
+    // What a tenant "sys" created by an earlier version looks like.
+    sql(format!(
+        "CREATE SCHEMA \"{sys}\"; CREATE TABLE \"{sys}\".head (id INT PRIMARY KEY, seq BIGINT NOT NULL); \
+         CREATE TABLE \"{sys}\".tenant_identity (one BOOLEAN PRIMARY KEY, tenant TEXT NOT NULL, claimed_at BIGINT NOT NULL)"
+    ));
+    let shared = PgShared::connect(&url, &PgOptions { listen: false, ..Default::default() }).unwrap();
+    let err = shared.ensure_sys(&prefix).unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, Error::Config(_)) && msg.contains("RENAME") && msg.contains(&sys), "{msg}");
+    let opts = PgOptions { listen: false, schema_prefix: prefix.clone(), ..Default::default() };
+    let err = shared.tenant("sys", opts).err().unwrap().to_string();
+    assert!(err.contains("reserved") && err.contains("STORAGE.md"), "{err}");
+    sql(format!("DROP SCHEMA \"{sys}\" CASCADE"));
+    // A fresh deployment creates it.
+    assert_eq!(shared.ensure_sys(&prefix).unwrap(), sys);
+    sql(format!("DROP SCHEMA \"{sys}\" CASCADE"));
+}

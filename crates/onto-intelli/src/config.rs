@@ -712,6 +712,13 @@ impl TracesConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChangesConfig {
+    /// Change records older than this many days are removed (whole commits)
+    /// and the floor raised over them, hourly while the tenant is open
+    /// (0: no age limit).
+    pub retain_days: u64,
+    /// Keep at most this many change records per tenant (0: no count
+    /// limit). Whole commits are removed, so slightly fewer may remain.
+    pub retain_max_rows: u64,
     /// Records scanned per `changes.poll` page when the call gives no
     /// `limit`, and per stream page (1 to 1000).
     pub page: usize,
@@ -741,6 +748,8 @@ pub struct ChangesConfig {
 impl Default for ChangesConfig {
     fn default() -> Self {
         Self {
+            retain_days: 7,
+            retain_max_rows: 5_000_000,
             page: 500,
             ring: 4096,
             eval_budget_ms: 50,
@@ -777,7 +786,18 @@ impl ChangesConfig {
         if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("changes.{name} = {v} (at least 1)")));
         }
+        if self.retain_days > 36_500 {
+            return Err(Error::Config(format!("changes.retain_days = {} (0 to 36500)", self.retain_days)));
+        }
         Ok(())
+    }
+
+    /// What one retention pass keeps.
+    pub fn retention(&self) -> onto_core::changes::ChangeRetention {
+        onto_core::changes::ChangeRetention {
+            keep_ms: (self.retain_days > 0).then(|| self.retain_days as i64 * 86_400_000),
+            keep_rows: (self.retain_max_rows > 0).then_some(self.retain_max_rows),
+        }
     }
 }
 

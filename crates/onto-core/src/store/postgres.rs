@@ -470,7 +470,8 @@ pub fn tenant_schema(prefix: &str, tenant: &str) -> Result<String> {
     let name = safe_ident(&format!("{prefix}{tenant}"), tenant);
     if name == sys_schema(prefix) {
         return Err(Error::invalid(format!(
-            "tenant id '{tenant}' is reserved: its schema {name} is the deployment's shared schema"
+            "tenant id '{tenant}' is reserved: its schema {name} is the deployment's shared schema \
+             (a tenant created with this id by an earlier version must be renamed; see docs/STORAGE.md)"
         )));
     }
     Ok(name)
@@ -503,9 +504,13 @@ pub fn sys_schema(prefix: &str) -> String {
     safe_ident(&format!("{base}_sys"), prefix)
 }
 
-/// The channel wake bumps are announced on (`onto_wake` for `onto_`).
+/// The channel wake bumps are announced on (`onto-wake` for `onto_`). The
+/// `-` keeps it apart from every tenant's own notice channel, which is the
+/// tenant's schema name and so only `[a-z0-9_]`: no tenant id (`wake`
+/// included) can make its commits wake the scanner, and wake notices (which
+/// name other tenants) never reach a tenant's listeners.
 pub fn wake_channel(prefix: &str) -> String {
-    format!("{}_wake", prefix.trim_end_matches('_'))
+    format!("{}-wake", prefix.trim_end_matches('_'))
 }
 
 /// SQL error codes of a relation, schema or function that does not exist.
@@ -515,10 +520,22 @@ fn undefined(e: &sqlx::Error) -> bool {
 
 /// Create `{prefix}_sys` and its `wake` table if missing. Idempotent; one
 /// creator at a time.
+///
+/// Refused when the schema is a tenant's (a `head` or `tenant_identity`
+/// table): tenant ids `sys` and `_sys` (any case) were valid before this
+/// schema was reserved, and their data must not get a `wake` table mixed in.
 async fn create_sys(pool: &PgPool, sys: &str) -> Result<()> {
     let q = quote_ident(sys);
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(sys).execute(&mut *tx).await?;
+    let tenant: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL OR to_regclass($2) IS NOT NULL")
+        .bind(format!("{q}.head"))
+        .bind(format!("{q}.tenant_identity"))
+        .fetch_one(&mut *tx)
+        .await?;
+    if tenant {
+        return Err(sys_is_a_tenant(sys));
+    }
     sqlx::raw_sql(sql(format!(
         "CREATE SCHEMA IF NOT EXISTS {q}; \
          CREATE TABLE IF NOT EXISTS {q}.wake (tenant TEXT PRIMARY KEY, due_at BIGINT, bumped BIGINT NOT NULL DEFAULT 0); \
@@ -530,6 +547,17 @@ async fn create_sys(pool: &PgPool, sys: &str) -> Result<()> {
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// The shared schema's name is taken by a tenant created before it was
+/// reserved: what to do about it.
+fn sys_is_a_tenant(sys: &str) -> Error {
+    Error::Config(format!(
+        "schema {sys} holds a tenant's data (tenant id 'sys' or '_sys' from an earlier version), but this version \
+         reserves it as the deployment's shared schema. Rename that tenant before upgrading, for example: \
+         ALTER SCHEMA {sys} RENAME TO {sys}_tenant; UPDATE {sys}_tenant.tenant_identity SET tenant = 'sys_tenant'; \
+         then address it as tenant 'sys_tenant' (docs/STORAGE.md, upgrade notes)"
+    ))
 }
 
 /// Bump `tenant`'s wake row to be due `delay_ms` from now (keeping an
@@ -974,13 +1002,8 @@ impl PgStore {
                 .bind(serde_json::to_string(&rec)?)
                 .execute(&mut *tx)
                 .await?;
-            let gap = Gap {
-                reason: GapReason::BulkImport,
-                origin: origin.clone(),
-                entities: gap_entities,
-                links: gap_links,
-                hidden: 0,
-            };
+            // One gap for the whole import, listing at most MAX_GAP_IDS ids.
+            let gap = Gap::listing(GapReason::BulkImport, origin.clone(), gap_entities, gap_links);
             let gap =
                 StoredChange { record: ChangeRecord::gap(seq as u64, rec.ts, gap), before_vis: None, rev_after: None };
             sqlx::query(sql(format!(
@@ -1779,8 +1802,10 @@ impl Store for PgStore {
 
     /// Locks the head, so no commit straddles the switch: commits after it
     /// see the new setting in the gap trigger. Turning capture on after a
-    /// period off raises the floor to the head. Other processes hear of it
-    /// through a notice and re-read the setting.
+    /// period off raises the floor to the head (older cursors are expired)
+    /// and writes a `capture_enabled` gap after every cursor at the head (a
+    /// reader moved to the head while capture was off receives it). Other
+    /// processes hear of it through a notice and re-read the setting.
     fn set_capture(&self, on: bool) -> Result<()> {
         let pool = self.pool.clone();
         let t = Tables::of(self);
@@ -1788,6 +1813,9 @@ impl Store for PgStore {
         self.block(async move {
             let mut tx = pool.begin().await?;
             let head = lock_head(&mut tx, &t.head).await?;
+            let was_on: bool = sqlx::query_scalar(sql(format!("SELECT capture FROM {} FOR UPDATE", t.changes_meta)))
+                .fetch_one(&mut *tx)
+                .await?;
             sqlx::query(sql(format!(
                 "UPDATE {} SET floor = CASE WHEN $1 AND NOT capture THEN GREATEST(floor, $2) ELSE floor END, \
                  capture = $1",
@@ -1797,6 +1825,27 @@ impl Store for PgStore {
             .bind(head)
             .execute(&mut *tx)
             .await?;
+            if on && !was_on && head > 0 {
+                // A reader moved to the head while capture was off gets this
+                // gap instead of silently missing what was written meanwhile.
+                let last_n: Option<i32> =
+                    sqlx::query_scalar(sql(format!("SELECT max(n) FROM {} WHERE seq = $1", t.changes)))
+                        .bind(head)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let gap = super::capture_enabled_gap(head as u64, last_n.map(|n| n as u32), &origin);
+                sqlx::query(sql(format!(
+                    "INSERT INTO {} (seq, n, ts, workspace, kind, op, target, doc) \
+                     VALUES ($1, $2, $3, '', '', 'gap', '', $4::jsonb)",
+                    t.changes
+                )))
+                .bind(head)
+                .bind(gap.record.cursor.n.min(i32::MAX as u32) as i32)
+                .bind(gap.record.ts)
+                .bind(serde_json::to_string(&gap)?)
+                .execute(&mut *tx)
+                .await?;
+            }
             send_notice(
                 &mut tx,
                 &channel,
@@ -2491,7 +2540,12 @@ mod tests {
         assert_eq!(sys_schema("onto_"), "onto_sys");
         assert_eq!(sys_schema("onto"), "onto_sys");
         assert_eq!(sys_schema("o120_ab12"), "o120_ab12_sys");
-        assert_eq!(wake_channel("onto_"), "onto_wake");
+        assert_eq!(wake_channel("onto_"), "onto-wake");
+        // No tenant's schema (its own notice channel) is the wake channel.
+        for (prefix, t) in [("onto_", "wake"), ("onto", "_wake"), ("onto_", "WAKE"), ("o120_ab12_", "wake")] {
+            let schema = tenant_schema(prefix, t).unwrap();
+            assert_ne!(schema, wake_channel(prefix), "{prefix}{t}");
+        }
         for t in ["sys", "SYS", "Sys"] {
             let e = tenant_schema("onto_", t).unwrap_err().to_string();
             assert!(e.contains("reserved") && e.contains("onto_sys"), "{e}");

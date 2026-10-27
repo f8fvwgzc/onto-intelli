@@ -30,8 +30,9 @@ pub use stream::{ChangeHub, Frame, Reauth, ReauthError, Start, Subscription};
 pub const CALLS: &[&str] = &["changes.poll", "changes.head", "changes.capture"];
 
 /// What an expired page says, besides `expired: true`.
-pub const EXPIRED_MESSAGE: &str = "the cursor is older than the floor: records after it may be missing. Consistent \
-     resync is not offered; re-read with entity.find (the result is not pinned to a cursor) and resume from the head.";
+pub const EXPIRED_MESSAGE: &str = "the cursor is older than the floor, or ahead of the head (a cursor from before the \
+     store restarted or was restored): records after it may be missing. Consistent resync is not offered; re-read \
+     with entity.find (the result is not pinned to a cursor) and resume from the head.";
 
 /// The filter keys of `changes.poll` (and, later, of streams): lists accept
 /// one string or many; `exclude_migrations` is the negative form gRPC needs,
