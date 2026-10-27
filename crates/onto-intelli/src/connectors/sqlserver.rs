@@ -192,17 +192,23 @@ impl SelectPermission {
     }
 }
 
-/// Who reads each table that has table-level GRANTs. `members` are
-/// `(role, member)` pairs from `sys.database_role_members`.
+/// Who reads each table that has table-level GRANTs: `perms` are the SELECT
+/// grants and the SELECT or CONTROL denies, `members` the memberships of
+/// `sys.database_role_members` (with whether the member is a group). Both
+/// must be complete, so [`grant_readers`] calls this only when the crawl
+/// account sees every row (VIEW DEFINITION).
 ///
 /// A DENY (on the table, any of its columns, its schema or the database,
 /// and membership in `db_denydatareader`) wins for the denied principal and
-/// everyone in it, through nested roles. The ACL can only list readers, so
-/// it fails closed: once anyone is denied, `public` is no reader (it would
-/// let the denied in), nor is a granted role that holds a denied principal,
-/// nor a granted Windows or Entra group (its members cannot be seen); a DENY
-/// to `public` leaves no reader at all. A column grant is not a table grant;
-/// grants on a schema or the database are not read (fewer readers).
+/// everyone in it, through nested roles; a DENY to a group is one to
+/// `public` ([`SelectPermission::read`]). The ACL can only list readers, so
+/// it fails closed once anyone is denied: `public` is no reader (it would
+/// let the denied in), nor is a granted principal that reaches a denied one
+/// or a group whose members cannot be listed (a Windows or Entra group, or
+/// a member of unknown type, granted directly or held in a role). A DENY to
+/// `public`, or to a principal that reaches such a group, leaves no reader
+/// at all. A column grant is not a table grant; grants on a schema or the
+/// database are not read (fewer readers).
 pub fn table_readers(perms: &[SelectPermission], members: &[RoleMember]) -> Readers {
     let mut deny_all: Vec<SelectPermission> = perms.iter().filter(|p| p.deny).cloned().collect();
     if members.iter().any(|m| m.role == "db_denydatareader") {
@@ -444,6 +450,69 @@ pub const MEMBERS_SQL: &str = "SELECT r.name, m.name, m.type FROM sys.database_r
      JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id \
      JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id";
 
+/// The start of the crawl note when the permission catalogs could not be read.
+pub const GRANTS_UNREAD: &str =
+    "map_grants: the permissions could not be read, so every table is restricted (no readers)";
+
+/// What mapping grants reads: [`VISIBILITY_SQL`]'s answer, [`GRANTS_SQL`]
+/// and [`MEMBERS_SQL`]. A trait so the order and the failures are tested
+/// without a server.
+#[async_trait]
+trait GrantSource {
+    async fn visibility(&mut self) -> Result<Option<i64>>;
+    async fn permissions(&mut self) -> Result<Vec<SelectPermission>>;
+    async fn members(&mut self) -> Result<Vec<RoleMember>>;
+}
+
+#[async_trait]
+impl GrantSource for Conn {
+    async fn visibility(&mut self) -> Result<Option<i64>> {
+        Ok(rows_of(self, VISIBILITY_SQL).await?.first().and_then(|r| int_opt(r, 0)))
+    }
+
+    async fn permissions(&mut self) -> Result<Vec<SelectPermission>> {
+        Ok(rows_of(self, GRANTS_SQL)
+            .await?
+            .iter()
+            .filter_map(|r| {
+                let (class, minor_id) = (int_opt(r, 2), int_opt(r, 5));
+                SelectPermission::read(&s(r, 0), &s(r, 1), class, &s(r, 3), &s(r, 4), minor_id, &s(r, 6))
+            })
+            .collect())
+    }
+
+    async fn members(&mut self) -> Result<Vec<RoleMember>> {
+        Ok(rows_of(self, MEMBERS_SQL).await?.iter().map(|r| RoleMember::read(&s(r, 0), &s(r, 1), &s(r, 2))).collect())
+    }
+}
+
+/// The readers of each table, and the crawl note when there are none to
+/// trust. The permission catalogs are read only when the crawl account sees
+/// every row; a read that fails restricts every table and adds a note, as
+/// missing VIEW DEFINITION does, instead of failing the crawl.
+async fn map_grants(src: &mut (impl GrantSource + Send)) -> (Readers, Option<String>) {
+    let unread = |e: Error| (Readers::new(), Some(format!("{GRANTS_UNREAD}: {e}")));
+    let answer = match src.visibility().await {
+        Ok(answer) => answer,
+        Err(e) => return unread(e),
+    };
+    if !sees_all_permissions(answer) {
+        let (readers, note) = grant_readers(answer, &[], &[]);
+        return (readers, note.map(String::from));
+    }
+    let perms = match src.permissions().await {
+        Ok(perms) => perms,
+        Err(e) => return unread(e),
+    };
+    let members = match src.members().await {
+        Ok(members) => members,
+        Err(e) => return unread(e),
+    };
+    // The one place that decides whether grants are trusted.
+    let (readers, note) = grant_readers(answer, &perms, &members);
+    (readers, note.map(String::from))
+}
+
 const TYPE_NAME: &str = "CASE \
     WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') \
       THEN t.name + '(' + IIF(c.max_length = -1, 'max', CAST(c.max_length AS varchar(10))) + ')' \
@@ -540,24 +609,9 @@ impl Connector for SqlServerConnector {
         // Without grants mapped, every table is restricted with no readers.
         let mut readers: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         if spec.map_grants {
-            let answer = rows_of(&mut c, VISIBILITY_SQL).await?.first().and_then(|r| int_opt(r, 0));
-            let perms: Vec<SelectPermission> = rows_of(&mut c, GRANTS_SQL)
-                .await?
-                .iter()
-                .filter_map(|r| {
-                    let (class, minor_id) = (int_opt(r, 2), int_opt(r, 5));
-                    SelectPermission::read(&s(r, 0), &s(r, 1), class, &s(r, 3), &s(r, 4), minor_id, &s(r, 6))
-                })
-                .collect();
-            let members: Vec<RoleMember> = rows_of(&mut c, MEMBERS_SQL)
-                .await?
-                .iter()
-                .map(|r| RoleMember::read(&s(r, 0), &s(r, 1), &s(r, 2)))
-                .collect();
-            // The one place that decides whether grants are trusted.
-            let (mapped, note) = grant_readers(answer, &perms, &members);
+            let (mapped, note) = map_grants(&mut c).await;
             readers = mapped;
-            notes.extend(note.map(String::from));
+            notes.extend(note);
         }
         let mut by_table: BTreeMap<(String, String), Vec<ColumnInfo>> = BTreeMap::new();
         for r in &columns {
@@ -840,6 +894,68 @@ mod tests {
             assert!(readers.is_empty(), "{answer:?}: {readers:?}");
             assert_eq!(note, Some(GRANTS_HIDDEN));
         }
+    }
+
+    /// Canned answers, and which reads were asked for.
+    struct Canned {
+        visible: Option<i64>,
+        /// The read that fails, if any.
+        fail: &'static str,
+        asked: Vec<&'static str>,
+    }
+
+    impl Canned {
+        fn new(visible: Option<i64>, fail: &'static str) -> Self {
+            Self { visible, fail, asked: Vec::new() }
+        }
+
+        fn read(&mut self, what: &'static str) -> Result<()> {
+            self.asked.push(what);
+            if self.fail == what {
+                return Err(Error::Unavailable(format!("sqlserver: The SELECT permission was denied ({what})")));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl GrantSource for Canned {
+        async fn visibility(&mut self) -> Result<Option<i64>> {
+            self.read("visibility").map(|()| self.visible)
+        }
+
+        async fn permissions(&mut self) -> Result<Vec<SelectPermission>> {
+            self.read("permissions").map(|()| vec![on("analysts", "orders")])
+        }
+
+        async fn members(&mut self) -> Result<Vec<RoleMember>> {
+            self.read("members").map(|()| Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn permissions_are_read_only_with_view_definition_and_a_failed_read_is_a_note() {
+        // Without VIEW DEFINITION the permission catalogs are not read at all.
+        for visible in [Some(0), None] {
+            let mut src = Canned::new(visible, "");
+            let (readers, note) = map_grants(&mut src).await;
+            assert_eq!(src.asked, ["visibility"], "{visible:?}");
+            assert!(readers.is_empty());
+            assert_eq!(note.as_deref(), Some(GRANTS_HIDDEN));
+        }
+        // A catalog that cannot be read restricts every table and says why;
+        // the crawl goes on.
+        for fail in ["visibility", "permissions", "members"] {
+            let (readers, note) = map_grants(&mut Canned::new(Some(1), fail)).await;
+            assert!(readers.is_empty(), "{fail}: {readers:?}");
+            let note = note.unwrap();
+            assert!(note.starts_with(GRANTS_UNREAD) && note.contains(fail), "{fail}: {note}");
+        }
+        let mut src = Canned::new(Some(1), "");
+        let (readers, note) = map_grants(&mut src).await;
+        assert_eq!(src.asked, ["visibility", "permissions", "members"]);
+        let key = ("dbo".to_string(), "orders".to_string());
+        assert_eq!((readers[&key].clone(), note), (vec!["analysts".to_string()], None));
     }
 
     #[test]

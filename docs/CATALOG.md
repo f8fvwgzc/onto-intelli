@@ -159,8 +159,10 @@ through nested roles) is no reader.
 **`map_grants` on SQL Server needs `VIEW DEFINITION` on the database** (`GRANT VIEW DEFINITION TO
 <crawl user>`). Without it, SQL Server shows the crawl account only its own permission rows and
 role memberships, so a `DENY` to anyone else would look absent. The crawl checks
-(`HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')`) and, without it, maps every table
-as restricted with no readers and says so in the crawl's notes. The crawl account otherwise needs
+(`HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')`) and, without it, does not read the
+permission catalogs at all: it maps every table as restricted with no readers and says so in the
+crawl's notes. When reading them fails anyway, the crawl goes on the same way, with the error in its
+notes. The crawl account otherwise needs
 only `db_datareader` (or `SELECT` on the crawled schemas).
 
 Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
