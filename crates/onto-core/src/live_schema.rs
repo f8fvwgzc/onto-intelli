@@ -3656,6 +3656,7 @@ impl Ontology {
                 events,
                 schema: Some((Arc::new(schema), version)),
                 reindex: planned.reindex.clone(),
+                renames: renames_of(&set.changes),
             };
             Ok((planned.mutations, extra, (SchemaVersionInfo::from(&sv), planned.plan)))
         })?;
@@ -3811,6 +3812,23 @@ pub struct SchemaRevert {
     pub plan: Option<SchemaPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<SchemaApplied>,
+}
+
+/// The kind and relation renames of a change set, for its change record.
+fn renames_of(changes: &[SchemaChange]) -> Vec<crate::changes::Rename> {
+    use crate::changes::{Rename, RenameWhat};
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::RenameObjectType { from, to } => {
+                Some(Rename { what: RenameWhat::Kind, from: from.clone(), to: to.clone() })
+            }
+            SchemaChange::RenameLinkType { from, to } => {
+                Some(Rename { what: RenameWhat::Rel, from: from.clone(), to: to.clone() })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Migrations run with system authority across workspaces, attributed to the caller.

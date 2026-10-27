@@ -19,6 +19,7 @@ pub mod action_types;
 pub mod align;
 pub mod authority;
 pub mod catalog;
+pub mod changes;
 pub mod deps;
 pub mod engine;
 pub mod error;
@@ -56,6 +57,7 @@ pub mod time;
 pub mod trace;
 
 pub use align::{AlignOptions, AlignReport, AlignSource, CertifyReport, Mapping, MatchPredicate};
+pub use changes::{ChangeFilter, ChangeOp, ChangePage, ChangeRecord, Cursor, FieldMode, RunCause};
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
     SearchHit, SearchMode, SyncReport,

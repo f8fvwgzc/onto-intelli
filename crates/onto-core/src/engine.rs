@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
@@ -71,11 +71,21 @@ pub struct ActionContext {
     pub intent: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// The automation run this write belongs to, copied into change records.
+    #[serde(default)]
+    pub cause: Option<crate::changes::RunCause>,
 }
 
 impl ActionContext {
     pub fn new(principal: Principal, workspace: impl Into<String>) -> Self {
-        Self { principal, workspace: workspace.into(), request_id: new_id("req"), intent: None, source: None }
+        Self {
+            principal,
+            workspace: workspace.into(),
+            request_id: new_id("req"),
+            intent: None,
+            source: None,
+            cause: None,
+        }
     }
 
     pub fn system(workspace: impl Into<String>) -> Self {
@@ -101,6 +111,8 @@ impl ActionContext {
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeSet {
     pub revision: u64,
+    /// Store commit sequence the in-memory state reflects after this change.
+    pub seq: u64,
     pub workspace: String,
     pub request_id: String,
     pub entities: Vec<Id>,
@@ -181,6 +193,8 @@ pub(crate) struct Extra {
     pub schema: Option<(Arc<Schema>, u64)>,
     /// Kinds whose search documents are rebuilt after the commit.
     pub reindex: Vec<String>,
+    /// Renames made by the schema change (`schema`), for its change record.
+    pub renames: Vec<crate::changes::Rename>,
 }
 
 impl Extra {
@@ -286,6 +300,9 @@ struct Inner {
     revision: AtomicU64,
     /// Store commit sequence the in-memory state reflects.
     seq: AtomicU64,
+    /// Commits record change records (the tenant's `capture` setting as last
+    /// read; a stale value only adds records or leaves a gap).
+    capture: AtomicBool,
     opts: OntologyOptions,
     listeners: RwLock<Vec<Listener>>,
     /// The last few reasoner closures (see [`crate::reason`]).
@@ -321,6 +338,7 @@ impl Ontology {
             .filter_map(|(k, v)| v.as_str().map(|t| (k, t.to_string())))
             .collect();
         let follow = store.shared().then(|| std::time::Duration::from_millis(opts.follow_interval_ms.max(50)));
+        let capture = store.keeps_changes() && store.changes_meta()?.capture;
         let onto = Self {
             inner: Arc::new(Inner {
                 active: RwLock::new(ActiveSchema { schema: Arc::new(schema), version }),
@@ -335,6 +353,7 @@ impl Ontology {
                 store,
                 revision: AtomicU64::new(1),
                 seq: AtomicU64::new(snap.seq),
+                capture: AtomicBool::new(capture),
                 opts,
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
@@ -399,6 +418,34 @@ impl Ontology {
     /// Called synchronously after each committed write.
     pub fn on_change(&self, f: impl Fn(&ChangeSet) + Send + Sync + 'static) {
         self.inner.listeners.write().push(Arc::new(f));
+    }
+
+    /// Do this process's commits record change records?
+    pub fn capture_enabled(&self) -> bool {
+        self.inner.capture.load(Ordering::SeqCst)
+    }
+
+    /// Turn change capture on or off for the tenant (admins and the system;
+    /// never agents). Turning it on after a period off expires every older
+    /// cursor: nothing was recorded meanwhile. Audited as `changes.capture`.
+    pub fn set_capture(&self, ctx: &ActionContext, on: bool) -> Result<()> {
+        let p = &ctx.principal;
+        if !p.is_privileged() || p.is_agent() || !p.in_workspace("*") {
+            let reason = format!("{} may not change change capture (admins of every workspace only)", p.id);
+            self.audit_denied(ctx, &reason, now_ms());
+            return Err(Error::Denied(reason));
+        }
+        if !self.inner.store.keeps_changes() {
+            return Err(Error::Unavailable("this store keeps no change log".into()));
+        }
+        // Under the write lock, so no commit of this process straddles the switch.
+        self.transact(ctx, |o, _| {
+            o.inner.store.set_capture(on)?;
+            o.inner.capture.store(on, Ordering::SeqCst);
+            let ev = o.event(ctx, &ctx.workspace, "changes.capture", None, now_ms(), json!({ "on": on }), Vec::new());
+            Ok((Vec::new(), Extra { events: vec![ev], ..Default::default() }, ()))
+        })?;
+        Ok(())
     }
 
     pub(crate) fn set_authority(&self, scores: crate::authority::Scores) {
@@ -517,6 +564,9 @@ impl Ontology {
     /// never reach this ontology or its store.
     pub fn fork(&self) -> Ontology {
         let graph = self.inner.graph.read().clone();
+        // What-if edits never produce change records (nor gaps).
+        let store = MemoryStore::default();
+        let _ = store.set_capture(false);
         Ontology {
             inner: Arc::new(Inner {
                 active: RwLock::new(self.active_schema()),
@@ -530,9 +580,10 @@ impl Ontology {
                 vector_wake: std::sync::OnceLock::new(),
                 authority: RwLock::new(self.authority_scores()),
                 redirects: RwLock::new(self.inner.redirects.read().clone()),
-                store: Arc::new(MemoryStore::default()),
+                store: Arc::new(store),
                 revision: AtomicU64::new(self.revision()),
                 seq: AtomicU64::new(0),
+                capture: AtomicBool::new(false),
                 opts: self.inner.opts.clone(),
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
@@ -1284,6 +1335,12 @@ impl Ontology {
                 }
             }
         }
+        if self.inner.capture.load(Ordering::SeqCst) {
+            // `g` is still the graph before this commit.
+            let moved = extra.schema.as_ref().map(|(_, version)| (*version, extra.renames.as_slice()));
+            staged.batch.changes = crate::changes::capture(g, &schema, &staged.batch, ctx, moved, now);
+            staged.batch.captured = true;
+        }
         if self.inner.store.tracks_commits() {
             staged.batch.expect_seq = Some(self.inner.seq.load(Ordering::SeqCst));
         }
@@ -1354,6 +1411,7 @@ impl Ontology {
         if wrote {
             let change = ChangeSet {
                 revision,
+                seq: self.seq(),
                 workspace: ctx.workspace.clone(),
                 request_id: ctx.request_id.clone(),
                 entities: staged.touched.clone(),

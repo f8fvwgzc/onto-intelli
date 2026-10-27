@@ -974,6 +974,13 @@ impl Schema {
         self.link_types.values().filter(|lt| lt.dependency).map(|lt| lt.name.clone()).collect()
     }
 
+    /// Are changes to entities of `kind` recorded in the change feed? True for
+    /// every graph kind today; the hook that will leave out Records-stored
+    /// types until field masks exist (docs/design/EVENTS.md, A.1).
+    pub fn captures(&self, _kind: &str) -> bool {
+        true
+    }
+
     /// Is `kind` the same as, a subtype of, or an implementer of `ancestor`
     /// (an object type or an interface)?
     pub fn kind_is(&self, kind: &str, ancestor: &str) -> bool {

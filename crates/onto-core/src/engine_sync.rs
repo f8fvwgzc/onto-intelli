@@ -121,6 +121,7 @@ impl Ontology {
             let revision = self.inner.revision.fetch_add(1, Ordering::SeqCst) + 1;
             let change = ChangeSet {
                 revision,
+                seq: report.seq,
                 workspace: String::new(),
                 request_id: "sync".into(),
                 entities: Vec::new(),

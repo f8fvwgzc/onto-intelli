@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Result;
+use crate::changes::{ChangeOp, ChangeRecord, ChangesMeta, Cursor, Gap, GapReason, StoredChange, StoredPage};
 use crate::graph::LinkKey;
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::time::now_ms;
@@ -31,6 +31,7 @@ use crate::trace::{
     self, MetricsQuery, ScoreRow, SessionPage, SessionQuery, TraceDetail, TraceMetrics, TracePage, TraceQuery,
     TraceRecord, TraceRow,
 };
+use crate::{Error, Result};
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -66,6 +67,9 @@ pub struct CommitRecord {
     /// Too much changed to list (bulk import): followers reload everything.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reload: bool,
+    /// The writer recorded this commit's changes (see [`WriteBatch::captured`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub captured: bool,
 }
 
 /// A change made by another process, delivered to [`Store::subscribe`] callbacks.
@@ -132,6 +136,12 @@ pub struct WriteBatch {
     /// against. When the store's head differs, the write is refused with
     /// `Error::Stale` and nothing is written.
     pub expect_seq: Option<u64>,
+    /// Change records of this batch ([`crate::changes`]); the store stamps
+    /// their `seq` and keeps them with the commit.
+    pub changes: Vec<StoredChange>,
+    /// The writer computed `changes` (possibly none). A state-changing batch
+    /// that is not captured gets a `gap` record from a store that keeps changes.
+    pub captured: bool,
 }
 
 impl WriteBatch {
@@ -162,7 +172,29 @@ impl WriteBatch {
         let mut kv: Vec<(String, String)> = self.kv.iter().map(|(n, k, _)| (n.clone(), k.clone())).collect();
         kv.sort();
         kv.dedup();
-        CommitRecord { seq, ts: now_ms(), origin: origin.to_string(), entities, links, kv, reload: false }
+        CommitRecord {
+            seq,
+            ts: now_ms(),
+            origin: origin.to_string(),
+            entities,
+            links,
+            kv,
+            reload: false,
+            captured: self.captured,
+        }
+    }
+
+    /// Does this batch change what the change feed reports (entities, links
+    /// or the live schema), as opposed to other KV only?
+    pub fn touches_feed(&self) -> bool {
+        !(self.put_entities.is_empty()
+            && self.del_entities.is_empty()
+            && self.put_links.is_empty()
+            && self.del_links.is_empty())
+            || self
+                .kv
+                .iter()
+                .any(|(ns, _, _)| ns == crate::live_schema::NS_SCHEMA || ns == crate::live_schema::NS_VERSIONS)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -254,6 +286,27 @@ pub trait Store: Send + Sync {
         }
         Ok(seq)
     }
+    // ── change feed (docs/design/EVENTS.md, Part A); stores without one refuse ──
+
+    /// Does this store keep a change log?
+    fn keeps_changes(&self) -> bool {
+        false
+    }
+    /// Change records after `after`, ascending, at most `limit`, each with
+    /// the entity document it joins (create, update), plus head and floor.
+    fn changes_since(&self, _after: Cursor, _limit: usize) -> Result<StoredPage> {
+        Err(no_change_log())
+    }
+    /// Whether commits are captured, the floor and the head.
+    fn changes_meta(&self) -> Result<ChangesMeta> {
+        Err(no_change_log())
+    }
+    /// Turn capture on or off for the tenant. Turning it on after a period
+    /// off raises the floor to the head: nothing was recorded meanwhile.
+    fn set_capture(&self, _on: bool) -> Result<()> {
+        Err(no_change_log())
+    }
+
     /// Newest first.
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>>;
     fn kv_put(&self, ns: &str, key: &str, value: &Value, expires_at: Option<i64>) -> Result<()>;
@@ -335,6 +388,10 @@ pub trait Store: Send + Sync {
     }
 }
 
+fn no_change_log() -> Error {
+    Error::Unavailable("this store keeps no change log".into())
+}
+
 pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
     f.workspace.as_ref().is_none_or(|w| &e.workspace == w)
         && f.actor.as_ref().is_none_or(|a| &e.actor == a)
@@ -349,9 +406,14 @@ pub(crate) fn event_matches(e: &Event, f: &EventFilter) -> bool {
 
 /// Volatile store: the graph itself holds entities and links; events are kept
 /// in a bounded ring buffer. Ideal for tests, demos and embedded caches.
+///
+/// It keeps a bounded change log with full entity documents (memory only).
+/// Evicting the oldest commit's records raises the floor; a state-changing
+/// write without change records gets a `gap` record.
 pub struct MemoryStore {
     inner: Mutex<MemInner>,
     max_events: usize,
+    max_changes: usize,
     traces: Mutex<MemTraces>,
 }
 
@@ -370,6 +432,11 @@ struct MemInner {
     versions: VecDeque<VersionRecord>,
     link_versions: VecDeque<LinkVersion>,
     kv: HashMap<String, std::collections::BTreeMap<String, (Value, Option<i64>)>>,
+    /// Change records in cursor order, each with the entity it left (create, update).
+    changes: VecDeque<(StoredChange, Option<Entity>)>,
+    /// Records of commits below the floor are gone.
+    floor: u64,
+    capture_off: bool,
 }
 
 impl Default for MemoryStore {
@@ -379,17 +446,23 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// Keeps at most `max_events` events, versions and change records.
     pub fn with_event_capacity(max_events: usize) -> Self {
-        Self { inner: Mutex::new(MemInner::default()), max_events, traces: Mutex::new(MemTraces::default()) }
+        Self {
+            inner: Mutex::new(MemInner::default()),
+            max_events,
+            max_changes: max_events,
+            traces: Mutex::new(MemTraces::default()),
+        }
     }
-}
 
-impl Store for MemoryStore {
-    fn load(&self) -> Result<Snapshot> {
-        Ok(Snapshot::default())
+    /// Keep at most `max` change records (whole commits are evicted).
+    pub fn with_change_capacity(mut self, max: usize) -> Self {
+        self.max_changes = max.max(1);
+        self
     }
 
-    fn write(&self, batch: &WriteBatch) -> Result<u64> {
+    fn write_as(&self, batch: &WriteBatch, uncaptured: GapReason) -> Result<u64> {
         let mut inner = self.inner.lock();
         for e in &batch.events {
             if inner.events.len() >= self.max_events {
@@ -414,8 +487,100 @@ impl Store for MemoryStore {
         }
         if batch.changes_state() {
             inner.seq += 1;
+            let seq = inner.seq;
+            if batch.captured {
+                // Kept even while capture is off (a writer with a stale flag):
+                // extra records, never missing ones.
+                let docs: HashMap<&str, &Entity> = batch.put_entities.iter().map(|e| (e.id.as_str(), e)).collect();
+                for c in &batch.changes {
+                    let mut c = c.clone();
+                    c.record.cursor.seq = seq;
+                    let doc = match c.record.op {
+                        ChangeOp::EntityCreate | ChangeOp::EntityUpdate => {
+                            docs.get(c.record.id.as_str()).map(|e| (*e).clone())
+                        }
+                        _ => None,
+                    };
+                    inner.changes.push_back((c, doc));
+                }
+            } else if !inner.capture_off && batch.touches_feed() {
+                let rec = batch.commit_record(seq, "");
+                let gap =
+                    Gap { reason: uncaptured, origin: rec.origin, entities: rec.entities, links: rec.links, hidden: 0 };
+                inner.changes.push_back((
+                    StoredChange { record: ChangeRecord::gap(seq, rec.ts, gap), before_vis: None, rev_after: None },
+                    None,
+                ));
+            }
+            while inner.changes.len() > self.max_changes {
+                let Some(oldest) = inner.changes.front().map(|(c, _)| c.record.cursor.seq) else { break };
+                while inner.changes.front().is_some_and(|(c, _)| c.record.cursor.seq == oldest) {
+                    inner.changes.pop_front();
+                }
+                inner.floor = inner.floor.max(oldest + 1);
+            }
         }
         Ok(inner.seq)
+    }
+}
+
+fn head_cursor(inner: &MemInner) -> Cursor {
+    match inner.changes.back() {
+        Some((c, _)) if c.record.cursor.seq == inner.seq => c.record.cursor,
+        _ => Cursor::new(inner.seq, 0),
+    }
+}
+
+impl Store for MemoryStore {
+    fn load(&self) -> Result<Snapshot> {
+        Ok(Snapshot::default())
+    }
+
+    fn write(&self, batch: &WriteBatch) -> Result<u64> {
+        self.write_as(batch, GapReason::UncapturedWriter)
+    }
+
+    /// Like the default, one commit per chunk; each uncaptured commit's gap
+    /// says `bulk_import`.
+    fn bulk_import(&self, entities: &[Entity], links: &[Link]) -> Result<u64> {
+        let mut seq = self.head()?;
+        for chunk in entities.chunks(5_000) {
+            seq = self
+                .write_as(&WriteBatch { put_entities: chunk.to_vec(), ..Default::default() }, GapReason::BulkImport)?;
+        }
+        for chunk in links.chunks(5_000) {
+            seq =
+                self.write_as(&WriteBatch { put_links: chunk.to_vec(), ..Default::default() }, GapReason::BulkImport)?;
+        }
+        Ok(seq)
+    }
+
+    fn keeps_changes(&self) -> bool {
+        true
+    }
+
+    fn changes_since(&self, after: Cursor, limit: usize) -> Result<StoredPage> {
+        let inner = self.inner.lock();
+        let start = inner.changes.partition_point(|(c, _)| c.record.cursor <= after);
+        Ok(StoredPage {
+            changes: inner.changes.iter().skip(start).take(limit).cloned().collect(),
+            head: head_cursor(&inner),
+            floor: inner.floor,
+        })
+    }
+
+    fn changes_meta(&self) -> Result<ChangesMeta> {
+        let inner = self.inner.lock();
+        Ok(ChangesMeta { capture: !inner.capture_off, floor: inner.floor, head: head_cursor(&inner) })
+    }
+
+    fn set_capture(&self, on: bool) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if on && inner.capture_off {
+            inner.floor = inner.floor.max(inner.seq);
+        }
+        inner.capture_off = !on;
+        Ok(())
     }
 
     fn head(&self) -> Result<u64> {
