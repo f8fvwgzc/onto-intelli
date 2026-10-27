@@ -387,6 +387,57 @@ fn retention_removes_whole_commits_below_the_head() {
 }
 
 #[test]
+fn earliest_starts_at_the_floor() {
+    earliest_starts_at_the_floor_on(&Ontology::in_memory(Schema::enterprise()));
+}
+
+fn earliest_starts_at_the_floor_on(o: &Ontology) {
+    let f = ChangeFilter::default();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("1", "ws1"))]).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("2", "ws1")), Mutation::Upsert(issue("3", "ws1"))]).unwrap();
+    let s2 = o.seq();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("4", "ws1"))]).unwrap();
+    // Keep three records: the floor is s2, and s2's records stay.
+    let keep = onto_core::changes::ChangeRetention { keep_ms: None, keep_rows: Some(3) };
+    assert_eq!(o.store().vacuum_changes(&keep).unwrap().floor, s2);
+    let first = o.changes_page_earliest(&admin(), &f, 100).unwrap();
+    assert!(!first.expired);
+    assert_eq!(
+        ops(&first.changes),
+        vec![
+            (ChangeOp::EntityCreate, "issue:2".into()),
+            (ChangeOp::EntityCreate, "issue:3".into()),
+            (ChangeOp::EntityCreate, "issue:4".into())
+        ]
+    );
+    assert_eq!(first.next, o.change_head().unwrap());
+    // The same position as a cursor is below the floor (the edge reset).
+    assert!(o.changes_page(&admin(), Cursor::new(s2 - 1, u32::MAX), &f, 100).unwrap().expired);
+    // Paging from earliest in small pages reaches the same records.
+    let small = o.changes_page_earliest(&admin(), &f, 1).unwrap();
+    assert_eq!(ops(&small.changes), vec![(ChangeOp::EntityCreate, "issue:2".into())]);
+    assert_eq!(
+        ops(&feed(o, &admin(), small.next, &f)),
+        vec![(ChangeOp::EntityCreate, "issue:3".into()), (ChangeOp::EntityCreate, "issue:4".into())]
+    );
+
+    // Capture off, a write, capture on: the floor is the head commit, which
+    // has no records. Earliest is empty and resumes from the head without
+    // a reset.
+    o.set_capture(&ctx("ws1"), false).unwrap();
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("5", "ws1"))]).unwrap();
+    o.set_capture(&ctx("ws1"), true).unwrap();
+    let empty = o.changes_page_earliest(&admin(), &f, 100).unwrap();
+    assert!(!empty.expired && empty.changes.is_empty(), "{empty:?}");
+    assert_eq!(empty.next, o.change_head().unwrap());
+    assert!(!o.changes_page(&admin(), empty.next, &f, 100).unwrap().expired);
+    o.apply(&ctx("ws1"), vec![Mutation::Upsert(issue("6", "ws1"))]).unwrap();
+    assert_eq!(ops(&feed(o, &admin(), empty.next, &f)), vec![(ChangeOp::EntityCreate, "issue:6".into())]);
+    // A reader without a read role is refused.
+    assert!(o.changes_page_earliest(&Principal::new("x", vec![], vec!["ws1".into()]), &f, 10).is_err());
+}
+
+#[test]
 fn capture_off_then_on_expires_old_cursors() {
     capture_off_then_on_expires_old_cursors_on(&Ontology::in_memory(Schema::enterprise()));
 }
@@ -743,6 +794,12 @@ mod pg {
     fn forks_record_nothing() {
         let Some(pg) = TestTenant::new("chg_fork") else { return };
         super::forks_record_nothing_on(&open(&pg));
+    }
+
+    #[test]
+    fn earliest_starts_at_the_floor() {
+        let Some(pg) = TestTenant::new("chg_earliest") else { return };
+        super::earliest_starts_at_the_floor_on(&open(&pg));
     }
 
     #[test]

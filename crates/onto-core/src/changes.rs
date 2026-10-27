@@ -976,14 +976,44 @@ impl Ontology {
     /// keeps no change log. An `after` older than the floor returns no
     /// records and `expired = true`.
     pub fn changes_page(&self, p: &Principal, after: Cursor, f: &ChangeFilter, limit: usize) -> Result<ChangePage> {
+        self.changes_page_valid_from(p, after, after.seq, f, limit)
+    }
+
+    /// The first page of the oldest records kept (`from = earliest`): every
+    /// record from the floor on. When retention raises the floor while the
+    /// page is read, the page is `expired` instead of silently starting
+    /// later.
+    pub fn changes_page_earliest(&self, p: &Principal, f: &ChangeFilter, limit: usize) -> Result<ChangePage> {
+        let floor = self.store().changes_meta()?.floor;
+        // Records of the floor's commit are kept, so start just before it.
+        let after = if floor == 0 { Cursor::default() } else { Cursor::new(floor - 1, u32::MAX) };
+        self.changes_page_valid_from(p, after, floor, f, limit)
+    }
+
+    /// A page after `after` that is complete only when nothing below
+    /// `valid_from` was removed: expired iff `valid_from < floor`.
+    fn changes_page_valid_from(
+        &self,
+        p: &Principal,
+        after: Cursor,
+        valid_from: u64,
+        f: &ChangeFilter,
+        limit: usize,
+    ) -> Result<ChangePage> {
         f.check()?;
         if !p.allows(Access::Read) {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
         }
         let page = self.store().changes_since(after, limit.clamp(1, MAX_PAGE))?;
         let (head, floor) = (page.head.seq, page.floor);
-        if after.seq < floor {
+        if valid_from < floor {
             return Ok(ChangePage { changes: Vec::new(), next: after, head, floor, expired: true });
+        }
+        if page.changes.is_empty() {
+            // Nothing after `after` up to the head (read in the same
+            // snapshot): resume from the head, so a reader that started
+            // before the floor's commit is not reported expired next time.
+            return Ok(ChangePage { changes: Vec::new(), next: after.max(page.head), head, floor, expired: false });
         }
         let schema = self.schema();
         let g = self.reader(p)?;

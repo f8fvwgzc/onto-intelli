@@ -156,6 +156,11 @@ enum Command {
         #[arg(long)]
         within: Option<String>,
     },
+    /// The change feed: what each commit changed, filtered for you.
+    ///
+    /// `--once` prints one page after a cursor and the cursor to resume from
+    /// (`--after`). Following the feed live is not in this version.
+    Watch(WatchArgs),
     /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
     Metric {
         name: Option<String>,
@@ -899,6 +904,152 @@ impl Backend {
             }
         }
     }
+}
+
+// ── onto watch ────────────────────────────────────────────────────────
+
+#[derive(clap::Args)]
+struct WatchArgs {
+    /// Print one page and exit (live following is not in this version).
+    #[arg(long)]
+    once: bool,
+    /// Resume after this cursor: a previous page's next, like 42.0.
+    #[arg(long, conflicts_with = "from")]
+    after: Option<String>,
+    /// Without --after: earliest (default) or now.
+    #[arg(long, value_parser = ["earliest", "now"])]
+    from: Option<String>,
+    /// Records scanned (default: [changes] page; at most 1000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Entity kinds or interfaces (repeat or comma-separate).
+    #[arg(long, value_delimiter = ',')]
+    kinds: Vec<String>,
+    /// entity.create, entity.update, entity.delete, entity.hidden, link.*, schema.change, gap.
+    #[arg(long, value_delimiter = ',')]
+    ops: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    workspaces: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    ids: Vec<String>,
+    /// Relations (link records only).
+    #[arg(long, value_delimiter = ',')]
+    rels: Vec<String>,
+    /// Updates that changed any of these fields.
+    #[arg(long, value_delimiter = ',')]
+    props: Vec<String>,
+    /// Globs on the writer's source; !x excludes.
+    #[arg(long, value_delimiter = ',')]
+    sources: Vec<String>,
+    /// Ids, kinds, ops and changed field names only.
+    #[arg(long)]
+    ids_only: bool,
+    /// Leave out records written by schema migrations.
+    #[arg(long)]
+    no_migrations: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+impl WatchArgs {
+    /// The `changes.poll` input.
+    fn poll_input(&self) -> Value {
+        let mut input = json!({
+            "kinds": self.kinds, "ops": self.ops, "workspaces": self.workspaces, "ids": self.ids,
+            "rels": self.rels, "props": self.props, "sources": self.sources,
+        });
+        let m = input.as_object_mut().expect("an object");
+        if let Some(a) = &self.after {
+            m.insert("after".into(), json!(a));
+        }
+        if let Some(f) = &self.from {
+            m.insert("from".into(), json!(f));
+        }
+        if let Some(l) = self.limit {
+            m.insert("limit".into(), json!(l));
+        }
+        if self.ids_only {
+            m.insert("fields".into(), json!("ids"));
+        }
+        if self.no_migrations {
+            m.insert("include_migrations".into(), json!(false));
+        }
+        input
+    }
+}
+
+/// One record as a line: cursor, op, kind, id and what changed.
+fn change_line(c: &Value, st: &Style) -> String {
+    let strs = |v: &Value| -> Vec<String> {
+        v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    };
+    let detail = match c["op"].as_str().unwrap_or_default() {
+        "entity.update" if !c["state"].is_null() => {
+            format!("{} → {}", c["state"]["from"].as_str().unwrap_or("∅"), c["state"]["to"].as_str().unwrap_or("∅"))
+        }
+        "entity.update" | "link.update" => strs(&c["changed"]).join(", "),
+        "entity.create" if c["became_visible"] == true => "came into view".to_string(),
+        "schema.change" => format!("version {}", c["schema"]["version"]),
+        "gap" => {
+            let g = &c["gap"];
+            let n = strs(&g["entities"]).len() + g["links"].as_array().map_or(0, Vec::len);
+            let hidden = g["hidden"].as_u64().unwrap_or(0);
+            format!(
+                "{}: {n} changed without records{}; re-read with entity.find",
+                g["reason"].as_str().unwrap_or("?"),
+                if hidden > 0 { format!(" (+{hidden} you cannot see)") } else { String::new() }
+            )
+        }
+        _ => String::new(),
+    };
+    let kind = c["kind"].as_str().unwrap_or_default();
+    let id = c["id"].as_str().unwrap_or_default();
+    format!(
+        "{} {:<14} {} {}{}",
+        st.dim(c["cursor"].as_str().unwrap_or_default()),
+        c["op"].as_str().unwrap_or_default(),
+        st.cyan(kind),
+        st.bold(id),
+        if detail.is_empty() { String::new() } else { format!("  {detail}") }
+    )
+}
+
+async fn watch(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
+    if !w.once {
+        return Err(Error::invalid(
+            "following the change feed live is not in this version: run onto watch --once, then again with \
+             --after <next>",
+        ));
+    }
+    let be = backend(cli).await?;
+    let page = be.call("changes.poll", w.poll_input()).await?;
+    if w.json {
+        print_json(&page);
+        return Ok(());
+    }
+    if page["expired"] == true {
+        return Err(Error::Other(format!(
+            "cursor {} expired (floor {}, head {}): {}",
+            w.after.as_deref().unwrap_or("earliest"),
+            page["floor"],
+            page["head"],
+            page["message"].as_str().unwrap_or_default()
+        )));
+    }
+    let changes = page["changes"].as_array().cloned().unwrap_or_default();
+    if changes.is_empty() {
+        println!("No changes you may see{}.", w.after.as_deref().map(|a| format!(" after {a}")).unwrap_or_default());
+    }
+    for c in &changes {
+        println!("{}", change_line(c, st));
+    }
+    println!(
+        "{} {}  {}",
+        st.dim("next:"),
+        page["next"].as_str().unwrap_or_default(),
+        st.dim(&format!("(head {}, floor {}; resume with --after)", page["head"], page["floor"]))
+    );
+    Ok(())
 }
 
 // ── output helpers ────────────────────────────────────────────────────
@@ -1776,6 +1927,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
+        Command::Watch(w) => watch(&cli, w, st).await,
         Command::Changes { days, within } => {
             let be = backend(&cli).await?;
             let r = be

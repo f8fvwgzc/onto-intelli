@@ -144,6 +144,9 @@ const BUILTIN_ROUTES: &[(&str, &str)] = &[
     ("onto_intelli.v1.AssuranceService/InstallPack", "pack.install"),
     ("onto_intelli.v1.AssuranceService/InduceSheet", "model.induce"),
     ("onto_intelli.v1.AssuranceService/IngestSheet", "ingest.sheet"),
+    ("onto_intelli.v1.ChangeService/Poll", "changes.poll"),
+    ("onto_intelli.v1.ChangeService/Head", "changes.head"),
+    ("onto_intelli.v1.ChangeService/Capture", "changes.capture"),
 ];
 
 pub struct Route {

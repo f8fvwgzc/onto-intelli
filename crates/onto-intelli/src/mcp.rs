@@ -220,6 +220,29 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             false,
         ),
         (
+            "poll_changes",
+            "changes.poll",
+            "One page of the change feed after a cursor: each record says what one commit changed (op, kind, id, changed fields, old values when you could see them before, the entity after). Pass `next` back as `after` for the following page. `expired` means records were removed: re-read with find_entities (not pinned to a cursor). A `gap` record means state changed without records.",
+            obj(
+                json!({
+                    "after": s("Cursor from a previous page's next (like 42.0)"),
+                    "from": { "type": "string", "enum": ["earliest", "now"], "description": "Without after: earliest (default) or now" },
+                    "limit": { "type": "integer", "description": "Records scanned (default 500, at most 1000)" },
+                    "kinds": arr("Entity kinds or interfaces (links match through either end)"),
+                    "ops": arr("entity.create, entity.update, entity.delete, entity.hidden, link.create, link.update, link.delete, schema.change, gap"),
+                    "workspaces": arr("Workspaces"),
+                    "ids": arr("Entity ids (at most 1000)"),
+                    "rels": arr("Relations (link records only)"),
+                    "props": arr("Updates that changed any of these fields"),
+                    "sources": arr("Globs on the writer's source; !x excludes"),
+                    "fields": { "type": "string", "enum": ["full", "ids"], "description": "ids: no documents or old values" },
+                    "include_migrations": { "type": "boolean", "description": "Records written by schema migrations (default true)" }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        (
             "experts",
             "people.experts",
             "Who knows about a topic, with reasons.",
@@ -581,6 +604,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "metric",
             "history",
             "changes",
+            "poll_changes",
             "experts",
         ],
     ),
@@ -645,6 +669,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "data_quality",
             "history",
             "changes",
+            "poll_changes",
         ],
     ),
     (
@@ -659,6 +684,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "metric",
             "history",
             "changes",
+            "poll_changes",
             "experts",
             "query_inferred",
             "explain_fact",

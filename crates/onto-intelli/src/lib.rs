@@ -26,6 +26,7 @@ pub mod answer;
 pub mod assurance;
 pub mod blocking;
 pub mod cache;
+pub mod changes;
 pub mod command;
 pub mod config;
 pub mod connectors;

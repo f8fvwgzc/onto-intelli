@@ -36,6 +36,11 @@
 //! * `GET  /v1/packs`           industry packs; `GET /v1/packs/{id}` one pack with its lint
 //! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
 //! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose)
+//! * `GET  /v1/changes`         one page of the change feed (`?after=` or `?from=earliest|now`, `limit`,
+//!   comma-separated `kinds`, `ops`, `workspaces`, `ids`, `rels`, `props`, `sources`, `fields`,
+//!   `include_migrations`)
+//! * `GET  /v1/changes/head`    the feed's cursor, head, floor and whether capture is on
+//! * `POST /v1/changes/capture` `{on}`: record changes or not (admins of every workspace)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
 //!   A session minting a session cannot outlive itself and belongs to the same login (`sid`).
@@ -130,6 +135,9 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/packs", get(packs_list))
         .route("/v1/packs/{id}", get(pack_show))
         .route("/v1/packs/{id}/{verb}", post(pack_verb))
+        .route("/v1/changes", get(changes_poll))
+        .route("/v1/changes/head", get(changes_head))
+        .route("/v1/changes/capture", post(changes_capture))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -806,6 +814,46 @@ async fn schema_lint(
         input.insert("include_dismissed".into(), json!(matches!(d.as_str(), "true" | "1" | "yes")));
     }
     run(&s, &headers, "schema.lint", Value::Object(input)).await
+}
+
+/// Change feed query parameters as `changes.poll` input: list keys split on
+/// commas, `limit` a number, the migration flags booleans, everything else
+/// (cursors like `42.0` included) a string.
+pub(crate) fn changes_query(q: HashMap<String, String>) -> Value {
+    const LISTS: &[&str] = &["kinds", "ops", "workspaces", "ids", "rels", "props", "sources"];
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            k if LISTS.contains(&k) => {
+                json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            }
+            "limit" => v.trim().parse::<u64>().map(Value::from).unwrap_or(Value::String(v)),
+            "include_migrations" | "exclude_migrations" => match v.trim() {
+                "true" | "1" | "yes" => Value::Bool(true),
+                "false" | "0" | "no" => Value::Bool(false),
+                _ => Value::String(v),
+            },
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    Value::Object(input)
+}
+
+async fn changes_poll(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "changes.poll", changes_query(q)).await
+}
+
+async fn changes_head(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "changes.head", json!({})).await
+}
+
+async fn changes_capture(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "changes.capture", body_or_empty(body)).await
 }
 
 async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {

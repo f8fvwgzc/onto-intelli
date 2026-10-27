@@ -952,3 +952,37 @@ service AssuranceService {
   rpc InduceSheet(SheetRequest) returns (google.protobuf.Struct);             // model.induce
   rpc IngestSheet(SheetIngestRequest) returns (google.protobuf.Struct);       // ingest.sheet
 }
+
+// ── Change feed: what each commit changed, filtered per reader ───────────
+// Unary in this version: Poll reads one page after a cursor, Head says where
+// the feed is, Capture switches recording for the tenant (admins of every
+// workspace). Responses are the JSON of changes.poll, changes.head and
+// changes.capture. Proto3 drops false values, hence exclude_migrations and
+// off. Delivery is at least once; exactly once is not offered.
+
+message ChangesPollRequest {
+  string after = 1;               // a previous page's next ("42.0"); empty: see from
+  string from = 2;                // without after: earliest (default) | now
+  uint32 limit = 3;               // records scanned (default [changes] page, at most 1000)
+  repeated string kinds = 4;      // entity kinds or interfaces (links match through either end)
+  repeated string ops = 5;        // entity.create | entity.update | entity.delete | entity.hidden | link.* | schema.change | gap
+  repeated string workspaces = 6;
+  repeated string ids = 7;        // at most 1000
+  repeated string rels = 8;       // link records only
+  repeated string props = 9;      // updates that changed any of these fields
+  repeated string sources = 10;   // globs on the writer's source; !x excludes
+  string fields = 11;             // full (default) | ids
+  bool exclude_migrations = 12;   // leave out records written by schema migrations
+}
+
+message ChangesCaptureRequest {
+  bool on = 1;                    // record changes
+  bool off = 2;                   // stop recording (proto3 drops on = false)
+  string workspace = 3;           // workspace of the audit event
+}
+
+service ChangeService {
+  rpc Poll(ChangesPollRequest) returns (google.protobuf.Struct);        // changes.poll
+  rpc Head(google.protobuf.Empty) returns (google.protobuf.Struct);     // changes.head
+  rpc Capture(ChangesCaptureRequest) returns (google.protobuf.Struct);  // changes.capture
+}

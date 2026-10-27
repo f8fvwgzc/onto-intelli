@@ -240,3 +240,9 @@ calls = "writes"
 flush_ms = 500
 flush_records = 200
 queue = 10000                      # records waiting; beyond this they are dropped and counted
+
+# The change feed (changes.poll, changes.head): records of what each commit
+# changed, filtered per reader. Whether commits record changes is a tenant
+# property, switched with the changes.capture action (admins of every workspace).
+[changes]
+page = 500                         # records scanned per changes.poll page without a limit (1..1000)

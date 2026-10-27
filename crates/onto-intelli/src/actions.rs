@@ -17,6 +17,7 @@ use onto_core::{
 use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, SchemaChangeSet, SearchMode};
 
 use crate::assurance;
+use crate::changes;
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RecallOptions, RememberInput};
@@ -433,6 +434,17 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "Write a sheet's rows as objects with a mapping; when absent, the rows go into the existing object type the sheet names (kind, else induced), column by column, and a type the schema lacks must be applied from model.induce first. dry_run validates only. Input: {csv, mapping?, kind?, key?, workspace?, dry_run?}.",
     ),
+    a(
+        "changes.poll",
+        false,
+        "One page of the change feed after a cursor: records the caller may see that the filter wants (gap records always pass), next (the last cursor scanned), head, floor, and expired with a message when the cursor is older than the floor. Delivery is at least once; exactly once is not offered. Input: {after? | from?: earliest (default) | now, limit? (at most 1000), kinds?, ops?, workspaces?, ids?, rels?, props?, sources?, fields?: full | ids, include_migrations? | exclude_migrations?}.",
+    ),
+    a("changes.head", false, "The change feed's position: {cursor, head, floor, capture}."),
+    a(
+        "changes.capture",
+        true,
+        "Turn change recording on or off for the tenant (admins of every workspace, never agents); turning it on after a period off expires every older cursor, since nothing was recorded meanwhile. Input: {on | off, workspace?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -770,15 +782,27 @@ impl Intelli {
         Traced { result, trace_id: Some(id) }
     }
 
+    /// The checks every call passes before it runs, for the action table
+    /// and for surfaces that serve an action outside it (the change stream):
+    /// agents run only the write actions open to them ([`AGENT_WRITES`],
+    /// raw writes with `governance.agent_raw_writes`). The action's own arm
+    /// checks roles, workspaces and governance.
+    pub fn admit(&self, p: &Principal, action: &str, input: &Value) -> Result<()> {
+        agent_may_write(p, action, input, self.ontology().options().governance.agent_raw_writes)
+    }
+
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
-        agent_may_write(p, action, &input, onto.options().governance.agent_raw_writes)?;
+        self.admit(p, action, &input)?;
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
             return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
         if assurance::CALLS.contains(&action) {
             return blocking(|| self.assurance_call(p, action, input));
+        }
+        if changes::CALLS.contains(&action) {
+            return blocking(|| self.changes_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {

@@ -225,6 +225,7 @@ impl Intelli {
         let schema = load_schema(&config)?;
         config.traces.check()?;
         config.mcp.check()?;
+        config.changes.check()?;
         let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,

@@ -64,6 +64,81 @@ async fn every_listed_action_is_dispatched() {
     }
 }
 
+#[tokio::test]
+async fn change_feed_actions_through_the_hub() {
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let a = hub.tenant("ws_a").await.unwrap();
+    let b = hub.tenant("ws_b").await.unwrap();
+    seed::load_demo(&a, "acme").await.unwrap();
+    let admin = Principal::admin("x");
+    let head = a.call(&admin, "changes.head", json!({})).await.unwrap();
+    assert_eq!(head["capture"], true, "{head}");
+    let start = head["cursor"].as_str().unwrap().to_string();
+    let b_head = b.call(&admin, "changes.head", json!({})).await.unwrap();
+
+    a.call(&admin, "entity.upsert", json!({ "id": "task:feed", "title": "Feed", "workspace": "acme" })).await.unwrap();
+    let page = a.call(&admin, "changes.poll", json!({ "after": start })).await.unwrap();
+    let changes = page["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{page}");
+    assert_eq!((changes[0]["op"].as_str(), changes[0]["id"].as_str()), (Some("entity.create"), Some("task:feed")));
+    assert_eq!(changes[0]["cause"]["source"], "api");
+    assert_eq!(page["next"], changes[0]["cursor"]);
+    assert_eq!(page["expired"], false);
+    // The other tenant's feed did not move.
+    assert_eq!(b.call(&admin, "changes.head", json!({})).await.unwrap(), b_head);
+
+    // Readers get what they may see; next still moves past the rest.
+    let outsider = Principal::named("user:o", &["viewer"], &["elsewhere"]).unwrap();
+    let theirs = a.call(&outsider, "changes.poll", json!({ "after": start })).await.unwrap();
+    assert!(theirs["changes"].as_array().unwrap().is_empty(), "{theirs}");
+    assert_eq!(theirs["next"], page["next"]);
+    let nobody = Principal::named("user:n", &[], &["acme"]).unwrap();
+    assert!(a.call(&nobody, "changes.head", json!({})).await.is_err(), "no read role");
+
+    // Agents read the feed but never switch capture.
+    let agent = Principal::named("agent:bot", &["admin", "agent"], &["*"]).unwrap();
+    assert!(a.call(&agent, "changes.poll", json!({ "from": "now" })).await.is_ok());
+    let err = a.call(&agent, "changes.capture", json!({ "on": false })).await.unwrap_err();
+    assert!(matches!(err, onto_intelli::Error::Denied(ref m) if m.contains("not open to agents")), "{err}");
+    assert!(a.admit(&agent, "changes.capture", &json!({})).is_err());
+    assert!(a.admit(&agent, "changes.poll", &json!({})).is_ok());
+    assert!(a.admit(&agent, "changes.stream", &json!({})).is_ok(), "a read outside the table");
+    // Nor does an admin of one workspace.
+    let scoped = Principal::named("user:w", &["admin"], &["acme"]).unwrap();
+    assert!(matches!(
+        a.call(&scoped, "changes.capture", json!({ "on": false })).await.unwrap_err(),
+        onto_intelli::Error::Denied(_)
+    ));
+
+    // Off, an unrecorded write, on: the old cursor is expired, with a message.
+    let off = a.call(&admin, "changes.capture", json!({ "on": false })).await.unwrap();
+    assert_eq!(off["capture"], false);
+    a.call(&admin, "entity.patch", json!({ "id": "task:feed", "title": "Unrecorded" })).await.unwrap();
+    let on = a.call(&admin, "changes.capture", json!({ "off": false })).await.unwrap();
+    assert_eq!(on["capture"], true);
+    let expired = a.call(&admin, "changes.poll", json!({ "after": page["next"] })).await.unwrap();
+    assert_eq!(expired["expired"], true, "{expired}");
+    assert!(expired["message"].as_str().unwrap().contains("not pinned to a cursor"), "{expired}");
+    let resumed = a.call(&admin, "changes.poll", json!({ "after": on["cursor"] })).await.unwrap();
+    assert_eq!(resumed["expired"], false);
+    let audit = a.call(&admin, "event.list", json!({ "action": "changes.capture" })).await.unwrap();
+    assert_eq!(audit["events"].as_array().unwrap().len(), 2, "{audit}");
+
+    // Inputs are checked.
+    for bad in [
+        json!({ "after": "soon" }),
+        json!({ "after": start, "from": "now" }),
+        json!({ "from": "yesterday" }),
+        json!({ "ops": ["entity.created"] }),
+        json!({ "fields": "some" }),
+    ] {
+        let err = a.call(&admin, "changes.poll", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "{bad}: {err}");
+        assert!(err.to_string().contains("changes.poll"), "{bad}: {err}");
+    }
+    assert_eq!(a.call(&admin, "changes.capture", json!({})).await.unwrap_err().code(), "invalid_argument");
+}
+
 mod hooks {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

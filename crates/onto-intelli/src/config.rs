@@ -40,6 +40,9 @@ pub struct Config {
     pub console: ConsoleConfig,
     /// Traces of asks, actions and calls (docs/CONTROL_PLANE.md section 9).
     pub traces: TracesConfig,
+    /// Reading the change feed (`changes.poll`). Capture itself is a tenant
+    /// property (`changes.capture`), not process configuration.
+    pub changes: ChangesConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -694,6 +697,34 @@ impl TracesConfig {
         }
         if self.queue == 0 || self.flush_records == 0 || self.retention_days == 0 {
             return Err(Error::Config("traces.queue, flush_records and retention_days must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
+/// `[changes]`: reading the change feed (docs/design/EVENTS.md, Part A).
+/// Whether commits record changes is a tenant property, switched with the
+/// `changes.capture` action, so replicas never disagree about it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChangesConfig {
+    /// Records scanned per `changes.poll` page when the call gives no
+    /// `limit` (1 to 1000).
+    pub page: usize,
+}
+
+impl Default for ChangesConfig {
+    fn default() -> Self {
+        Self { page: 500 }
+    }
+}
+
+impl ChangesConfig {
+    /// `page` is 1 to [`onto_core::changes::MAX_PAGE`].
+    pub fn check(&self) -> Result<()> {
+        let max = onto_core::changes::MAX_PAGE;
+        if self.page == 0 || self.page > max {
+            return Err(Error::Config(format!("changes.page = {} (1 to {max})", self.page)));
         }
         Ok(())
     }
