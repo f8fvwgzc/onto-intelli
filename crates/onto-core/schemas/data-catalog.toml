@@ -17,7 +17,7 @@ category = "container"
 icon = "database"
 color = "#0f766e"
 description = "A database a connector crawls. Only metadata is read: schemas, tables, columns, comments, constraints and usage statistics."
-properties.engine = { type = "enum", values = ["postgres"], description = "Database engine." }
+properties.engine = { type = "enum", values = ["postgres", "mysql", "mariadb", "sqlserver", "mongodb"], description = "Database engine." }
 properties.host = { type = "string" }
 properties.database = { type = "string" }
 properties.server_version = { type = "string" }

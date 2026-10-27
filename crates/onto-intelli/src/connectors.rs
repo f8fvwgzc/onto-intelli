@@ -46,6 +46,14 @@ use onto_core::{ActionContext, Error, EventInput, Mutation, Ontology, Principal,
 use crate::intelli::Intelli;
 
 pub mod repo;
+pub mod restricted;
+
+#[cfg(feature = "mongodb")]
+pub mod mongo;
+#[cfg(feature = "mysql")]
+pub mod mysql;
+#[cfg(feature = "sqlserver")]
+pub mod sqlserver;
 
 /// KV namespaces: connector specs and their crawl state.
 pub const NS_SPEC: &str = "connector";
@@ -74,7 +82,7 @@ fn default_exclude() -> Vec<String> {
 pub struct ConnectorSpec {
     /// `[a-z0-9_-]`, at most 40: also the source key in entity ids.
     pub name: String,
-    /// `postgres` or `repo`.
+    /// `postgres`, `mysql` (also MariaDB), `sqlserver`, `mongodb` or `repo`.
     #[serde(default = "default_kind")]
     pub kind: String,
     /// Connection URL, or `env:VAR` to read it from the environment when
@@ -105,9 +113,13 @@ pub struct ConnectorSpec {
     /// Database role → team or person that owns what the role owns.
     #[serde(default)]
     pub owner_map: BTreeMap<String, String>,
-    /// Most-called statements read from pg_stat_statements.
+    /// Most-called statements read from pg_stat_statements (MySQL:
+    /// performance_schema).
     #[serde(default = "default_max_queries")]
     pub max_queries: usize,
+    /// `mongodb`: documents sampled per collection to infer its fields (1..=1000).
+    #[serde(default = "default_sample_rows")]
+    pub sample_rows: usize,
     /// `repo` connectors: branch, include and exclude patterns, owner map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<repo::RepoOptions>,
@@ -122,6 +134,10 @@ pub struct ConnectorSpec {
     pub created_by: String,
     #[serde(default)]
     pub created_at: i64,
+}
+
+fn default_sample_rows() -> usize {
+    100
 }
 
 fn default_kind() -> String {
@@ -168,9 +184,15 @@ impl ConnectorSpec {
             )));
         }
         match self.kind.as_str() {
-            "postgres" => {
+            "postgres" | "mysql" | "sqlserver" | "mongodb" => {
                 if self.url.trim().is_empty() {
-                    return Err(Error::invalid("connector url is required (postgres://… or env:VAR)"));
+                    return Err(Error::invalid(format!(
+                        "connector url is required ({}://… or env:VAR)",
+                        if self.kind == "postgres" { "postgres" } else { self.kind.as_str() }
+                    )));
+                }
+                if !(1..=1000).contains(&self.sample_rows) {
+                    return Err(Error::invalid("sample_rows must be 1 to 1000"));
                 }
                 Ok(())
             }
@@ -180,7 +202,9 @@ impl ConnectorSpec {
                 }
                 repo::validate(self)
             }
-            other => Err(Error::invalid(format!("unknown connector kind '{other}' (postgres, repo)"))),
+            other => Err(Error::invalid(format!(
+                "unknown connector kind '{other}' (postgres, mysql, sqlserver, mongodb, repo)"
+            ))),
         }
     }
 
@@ -364,6 +388,12 @@ pub fn connector_for(kind: &str, allow_private: bool) -> Result<Box<dyn Connecto
     match kind {
         #[cfg(feature = "postgres")]
         "postgres" => Ok(Box::new(postgres::PgConnector::new(allow_private))),
+        #[cfg(feature = "mysql")]
+        "mysql" | "mariadb" => Ok(Box::new(mysql::MySqlConnector::new(allow_private))),
+        #[cfg(feature = "sqlserver")]
+        "sqlserver" | "mssql" => Ok(Box::new(sqlserver::SqlServerConnector::new(allow_private))),
+        #[cfg(feature = "mongodb")]
+        "mongodb" => Ok(Box::new(mongo::MongoConnector::new(allow_private))),
         other => Err(Error::Config(format!("no connector for '{other}' in this build"))),
     }
 }

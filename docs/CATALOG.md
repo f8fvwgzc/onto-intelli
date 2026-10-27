@@ -112,6 +112,62 @@ dependencies and CODEOWNERS (section 13 of
 - **Owners.** `owner_map` turns a database role into an `owns` link from a
   team or person. Owners set by hand are never touched.
 
+### Other databases: MySQL and MariaDB, SQL Server, MongoDB
+
+The same registration, crawl, fingerprints, provenance and permissions apply to three more kinds
+(`connector.add` with `kind`, or `POST /v1/catalog/connectors`):
+
+| `kind` | URL | Metadata | Rows of synced types |
+|---|---|---|---|
+| `mysql` (also MariaDB) | `mysql://user:pass@host:3306/db?ssl-mode=REQUIRED` | `information_schema`: databases as schemas, tables, views (definitions; the tables they read on MySQL 8.0.13+), columns with `COLUMN_TYPE`, keys, comments and `ENUM` labels, foreign keys, `SELECT` grants, and the most-run statements of `performance_schema` when readable | `JSON_OBJECT` pages in key order |
+| `sqlserver` | `sqlserver://user:pass@host:1433/db?encrypt=true` | the catalog views of one database: schemas, tables and views (row counts from `sys.partitions`, definitions, dependencies), columns with keys, `MS_Description` comments and column `CHECK` lists, foreign keys, `SELECT` grants | `FOR JSON PATH` pages in key order |
+| `mongodb` | `mongodb://user:pass@host:27017/db?authSource=admin` | databases as schemas, collections as tables, views with their pipeline; fields **inferred from a sample** (`sample_rows`, default 100, at most 1000; `$sample`): the most common BSON type (`mixed(a\|b)` when several), nullable when missing or null in some, nested documents as `a.b`; `_id` is the key; single-field unique indexes; a field `x_id`/`xId` of object ids becomes a foreign key to a collection `x` or `xs` of the same database (a heuristic) | `find` pages in key order (one key field; object ids as their hex text) |
+
+Every connector only reads: a read-only MySQL session with a statement time limit, `SET LOCK_TIMEOUT`
+on SQL Server, `maxTimeMS` on MongoDB. No row is read for the snapshot; rows are read only for synced
+object types, with only the key and mapped columns. The ontology builder (`ontology.draft`) drafts
+object types, states (from `ENUM` labels and `CHECK` lists), properties and links from these
+catalog entities exactly as from PostgreSQL's.
+
+**Restricted connectors** (registered by an API key or a console session) follow the same SSRF rules
+as PostgreSQL's: one TCP host (no socket, no host list, no `mongodb+srv`), a user for the SQL engines,
+only the query parameters each kind allows (`ssl-mode`; `encrypt`, `trust_server_certificate`;
+`authSource`, `authMechanism`, `tls`, `appName`), no `env:` URL, and, unless
+`console.allow_private_urls`, a host that resolves only to public addresses. The connection goes to
+the checked address: for SQL Server the TCP stream is pinned while TLS still verifies the name;
+MySQL with `ssl-mode=VERIFY_IDENTITY` and MongoDB with `tls=true` connect by name, since their
+certificates are checked against it. MongoDB always connects directly to that one host
+(`directConnection`), so a replica set cannot redirect the crawl.
+
+SQL Server: `encrypt` is `true` by default (everything encrypted, failing without TLS); `true`,
+`yes`, `1`, `on`, `mandatory` or `required` keep that, `false`, `no`, `0`, `off` or `optional`
+encrypt the login only, and any other value (`strict` too: TDS 8.0 is not supported yet) is
+refused rather than read as off. `trust_server_certificate` takes `true` or `false` alike; both
+names are read in any case (`Encrypt`, `TrustServerCertificate`). With `map_grants`, only a
+table-level `GRANT SELECT` makes a reader: a column grant does not, nor (fewer readers, never
+more) a grant on a schema or the database. A `DENY` wins: on the table, a column, its schema or
+the database, or membership in `db_denydatareader`, it blocks the denied principal and everyone in
+it through nested roles. As the ACL only lists readers, it fails closed: once anyone is denied,
+`public` is no reader and neither is a granted role that holds a denied principal. A `DENY` to
+`public` leaves no reader. A permission row that cannot be read counts as a `DENY`. A `DENY` of
+`CONTROL` counts as one of `SELECT`, which it covers. Windows and Entra ID groups (principal types
+`G` and `X`), and role members of a type that cannot be read, are opaque: their members live
+outside the database. A `DENY` to one counts as a `DENY` to everyone, and so does a `DENY` to a
+role that holds one. Once anyone is denied, a granted principal that holds one (directly or
+through nested roles) is no reader.
+
+**`map_grants` on SQL Server needs `VIEW DEFINITION` on the database** (`GRANT VIEW DEFINITION TO
+<crawl user>`). Without it, SQL Server shows the crawl account only its own permission rows and
+role memberships, so a `DENY` to anyone else would look absent. The crawl checks
+(`HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')`) and, without it, maps every table
+as restricted with no readers and says so in the crawl's notes. The crawl account otherwise needs
+only `db_datareader` (or `SELECT` on the crawled schemas).
+
+Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
+CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers
+(`crates/onto-intelli/tests/connectors_dbs.rs`; set `ONTO_TEST_MYSQL_URL`, `ONTO_TEST_MARIADB_URL`,
+`ONTO_TEST_SQLSERVER_URL` or `ONTO_TEST_MONGODB_URL` to run them locally).
+
 ## OntoRank
 
 Every crawl, and `onto rank --recompute` (`catalog.rerank`), scores data
