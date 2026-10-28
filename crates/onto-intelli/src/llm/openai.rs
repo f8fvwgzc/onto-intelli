@@ -9,16 +9,57 @@ use serde_json::{Value, json};
 
 use onto_core::{Error, Result};
 
-use super::{ChatRole, ChunkStream, LlmProvider, LlmRequest, LlmResponse, StreamChunk, api_key, sse};
+use super::{ChatRole, ChunkStream, KeySource, LlmProvider, LlmRequest, LlmResponse, StreamChunk, sse};
 use crate::config::{LlmConfig, Pricing};
 use crate::token::TokenUsage;
+
+/// Send, then retry up to `retries` times after a transport error or a
+/// 408, 429, 500, 502, 503, 504 or 529 answer, waiting 250 ms doubling up to
+/// 8 s, or the server's `Retry-After` (at most 30 s). The last answer is
+/// returned whatever its status; the caller reports a failure.
+pub(super) async fn send_retrying(
+    retries: u32,
+    request: impl Fn() -> reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 0u32;
+    loop {
+        let res = request().send().await;
+        let wait = match &res {
+            Ok(r) if attempt < retries && matches!(r.status().as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529) => {
+                let after = r
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|s| Duration::from_secs(s.min(30)));
+                Some(after.unwrap_or_else(|| backoff(attempt)))
+            }
+            Err(e) if attempt < retries && (e.is_connect() || e.is_timeout() || e.is_request()) => {
+                Some(backoff(attempt))
+            }
+            _ => None,
+        };
+        match wait {
+            Some(d) => {
+                attempt += 1;
+                tokio::time::sleep(d).await;
+            }
+            None => return res,
+        }
+    }
+}
+
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis((250u64 << attempt.min(5)).min(8_000))
+}
 
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
     max_output_tokens: u32,
     name: String,
     base: String,
-    key: Option<String>,
+    key: KeySource,
+    max_retries: u32,
     model: String,
     temperature: Option<f32>,
     max_field: &'static str,
@@ -45,8 +86,11 @@ impl OpenAiCompatProvider {
             }
             _ => ("http://localhost:8000/v1", "default", ""),
         };
-        let (key, var) = api_key(cfg, key_env);
-        let unavailable = (key.is_none() && !var.is_empty() && flavor != "ollama").then(|| super::missing_key(&var));
+        let key = KeySource::of(cfg, key_env);
+        let unavailable = match &key {
+            KeySource::Missing(var) if !var.is_empty() && flavor != "ollama" => Some(super::missing_key(var)),
+            _ => None,
+        };
         let client = match client {
             Some(c) => c,
             None => reqwest::Client::builder()
@@ -60,6 +104,7 @@ impl OpenAiCompatProvider {
             name: flavor.to_string(),
             base: cfg.base_url.clone().unwrap_or_else(|| base.to_string()).trim_end_matches('/').to_string(),
             key,
+            max_retries: cfg.max_retries.min(10),
             model: if cfg.model.is_empty() { default_model.to_string() } else { cfg.model.clone() },
             temperature: cfg.temperature,
             max_field: if flavor == "openai" { "max_completion_tokens" } else { "max_tokens" },
@@ -91,14 +136,20 @@ impl OpenAiCompatProvider {
         if let Some(why) = &self.unavailable {
             return Err(Error::Unavailable(format!("{}: {why}", self.name)));
         }
-        let mut rb = self.client.post(format!("{}/chat/completions", self.base)).json(body);
-        if let Some(key) = &self.key {
-            rb = rb.bearer_auth(key);
-        }
-        for (k, v) in &self.headers {
-            rb = rb.header(k, v);
-        }
-        let resp = rb.send().await.map_err(|e| Error::Llm(format!("{}: {}", self.name, describe(&e.without_url()))))?;
+        let key = self.key.get()?;
+        let request = || {
+            let mut rb = self.client.post(format!("{}/chat/completions", self.base)).json(body);
+            if let Some(key) = &key {
+                rb = rb.bearer_auth(key);
+            }
+            for (k, v) in &self.headers {
+                rb = rb.header(k, v);
+            }
+            rb
+        };
+        let resp = send_retrying(self.max_retries, request)
+            .await
+            .map_err(|e| Error::Llm(format!("{}: {}", self.name, describe(&e.without_url()))))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

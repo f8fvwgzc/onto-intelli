@@ -44,12 +44,16 @@ background = true             # crawl due connectors while onto runs
 tick_secs = 30
 
 [llm]
+# Keys set here win over the platform's LLM_* variables (LLM connection contract v1,
+# docs/EMBEDDING.md); keys left unset take them, else the defaults shown.
 # mock: offline and deterministic (default, no key needed)
 # openai | ollama | openai-compatible (vLLM, LM Studio, OpenRouter) | anthropic | none
-provider = "mock"
-model = ""                    # empty = provider default
+# provider = "mock"
+# model = ""                  # empty = provider default
 # api_key_env = "OPENAI_API_KEY"      # keys are read from the environment only
+# api_key_file = "/var/run/secrets/llm/api-key"  # or a file, read on every request
 # base_url = "http://localhost:11434/v1"
+# max_retries = 0             # retries after a transport error, 408, 429 or 5xx (0..=10)
 max_output_tokens = 4096
 # effort = "medium"           # anthropic: low | medium | high | xhigh | max
 # fallbacks = true            # anthropic: server-side refusal fallback

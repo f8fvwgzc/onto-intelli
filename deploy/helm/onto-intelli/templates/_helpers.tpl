@@ -11,6 +11,36 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{/* LLM_* from global.llm values that are set (they win over the ConfigMap), and the key files. */}}
+{{- define "onto-intelli.llmEnv" -}}
+{{- $llm := .Values.global.llm -}}
+{{- $vars := dict "LLM_PROVIDER" $llm.provider "LLM_BASE_URL" $llm.baseUrl "LLM_MODEL" $llm.model "LLM_MODEL_SMALL" $llm.modelSmall "LLM_TIMEOUT_SECS" (toString $llm.timeoutSecs) "LLM_MAX_RETRIES" (toString $llm.maxRetries) "LLM_GATEWAY_URL" $llm.gatewayUrl -}}
+{{- range $name := keys $vars | sortAlpha }}
+{{- $value := get $vars $name }}
+{{- if $value }}
+- name: {{ $name }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if and $llm.secret $llm.apiKeySecretKey (not $llm.gatewayUrl) }}
+- name: LLM_API_KEY_FILE
+  value: {{ printf "/var/run/secrets/llm/%s" $llm.apiKeySecretKey | quote }}
+{{- end }}
+{{- if and $llm.secret $llm.gatewayTokenSecretKey }}
+- name: LLM_GATEWAY_TOKEN_FILE
+  value: {{ printf "/var/run/secrets/llm/%s" $llm.gatewayTokenSecretKey | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* Secret keys to mount: only the gateway token in gateway mode, so no provider key is in the pod. */}}
+{{- define "onto-intelli.llmSecretKeys" -}}
+{{- $llm := .Values.global.llm -}}
+{{- $keys := list -}}
+{{- if and $llm.apiKeySecretKey (not $llm.gatewayUrl) }}{{ $keys = append $keys $llm.apiKeySecretKey }}{{ end -}}
+{{- if $llm.gatewayTokenSecretKey }}{{ $keys = append $keys $llm.gatewayTokenSecretKey }}{{ end -}}
+{{- join "," $keys -}}
+{{- end -}}
+
 {{- define "onto-intelli.labels" -}}
 {{ include "onto-intelli.selectorLabels" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}

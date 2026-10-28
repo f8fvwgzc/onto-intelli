@@ -13,7 +13,9 @@ use crate::config::LlmConfig;
 use crate::hash::stable_hash;
 use crate::token::TokenUsage;
 
+mod contract;
 mod mock;
+pub use contract::{KeyRef, LlmContract, stray_variables};
 pub use mock::MockProvider;
 
 #[cfg(feature = "http-llm")]
@@ -192,6 +194,57 @@ fn build_provider(cfg: &LlmConfig, client: Client) -> Result<Arc<dyn LlmProvider
             "unknown llm.provider '{other}' (mock, none, openai, ollama, openai-compatible, anthropic{})",
             if cfg!(feature = "http-llm") { "" } else { "; http providers need the http-llm feature" }
         ))),
+    }
+}
+
+/// Where a provider's key comes from when it sends a request.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "http-llm"), allow(dead_code))]
+pub(crate) enum KeySource {
+    /// No key: the variable named (empty: none applies).
+    Missing(String),
+    Value(String),
+    /// Read on every request (a mounted Secret rotates in place).
+    File(std::path::PathBuf),
+}
+
+#[cfg_attr(not(feature = "http-llm"), allow(dead_code))]
+impl KeySource {
+    /// `cfg.api_key`, else `cfg.api_key_file`, else the configured (or
+    /// conventional) environment variable.
+    pub(crate) fn of(cfg: &LlmConfig, default_env: &str) -> KeySource {
+        if let Some(k) = cfg.api_key.as_ref().filter(|k| !k.expose().trim().is_empty()) {
+            return KeySource::Value(k.expose().to_string());
+        }
+        if let Some(f) = &cfg.api_key_file {
+            return KeySource::File(f.clone());
+        }
+        match api_key(cfg, default_env) {
+            (Some(k), _) => KeySource::Value(k),
+            (None, var) => KeySource::Missing(var),
+        }
+    }
+
+    /// The key now (a file is read again).
+    pub(crate) fn get(&self) -> Result<Option<String>> {
+        match self {
+            KeySource::Missing(_) => Ok(None),
+            KeySource::Value(v) => Ok(Some(v.clone())),
+            KeySource::File(p) => match std::fs::read_to_string(p) {
+                Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
+                Ok(_) => Err(Error::Unavailable(format!("the LLM key file {} is empty", p.display()))),
+                Err(e) => Err(Error::Unavailable(format!("reading the LLM key file {}: {}", p.display(), e.kind()))),
+            },
+        }
+    }
+
+    /// Why a provider that needs a key cannot run (`None` for a file: it is
+    /// checked on every request).
+    pub(crate) fn missing(&self) -> Option<String> {
+        match self {
+            KeySource::Missing(var) => Some(missing_key(var)),
+            _ => None,
+        }
     }
 }
 

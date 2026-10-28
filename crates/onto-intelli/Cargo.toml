@@ -10,9 +10,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["postgres", "http-llm"]
+default = ["postgres", "http-llm", "mysql", "sqlserver", "mongodb"]
 # Durable storage: PostgreSQL 16+ with pgvector (the only durable backend).
 postgres = ["onto-core/postgres"]
+# Read-only metadata connectors for other databases (the catalog and the ontology builder).
+mysql = ["onto-core/postgres", "dep:sqlx-mysql"]
+sqlserver = ["dep:tiberius", "dep:tokio-util"]
+mongodb = ["dep:mongodb", "dep:bson"]
 # OpenAI-compatible (OpenAI, Ollama, vLLM, LM Studio, OpenRouter) and Anthropic providers.
 http-llm = ["dep:reqwest"]
 
@@ -31,6 +35,11 @@ futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 reqwest = { workspace = true, optional = true }
+sqlx-mysql = { workspace = true, optional = true }
+tiberius = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
+bson = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

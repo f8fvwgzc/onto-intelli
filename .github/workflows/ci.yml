@@ -52,6 +52,57 @@ jobs:
           cargo run -q --locked -p onto-intelli-cli -- -c "$RUNNER_TEMP/eval/onto-intelli.toml" --tenant ci_eval seed demo
           cargo run -q --locked -p onto-intelli-cli -- -c "$RUNNER_TEMP/eval/onto-intelli.toml" --tenant ci_eval eval
 
+  # The MySQL/MariaDB, SQL Server and MongoDB connectors against real servers.
+  connectors:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: onto-ci
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ponto-ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: onto-ci
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Onto-ci-Passw0rd
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Onto-ci-Passw0rd -Q 'SELECT 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 20
+      mongo:
+        image: mongo:8
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ONTO_TEST_MYSQL_URL: mysql://root:onto-ci@127.0.0.1:3306/{db}
+      ONTO_TEST_MARIADB_URL: mysql://root:onto-ci@127.0.0.1:3307/{db}
+      ONTO_TEST_SQLSERVER_URL: sqlserver://sa:Onto-ci-Passw0rd@127.0.0.1:1433/{db}?trust_server_certificate=true
+      ONTO_TEST_MONGODB_URL: mongodb://127.0.0.1:27017/{db}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The connector tests, on every engine (none skipped)
+        shell: bash
+        run: |
+          cargo test --locked -p onto-intelli --test connectors_dbs -- --nocapture 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          if grep -q "skipped:" "$RUNNER_TEMP/out.txt"; then exit 1; fi
+
   # The tests that need no database (PostgreSQL tests skip without DATABASE_URL).
   test:
     strategy:
@@ -90,6 +141,27 @@ jobs:
           if helm template onto deploy/helm/onto-intelli > /dev/null 2>&1; then
             echo "rendered without existingSecret" >&2; exit 1
           fi
+      - name: The LLM contract mounts no provider key in gateway mode
+        run: |
+          if helm template onto deploy/helm/onto-intelli --set existingSecret=onto | grep -q 'name: LLM_'; then
+            echo "LLM_* without global.llm.enabled" >&2; exit 1
+          fi
+          out=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto \
+            --set global.llm.enabled=true --set global.llm.gatewayUrl=https://gateway:8443 --set global.llm.model=m)
+          grep -q 'key: gateway-token' <<<"$out"
+          if grep -q 'api-key' <<<"$out"; then
+            echo "a provider key is mounted in gateway mode" >&2; exit 1
+          fi
+          out=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true)
+          grep -q 'key: api-key' <<<"$out" && grep -q 'name: llm-config' <<<"$out"
+      - name: The process can read the mounted LLM credentials
+        run: |
+          # Secret files are root-owned with mode 0440: uid 10001 reads them only through
+          # fsGroup, in the pod that mounts them (the Deployment).
+          pod=$(helm template onto deploy/helm/onto-intelli --set existingSecret=onto --set global.llm.enabled=true \
+            -s templates/deployment.yaml)
+          grep -q 'secretName: llm-credentials' <<<"$pod" && grep -q 'defaultMode: 0440' <<<"$pod"
+          grep -q 'fsGroup: 10001' <<<"$pod" || { echo "0440 Secret files without fsGroup" >&2; exit 1; }
 
   # The release image builds (linux/amd64 here; the release adds arm64) and carries git for the
   # repository connector.

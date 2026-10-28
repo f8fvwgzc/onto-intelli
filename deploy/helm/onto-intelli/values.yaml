@@ -19,6 +19,30 @@ port: 50051
 # the container as an environment variable too.
 existingSecret: ""
 
+# The platform's LLM connection contract v1 (LLM_* variables; docs/EMBEDDING.md). Off by
+# default: the [llm] of `config` applies. Keys `config` sets under [llm] still win.
+global:
+  llm:
+    enabled: false
+    # Non-secret settings: LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, LLM_MODEL_SMALL,
+    # LLM_TIMEOUT_SECS, LLM_MAX_RETRIES, LLM_GATEWAY_URL (optional ConfigMap).
+    configMap: llm-config
+    # Credentials, mounted read-only at /var/run/secrets/llm (optional Secret).
+    secret: llm-credentials
+    # Secret keys: the provider key (LLM_API_KEY_FILE) and the gateway token
+    # (LLM_GATEWAY_TOKEN_FILE); "" for one that is not used (a keyless local server).
+    apiKeySecretKey: api-key
+    gatewayTokenSecretKey: gateway-token
+    # Explicit values win over the ConfigMap; "" leaves a variable to it.
+    provider: ""
+    baseUrl: ""
+    model: ""
+    modelSmall: ""
+    timeoutSecs: ""
+    maxRetries: ""
+    # Gateway mode: only the gateway token is mounted, so the pod holds no provider key.
+    gatewayUrl: ""
+
 # onto-intelli.toml, mounted read-only at /etc/onto (docs: crates/onto-intelli/templates/onto-intelli.toml).
 # grpc.listen is ignored: the chart passes --listen 0.0.0.0:<port>.
 config: |
@@ -30,8 +54,7 @@ config: |
   schema = "builtin:enterprise"
   schema_mode = "live"
 
-  [llm]
-  provider = "mock"
+  # [llm] is left unset: global.llm (LLM_*) or the offline mock applies.
 
   [grpc]
   builtin_api = true
@@ -62,6 +85,9 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001
   runAsGroup: 10001
+  # Mounted Secret files (llm-credentials, mode 0440) belong to this group,
+  # so the process can read them.
+  fsGroup: 10001
   seccompProfile: { type: RuntimeDefault }
 
 securityContext:
