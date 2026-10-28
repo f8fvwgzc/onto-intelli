@@ -44,12 +44,15 @@ use super::{
     VectorFilter, VersionRecord, WriteBatch,
 };
 use crate::changes::{
-    ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, Cursor, Gap, GapReason, StoredChange, StoredPage,
+    ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, ConsumerLag, Cursor, Gap, GapReason, GapStats,
+    GapSummary, MAX_LAG_CONSUMERS, StoredChange, StoredPage,
 };
 use crate::graph::LinkKey;
 use crate::leases::{Fence, Lease, Timer, Wake, lease_lost};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
-use crate::outbox::{Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, replay_states};
+use crate::outbox::{
+    Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, STATS_STATES, replay_states,
+};
 use crate::runs::{RunQuery, RunRow, RunState, settled};
 use crate::time::{new_id, now_ms};
 use crate::{Error, Result};
@@ -78,7 +81,11 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (11, "outbox", include_str!("../../migrations/0011_outbox.sql")),
     (12, "automate", include_str!("../../migrations/0012_automate.sql")),
     (13, "outbox_claim", include_str!("../../migrations/0013_outbox_claim.sql")),
+    (14, "feed_counters", include_str!("../../migrations/0014_feed_counters.sql")),
 ];
+/// Most targets [`Store::outbox_state_counts`] reports (a guard: endpoints
+/// and writeback targets are capped far below it).
+const MAX_STATS_TARGETS: i64 = 1000;
 /// This build's writer version. A tenant whose `head.min_writer` is higher
 /// refuses this build's writes (builds before this one never read it; the
 /// gap trigger covers them).
@@ -1655,6 +1662,25 @@ impl Store for PgStore {
         })
     }
 
+    /// From `automation_runs_started` (started_at DESC, id DESC); reads the
+    /// state column only.
+    fn runs_state_counts(&self, since_ms: i64, cap: usize) -> Result<Vec<(RunState, u64)>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            let rows: Vec<(String, i64)> = sqlx::query_as(sql(format!(
+                "SELECT state, count(*) FROM (SELECT state FROM {} WHERE started_at >= $1 \
+                 ORDER BY started_at DESC, id DESC LIMIT $2) x GROUP BY state ORDER BY state",
+                t.runs
+            )))
+            .bind(since_ms)
+            .bind(cap.min(i64::MAX as usize) as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.into_iter().map(|(st, n)| Ok((st.parse()?, n.max(0) as u64))).collect()
+        })
+    }
+
     fn runs_running(&self, epoch: u64, limit: usize) -> Result<Vec<RunRow>> {
         let pool = self.pool.clone();
         let t = Tables::of(self);
@@ -1980,6 +2006,59 @@ impl Store for PgStore {
         self.block(async move { changes_meta_on(&pool, &t).await })
     }
 
+    /// Both from the gap-records index (`changes_gaps`, 0014): the count
+    /// reads at most `cap` index entries, the newest gap one. The newest
+    /// gap's id lists are counted on the server, never sent.
+    fn gap_stats(&self, since_ms: i64, cap: u64) -> Result<GapStats> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            #[allow(clippy::type_complexity)]
+            let (count, seq, n, ts, reason, origin, listed, truncated, total): (
+                i64,
+                Option<i64>,
+                Option<i32>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<bool>,
+                Option<i64>,
+            ) = sqlx::query_as(sql(format!(
+                "SELECT (SELECT count(*) FROM (SELECT 1 FROM {c} WHERE op = 'gap' AND ts >= $1 LIMIT $2) x), \
+                   l.seq, l.n, l.ts, l.g->>'reason', l.g->>'origin', \
+                   jsonb_array_length(coalesce(l.g->'entities', '[]'::jsonb)) \
+                     + jsonb_array_length(coalesce(l.g->'links', '[]'::jsonb)) \
+                     + coalesce((l.g->>'hidden')::bigint, 0), \
+                   (l.g->>'truncated')::boolean, (l.g->>'total')::bigint \
+                 FROM (SELECT 1) one LEFT JOIN LATERAL ( \
+                   SELECT seq, n, ts, doc->'gap' AS g FROM {c} WHERE op = 'gap' \
+                   ORDER BY ts DESC, seq DESC, n DESC LIMIT 1) l ON true",
+                c = t.changes
+            )))
+            .bind(since_ms)
+            .bind(cap.min(i64::MAX as u64) as i64)
+            .fetch_one(&pool)
+            .await?;
+            let latest = match (seq, n, ts) {
+                (Some(seq), Some(n), Some(ts)) => {
+                    let listed = listed.unwrap_or(0).max(0) as u64;
+                    let total = total.unwrap_or(0).max(0) as u64;
+                    Some(GapSummary {
+                        cursor: Cursor::new(seq.max(0) as u64, n.max(0) as u32),
+                        ts,
+                        reason: reason.unwrap_or_default(),
+                        origin: origin.unwrap_or_default(),
+                        touched: if truncated.unwrap_or(false) { total.max(listed) } else { listed },
+                    })
+                }
+                _ => None,
+            };
+            let count = count.max(0) as u64;
+            Ok(GapStats { count, capped: cap > 0 && count >= cap, latest })
+        })
+    }
+
     /// Locks the head, so no commit straddles the switch: commits after it
     /// see the new setting in the gap trigger. Turning capture on after a
     /// period off raises the floor to the head (older cursors are expired)
@@ -2182,6 +2261,41 @@ impl Store for PgStore {
                     .fetch_optional(&pool)
                     .await?;
             Ok(row.map(|(seq, n)| Cursor::new(seq as u64, n as u32)))
+        })
+    }
+
+    /// One statement: per consumer, the head, the floor and its oldest
+    /// unread record (one primary-key probe after its cursor).
+    fn consumer_lags(&self) -> Result<Vec<ConsumerLag>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            // name, seq, n, updated_at, head seq, floor, oldest unread ts, clock
+            type LagRow = (String, i64, i32, i64, i64, i64, Option<i64>, i64);
+            let rows: Vec<LagRow> = sqlx::query_as(sql(format!(
+                "SELECT k.name, k.seq, k.n, k.updated_at, h.seq, m.floor, \
+                   (SELECT c.ts FROM {c} c WHERE (c.seq, c.n) > (k.seq, k.n) ORDER BY c.seq, c.n LIMIT 1), {now} \
+                 FROM {k} k CROSS JOIN {h} h CROSS JOIN {m} m WHERE h.id = 1 ORDER BY k.name LIMIT $1",
+                c = t.changes,
+                k = t.consumers,
+                h = t.head,
+                m = t.changes_meta,
+                now = t.now
+            )))
+            .bind(MAX_LAG_CONSUMERS as i64)
+            .fetch_all(&pool)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .map(|(name, seq, n, updated_at, head, floor, oldest, now)| ConsumerLag {
+                    name,
+                    cursor: Cursor::new(seq.max(0) as u64, n.max(0) as u32),
+                    behind: head.saturating_sub(seq).max(0) as u64,
+                    age_ms: oldest.map_or(0, |ts| now.saturating_sub(ts).max(0)),
+                    updated_at: Some(updated_at),
+                    expired: seq < floor,
+                })
+                .collect())
         })
     }
 
@@ -2652,6 +2766,42 @@ impl Store for PgStore {
             .fetch_all(&pool)
             .await?;
             Ok(rows.into_iter().map(|(t, n)| (t, n.max(0) as u64)).collect())
+        })
+    }
+
+    /// From the `outbox_stats` index (0014): the targets that have such rows
+    /// by a skip scan (one probe per target), then each (target, state)
+    /// counted up to `cap` as an index range. Delivered and cancelled rows
+    /// are not in the index.
+    fn outbox_state_counts(&self, cap: u64) -> Result<Vec<(String, OutboxState, u64)>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let states: Vec<String> = STATS_STATES.iter().map(|s| s.as_str().to_string()).collect();
+        self.block(async move {
+            const IN: &str = "state IN ('pending', 'inflight', 'retry', 'dead')";
+            let rows: Vec<(String, String, i64)> = sqlx::query_as(sql(format!(
+                "WITH RECURSIVE t(target, d) AS ( \
+                   (SELECT target, 1 FROM {o} WHERE {IN} ORDER BY target LIMIT 1) \
+                   UNION ALL \
+                   SELECT (SELECT o.target FROM {o} o WHERE o.{IN} AND o.target > t.target ORDER BY o.target LIMIT 1), \
+                          t.d + 1 \
+                   FROM t WHERE t.target IS NOT NULL AND t.d < $3) \
+                 SELECT t.target, s.state, \
+                   (SELECT count(*) FROM (SELECT 1 FROM {o} o \
+                      WHERE o.target = t.target AND o.state = s.state AND o.{IN} LIMIT $1) x) AS n \
+                 FROM t CROSS JOIN unnest($2::text[]) AS s(state) \
+                 WHERE t.target IS NOT NULL ORDER BY t.target, s.state",
+                o = t.outbox
+            )))
+            .bind(cap.min(i64::MAX as u64) as i64)
+            .bind(&states)
+            .bind(MAX_STATS_TARGETS)
+            .fetch_all(&pool)
+            .await?;
+            rows.into_iter()
+                .filter(|(_, _, n)| *n > 0)
+                .map(|(target, state, n)| Ok((target, state.parse()?, n as u64)))
+                .collect()
         })
     }
 

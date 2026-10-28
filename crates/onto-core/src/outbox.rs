@@ -127,6 +127,14 @@ impl OutboxState {
     }
 }
 
+/// The states `system.stats` counts per target (docs/design/EVENTS.md
+/// section 11): what is still to be sent, and what was given up.
+pub const STATS_STATES: [OutboxState; 4] =
+    [OutboxState::Pending, OutboxState::Inflight, OutboxState::Retry, OutboxState::Dead];
+
+/// Rows of one target in one state that a stats count reads at most.
+pub const STATS_COUNT_CAP: u64 = 10_000;
+
 impl fmt::Display for OutboxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

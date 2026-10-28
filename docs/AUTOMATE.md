@@ -797,8 +797,31 @@ as.
   it started and their deliveries together. A rerun is traced again under a
   new id. Delivery attempts are traced as `[traces] deliveries` says
   (section 2).
+- **Counters.** `system.stats` (`GET /v1/stats`) has, under `outbound`:
+  `lag`, how far each change consumer is behind (`consumers`, by name:
+  `automation:consumer` and `webhook:<endpoint>`; `endpoints`, by endpoint
+  name), as `behind` (head commit seq minus the cursor's, counting commits
+  that wrote no records), `age_ms` (age of the oldest record it has not
+  read; 0 when there is none), `cursor`, `updated_at` and `expired`
+  (retention removed records it had not read); `outbox`, rows per target
+  split by state (`pending`, `inflight`, `retry`, `dead`; delivered and
+  cancelled rows are not counted), each counted up to `outbox.cap`
+  (10,000), and `outbox_open`, their open sum per target; `gaps_24h`, gap
+  records of the last 24 hours (up to 10,000) with the `latest` gap kept
+  (cursor, time, reason, origin, how many entities and links it touched;
+  never their ids); and `runs_1h`, runs per state among the newest 10,000
+  of the last hour. `system.health` reports the latest gap under
+  `outbound.changes.latest_gap`. `GET /v1/admin/tenants` (operators) gives
+  the same counters per open tenant under `outbound`, with the paused
+  automations and endpoints. Each count reads an index range bounded by
+  its cap, never a whole table: on a tenant with 2 million change records
+  (25 gaps), 658,200 outbox rows (20 endpoints) and 60,000 runs, the four
+  store reads took 1.1 ms (20 consumers), 0.7 ms (gaps), 3.1 ms (outbox
+  states, 80 counts) and 2.3 ms (runs, capped at 10,000) once warm, from a
+  release build against a local PostgreSQL 16; counting the gaps without their
+  index read 269 MB of the feed in 222 ms.
 - **Where the state lives.** docs/STORAGE.md lists the tables and
-  migrations (0009 to 0013) and how to roll back past them;
+  migrations (0009 to 0014) and how to roll back past them;
   docs/CONTROL_PLANE.md lists the routes, the outbound address rules and the
   reserved ids.
 - **Surfaces.** Actions `changes.*`, `webhook.*`, `outbox.list`,

@@ -78,7 +78,8 @@
 //!   session minted from that one (a `sid` works too), whatever the tenant
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
-//! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits
+//! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory, outbound counters
+//!   (outbox rows per state, change lag, gaps, runs, paused counts) and the limits
 //! * `/v1/traces`, `/v1/metrics`, `/v1/sessions`: observability (see [`crate::observe`])
 //! * `POST /mcp`: MCP over HTTP (see [`crate::mcp_http`])
 //!
@@ -613,9 +614,15 @@ async fn admin_tenants(State(s): State<AppState>, headers: HeaderMap) -> Respons
         )));
     }
     let e = &s.hub.config().engine;
-    let tenants = s.hub.tenant_stats();
+    // The outbound counters read each tenant's store (index reads only).
+    let hub = s.hub.clone();
+    let tenants = match tokio::task::spawn_blocking(move || hub.tenant_report()).await {
+        Ok(t) => t,
+        Err(_) => return error_response(&Error::Unavailable("tenant report failed".into())),
+    };
     Json(json!({
         "open": tenants.len(),
+        "subscribers_process": onto_intelli::changes::ChangeHub::process_subscribers(),
         "estimated_bytes": tenants.iter().map(|t| t.estimated_bytes).sum::<u64>(),
         "listening_stores": s.hub.listening_stores(),
         "limits": {

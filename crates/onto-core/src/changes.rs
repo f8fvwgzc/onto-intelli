@@ -546,6 +546,71 @@ pub struct ChangeVacuum {
     pub floor: u64,
 }
 
+/// How far a background consumer's cursor (a webhook endpoint's fan-out,
+/// the automation consumer) is behind the head (docs/design/EVENTS.md
+/// section 11), from [`crate::store::Store::consumer_lags`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerLag {
+    pub name: String,
+    /// Where it resumes (after this position).
+    pub cursor: Cursor,
+    /// Head commit seq minus the cursor's seq: commits not yet read,
+    /// counting those that wrote no records (KV-only commits).
+    pub behind: u64,
+    /// Age in milliseconds of the oldest record after the cursor (0: none to read).
+    pub age_ms: i64,
+    /// When the cursor last moved (store clock; `None` where the store does not keep it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    /// The cursor is below the floor: retention removed what it had not read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expired: bool,
+}
+
+/// Most consumers [`crate::store::Store::consumer_lags`] reports.
+pub const MAX_LAG_CONSUMERS: usize = 1000;
+
+/// One gap record, summarized for `system.health`: no ids, only counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSummary {
+    pub cursor: Cursor,
+    pub ts: i64,
+    /// [`GapReason`] as its name (`uncaptured_writer`, `bulk_import`, `capture_enabled`).
+    pub reason: String,
+    #[serde(default)]
+    pub origin: String,
+    /// Entities and links the commit touched (all of them, also past the listed ones).
+    pub touched: u64,
+}
+
+impl GapSummary {
+    pub fn of(cursor: Cursor, ts: i64, gap: &Gap) -> Self {
+        let listed = (gap.entities.len() + gap.links.len()) as u64 + gap.hidden;
+        Self {
+            cursor,
+            ts,
+            reason: serde_json::to_value(gap.reason)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            origin: gap.origin.clone(),
+            touched: if gap.truncated { gap.total.max(listed) } else { listed },
+        }
+    }
+}
+
+/// Gap records since a time, and the newest one at all, from
+/// [`crate::store::Store::gap_stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapStats {
+    /// Gap records with `ts >= since` (store clock), counted up to the cap.
+    pub count: u64,
+    /// `count` reached the cap: there are at least that many.
+    pub capped: bool,
+    /// The newest gap record still kept, however old.
+    pub latest: Option<GapSummary>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldMode {

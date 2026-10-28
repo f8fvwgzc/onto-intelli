@@ -147,6 +147,11 @@ pub struct TenantStat {
     pub streams: usize,
     /// Memory of the change stream ring (0 without streams).
     pub ring_bytes: u64,
+    /// [`Intelli::outbound_counters`]: outbox rows per state, change lag,
+    /// gaps, runs and paused counts. Only [`Hub::tenant_report`] reads
+    /// them (they cost a few index reads per tenant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<serde_json::Value>,
 }
 
 pub struct Hub {
@@ -598,6 +603,18 @@ impl Hub {
 
     /// The open tenants with their estimated memory, largest first.
     pub fn tenant_stats(&self) -> Vec<TenantStat> {
+        self.stats_of_open(false)
+    }
+
+    /// [`tenant_stats`](Self::tenant_stats) with each tenant's outbound
+    /// counters (docs/design/EVENTS.md section 11), for `GET
+    /// /v1/admin/tenants`. It reads the store: call it off the async
+    /// workers (`spawn_blocking`).
+    pub fn tenant_report(&self) -> Vec<TenantStat> {
+        self.stats_of_open(true)
+    }
+
+    fn stats_of_open(&self, outbound: bool) -> Vec<TenantStat> {
         let now = now_ms();
         let open: Vec<(String, i64, Arc<Intelli>)> = self
             .tenants
@@ -617,6 +634,7 @@ impl Hub {
                     idle_ms: now - used,
                     streams: i.changes().subscribers(),
                     ring_bytes: i.changes().bytes() as u64,
+                    outbound: outbound.then(|| i.outbound_counters()),
                 }
             })
             .collect();

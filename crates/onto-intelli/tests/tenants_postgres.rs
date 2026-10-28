@@ -387,3 +387,43 @@ async fn one_wake_scanner_per_deployment_opens_due_tenants() {
     .await
     .unwrap();
 }
+
+/// `GET /v1/admin/tenants` counters (docs/design/EVENTS.md section 11) on
+/// PostgreSQL: per open tenant, change lag per consumer and endpoint, gap
+/// records over 24 h with the latest, outbox rows per state and paused
+/// counts; the plain stats (memory budget, eviction) leave them out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tenant_report_carries_outbound_counters() {
+    let Some(url) = common::database_url("the_tenant_report_carries_outbound_counters") else { return };
+    let prefix = common::unique("orep_");
+    let mut cfg = config(&url, &prefix);
+    cfg.webhooks.enabled = false;
+    cfg.automation.workers = false;
+    let hub = Hub::open(cfg).await.unwrap();
+    let admin = Principal::admin("ops");
+    let i = hub.tenant("a").await.unwrap();
+    i.call(&admin, "entity.upsert", json!({ "id": "team:x", "title": "X" })).await.unwrap();
+    let store = i.ontology().store().clone();
+    store.consumer_set("webhook:ops", onto_intelli::core::Cursor::new(0, 0), None).unwrap();
+    let mut y = i.ontology().get(&admin, "team:x").unwrap();
+    y.id = "team:y".into();
+    store.bulk_import(&[y], &[]).unwrap();
+    let head = store.head().unwrap();
+
+    assert!(hub.tenant_stats().iter().all(|t| t.outbound.is_none()));
+    let h = hub.clone();
+    let report = tokio::task::spawn_blocking(move || h.tenant_report()).await.unwrap();
+    assert_eq!(report.len(), 1);
+    let o = report[0].outbound.as_ref().expect("counters");
+    assert_eq!(o["lag"]["endpoints"]["ops"]["behind"].as_u64(), Some(head), "{o}");
+    assert!(o["lag"]["endpoints"]["ops"]["updated_at"].is_i64(), "{o}");
+    assert_eq!(o["gaps_24h"]["count"], 1, "{o}");
+    assert_eq!(o["gaps_24h"]["latest"]["cursor"], format!("{head}.0"), "{o}");
+    assert_eq!(o["outbox"]["targets"], json!({}), "{o}");
+    assert!(o["runs_1h"]["states"].is_object(), "{o}");
+    assert_eq!(o["paused"]["endpoints"], 0, "{o}");
+    let h = i.call(&admin, "system.health", json!({})).await.unwrap();
+    assert_eq!(h["outbound"]["changes"]["latest_gap"]["reason"], "bulk_import", "{h}");
+    drop(i);
+    cleanup(&hub, &url, &prefix).await;
+}

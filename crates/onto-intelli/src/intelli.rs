@@ -179,6 +179,19 @@ fn ms(t: Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0
 }
 
+/// Gap records over this window are counted (`system.stats`).
+const GAP_WINDOW_MS: i64 = 24 * 3_600_000;
+/// Runs of the last hour counted at most (`system.stats`).
+const RUNS_COUNT_CAP: usize = 10_000;
+
+/// Paused automations and endpoints (`system.health`, admin tenants).
+struct Paused {
+    automations_enabled: Option<usize>,
+    automations: Option<usize>,
+    endpoints: Option<usize>,
+    endpoints_total: Option<usize>,
+}
+
 pub struct Intelli {
     config: Config,
     onto: Ontology,
@@ -490,23 +503,49 @@ impl Intelli {
         self.wants.automation_rounds.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Switches and paused counts of webhooks and automations, and whether
-    /// the change feed captures (docs/design/EVENTS.md section 11), for
-    /// `system.health`. A store error leaves the field `null`.
+    /// Switches and paused counts of webhooks and automations, whether the
+    /// change feed captures, and its latest gap record (docs/design/EVENTS.md
+    /// section 11), for `system.health`. A store error leaves the field `null`.
     pub fn outbound_health(&self) -> Value {
         let onto = &self.onto;
         let store = onto.store();
-        let now = onto_core::time::now_ms();
+        let paused = self.paused_counts();
         let automation = store.keeps_runs().then(|| {
-            let en = onto_core::automate::Enablements::load(&**store).ok();
             json!({
                 "process_enabled": self.config.automation.enabled,
                 "kill": onto_core::runs::killed(&**store).ok(),
-                "enabled": en.as_ref().map(|e| e.states.values().filter(|s| s.enabled).count()),
-                "paused": en.as_ref().map(|e| e.states.values().filter(|s| s.enabled && s.paused.is_some()).count()),
+                "enabled": paused.automations_enabled,
+                "paused": paused.automations,
             })
         });
         let webhooks = store.keeps_outbox().then(|| {
+            json!({
+                "process_enabled": self.config.webhooks.enabled,
+                "kill": crate::webhooks::killed(onto).ok(),
+                "endpoints": paused.endpoints_total,
+                "paused": paused.endpoints,
+            })
+        });
+        // Cap 0: the newest gap only, nothing counted.
+        let latest_gap = store.keeps_changes().then(|| store.gap_stats(i64::MAX, 0).ok().map(|g| g.latest)).flatten();
+        json!({
+            "changes": { "capture": onto.capture_enabled(), "latest_gap": latest_gap.flatten() },
+            "automation": automation,
+            "webhooks": webhooks,
+        })
+    }
+
+    /// Enabled automations that are paused, and enabled endpoints that are
+    /// paused (by an operator, the breaker or their backlog), out of all
+    /// endpoints. `None` where the store keeps neither or could not say.
+    fn paused_counts(&self) -> Paused {
+        let onto = &self.onto;
+        let store = onto.store();
+        let now = onto_core::time::now_ms();
+        let en = store.keeps_runs().then(|| onto_core::automate::Enablements::load(&**store).ok()).flatten();
+        let automations_enabled = en.as_ref().map(|e| e.states.values().filter(|s| s.enabled).count());
+        let automations = en.as_ref().map(|e| e.states.values().filter(|s| s.enabled && s.paused.is_some()).count());
+        let (endpoints_total, endpoints) = if store.keeps_outbox() {
             let eps = crate::webhooks::Endpoint::list(onto).ok();
             let control: Vec<(String, Value)> =
                 store.kv_scan(crate::webhooks::NS_CONTROL, "").unwrap_or_default().into_iter().collect();
@@ -518,47 +557,93 @@ impl Intelli {
                                 .is_ok_and(|b| b.is_open()))
                 })
             };
-            json!({
-                "process_enabled": self.config.webhooks.enabled,
-                "kill": crate::webhooks::killed(onto).ok(),
-                "endpoints": eps.as_ref().map(Vec::len),
-                "paused": eps.as_ref().map(|eps| eps
-                    .iter()
-                    .filter(|e| e.enabled && (e.paused.as_ref().is_some_and(|p| p.until.is_none_or(|u| u > now)) || held(&e.name)))
-                    .count()),
-            })
-        });
-        json!({
-            "changes": { "capture": onto.capture_enabled() },
-            "automation": automation,
-            "webhooks": webhooks,
-        })
+            let paused = eps.as_ref().map(|eps| {
+                eps.iter()
+                    .filter(|e| {
+                        e.enabled
+                            && (e.paused.as_ref().is_some_and(|p| p.until.is_none_or(|u| u > now)) || held(&e.name))
+                    })
+                    .count()
+            });
+            (eps.as_ref().map(Vec::len), paused)
+        } else {
+            (None, None)
+        };
+        Paused { automations_enabled, automations, endpoints, endpoints_total }
     }
 
-    /// Outbox rows not yet finished per target, and runs per state over the
-    /// last hour (at most the newest 500 counted), for `system.stats`.
-    fn outbound_stats(&self) -> Value {
+    /// The outbound counters of docs/design/EVENTS.md section 11, for
+    /// `system.stats` and `GET /v1/admin/tenants`: outbox rows per target
+    /// and state (pending, inflight, retry, dead; each counted up to
+    /// [`STATS_COUNT_CAP`](onto_core::outbox::STATS_COUNT_CAP)) and open
+    /// rows per target, how far each change consumer is behind (per
+    /// consumer, and per webhook endpoint), gap records over 24 hours with
+    /// the latest, and runs per state over the last hour. Every count reads
+    /// an index range bounded by its cap, never a whole table. A store error
+    /// leaves the field `null`.
+    pub fn outbound_stats(&self) -> Value {
+        use onto_core::outbox::STATS_COUNT_CAP;
         let store = self.onto.store();
-        let open: Option<serde_json::Map<String, Value>> = store
-            .keeps_outbox()
-            .then(|| store.outbox_open_counts().ok())
-            .flatten()
-            .map(|v| v.into_iter().map(|(t, n)| (t, json!(n))).collect());
-        let runs = store.keeps_runs().then(|| {
-            let q = onto_core::runs::RunQuery {
-                since: Some(store.clock_ms().unwrap_or_else(|_| onto_core::time::now_ms()) - 3_600_000),
-                limit: Some(onto_core::runs::MAX_LIST),
-                ..Default::default()
-            };
-            store.runs_list(&q).ok().map(|rows| {
-                let mut by: std::collections::BTreeMap<&'static str, u64> = Default::default();
-                for r in &rows {
-                    *by.entry(r.state.as_str()).or_default() += 1;
+        let clock = store.clock_ms().unwrap_or_else(|_| onto_core::time::now_ms());
+        let by_state = store.keeps_outbox().then(|| store.outbox_state_counts(STATS_COUNT_CAP).ok()).flatten();
+        let (open, outbox) = match by_state {
+            Some(rows) => {
+                let mut open = serde_json::Map::new();
+                let mut targets = serde_json::Map::new();
+                for (target, state, n) in rows {
+                    if state.is_open() {
+                        let o = open.entry(target.clone()).or_insert(json!(0));
+                        *o = json!(o.as_u64().unwrap_or(0) + n);
+                    }
+                    let t = targets.entry(target).or_insert_with(|| json!({}));
+                    t[state.as_str()] = json!(n);
                 }
-                json!({ "states": by, "counted": rows.len(), "capped": rows.len() >= onto_core::runs::MAX_LIST })
-            })
+                (Some(open), Some(json!({ "cap": STATS_COUNT_CAP, "targets": targets })))
+            }
+            None => (None, None),
+        };
+        let lag = store.keeps_changes().then(|| store.consumer_lags().ok()).flatten().map(|lags| {
+            let mut consumers = serde_json::Map::new();
+            let mut endpoints = serde_json::Map::new();
+            for l in lags {
+                let v = json!({
+                    "cursor": l.cursor,
+                    "behind": l.behind,
+                    "age_ms": l.age_ms,
+                    "updated_at": l.updated_at,
+                    "expired": l.expired,
+                });
+                if let Some(ep) = l.name.strip_prefix(crate::webhooks::CONSUMER_PREFIX) {
+                    endpoints.insert(ep.to_string(), v.clone());
+                }
+                consumers.insert(l.name, v);
+            }
+            json!({ "consumers": consumers, "endpoints": endpoints })
         });
-        json!({ "outbox_open": open, "runs_1h": runs.flatten() })
+        let gaps = store
+            .keeps_changes()
+            .then(|| store.gap_stats(clock - GAP_WINDOW_MS, STATS_COUNT_CAP).ok())
+            .flatten()
+            .map(|g| json!({ "count": g.count, "capped": g.capped, "latest": g.latest }));
+        let runs =
+            store.keeps_runs().then(|| store.runs_state_counts(clock - 3_600_000, RUNS_COUNT_CAP).ok()).flatten().map(
+                |rows| {
+                    let counted: u64 = rows.iter().map(|(_, n)| n).sum();
+                    let states: serde_json::Map<String, Value> =
+                        rows.into_iter().map(|(st, n)| (st.as_str().to_string(), json!(n))).collect();
+                    json!({ "states": states, "counted": counted, "capped": counted >= RUNS_COUNT_CAP as u64 })
+                },
+            );
+        json!({ "outbox_open": open, "outbox": outbox, "lag": lag, "gaps_24h": gaps, "runs_1h": runs })
+    }
+
+    /// [`outbound_stats`](Self::outbound_stats) with the paused automations
+    /// and endpoints, for `GET /v1/admin/tenants`.
+    pub fn outbound_counters(&self) -> Value {
+        let mut v = self.outbound_stats();
+        let p = self.paused_counts();
+        v["paused"] = json!({ "automations": p.automations, "endpoints": p.endpoints });
+        v
     }
 
     /// Rounds the fan-out and the automation consumer ran in this process

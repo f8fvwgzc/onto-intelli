@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::changes::{
-    ChangeOp, ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, Cursor, Gap, GapReason, StoredChange,
-    StoredPage,
+    ChangeOp, ChangeRecord, ChangeRetention, ChangeVacuum, ChangesMeta, ConsumerLag, Cursor, Gap, GapReason, GapStats,
+    GapSummary, MAX_LAG_CONSUMERS, StoredChange, StoredPage,
 };
 use crate::graph::LinkKey;
 use crate::leases::{Fence, Lease, Timer, Wake, lease_lost, no_leases};
@@ -358,6 +358,12 @@ pub trait Store: Send + Sync {
     fn vacuum_changes(&self, _keep: &ChangeRetention) -> Result<ChangeVacuum> {
         Err(no_change_log())
     }
+    /// Gap records with `ts >= since_ms` (store clock), counted up to `cap`,
+    /// and the newest gap record kept, however old (docs/design/EVENTS.md
+    /// section 11). Reads gap records only, never the rest of the feed.
+    fn gap_stats(&self, _since_ms: i64, _cap: u64) -> Result<GapStats> {
+        Err(no_change_log())
+    }
 
     // ── leases, consumers, timers and wake-ups (docs/design/EVENTS.md D12, section 9) ──
     // Times are the store's clock (the database clock on PostgreSQL). Stores
@@ -398,6 +404,12 @@ pub trait Store: Send + Sync {
     /// Move the consumer `name` to `cursor`; with a fence, only while that
     /// lease is held at its epoch (otherwise "lease lost" and nothing moves).
     fn consumer_set(&self, _name: &str, _cursor: Cursor, _fence: Option<&Fence>) -> Result<()> {
+        Err(no_leases())
+    }
+    /// Every consumer's cursor and how far it is behind the head, by name
+    /// (at most [`MAX_LAG_CONSUMERS`]). One lookup per consumer, never a
+    /// scan of the feed.
+    fn consumer_lags(&self) -> Result<Vec<ConsumerLag>> {
         Err(no_leases())
     }
     /// Set (or move) the timer `name` to `delay_ms` from now by the store's
@@ -523,6 +535,13 @@ pub trait Store: Send + Sync {
         let all: std::collections::HashMap<String, u64> = self.outbox_open_counts()?.into_iter().collect();
         Ok(targets.iter().map(|t| (t.clone(), all.get(t).copied().unwrap_or(0).min(cap))).collect())
     }
+    /// Rows per target in each of [`STATS_STATES`](crate::outbox::STATS_STATES)
+    /// (pending, inflight, retry, dead), each counted up to `cap`, by target
+    /// then state; states without rows are left out. Delivered and cancelled
+    /// rows (most of the table) are never read.
+    fn outbox_state_counts(&self, _cap: u64) -> Result<Vec<(String, OutboxState, u64)>> {
+        Err(no_outbox())
+    }
     /// Delete finished rows (delivered, dead, cancelled) created before
     /// `before_ms`, and attempts logged before it. Returns the rows deleted.
     fn outbox_vacuum(&self, _before_ms: i64) -> Result<u64> {
@@ -558,6 +577,16 @@ pub trait Store: Send + Sync {
     /// Runs matching `q`, newest first (ties by id, descending).
     fn runs_list(&self, _q: &RunQuery) -> Result<Vec<RunRow>> {
         Err(no_runs())
+    }
+    /// Runs per state among the newest `cap` started at or after `since_ms`
+    /// (store clock), by state. Their documents are not read.
+    fn runs_state_counts(&self, since_ms: i64, cap: usize) -> Result<Vec<(RunState, u64)>> {
+        let q = RunQuery { since: Some(since_ms), limit: Some(cap), ..Default::default() };
+        let mut by: std::collections::BTreeMap<&'static str, (RunState, u64)> = Default::default();
+        for r in self.runs_list(&q)? {
+            by.entry(r.state.as_str()).or_insert((r.state, 0)).1 += 1;
+        }
+        Ok(by.into_values().collect())
     }
     /// `running` rows claimed under an epoch below `epoch` (what a new
     /// holder of the consumer lease recovers), oldest first, at most `limit`.
@@ -1007,6 +1036,28 @@ impl Store for MemoryStore {
         Ok(ChangeVacuum { deleted, floor })
     }
 
+    fn gap_stats(&self, since_ms: i64, cap: u64) -> Result<GapStats> {
+        let inner = self.inner.lock();
+        let mut out = GapStats::default();
+        // Newest first; records are in commit order, so stop at the first
+        // one older than `since_ms` once the newest gap is known.
+        for (c, _) in inner.changes.iter().rev() {
+            let r = &c.record;
+            if r.ts < since_ms && out.latest.is_some() {
+                break;
+            }
+            let Some(gap) = r.gap.as_ref().filter(|_| r.op == ChangeOp::Gap) else { continue };
+            if out.latest.is_none() {
+                out.latest = Some(GapSummary::of(r.cursor, r.ts, gap));
+            }
+            if r.ts >= since_ms && out.count < cap {
+                out.count += 1;
+            }
+        }
+        out.capped = cap > 0 && out.count >= cap;
+        Ok(out)
+    }
+
     fn head(&self) -> Result<u64> {
         Ok(self.inner.lock().seq)
     }
@@ -1072,6 +1123,30 @@ impl Store for MemoryStore {
         }
         inner.consumers.insert(name.to_string(), cursor);
         Ok(())
+    }
+
+    fn consumer_lags(&self) -> Result<Vec<ConsumerLag>> {
+        let inner = self.inner.lock();
+        let now = now_ms();
+        let mut names: Vec<&String> = inner.consumers.keys().collect();
+        names.sort();
+        names.truncate(MAX_LAG_CONSUMERS);
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let cursor = inner.consumers[name];
+                let start = inner.changes.partition_point(|(c, _)| c.record.cursor <= cursor);
+                let oldest = inner.changes.get(start).map(|(c, _)| c.record.ts);
+                ConsumerLag {
+                    name: name.clone(),
+                    cursor,
+                    behind: inner.seq.saturating_sub(cursor.seq),
+                    age_ms: oldest.map_or(0, |ts| now.saturating_sub(ts).max(0)),
+                    updated_at: None,
+                    expired: cursor.seq < inner.floor,
+                }
+            })
+            .collect())
     }
 
     fn timers_set(&self, name: &str, delay_ms: i64, doc: &Value) -> Result<i64> {
@@ -1163,6 +1238,17 @@ impl Store for MemoryStore {
         out.sort_by(|a, b| b.started_at.cmp(&a.started_at).then_with(|| b.id.cmp(&a.id)));
         out.truncate(q.limit());
         Ok(out)
+    }
+
+    fn runs_state_counts(&self, since_ms: i64, cap: usize) -> Result<Vec<(RunState, u64)>> {
+        let inner = self.inner.lock();
+        let mut recent: Vec<&RunRow> = inner.runs.values().filter(|r| r.started_at >= since_ms).collect();
+        recent.sort_by(|a, b| b.started_at.cmp(&a.started_at).then_with(|| b.id.cmp(&a.id)));
+        let mut by: std::collections::BTreeMap<&'static str, (RunState, u64)> = Default::default();
+        for r in recent.into_iter().take(cap) {
+            by.entry(r.state.as_str()).or_insert((r.state, 0)).1 += 1;
+        }
+        Ok(by.into_values().collect())
     }
 
     fn runs_running(&self, epoch: u64, limit: usize) -> Result<Vec<RunRow>> {
@@ -1358,6 +1444,16 @@ impl Store for MemoryStore {
             *counts.entry(r.target.clone()).or_default() += 1;
         }
         Ok(counts.into_iter().collect())
+    }
+
+    fn outbox_state_counts(&self, cap: u64) -> Result<Vec<(String, OutboxState, u64)>> {
+        let inner = self.inner.lock();
+        let mut counts: std::collections::BTreeMap<(String, &'static str), (OutboxState, u64)> = Default::default();
+        for r in inner.outbox.values().filter(|r| crate::outbox::STATS_STATES.contains(&r.state)) {
+            let c = counts.entry((r.target.clone(), r.state.as_str())).or_insert((r.state, 0));
+            c.1 = (c.1 + 1).min(cap);
+        }
+        Ok(counts.into_iter().map(|((t, _), (st, n))| (t, st, n)).collect())
     }
 
     fn outbox_vacuum(&self, before_ms: i64) -> Result<u64> {

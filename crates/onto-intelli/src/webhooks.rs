@@ -431,8 +431,11 @@ pub struct Endpoint {
 
 /// The change-feed consumer (cursor) of endpoint `name`: `webhook:<name>`.
 pub fn consumer_name(name: &str) -> String {
-    format!("webhook:{name}")
+    format!("{CONSUMER_PREFIX}{name}")
 }
+
+/// The prefix of an endpoint's change consumer ([`consumer_name`]).
+pub const CONSUMER_PREFIX: &str = "webhook:";
 
 /// `[a-z0-9_-]`, 1 to 40 characters.
 pub fn valid_name(name: &str) -> bool {

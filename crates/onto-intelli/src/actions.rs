@@ -563,11 +563,15 @@ pub const ACTIONS: &[ActionInfo] = &[
         false,
         "Check a writeback target without sending anything (a request could write): its references resolve, and its base URL and every route (or one) pass the outbound rules. Admins of every workspace it serves. Input: {name, route?}.",
     ),
-    a("system.stats", false, "Graph, memory, cache, token, ingestion, outbox and run statistics."),
+    a(
+        "system.stats",
+        false,
+        "Graph, memory, cache, token and ingestion statistics; outbox rows per target and state, change lag per consumer and endpoint, gap records over 24 h and runs per state over 1 h.",
+    ),
     a(
         "system.health",
         false,
-        "Liveness and version, the webhook and automation switches and paused counts, and change capture.",
+        "Liveness and version, the webhook and automation switches and paused counts, change capture and the latest gap record.",
     ),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
     a(

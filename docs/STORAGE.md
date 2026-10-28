@@ -86,6 +86,7 @@ TLS is rustls with aws-lc-rs and needs no system library.
 | `0011_outbox` | `outbox` (webhook deliveries and writeback calls) and `delivery_attempts` (append-only) |
 | `0012_automate` | `automation_runs` |
 | `0013_outbox_claim` | outbox indexes for claims (due rows, expired leases) and for open rows per target |
+| `0014_feed_counters` | partial indexes for the section 11 counters: gap records by time (`changes_gaps`) and outbox rows per target and state for pending, inflight, retry and dead (`outbox_stats`) |
 
 Released migrations never change; a schema change is a new migration.
 
@@ -111,10 +112,14 @@ tables, and the trigger turns each of its state-changing commits into a
 `gap` record, so change-feed readers see what they missed. A later upgrade
 applies the migrations again, and its first commit records changes again.
 
-Rolling back past `0011_outbox`, `0012_automate` and `0013_outbox_claim`
-(webhooks, automations and writeback): the tables and indexes are additive
-and an older build ignores them; delete the `schema_migrations` rows with
-`version >= 11` (or `>= 9`, as above) first. The schema needs one more step.
+Rolling back past `0011_outbox`, `0012_automate`, `0013_outbox_claim` and
+`0014_feed_counters` (webhooks, automations, writeback and their counters):
+the tables and indexes are additive and an older build ignores them; delete
+the `schema_migrations` rows with `version >= 11` (or `>= 9`, as above)
+first. Rolling back past `0014_feed_counters` alone needs only its row
+deleted (`version >= 14`): its two indexes are partial and an older build
+never reads them. Applying it builds both indexes, which reads the
+`changes` and `outbox` tables once and holds writes to them meanwhile. The schema needs one more step.
 An older build reads the head schema version whole when it opens a tenant:
 a version whose `changes` hold `put_automation` or `delete_automation`
 (builds before step 10 do not know them), or a head schema with an action
@@ -162,7 +167,11 @@ while the open ones' estimated memory is above `engine.tenant_memory_budget_mb`
 always stays. A closed tenant opens again on its next request.
 `GET /v1/admin/tenants` (operators) lists the open tenants with their
 `estimated_bytes` (`Ontology::estimated_bytes`, an estimate from their
-contents), and `system.stats` shows a tenant's own. A console sign-up
+contents) and their outbound counters (`outbound`: outbox rows per state,
+change lag per consumer and endpoint, gap records over 24 hours and the
+latest gap, runs per state over the last hour, paused automations and
+endpoints; see docs/AUTOMATE.md, operating notes), and `system.stats` shows
+a tenant's own. A console sign-up
 creates the first project's schema without opening it.
 
 | table | holds |

@@ -1017,3 +1017,38 @@ async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revok
         assert_eq!(status(&bases[1], token).await, 401, "{header:?}: the other replica");
     }
 }
+
+/// `GET /v1/admin/tenants` carries each open tenant's outbound counters
+/// (docs/design/EVENTS.md section 11) and the process's subscriber count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tenants_report_outbound_counters() {
+    let (addr, _stop) = start_hub().await;
+    let http = reqwest::Client::new();
+    let r: Value = http
+        .get(format!("http://{addr}/v1/admin/tenants"))
+        .bearer_auth("tenant-a-only-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["subscribers_process"].is_u64(), "{r}");
+    let t = r["tenants"].as_array().unwrap().iter().find(|t| t["tenant"] == "ws_a").expect("ws_a is open");
+    let o = &t["outbound"];
+    for key in ["lag", "outbox", "outbox_open", "gaps_24h", "runs_1h", "paused"] {
+        assert!(o.get(key).is_some(), "{key} missing: {o}");
+    }
+    assert_eq!(o["gaps_24h"]["count"], 0, "{o}");
+    assert!(o["outbox"]["targets"].is_object(), "{o}");
+    assert!(o["lag"]["endpoints"].is_object(), "{o}");
+
+    // A member is refused.
+    let denied = http
+        .get(format!("http://{addr}/v1/admin/tenants"))
+        .bearer_auth("service-token-for-tests")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+}

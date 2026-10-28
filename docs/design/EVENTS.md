@@ -1103,6 +1103,8 @@ tenant ids and times only. `tenant_schema` refuses tenant ids that map to `{pref
   bytes, change lag per consumer and endpoint, outbox pending/retry/dead per endpoint, runs per state
   over 1 h, gap records over 24 h, paused automations and endpoints.
 - `system.health` reports kill switches, paused counts, `capture` and the latest gap.
+- Every counter reads an index range bounded by a cap, never a whole table (built after step 13;
+  see the build notes, "Counters").
 
 ## 12. Test plan
 
@@ -1316,12 +1318,6 @@ commit.
 - Should `entity.hidden` also be sent for link records whose end becomes hidden (phase 1: no)?
 - `changes_meta.floor` reports a false `reset` at the exact retention edge; acceptable, or add an
   end-of-seq cursor form?
-- Section 11 observability still open after review round 1 (built: the `automation.run` and
-  `webhook.deliver` spans, `system.health` switches, paused counts and capture, `system.stats`
-  open outbox rows per target, runs per state over 1 h and worker rounds; after step 13, traces
-  of kind `automation` and `delivery` with `[traces] deliveries = failures|all|off`): change lag per
-  consumer and endpoint, gap records over 24 h, the latest gap in `system.health`, outbox
-  pending/retry/dead split by state, and the same counters in `GET /v1/admin/tenants`.
 
 ---
 
@@ -1771,3 +1767,41 @@ Traces (after step 13; B.7 and section 11):
   (`a_run_is_traced_and_continues_the_trace_of_its_trigger`), `webhooks_postgres.rs`
   (`a_traced_write_is_delivered_under_its_trace_on_postgres`) and `config.rs`
   (`delivery_traces_default_to_failures`).
+
+Counters (after step 13; section 11):
+
+- Store methods (defaulted; `MemoryStore` and `PgStore` implement them): `consumer_lags()` (every
+  consumer by name, at most `MAX_LAG_CONSUMERS` = 1000: cursor, `behind` = head seq minus cursor
+  seq, `age_ms` = store clock minus the `ts` of the oldest record after the cursor, `updated_at`,
+  `expired` = cursor seq below the floor), `gap_stats(since_ms, cap)` (gap records with `ts >=
+  since_ms` counted up to `cap`, and the newest gap kept as a `GapSummary`: cursor, ts, reason,
+  origin and how many entities and links it touched, never the ids; cap 0 reads only the newest),
+  `outbox_state_counts(cap)` (rows per target and state for `STATS_STATES` = pending, inflight,
+  retry, dead, each up to `cap`; zero counts left out) and `runs_state_counts(since_ms, cap)`
+  (states of the newest `cap` runs started since; documents not read).
+- `0014_feed_counters.sql`: `changes_gaps ON changes (ts) WHERE op = 'gap'` and `outbox_stats ON
+  outbox (target, state) WHERE state IN ('pending', 'inflight', 'retry', 'dead')`. Lag needs no
+  index: one primary-key probe `(seq, n) > cursor ORDER BY seq, n LIMIT 1` per consumer. Outbox
+  targets come from a skip scan of `outbox_stats` (one probe per target, at most 1000), then each
+  (target, state) is an index-only range up to the cap. Runs use `automation_runs_started`.
+- Surfaces: `system.stats.outbound` gains `lag {consumers, endpoints}` (endpoint `X` is consumer
+  `webhook:X`), `outbox {cap, targets: {<target>: {<state>: n}}}`, `gaps_24h {count, capped,
+  latest}`; `outbox_open` is now the open sum of the capped state counts, and `runs_1h` counts the
+  newest 10,000 runs (was 500 rows read whole). `system.health.outbound.changes.latest_gap`.
+  `GET /v1/admin/tenants` adds `subscribers_process` and, per open tenant, `outbound` (the
+  `system.stats.outbound` counters plus `paused {automations, endpoints}`) from
+  `Hub::tenant_report` on a blocking thread; `Hub::tenant_stats` (memory budget, eviction) still
+  reads nothing from the store.
+- Cost, measured on a scratch tenant with 2,000,000 change records over 24 h (25 gaps), 20
+  consumers, 658,200 outbox rows over 20 targets (600,000 delivered, 30,000 dead, 6,000
+  pending, 2,000 retry, 200 inflight, 20,000 cancelled) and 60,000 runs over 2 h, PostgreSQL 16
+  local, warm, release build, store call round trips: lags 1.1 ms (80 buffers), gaps 0.7 ms (18
+  buffers; without the partial index a sequential scan of 34,486 buffers, 222 ms), latest gap
+  only 0.6 ms, outbox states 3.1 ms (244 buffers, index-only; the same counts by `GROUP BY`
+  without `outbox_stats` read 11,936 buffers in 65 ms), runs 2.3 ms (491 buffers, 10,000 rows).
+- Tests: `onto-core` `feed_counters.rs` (`memory_consumer_lag`, `postgres_consumer_lag`,
+  `memory_gaps`, `postgres_gaps`, `memory_outbox_states`, `postgres_outbox_states`,
+  `memory_run_states`, `postgres_run_states`, `postgres_counters_read_their_indexes`);
+  `onto-intelli` `automate.rs` (`stats_health_and_tenant_report_show_lag_gaps_and_outbox_states`)
+  and `tenants_postgres.rs` (`the_tenant_report_carries_outbound_counters`); `onto-grpc`
+  `server.rs` (`admin_tenants_report_outbound_counters`).

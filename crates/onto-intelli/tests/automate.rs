@@ -865,6 +865,75 @@ async fn health_and_stats_show_switches_paused_counts_and_runs() {
     assert!(s["workers"]["automation"].is_u64(), "{s}");
 }
 
+/// Section 11 counters: `system.stats` reports change lag per consumer and
+/// per endpoint, gap records over 24 h with the latest, and outbox rows per
+/// target split by state; `system.health` the latest gap; the hub's tenant
+/// report (`GET /v1/admin/tenants`) the same counters with paused counts.
+#[tokio::test]
+async fn stats_health_and_tenant_report_show_lag_gaps_and_outbox_states() {
+    use onto_intelli::core::outbox::{Attempt, OutboxKind, OutboxRow, OutboxState, SOURCE_TEST};
+    let i = open(|_| {}).await;
+    ok(
+        &i,
+        &admin(),
+        "webhook.add",
+        json!({ "name": "ops", "url": "https://hooks.example.com/in", "secret": SECRET,
+                "filter": { "kinds": "issue" }, "principal": { "roles": ["member"], "workspaces": ["acme"] } }),
+    )
+    .await;
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    let lag = &s["outbound"]["lag"];
+    // Behind by the endpoint's own config commit (no records): nothing to read.
+    let b0 = lag["endpoints"]["ops"]["behind"].as_u64().expect("the endpoint's lag");
+    assert_eq!(lag["endpoints"]["ops"]["age_ms"], 0, "{s}");
+    assert_eq!(lag["consumers"]["webhook:ops"], lag["endpoints"]["ops"], "{s}");
+    assert_eq!(s["outbound"]["gaps_24h"]["count"], 0, "{s}");
+    assert!(s["outbound"]["gaps_24h"]["latest"].is_null(), "{s}");
+
+    // Fan-out is off here: the endpoint's cursor stays while commits land.
+    issue(&i, "1", "triaged", "high").await;
+    issue(&i, "2", "triaged", "low").await;
+    let store = i.ontology().store().clone();
+    let base = i.ontology().get(&admin(), "issue:1").unwrap();
+    let mut bulk = base.clone();
+    bulk.id = "issue:bulk".into();
+    store.bulk_import(&[bulk], &[]).unwrap();
+    // Outbox rows of `ops`: one dead, one left pending.
+    let row = |d: &str| OutboxRow::new(OutboxKind::Webhook, "ops", d, SOURCE_TEST, "acme", "onto.webhook.test");
+    store.outbox_enqueue(&[row("a"), row("b")], None, None).unwrap();
+    let c = store.outbox_claim(1, 60_000, "w", &[]).unwrap();
+    let gone = Attempt { status: Some(410), duration_ms: 1, ..Default::default() };
+    assert!(store.outbox_finish(&c[0].id, c[0].claim.as_deref().unwrap(), &gone, OutboxState::Dead, 0).unwrap());
+
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    let o = &s["outbound"];
+    let ep = &o["lag"]["endpoints"]["ops"];
+    assert_eq!(ep["behind"].as_u64(), Some(b0 + 3), "two upserts and the import: {s}");
+    assert!(ep["age_ms"].as_i64().is_some_and(|a| a >= 0), "{s}");
+    assert_eq!(ep["expired"], false, "{s}");
+    assert_eq!(o["gaps_24h"]["count"], 1, "{s}");
+    assert_eq!(o["gaps_24h"]["latest"]["reason"], "bulk_import", "{s}");
+    assert_eq!(o["gaps_24h"]["latest"]["touched"], 1, "{s}");
+    assert_eq!(o["outbox"]["targets"]["ops"], json!({ "dead": 1, "pending": 1 }), "{s}");
+    assert_eq!(o["outbox_open"]["ops"], 1, "{s}");
+    assert_eq!(o["outbox"]["cap"], onto_intelli::core::outbox::STATS_COUNT_CAP, "{s}");
+
+    let h = ok(&i, &admin(), "system.health", json!({})).await;
+    let g = &h["outbound"]["changes"]["latest_gap"];
+    assert_eq!((g["reason"].as_str(), &g["cursor"]), (Some("bulk_import"), &o["gaps_24h"]["latest"]["cursor"]), "{h}");
+    assert!(!h.to_string().contains("issue:bulk"), "the latest gap names no ids: {h}");
+
+    let hub = onto_intelli::Hub::single(i.clone());
+    assert!(hub.tenant_stats()[0].outbound.is_none(), "only the report reads the store");
+    let report = tokio::task::spawn_blocking(move || hub.tenant_report()).await.unwrap();
+    let t = report[0].outbound.as_ref().expect("the tenant's counters");
+    let tep = &t["lag"]["endpoints"]["ops"];
+    assert_eq!((&tep["behind"], &tep["cursor"]), (&ep["behind"], &ep["cursor"]), "{t}");
+    assert_eq!(t["gaps_24h"], o["gaps_24h"], "{t}");
+    assert_eq!(t["outbox"], o["outbox"], "{t}");
+    assert_eq!(t["paused"], json!({ "automations": 0, "endpoints": 0 }), "{t}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_is_traced_and_continues_the_trace_of_its_trigger() {
     const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
