@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use http::HeaderMap;
@@ -62,7 +63,14 @@ pub struct Auth {
     revocations: RwLock<Option<Arc<dyn Revocations>>>,
     /// Session ids by whether they are revoked, and when that was read.
     revoked: Mutex<HashMap<String, (bool, Instant)>>,
+    /// The cache size above which a read evicts from it: twice what the
+    /// last eviction kept, so a cache of live revocations is not scanned on
+    /// every read.
+    evict_above: AtomicUsize,
 }
+
+/// Entries the revocation cache holds before a read evicts from it.
+const REVOKED_CACHE_ENTRIES: usize = 100_000;
 
 /// How long a session id read as not revoked is trusted before it is read
 /// again. A revocation on this replica applies at once.
@@ -364,6 +372,7 @@ impl Auth {
             control,
             revocations: RwLock::new(None),
             revoked: Mutex::new(HashMap::new()),
+            evict_above: AtomicUsize::new(REVOKED_CACHE_ENTRIES),
         })
     }
 
@@ -394,6 +403,11 @@ impl Auth {
         }
         .min(now.saturating_add(REVOCATION_MAX_SECS).saturating_add(REVOCATION_GRACE_SECS));
         r.revoke(id, tenants, until).await?;
+        // No session lives past the limit: an id that claims to is kept in
+        // the store only, so made-up ids do not grow this replica's cache.
+        if id_expiry(id).is_some_and(|exp| exp > now.saturating_add(SESSION_MAX_TTL_LIMIT)) {
+            return Ok(());
+        }
         let mut cache = self.revoked.lock();
         match tenants {
             None => {
@@ -429,8 +443,9 @@ impl Auth {
         let revoked =
             r.is_revoked(id, tenant).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
         let mut cache = self.revoked.lock();
-        if cache.len() > 100_000 {
+        if cache.len() > self.evict_above.load(Ordering::Relaxed) {
             evict(&mut cache, now, REVOKED_CACHE_MAX);
+            self.evict_above.store((cache.len() * 2).max(REVOKED_CACHE_ENTRIES), Ordering::Relaxed);
         }
         // A revoke on this replica may have cached `true` while this read
         // was in flight: a revocation is never taken back.
@@ -1121,6 +1136,36 @@ mod tests {
         cache.insert(format!("far.{}", u64::MAX), (true, old));
         evict(&mut cache, now, Duration::from_secs(1));
         assert!(cache.keys().all(|k| !k.starts_with("old-") && !k.starts_with("far.")), "{:?}", cache.keys());
+    }
+
+    #[tokio::test]
+    async fn made_up_ids_stay_out_of_the_cache_and_a_full_cache_is_not_rescanned_on_every_read() {
+        let a = auth();
+        let recorded = Arc::new(Recorded::default());
+        a.set_revocations(recorded.clone());
+        // An id claiming an expiry no session reaches is revoked in the store
+        // only, and still read as revoked from there.
+        let far = format!("x.{}", now_secs() + SESSION_MAX_TTL_LIMIT + 3_600);
+        a.revoke_session(&far, None, 0).await.unwrap();
+        assert_eq!(recorded.0.lock().len(), 1);
+        assert!(!a.revoked.lock().contains_key(&far), "not cached");
+        assert!(a.session_revoked(&far, None).await.unwrap());
+        // A cache over its size, full of live revocations, is evicted once and
+        // then not again until it has doubled.
+        let live = now_secs() + 600;
+        {
+            let mut cache = a.revoked.lock();
+            for i in 0..=REVOKED_CACHE_ENTRIES {
+                cache.insert(format!("r{i}.{live}"), (true, Instant::now()));
+            }
+        }
+        a.session_revoked("another", None).await.unwrap();
+        let kept = a.revoked.lock().len();
+        assert!(kept > REVOKED_CACHE_ENTRIES, "live revocations stay: {kept}");
+        let threshold = a.evict_above.load(Ordering::Relaxed);
+        assert!(threshold > 2 * REVOKED_CACHE_ENTRIES, "{threshold}");
+        a.session_revoked("a-third", None).await.unwrap();
+        assert_eq!(a.evict_above.load(Ordering::Relaxed), threshold, "not scanned again");
     }
 
     /// A store that cannot be read.

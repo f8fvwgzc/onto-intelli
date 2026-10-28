@@ -111,6 +111,16 @@ fn purge_in_batches(purge: impl Fn(usize) -> Result<u64>) -> usize {
     }
 }
 
+/// Record `key` revoked until `exp` (Unix seconds), never shortening a
+/// revocation already there: revoking an id without an expiry again, after
+/// the limit was lowered, keeps the later of the two.
+fn write_revocation(store: &dyn onto_intelli::core::store::Store, key: &str, exp: u64) -> Result<()> {
+    let kept = store.kv_get(REVOKED_NS, key)?.and_then(|v| v.get("expires_at").and_then(serde_json::Value::as_u64));
+    let exp = kept.map_or(exp, |kept| kept.max(exp));
+    let until = i64::try_from(exp).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
+    store.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
+}
+
 impl HubRevocations {
     fn new(hub: &Arc<Hub>) -> Self {
         Self { hub: Arc::downgrade(hub), pruned: std::sync::atomic::AtomicI64::new(0) }
@@ -147,15 +157,10 @@ impl auth::Revocations for HubRevocations {
                 None => vec![id.to_string()],
                 Some(tenants) => tenants.iter().map(|t| auth::scoped_id(id, Some(t))).collect(),
             };
-            let until = i64::try_from(exp).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
             let written = store.clone();
-            tokio::task::spawn_blocking(move || {
-                keys.iter().try_for_each(|key| {
-                    written.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
-                })
-            })
-            .await
-            .map_err(|e| Error::Other(format!("revoking a session: {e}")))??;
+            tokio::task::spawn_blocking(move || keys.iter().try_for_each(|key| write_revocation(&*written, key, exp)))
+                .await
+                .map_err(|e| Error::Other(format!("revoking a session: {e}")))??;
             // Off the request: the revoke has answered by the time this runs.
             if self.prune_due() {
                 let before = onto_intelli::core::time::now_ms() - PRUNE_MARGIN_MS;
@@ -352,6 +357,22 @@ mod tests {
         assert_eq!(super::purge_in_batches(|_| answers.borrow_mut().pop().unwrap()), 2, "a full batch, then 3 rows");
         let failing = |_| Err(onto_intelli::Error::Unavailable("down".into()));
         assert_eq!(super::purge_in_batches(failing), 1, "an error stops it");
+    }
+
+    #[test]
+    fn a_repeated_revocation_never_shortens_the_first() {
+        use onto_intelli::core::store::{MemoryStore, Store};
+        let store = MemoryStore::default();
+        let now = onto_intelli::core::time::now_ms() as u64 / 1000;
+        let expiry =
+            |store: &MemoryStore| store.kv_get(super::REVOKED_NS, "old-id").unwrap().unwrap()["expires_at"].clone();
+        // Revoked for 30 days, then again after the limit was lowered to an hour.
+        super::write_revocation(&store, "old-id", now + 30 * 86_400).unwrap();
+        super::write_revocation(&store, "old-id", now + 3_600).unwrap();
+        assert_eq!(expiry(&store), now + 30 * 86_400);
+        // A later expiry still extends it.
+        super::write_revocation(&store, "old-id", now + 60 * 86_400).unwrap();
+        assert_eq!(expiry(&store), now + 60 * 86_400);
     }
 
     #[test]
