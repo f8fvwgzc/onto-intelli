@@ -1255,18 +1255,21 @@ impl Store for PgStore {
         })
     }
 
-    fn kv_purge_expired(&self, ns: &str, limit: usize) -> Result<u64> {
+    fn kv_purge_expired(&self, ns: &str, before: i64, limit: usize) -> Result<u64> {
         let pool = self.pool.clone();
         let tk = self.t("kv");
         let ns = ns.to_string();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.block(async move {
+            // The outer condition again: a key put again since the inner
+            // select keeps its new row.
             let deleted = sqlx::query(sql(format!(
-                "DELETE FROM {tk} WHERE ns = $1 AND key IN (SELECT key FROM {tk} WHERE ns = $1 \
+                "DELETE FROM {tk} WHERE ns = $1 AND expires_at IS NOT NULL AND expires_at <= $2 \
+                 AND key IN (SELECT key FROM {tk} WHERE ns = $1 \
                  AND expires_at IS NOT NULL AND expires_at <= $2 LIMIT $3)"
             )))
             .bind(&ns)
-            .bind(now_ms())
+            .bind(before)
             .bind(limit)
             .execute(&pool)
             .await?

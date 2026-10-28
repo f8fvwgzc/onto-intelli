@@ -170,7 +170,7 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
   name one of them (403 otherwise), as for any request. The id carries the
   session's expiry: the revocation lasts until that expiry plus 60
   seconds, whatever `auth.session_max_ttl_secs` is set to later (and at
-  most a year ahead, unless sessions may live longer); `expires_at`
+  most 366 days ahead); `expires_at`
   matters only for ids without one (minted by earlier builds).
 - Upgrading from an earlier build: replicas still on it ignore revocations
   limited to some tenants, so during a rolling deploy (or after rolling
@@ -180,7 +180,10 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
   revoking the middle one: revoke the login's `sid` instead. A client that
   renewed by minting from its last renewed session now gets 403: mint from
   the first session (or have the backend mint a new one).
-  `auth.session_max_ttl_secs` above 365 days is lowered to 365 days.
+  `auth.session_max_ttl_secs` above 365 days is lowered to 365 days. If it
+  was above 366 days, rotate the session secret when upgrading: sessions
+  minted before carry no expiry in their id, so their revocation lasts at
+  most 366 days while they may live longer.
 - Signing out from any session of a login ends the whole login (the
   session it was minted from and its other sessions too): the user signs
   out, not one copy of a token, and every session of a login is the same

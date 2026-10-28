@@ -511,8 +511,9 @@ async fn session_revoke(State(s): State<AppState>, headers: HeaderMap, body: Opt
         Ok(i) => i,
         Err(e) => return error_response(&Error::invalid(format!("revoke: {e}"))),
     };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let exp = input.expires_at.unwrap_or(now + s.hub.config().auth.session_max_ttl_secs);
+    // Without expires_at, revoke_session keeps an old-format id as long as
+    // a session minted now could live (the limit as clamped).
+    let exp = input.expires_at.unwrap_or(0);
     match s.auth.revoke_session(&input.jti, tenants.as_deref(), exp).await {
         Ok(()) => match tenants {
             Some(tenants) => Json(json!({ "revoked": input.jti, "tenants": tenants })).into_response(),

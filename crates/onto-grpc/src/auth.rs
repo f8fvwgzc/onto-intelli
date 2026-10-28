@@ -430,7 +430,7 @@ impl Auth {
             r.is_revoked(id, tenant).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
         let mut cache = self.revoked.lock();
         if cache.len() > 100_000 {
-            evict(&mut cache, now);
+            evict(&mut cache, now, REVOKED_CACHE_MAX);
         }
         // A revoke on this replica may have cached `true` while this read
         // was in flight: a revocation is never taken back.
@@ -823,7 +823,6 @@ pub async fn guard_project_call(
     Ok(())
 }
 
-/// A random session id.
 /// `auth.session_max_ttl_secs` as used: at least a minute, at most
 /// [`SESSION_MAX_TTL_LIMIT`].
 fn session_max_ttl(configured: u64) -> u64 {
@@ -835,17 +834,25 @@ fn session_max_ttl(configured: u64) -> u64 {
     configured.clamp(60, SESSION_MAX_TTL_LIMIT)
 }
 
+/// How long a "revoked" stays in the cache at most: as long as any
+/// revocation is kept ([`REVOCATION_MAX_SECS`] plus the grace).
+const REVOKED_CACHE_MAX: Duration = Duration::from_secs(REVOCATION_MAX_SECS + REVOCATION_GRACE_SECS);
+
 /// Drop from the revocation cache what it no longer needs: a "not revoked"
 /// older than [`REVOCATION_TTL`], and a "revoked" whose session has expired
-/// (the expiry its id carries, plus [`REVOCATION_GRACE_SECS`]). Revocations
-/// of ids without an expiry stay.
-fn evict(cache: &mut HashMap<String, (bool, Instant)>, now: Instant) {
+/// (the expiry its id carries, plus [`REVOCATION_GRACE_SECS`]) or that was
+/// cached more than `keep` ago (ids without an expiry, or with one too far
+/// ahead to be real).
+fn evict(cache: &mut HashMap<String, (bool, Instant)>, now: Instant, keep: Duration) {
     let secs = now_secs();
     let lapsed = |key: &str| {
         let id = key.split_once('@').map_or(key, |(id, _)| id);
         id_expiry(id).is_some_and(|exp| exp.saturating_add(REVOCATION_GRACE_SECS) < secs)
     };
-    cache.retain(|key, (revoked, at)| if *revoked { !lapsed(key) } else { now.duration_since(*at) < REVOCATION_TTL });
+    cache.retain(|key, (revoked, at)| {
+        let age = now.duration_since(*at);
+        if *revoked { !lapsed(key) && age < keep } else { age < REVOCATION_TTL }
+    });
 }
 
 /// A session id: random, then the session's expiry ([`id_expiry`]).
@@ -1103,10 +1110,17 @@ mod tests {
         }
         let stale = now.checked_sub(REVOCATION_TTL + Duration::from_secs(1)).unwrap();
         cache.insert(format!("stale.{future}"), (false, stale));
-        evict(&mut cache, now);
-        let mut kept: Vec<String> = cache.into_keys().collect();
+        evict(&mut cache, now, REVOKED_CACHE_MAX);
+        let mut kept: Vec<String> = cache.keys().cloned().collect();
         kept.sort();
         assert_eq!(kept, ["an-id-without-expiry".to_string(), format!("fresh.{future}"), format!("live.{future}")]);
+        // A "revoked" cached longer than any revocation is kept goes too,
+        // expiry in its id or not (here `keep` stands for that bound).
+        let old = now.checked_sub(Duration::from_secs(2)).unwrap();
+        cache.insert("old-id-without-expiry".into(), (true, old));
+        cache.insert(format!("far.{}", u64::MAX), (true, old));
+        evict(&mut cache, now, Duration::from_secs(1));
+        assert!(cache.keys().all(|k| !k.starts_with("old-") && !k.starts_with("far.")), "{:?}", cache.keys());
     }
 
     /// A store that cannot be read.

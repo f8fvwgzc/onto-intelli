@@ -89,6 +89,28 @@ const PRUNE_EVERY_MS: i64 = 10 * 60 * 1000;
 /// Expired revocations deleted per statement.
 const PRUNE_BATCH: usize = 1_000;
 
+/// How long past its expiry a revocation is kept before it is deleted: a
+/// replica whose clock is ahead must not delete rows the others still
+/// read as live (reads skip expired rows anyway).
+const PRUNE_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+/// Delete expired revocations with `purge(limit)`, [`PRUNE_BATCH`] rows a
+/// statement, until a statement deletes fewer; how many statements ran.
+fn purge_in_batches(purge: impl Fn(usize) -> Result<u64>) -> usize {
+    let mut statements = 0;
+    loop {
+        statements += 1;
+        match purge(PRUNE_BATCH) {
+            Ok(n) if n as usize >= PRUNE_BATCH => continue,
+            Ok(_) => return statements,
+            Err(e) => {
+                tracing::warn!("deleting expired session revocations: {e}");
+                return statements;
+            }
+        }
+    }
+}
+
 impl HubRevocations {
     fn new(hub: &Arc<Hub>) -> Self {
         Self { hub: Arc::downgrade(hub), pruned: std::sync::atomic::AtomicI64::new(0) }
@@ -136,17 +158,9 @@ impl auth::Revocations for HubRevocations {
             .map_err(|e| Error::Other(format!("revoking a session: {e}")))??;
             // Off the request: the revoke has answered by the time this runs.
             if self.prune_due() {
+                let before = onto_intelli::core::time::now_ms() - PRUNE_MARGIN_MS;
                 tokio::task::spawn_blocking(move || {
-                    loop {
-                        match store.kv_purge_expired(REVOKED_NS, PRUNE_BATCH) {
-                            Ok(n) if n as usize >= PRUNE_BATCH => continue,
-                            Ok(_) => break,
-                            Err(e) => {
-                                tracing::warn!("deleting expired session revocations: {e}");
-                                break;
-                            }
-                        }
-                    }
+                    purge_in_batches(|limit| store.kv_purge_expired(REVOKED_NS, before, limit))
                 });
             }
             Ok(())
@@ -331,6 +345,15 @@ fn public_url_ok(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expired_revocations_are_deleted_in_batches_until_one_comes_back_short() {
+        use std::cell::RefCell;
+        let answers = RefCell::new(vec![Ok(3), Ok(super::PRUNE_BATCH as u64)]);
+        assert_eq!(super::purge_in_batches(|_| answers.borrow_mut().pop().unwrap()), 2, "a full batch, then 3 rows");
+        let failing = |_| Err(onto_intelli::Error::Unavailable("down".into()));
+        assert_eq!(super::purge_in_batches(failing), 1, "an error stops it");
+    }
+
     #[test]
     fn public_urls() {
         for ok in ["https://onto.example.com", "http://127.0.0.1:50051", "http://localhost", "http://[::1]:8080/x"] {
