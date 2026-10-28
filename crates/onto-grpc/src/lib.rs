@@ -164,11 +164,14 @@ pub async fn serve_hub(
     opts: ServeOptions,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let listen = hub.config().grpc.listen.clone();
-    let addr: SocketAddr = listen.parse().map_err(|e| Error::Config(format!("grpc.listen '{listen}': {e}")))?;
-    let listener =
-        tokio::net::TcpListener::bind(addr).await.map_err(|e| Error::Unavailable(format!("bind {addr}: {e}")))?;
+    let listener = bind(&hub.config().grpc.listen).await?;
     serve_hub_on(hub, opts, listener, shutdown).await
+}
+
+/// Bind `grpc.listen` (an address such as `127.0.0.1:50051`).
+pub async fn bind(listen: &str) -> Result<tokio::net::TcpListener> {
+    let addr: SocketAddr = listen.parse().map_err(|e| Error::Config(format!("grpc.listen '{listen}': {e}")))?;
+    tokio::net::TcpListener::bind(addr).await.map_err(|e| Error::Unavailable(format!("bind {addr}: {e}")))
 }
 
 /// Serve on an already-bound listener (tests, port 0, socket activation).
@@ -186,6 +189,22 @@ pub async fn serve_hub_on(
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    prepare(hub, opts, listener).await?.run(shutdown).await
+}
+
+/// A server whose configuration was checked (authentication, the console's
+/// startup rules, development mode on loopback only, routes and protos) on
+/// a bound port, not yet serving. `onto serve` prepares before it prints
+/// its banner, so a configuration error never follows a "listening" line.
+pub struct Prepared {
+    hub: Arc<Hub>,
+    router: axum::Router,
+    table: Arc<RouteTable>,
+    listener: tokio::net::TcpListener,
+}
+
+/// Check everything that can fail at startup and build the router.
+pub async fn prepare(hub: Arc<Hub>, opts: ServeOptions, listener: tokio::net::TcpListener) -> Result<Prepared> {
     let dev = opts.dev || hub.config().auth.mode == "dev";
     let addr = listener.local_addr().ok();
     if dev {
@@ -199,15 +218,86 @@ pub async fn serve_hub_on(
         tracing::warn!("DEVELOPMENT MODE: no authentication, every caller is {}", hub.config().auth.dev_principal.id);
     }
     check_console(hub.config(), opts.control.as_deref(), dev)?;
-    let (router, table) = router_hub(hub, &opts).await?;
-    tracing::info!(?addr, routes = table.routes.len(), "onto-intelli listening (gRPC + HTTP/JSON)");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    tonic::transport::Server::builder()
-        .accept_http1(true)
-        .add_routes(tonic::service::Routes::from(router))
-        .serve_with_incoming_shutdown(incoming, shutdown)
-        .await
-        .map_err(|e| Error::Unavailable(format!("server: {e}")))
+    let (router, table) = router_hub(hub.clone(), &opts).await?;
+    Ok(Prepared { hub, router, table, listener })
+}
+
+impl Prepared {
+    /// The bound address.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.local_addr().ok()
+    }
+
+    /// Serve until `shutdown` resolves, then until open connections close.
+    /// The hub is left as it is (another server may share it).
+    pub async fn run(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        let addr = self.listener.local_addr().ok();
+        tracing::info!(?addr, routes = self.table.routes.len(), "onto-intelli listening (gRPC + HTTP/JSON)");
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(self.listener);
+        tonic::transport::Server::builder()
+            .accept_http1(true)
+            .add_routes(tonic::service::Routes::from(self.router))
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+            .map_err(|e| Error::Unavailable(format!("server: {e}")))
+    }
+
+    /// Serve until `shutdown` resolves, then shut down gracefully within
+    /// `grace`: stop accepting connections, close the hub's tenants (change
+    /// streams end with their final frame, workers start no new round), let
+    /// open requests and the workers' current rounds finish, cut whatever is
+    /// left at the deadline, and release the leases, claimed outbox rows and
+    /// wake scanner lock this process holds (fenced: only the current
+    /// holder at its epoch), so a replacement process takes over at once.
+    /// Use it when this server owns the hub.
+    pub async fn run_graceful(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        grace: std::time::Duration,
+    ) -> Result<onto_intelli::Released> {
+        let hub = self.hub.clone();
+        let at: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
+        let fired = Arc::new(tokio::sync::Notify::new());
+        let signal = {
+            let (hub, at, fired) = (hub.clone(), at.clone(), fired.clone());
+            async move {
+                shutdown.await;
+                let _ = at.set(tokio::time::Instant::now());
+                tracing::info!(
+                    grace_secs = grace.as_secs(),
+                    "shutting down: no new connections, streams end, workers stop"
+                );
+                hub.begin_shutdown();
+                fired.notify_one();
+            }
+        };
+        let mut serve = Box::pin(self.run(signal));
+        let drained = tokio::select! {
+            r = &mut serve => r,
+            _ = async {
+                fired.notified().await;
+                let start = at.get().copied().unwrap_or_else(tokio::time::Instant::now);
+                tokio::time::sleep_until(start + grace).await;
+            } => {
+                tracing::warn!("connections still open after {grace:?}: closing them");
+                Ok(())
+            }
+        };
+        // Connections still open at the deadline are cut here.
+        drop(serve);
+        // The server may have stopped on its own (an error): stop the rest too.
+        let deadline = at.get().map_or_else(|| tokio::time::Instant::now() + grace, |t| *t + grace);
+        let released = hub.finish_shutdown(deadline).await;
+        tracing::info!(
+            leases = released.leases,
+            claims = released.claims,
+            crawls = released.crawls,
+            cut = released.cut,
+            failed = released.failed,
+            "released what this process held"
+        );
+        drained.map(|()| released)
+    }
 }
 
 /// Startup rules of the control plane: a control store when the console is

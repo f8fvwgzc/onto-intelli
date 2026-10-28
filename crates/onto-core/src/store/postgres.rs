@@ -335,9 +335,13 @@ impl PgShared {
             elected: elected.clone(),
             on_due,
         };
+        let (finished, done) = tokio::sync::watch::channel(false);
         let (h, _) = self.exec.handle();
-        h.spawn(scan(job, stopped));
-        WakeScanner { elected, stop }
+        h.spawn(async move {
+            scan(job, stopped).await;
+            let _ = finished.send(true);
+        });
+        WakeScanner { elected, stop, done }
     }
 
     /// One query (`SELECT 1`): the database answers.
@@ -2130,18 +2134,20 @@ impl Store for PgStore {
         })
     }
 
-    fn release(&self, name: &str, holder: &str) -> Result<bool> {
+    /// Fenced: only the holder at its epoch, while it still holds the lease.
+    fn release(&self, fence: &Fence) -> Result<bool> {
         let pool = self.pool.clone();
         let t = Tables::of(self);
-        let (name, holder) = (name.to_string(), holder.to_string());
+        let f = fence.clone();
         self.block(async move {
             let n = sqlx::query(sql(format!(
-                "UPDATE {l} SET until = {now} - 1 WHERE name = $1 AND holder = $2 AND until >= {now}",
+                "UPDATE {l} SET until = {now} - 1 WHERE name = $1 AND holder = $2 AND epoch = $3 AND until >= {now}",
                 l = t.leases,
                 now = t.now
             )))
-            .bind(&name)
-            .bind(&holder)
+            .bind(&f.name)
+            .bind(&f.holder)
+            .bind(f.epoch as i64)
             .execute(&pool)
             .await?
             .rows_affected();

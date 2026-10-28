@@ -39,6 +39,7 @@ pub mod hub;
 pub mod ingest;
 pub mod intelli;
 pub mod intent;
+pub mod lifecycle;
 pub mod limits;
 pub mod llm;
 pub mod mcp;
@@ -61,5 +62,6 @@ pub use onto_core::{
 pub use config::Config;
 pub use hub::Hub;
 pub use intelli::{AnswerMode, AskEvent, AskMode, AskRequest, AskResponse, Intelli};
+pub use lifecycle::Released;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

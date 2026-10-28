@@ -1061,8 +1061,9 @@ Store methods (defaulted, MemoryStore-implemented, none through the commit log o
   ```
 
   `holder` = the store origin plus a random suffix per process start.
-- `release`, `consumer_get/consumer_set` (fenced), `timers_set/timers_due/timers_delete` (database
-  clock), `run_claim`, `run_update`, `runs_list`, `runs_running(older_epoch)`.
+- `release` (fenced: name, holder and epoch must match), `consumer_get/consumer_set` (fenced),
+  `timers_set/timers_due/timers_delete` (database clock), `run_claim`, `run_update`, `runs_list`,
+  `runs_running(older_epoch)`.
 - Fencing: `WriteBatch.fence = Some(Fence { name, holder, epoch })` makes the PostgreSQL write run
   `SELECT 1 FROM leases WHERE name = $1 AND holder = $2 AND epoch = $3 AND until >= now_ms() FOR
   SHARE` inside the transaction; no row → `Error::Unavailable("lease lost")`, nothing written.
@@ -1709,6 +1710,16 @@ Build step 13 (docs):
   measured. In `--remote` mode the CLI prints a server error's code twice (`error: permission
   denied: permission denied: …`, `error: invalid: invalid: …`): `remote_error` wraps the
   server's message, which already starts with the code, in an `Error` whose display adds it again.
+- Fixed after step 13 (server lifecycle): `onto serve` shuts down gracefully on SIGTERM (Unix) and
+  Ctrl-C within `[grpc] shutdown_grace_secs` (20): it stops accepting, ends change streams with their
+  final `end` frame (`tenant_closed`, saying the server is shutting down), stops the workers after
+  their round, then releases what it holds: leases (`Store::release` now takes the `Fence`, so only
+  the holder at its epoch releases), unsettled outbox claims (by claim token), crawl leases and the
+  wake scanner's lock session. The replacement takes over at once; cursors resume. One-off `onto`
+  commands no longer run fan-out or delivery (`[webhooks] workers = false`, as for
+  `[automation] workers`): before, `onto webhook add` took the fan-out lease and exited holding it.
+  Every startup error (bind, auth such as a reserved principal id, console rules, dev mode on
+  loopback) now fails before the banner and the "listening" line (`onto_grpc::prepare`).
 - The configuration template said the automation retry delay is `min(base * 2^attempt, max)`;
   the code (`RetryPolicy::delay_ms`) is `min(base * 2^(attempt - 1), max)`, as these notes say.
   The comment is corrected.

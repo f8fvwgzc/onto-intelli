@@ -136,7 +136,7 @@ pub fn spawn_automation_workers(me: &Arc<Intelli>, notify: Arc<Notify>) {
     let weak = Arc::downgrade(me);
     let poll = Duration::from_secs((me.config().automation.lease_secs / 3).max(1));
     let mut closing = me.closing_signal();
-    tokio::spawn(async move {
+    let worker = tokio::spawn(async move {
         loop {
             let (again, wait) = {
                 let Some(me) = weak.upgrade() else { break };
@@ -181,6 +181,7 @@ pub fn spawn_automation_workers(me: &Arc<Intelli>, notify: Arc<Notify>) {
             }
         }
     });
+    me.holdings().worker(worker);
 }
 
 /// How long the consumer sleeps when the next retry timer is due at `due`
@@ -335,10 +336,13 @@ impl Intelli {
         let holder = rt.holder.get_or_insert_with(|| holder_for(&*store)).clone();
         let ttl = (cfg.lease_secs as i64).saturating_mul(1000);
         let Some(epoch) = store.lease(CONSUMER_LEASE, &holder, ttl)? else {
+            self.holdings().lost(CONSUMER_LEASE);
             report.idle = true;
             return Ok(report);
         };
         let fence = Fence::new(CONSUMER_LEASE, &holder, epoch);
+        // Released on shutdown, so a replacement process starts runs at once.
+        self.holdings().took(&fence);
         let retry = self.retry_policy();
         // Every round: what was claimed but never committed, by an earlier
         // holder or by this one (an execution that ended in an error, or a

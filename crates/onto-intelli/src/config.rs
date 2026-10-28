@@ -434,6 +434,11 @@ pub struct GrpcConfig {
     /// Proto files (relative to `proto_dirs`) whose services are mapped by `routes`.
     pub proto_files: Vec<String>,
     pub routes: Vec<RouteConfig>,
+    /// `onto serve` on SIGTERM or Ctrl-C: how long open connections and
+    /// background workers get to finish before the leases, claimed outbox
+    /// rows and the wake scanner lock this process holds are released and
+    /// it exits (keep it below your orchestrator's termination grace period).
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for GrpcConfig {
@@ -447,6 +452,7 @@ impl Default for GrpcConfig {
             proto_dirs: Vec::new(),
             proto_files: Vec::new(),
             routes: Vec::new(),
+            shutdown_grace_secs: 20,
         }
     }
 }
@@ -816,6 +822,12 @@ pub struct WebhooksConfig {
     /// Run the delivery worker in this process (`false`: the process kill
     /// switch; rows wait in the outbox).
     pub enabled: bool,
+    /// Start the fan-out of change subscriptions and the delivery worker
+    /// (webhook and writeback rows) in this process. onto-cli's local
+    /// commands turn them off outside `serve`, so a one-off command takes no
+    /// fan-out lease and claims no outbox row that would then wait for the
+    /// lease to expire after it exits.
+    pub workers: bool,
     /// Endpoints per tenant (enforced when one is added).
     pub max_endpoints: usize,
     /// Seconds one request may take.
@@ -865,6 +877,7 @@ impl Default for WebhooksConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            workers: true,
             max_endpoints: 50,
             timeout_secs: 10,
             poll_secs: 20,

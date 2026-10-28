@@ -220,6 +220,11 @@ pub struct Intelli {
     automation: parking_lot::Mutex<crate::automate::Runtime>,
     /// Which workers commits wake, and how often they ran.
     wants: Arc<Wants>,
+    /// Leases, claimed rows and workers of this tenant in this process,
+    /// released on shutdown (crate::lifecycle).
+    holdings: crate::lifecycle::Holdings,
+    /// The server is shutting down (not only this tenant closing).
+    stopping: AtomicBool,
 }
 
 /// Commits wake the fan-out only while the tenant has an enabled change
@@ -318,6 +323,8 @@ impl Intelli {
             automation_wake,
             automation: parking_lot::Mutex::new(crate::automate::Runtime::new()),
             wants,
+            holdings: Default::default(),
+            stopping: AtomicBool::new(false),
             changes,
             closing: watch::Sender::new(false),
             stream_touch: AtomicI64::new(0),
@@ -569,6 +576,19 @@ impl Intelli {
 
     pub fn is_closing(&self) -> bool {
         *self.closing.borrow()
+    }
+
+    /// The server is shutting down (its streams end saying so).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn holdings(&self) -> &crate::lifecycle::Holdings {
+        &self.holdings
     }
 
     pub(crate) fn closing_signal(&self) -> watch::Receiver<bool> {

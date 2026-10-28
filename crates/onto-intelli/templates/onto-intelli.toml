@@ -110,6 +110,11 @@ health = true                 # grpc.health.v1
 http = true                   # JSON on the same port: POST /v1/call/{action}, /v1/ask
 proto_dirs = ["protos"]
 proto_files = ["acme/tickets/v1/tickets.proto"]
+# On SIGTERM or Ctrl-C: seconds for open connections and background workers to
+# finish before this process gives back its leases and claimed outbox rows (so a
+# replacement takes over at once) and exits. Keep it below the orchestrator's
+# termination grace period (Kubernetes: 30 s by default).
+shutdown_grace_secs = 20
 
 # Map RPCs of your own protos onto engine actions (`onto actions` lists them).
 # Templates read the request with {{field.path}}; a value that is exactly one
@@ -267,6 +272,7 @@ max_subscribers_process = 2000
 # Delivery concurrency limits are per process.
 [webhooks]
 enabled = true                     # false: this process sends nothing (rows wait in the outbox)
+workers = true                     # fan-out and delivery workers (onto's one-off commands run none)
 max_endpoints = 50                 # per tenant
 timeout_secs = 10
 poll_secs = 20                     # fallback poll; commits that enqueue rows wake the worker at once

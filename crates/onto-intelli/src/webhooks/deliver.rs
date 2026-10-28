@@ -85,15 +85,16 @@ fn kind_words(kind: OutboxKind) -> (&'static str, &'static str) {
     }
 }
 
-/// Start the delivery worker of `me` (when `[webhooks] enabled` or
-/// `[writeback] enabled`, and the store keeps an outbox). It holds the
+/// Start the delivery worker of `me` (with `[webhooks] workers`, when
+/// `[webhooks] enabled` or `[writeback] enabled`, and the store keeps an
+/// outbox). It holds the
 /// tenant only weakly and ends when the tenant closes. Rows of a kind this
 /// process does not send are left in the outbox.
 pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
     let cfg = me.config().webhooks.clone();
     let wb = me.config().writeback.clone();
     let store = me.ontology().store().clone();
-    if !(cfg.enabled || wb.enabled) || !store.keeps_outbox() {
+    if !cfg.workers || !(cfg.enabled || wb.enabled) || !store.keeps_outbox() {
         return Ok(());
     }
     let writeback_timeout = Duration::from_secs(wb.timeout_secs.max(1));
@@ -120,7 +121,7 @@ pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
         cfg,
     });
     let mut closing = me.closing_signal();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let poll = Duration::from_secs(worker.cfg.poll_secs.max(1));
         // Retention is the tenant's periodic task (Intelli::vacuum_outbound).
         loop {
@@ -144,6 +145,7 @@ pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
             }
         }
     });
+    me.holdings().worker(task);
     Ok(())
 }
 
@@ -168,6 +170,10 @@ impl Worker {
     async fn drain(self: &Arc<Self>, me: &Arc<Intelli>) -> Result<Option<Duration>> {
         let onto = me.ontology().clone();
         loop {
+            // Shutting down (or the tenant closing): claim nothing more.
+            if me.is_closing() {
+                return Ok(None);
+            }
             let (seen, stop, skip) = {
                 let onto = onto.clone();
                 let cap = self.cfg.max_in_flight_per_endpoint;
@@ -217,6 +223,11 @@ impl Worker {
             if rows.is_empty() {
                 return self.settle(&onto, seen).await;
             }
+            // Given back on shutdown when not settled by then.
+            let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+            for r in &rows {
+                me.holdings().claimed(&r.id, r.claim.as_deref().unwrap_or_default());
+            }
             let claimed = Instant::now();
             let mut tasks = tokio::task::JoinSet::new();
             for row in rows {
@@ -235,6 +246,9 @@ impl Worker {
                 if let Err(e) = r {
                     tracing::warn!("webhook delivery task: {e}");
                 }
+            }
+            for id in &ids {
+                me.holdings().settled(id);
             }
         }
     }
@@ -261,6 +275,11 @@ impl Worker {
 
     /// Send one claimed row and record what happened.
     async fn send(self: &Arc<Self>, me: &Arc<Intelli>, row: OutboxRow, claimed: Instant) {
+        if me.is_closing() {
+            // Not sent: the next claim (another process, or this one after
+            // the restart) sends it.
+            return self.release(me, &row, "shutting down").await;
+        }
         match row.kind {
             OutboxKind::Webhook => self.send_webhook(me, row, claimed).await,
             OutboxKind::Writeback => self.send_writeback(me, row, claimed).await,

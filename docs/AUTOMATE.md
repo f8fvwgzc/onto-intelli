@@ -740,13 +740,26 @@ as.
 ## Operating notes
 
 - **Restarts.** Fan-out (`webhook:fanout`) and the automation consumer
-  (`automation:consumer`) run under database leases of 60 s. A stopped
-  process does not release them, also on Ctrl-C, so after a restart they
-  resume when the old lease expires. In this run, changes made right after a
-  restart were enqueued 18 to 49 s later (`leases` showed the fan-out epoch
-  move from 1 to 2). Nothing is skipped: each endpoint and the consumer
-  resume from their cursors. Change streams and delivery of rows already in
-  the outbox are not affected.
+  (`automation:consumer`) run under database leases of 60 s. `onto serve`
+  shuts down gracefully on SIGTERM (Unix; what `docker stop` and Kubernetes
+  send) and Ctrl-C: it stops accepting connections, ends open change
+  streams with their final `end` frame (`tenant_closed`, "the server is
+  shutting down", with the cursor to resume after), lets workers finish the
+  round they are in, then releases its leases, the outbox rows it claimed
+  and did not settle, and the wake scanner lock, all within
+  `[grpc] shutdown_grace_secs` (20) plus a few seconds, and exits 0. A
+  release is fenced: only the holder at the epoch it took the lease at
+  gives it back, so a process that lost its lease meanwhile releases
+  nothing. The replacement process takes over at once; nothing is skipped,
+  because each endpoint and the consumer resume from their cursors, and an
+  unsettled row is sent again (delivered at least once). A second signal
+  stops at once. A process that is killed (or crashes) still leaves its
+  leases to expire: changes are then enqueued up to 60 s later (18 to 49 s
+  in the run this page was written from, before graceful shutdown existed).
+  One-off `onto` commands run no fan-out, delivery or automation workers
+  (`[webhooks] workers`, `[automation] workers`), so they never hold a lease.
+  Change streams and delivery of rows already in the outbox are otherwise
+  not affected.
 - **Wake-ups.** A commit wakes fan-out while the tenant has an enabled
   subscription and the consumer while it has an enabled automation;
   otherwise they poll (`[webhooks] poll_secs`). The deployment's wake

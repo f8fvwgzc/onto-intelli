@@ -378,9 +378,13 @@ pub trait Store: Send + Sync {
     fn lease(&self, _name: &str, _holder: &str, _ttl_ms: i64) -> Result<Option<u64>> {
         Err(no_leases())
     }
-    /// Give the lease back if `holder` has it (it expires now; the epoch is
-    /// kept, so the next holder's is higher). Returns whether it did.
-    fn release(&self, _name: &str, _holder: &str) -> Result<bool> {
+    /// Give the lease back if `fence.holder` still has it at `fence.epoch`
+    /// (it expires now; the epoch is kept, so the next holder's is higher).
+    /// Fenced: a stale holder, one whose epoch was since taken by another
+    /// holder or again by itself, releases nothing. Returns whether it did.
+    /// What the lease guarded is not lost: consumer cursors stay where the
+    /// holder's fenced writes left them, and the next holder resumes there.
+    fn release(&self, _fence: &Fence) -> Result<bool> {
         Err(no_leases())
     }
     /// The lease row, if the lease was ever taken.
@@ -1034,11 +1038,11 @@ impl Store for MemoryStore {
         }
     }
 
-    fn release(&self, name: &str, holder: &str) -> Result<bool> {
+    fn release(&self, fence: &Fence) -> Result<bool> {
         let mut inner = self.inner.lock();
         let now = now_ms();
-        match inner.leases.get_mut(name) {
-            Some(l) if l.holder == holder && l.until >= now => {
+        match inner.leases.get_mut(&fence.name) {
+            Some(l) if l.holder == fence.holder && l.epoch == fence.epoch && l.until >= now => {
                 l.until = now - 1;
                 Ok(true)
             }

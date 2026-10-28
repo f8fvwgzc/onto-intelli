@@ -37,12 +37,28 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 pub struct WakeScanner {
     pub(super) elected: Arc<AtomicBool>,
     pub(super) stop: watch::Sender<bool>,
+    /// Set once the candidate ended (its lock session closed).
+    pub(super) done: watch::Receiver<bool>,
 }
 
 impl WakeScanner {
     /// This process holds the deployment's scanner lock right now.
     pub fn elected(&self) -> bool {
         self.elected.load(Ordering::SeqCst)
+    }
+
+    /// Stop standing. An elected scanner ends its term: it closes its lock
+    /// session, which releases the lock, so another process's candidate is
+    /// elected on its next try instead of after this connection times out.
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    /// Wait until the candidate ended (an elected one closed its lock
+    /// session). Bound it with a timeout: closing waits on the database.
+    pub async fn stopped(&self) {
+        let mut done = self.done.clone();
+        let _ = done.wait_for(|d| *d).await;
     }
 }
 

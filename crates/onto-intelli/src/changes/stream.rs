@@ -792,12 +792,17 @@ impl Producer {
         *self.closing.borrow() || self.intelli.strong_count() == 0
     }
 
+    /// The last frame when the tenant closes: an eviction, or the server
+    /// shutting down (same code, so clients resume as they do for either).
     fn tenant_closed(&self) -> Frame {
-        Frame::End {
-            code: "tenant_closed",
-            cursor: self.cursor,
-            message: "the tenant was closed on this server; reconnect with Last-Event-ID to resume".into(),
-        }
+        let stopping = self.intelli.upgrade().is_some_and(|i| i.is_stopping());
+        let message = if stopping {
+            "the server is shutting down; reconnect with Last-Event-ID to resume (on another replica, or here once \
+             it restarts)"
+        } else {
+            "the tenant was closed on this server; reconnect with Last-Event-ID to resume"
+        };
+        Frame::End { code: "tenant_closed", cursor: self.cursor, message: message.into() }
     }
 
     /// Read and send one page; `Ok(true)` when nothing new is left.

@@ -229,10 +229,16 @@ commit happened, and recovery executes it again. Over-limit triggers are
 **Leases and fencing.** Fan-out (`webhook:fanout`) and the automation
 consumer (`automation:consumer`) each run in one process per tenant under a
 `leases` row. The epoch grows when the holder changes, and their writes
-commit only while the writer still holds the lease at its epoch. A process
-that stops does not release its leases (also on Ctrl-C), so after a restart
-that work resumes when the old lease expires (60 s at most); consumers resume
-from their cursors in `consumers`, so nothing is skipped.
+commit only while the writer still holds the lease at its epoch. On a
+graceful shutdown (`onto serve` on SIGTERM or Ctrl-C, within `[grpc]
+shutdown_grace_secs`) a process releases its leases, fenced like its
+writes (`UPDATE leases … WHERE name, holder and epoch match`: a holder whose
+epoch is stale releases nothing), gives back the outbox rows it claimed and
+did not settle, and closes the wake scanner's lock session, so the next
+process takes over at once. A process that is killed leaves them to expire
+(60 s at most). Either way consumers resume from their cursors in
+`consumers` and runs claimed under an older epoch are recovered, so nothing
+is skipped.
 
 **Retention.** One task per open tenant, 5 minutes after it opens and then
 hourly, trims: change records by `[changes] retain_days` (7) and

@@ -228,6 +228,10 @@ claims and timers use `now_ms()` in SQL, since process clocks skew. Change
 streams are pulled per subscriber from a per-tenant hub, and filtering runs
 off the async runtime in slices, so a slow client or a large page never
 holds the graph lock for long. Delivery concurrency limits are per process.
+A graceful shutdown (`Hub::begin_shutdown`, then `finish_shutdown`) ends
+streams with a final frame, lets workers finish their round, and releases
+the leases (fenced by epoch), claimed rows and wake scanner lock it holds,
+so the next process takes over at once instead of when the leases expire.
 
 ## Performance notes
 

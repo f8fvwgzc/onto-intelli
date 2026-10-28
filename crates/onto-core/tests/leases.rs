@@ -45,12 +45,14 @@ fn protocol(store: &dyn Store) {
     assert_eq!(store.lease("l", "a", 60_000).unwrap(), Some(1), "renewing keeps the epoch");
     let row = store.lease_get("l").unwrap().unwrap();
     assert!(row.held && row.holder == "a" && row.epoch == 1, "{row:?}");
-    assert!(!store.release("l", "b").unwrap(), "only the holder releases");
-    assert!(store.release("l", "a").unwrap());
+    assert!(!store.release(&Fence::new("l", "b", 1)).unwrap(), "only the holder releases");
+    assert!(!store.release(&Fence::new("l", "a", 2)).unwrap(), "only at its epoch");
+    assert!(store.release(&Fence::new("l", "a", 1)).unwrap());
+    assert!(!store.release(&Fence::new("l", "a", 1)).unwrap(), "released once");
     assert!(!store.lease_get("l").unwrap().unwrap().held);
     assert_eq!(store.lease("l", "b", 60_000).unwrap(), Some(2), "a new holder: the epoch grows");
     assert_eq!(store.lease("l", "a", 60_000).unwrap(), None);
-    assert!(store.release("l", "b").unwrap());
+    assert!(store.release(&Fence::new("l", "b", 2)).unwrap());
     assert_eq!(store.lease("l", "a", 60_000).unwrap(), Some(3));
     assert_eq!(store.lease_get("missing").unwrap(), None);
 
@@ -114,6 +116,35 @@ fn fenced_writes(o: &Ontology) {
     assert!(o.get(&Principal::admin("ada"), "issue:2").is_ok());
 }
 
+/// Releasing is fenced: a holder whose epoch is stale (the lease went to
+/// another holder and came back to it) cannot give back the newer epoch;
+/// a lease released by its holder is taken by the next one at once, without
+/// waiting out its TTL; and the consumer cursor the old holder moved stays.
+fn release_is_fenced(a: &dyn Store, b: &dyn Store) {
+    let e1 = a.lease("r", "a", 60_000).unwrap().unwrap();
+    let stale = Fence::new("r", "a", e1);
+    a.consumer_set("automation:r", Cursor::new(4, 2), Some(&stale)).unwrap();
+    assert!(a.release(&stale).unwrap(), "the holder at its epoch releases");
+    // A second instance takes it at once (the TTL was a minute).
+    let e2 = b.lease("r", "b", 60_000).unwrap().expect("released: taken at once");
+    assert_eq!(e2, e1 + 1, "a new holder: the epoch grows");
+    assert_eq!(b.consumer_get("automation:r").unwrap(), Some(Cursor::new(4, 2)), "the cursor resumes");
+    assert!(b.release(&Fence::new("r", "b", e2)).unwrap());
+    let e3 = a.lease("r", "a", 60_000).unwrap().unwrap();
+    assert_eq!(e3, e2 + 1);
+    // `a` again, at a newer epoch: its stale fence releases nothing.
+    assert!(!a.release(&stale).unwrap(), "a stale holder cannot release a newer epoch");
+    assert!(!b.release(&Fence::new("r", "b", e2)).unwrap(), "nor can the previous holder");
+    let row = a.lease_get("r").unwrap().unwrap();
+    assert!(row.held && row.holder == "a" && row.epoch == e3, "{row:?}");
+    assert_eq!(b.lease("r", "b", 60_000).unwrap(), None, "still held");
+    // An expired lease is not released (it is free already, maybe taken).
+    assert_eq!(a.lease("x", "a", 50).unwrap(), Some(1));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!a.release(&Fence::new("x", "a", 1)).unwrap());
+    assert!(a.release(&Fence::new("r", "a", e3)).unwrap());
+}
+
 #[test]
 fn memory_leases_follow_the_protocol() {
     protocol(&MemoryStore::default());
@@ -121,6 +152,12 @@ fn memory_leases_follow_the_protocol() {
     let m = MemoryStore::default();
     assert_eq!(m.wake_get().unwrap(), None, "memory tenants never close: no wake rows");
     assert!(m.wake_settle(0, Some(1)).unwrap());
+}
+
+#[test]
+fn memory_release_is_fenced_and_hands_over_at_once() {
+    let m = MemoryStore::default();
+    release_is_fenced(&m, &m);
 }
 
 #[test]
@@ -186,6 +223,14 @@ fn pg_leases_follow_the_protocol() {
 }
 
 #[test]
+fn pg_release_is_fenced_and_hands_over_at_once() {
+    let Some(pg) = common::TestTenant::new("leases_release") else { return };
+    // Two stores on one tenant: two processes' worth.
+    let (a, b) = (pg.store(), pg.store());
+    release_is_fenced(&a, &b);
+}
+
+#[test]
 fn pg_fenced_writes_are_refused_after_a_handover() {
     let Some(pg) = common::TestTenant::new("leases_fence") else { return };
     let o = pg.open(Schema::enterprise(), OntologyOptions::default());
@@ -224,12 +269,13 @@ fn pg_two_holders_with_skewed_clocks_never_both_hold_a_lease() {
     assert!(now_ms() + SKEW_B > a_thinks_until, "B believes the lease is free");
     assert_eq!(b.lease("fanout", "b", 60_000).unwrap(), None);
     lost(b.consumer_set("webhook:x", Cursor::new(1, 0), Some(&Fence::new("fanout", "b", a_epoch))));
-    assert!(a.release("fanout", "a").unwrap());
+    assert!(a.release(&Fence::new("fanout", "a", a_epoch)).unwrap());
 
     let race = |store: Arc<dyn Store>, me: &'static str, skew: i64, seed: u64| {
         std::thread::spawn(move || {
             let mut rng = fastrand::Rng::with_seed(seed);
             let mut held: Vec<u64> = Vec::new();
+            let mut last: Option<Fence> = None;
             let (mut refused, mut paused) = (0, 0);
             let end = Instant::now() + Duration::from_secs(4);
             while Instant::now() < end {
@@ -238,6 +284,7 @@ fn pg_two_holders_with_skewed_clocks_never_both_hold_a_lease() {
                     continue;
                 };
                 let fence = Fence::new("fanout", me, epoch);
+                last = Some(fence.clone());
                 // What this holder believes, by its own clock. A constant
                 // skew cancels out within one process; across processes it
                 // never enters, because the store is given no client time.
@@ -261,7 +308,9 @@ fn pg_two_holders_with_skewed_clocks_never_both_hold_a_lease() {
                     std::thread::sleep(Duration::from_millis(rng.u64(10..60)));
                 }
             }
-            let _ = store.release("fanout", me);
+            if let Some(f) = &last {
+                let _ = store.release(f);
+            }
             (me, held, refused, paused)
         })
     };

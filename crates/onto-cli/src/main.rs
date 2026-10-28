@@ -5,6 +5,7 @@ mod assure;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -1812,7 +1813,12 @@ fn main() {
     let main = std::thread::Builder::new()
         .name("main".into())
         .stack_size(8 << 20)
-        .spawn(|| tokio::runtime::Runtime::new().expect("starting the tokio runtime").block_on(cli_main()))
+        .spawn(|| {
+            let rt = tokio::runtime::Runtime::new().expect("starting the tokio runtime");
+            rt.block_on(cli_main());
+            // Blocking work still running (a crawl, a store call) does not hold the exit up.
+            rt.shutdown_timeout(Duration::from_secs(2));
+        })
         .expect("starting the main thread");
     if main.join().is_err() {
         // The panic message is printed; exit as a panicking main would.
@@ -1871,8 +1877,10 @@ fn local_config(cli: &Cli) -> Result<Config> {
 /// The local store (the `--tenant`'s, when given).
 async fn open_local(cli: &Cli) -> Result<(Arc<Intelli>, Config)> {
     let mut cfg = local_config(cli)?;
-    // One-off commands run no automation consumer (`onto serve` does).
+    // One-off commands run no background workers (`onto serve` does): they
+    // would take leases and claim rows that wait to expire once they exit.
     cfg.automation.workers = false;
+    cfg.webhooks.workers = false;
     let intelli = match &cli.tenant {
         Some(t) => onto_intelli::Hub::open(cfg.clone()).await?.tenant(t).await?,
         None => Intelli::open(cfg.clone()).await?,
@@ -1895,6 +1903,45 @@ async fn backend(cli: &Cli) -> Result<Backend> {
     }
 }
 
+/// What stops `onto serve`: Ctrl-C, and on Unix SIGTERM (what `docker stop`
+/// and Kubernetes send) and SIGINT. Installed before the banner, so a
+/// signal right after it is a graceful shutdown, not the default exit.
+struct StopSignal {
+    #[cfg(unix)]
+    unix: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl StopSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let unix = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+                (Ok(term), Ok(int)) => Some((term, int)),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("catching SIGTERM: {e}; only Ctrl-C stops gracefully");
+                    None
+                }
+            };
+            Self { unix }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        if let Some((term, int)) = self.unix.as_mut() {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            return;
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn run(cli: Cli, st: &Style) -> Result<()> {
     match &cli.command {
         Command::Init { dir, force } => init(dir, *force, st),
@@ -1907,11 +1954,29 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 cfg.engine.postgres.tenant = t.clone();
             }
             let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            let control = if cfg.console.enabled { Some(open_control(&cfg).await?) } else { None };
+            // Everything that can fail at startup fails before the banner:
+            // the port, authentication (a reserved principal id), the
+            // console's rules, development mode on loopback only, routes.
+            let listener = onto_grpc::bind(&cfg.grpc.listen).await?;
+            let server = onto_grpc::prepare(
+                hub.clone(),
+                onto_grpc::ServeOptions { dev: *dev, control: control.clone() },
+                listener,
+            )
+            .await?;
+            // Open the default tenant now: configuration problems show at startup.
+            let intelli = match hub.tenant(hub.default_tenant()).await {
+                Ok(i) => i,
+                Err(e) => {
+                    hub.shutdown(Duration::from_secs(5)).await;
+                    return Err(e);
+                }
+            };
+            // Signals are caught from here on (not only once serving starts).
+            let mut stop = StopSignal::install();
             // Stand for the deployment's wake scanner (PostgreSQL; one process is elected).
             hub.start_wake_scanner();
-            // Open the default tenant now: configuration problems show at startup.
-            let intelli = hub.tenant(hub.default_tenant()).await?;
-            let control = if cfg.console.enabled { Some(open_control(&cfg).await?) } else { None };
             let mut auth = if *dev || cfg.auth.mode == "dev" {
                 st.red("DEVELOPMENT MODE, no authentication")
             } else {
@@ -1939,7 +2004,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             eprintln!(
                 "{} gRPC + HTTP on {} · storage {} · {} · tenant {}{} · llm {} ({})",
                 st.bold("onto-intelli"),
-                cfg.grpc.listen,
+                server.local_addr().map_or_else(|| cfg.grpc.listen.clone(), |a| a.to_string()),
                 cfg.engine.storage,
                 auth,
                 hub.default_tenant(),
@@ -1953,11 +2018,30 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                     st.red("!")
                 );
             }
-            onto_grpc::serve_hub(hub, onto_grpc::ServeOptions { dev: *dev, control }, async {
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("\nshutting down");
-            })
-            .await
+            drop(intelli);
+            let grace = Duration::from_secs(cfg.grpc.shutdown_grace_secs);
+            let signal = async move {
+                stop.next().await;
+                eprintln!("\nshutting down (up to {}s; signal again to stop at once)", grace.as_secs());
+                // A second signal stops at once: what is still held expires on its own.
+                tokio::spawn(async move {
+                    stop.next().await;
+                    eprintln!("stopped at once");
+                    std::process::exit(130);
+                });
+            };
+            let released = server.run_graceful(signal, grace).await?;
+            eprintln!(
+                "stopped · released {}, {}{}",
+                n_of(released.leases as u64, "lease"),
+                n_of(released.claims as u64, "claimed outbox row"),
+                if released.cut > 0 {
+                    format!(" · {} cut at the deadline", n_of(released.cut as u64, "worker"))
+                } else {
+                    String::new()
+                }
+            );
+            Ok(())
         }
         Command::Ask { question, mode, json: as_json, context, stream, no_cache, budget } => {
             let q = question.join(" ");

@@ -318,6 +318,12 @@ onto serve                      # gRPC + HTTP on 127.0.0.1:50051 (token auth)
 onto serve --dev                # local development: no auth, loopback only
 ```
 
+`onto serve` checks its whole configuration (the port, auth tokens, the console)
+before it prints its banner, so a bad config never looks like a running server.
+On SIGTERM or Ctrl-C it shuts down gracefully within `[grpc] shutdown_grace_secs`
+(20): change streams get a final `end` frame to resume from, and the leases and
+claimed outbox rows it holds are released so another replica takes over at once.
+
 Bring data in with JSONL (mutations, bare entities or GitHub `issues` webhook payloads):
 
 ```bash

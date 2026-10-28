@@ -596,8 +596,8 @@ mod runtime {
         fn lease(&self, name: &str, holder: &str, ttl_ms: i64) -> Result<Option<u64>> {
             self.inner.lease(name, holder, ttl_ms)
         }
-        fn release(&self, name: &str, holder: &str) -> Result<bool> {
-            self.inner.release(name, holder)
+        fn release(&self, fence: &Fence) -> Result<bool> {
+            self.inner.release(fence)
         }
         fn lease_get(&self, name: &str) -> Result<Option<Lease>> {
             self.inner.lease_get(name)

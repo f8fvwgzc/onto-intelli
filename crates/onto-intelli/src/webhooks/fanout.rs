@@ -66,19 +66,19 @@ enum Round {
     More,
 }
 
-/// Start the fan-out of `me` (stores that keep a change log, an outbox and
-/// fenced leases). It holds the tenant only weakly and ends when the tenant
+/// Start the fan-out of `me` (`[webhooks] workers`, and stores that keep a
+/// change log, an outbox and fenced leases). It holds the tenant only weakly and ends when the tenant
 /// closes. It wakes on every commit (`notify`), and every `poll_secs`.
 pub fn spawn_fanout(me: &Arc<Intelli>, notify: Arc<Notify>) {
     let store = me.ontology().store().clone();
-    if !store.keeps_outbox() || !store.keeps_changes() || !store.fences() {
+    if !me.config().webhooks.workers || !store.keeps_outbox() || !store.keeps_changes() || !store.fences() {
         return;
     }
     let weak = Arc::downgrade(me);
     let holder = holder_for(store.as_ref());
     let poll = Duration::from_secs(me.config().webhooks.poll_secs.max(1));
     let mut closing = me.closing_signal();
-    tokio::spawn(async move {
+    let worker = tokio::spawn(async move {
         loop {
             let again = {
                 let Some(me) = weak.upgrade() else { break };
@@ -110,6 +110,7 @@ pub fn spawn_fanout(me: &Arc<Intelli>, notify: Arc<Notify>) {
             }
         }
     });
+    me.holdings().worker(worker);
 }
 
 /// One endpoint taking part in a round.
@@ -234,9 +235,12 @@ fn round(me: &Intelli, holder: &str) -> Result<Round> {
         return Ok(Round::Idle);
     }
     let Some(epoch) = store.lease(FANOUT_LEASE, holder, LEASE_MS)? else {
+        me.holdings().lost(FANOUT_LEASE);
         return Ok(Round::Idle);
     };
     let fence = Fence::new(FANOUT_LEASE, holder, epoch);
+    // Released on shutdown, so a replacement process fans out at once.
+    me.holdings().took(&fence);
     // Cursors first, then the feed's position: a cursor set meanwhile (a
     // new subscription starts at the head) is never ahead of the head read.
     let mut cursors = HashMap::new();

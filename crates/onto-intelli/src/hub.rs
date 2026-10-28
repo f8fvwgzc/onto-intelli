@@ -158,6 +158,8 @@ pub struct Hub {
     hooks: RwLock<Option<Arc<dyn TenantHooks>>>,
     me: Weak<Hub>,
     sweeping: AtomicBool,
+    /// [`begin_shutdown`](Hub::begin_shutdown) was called: no tenant opens.
+    stopping: AtomicBool,
     /// This process's wake scanner candidate (stopped when the hub goes away).
     #[cfg(feature = "postgres")]
     wake: Mutex<Option<onto_core::store::WakeScanner>>,
@@ -208,6 +210,7 @@ impl Hub {
             config,
             me: me.clone(),
             sweeping: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             #[cfg(feature = "postgres")]
             wake: Mutex::new(None),
         })
@@ -223,6 +226,7 @@ impl Hub {
             backend,
             me: me.clone(),
             sweeping: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             #[cfg(feature = "postgres")]
             wake: Mutex::new(None),
         })
@@ -289,6 +293,9 @@ impl Hub {
             return Err(Error::invalid(format!("invalid tenant id '{id}' (letters, digits, '_', '-', '.')")));
         }
         self.check_reserved(id)?;
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Error::Unavailable("the server is shutting down; retry on another replica".into()));
+        }
         let slot = self.tenants.lock().entry(id.to_string()).or_insert_with(Slot::new).clone();
         slot.last_used.store(now_ms(), Ordering::Relaxed);
         let opened = !slot.cell.initialized();
@@ -303,7 +310,73 @@ impl Hub {
             self.enforce_limits(Some(id), now_ms());
             self.start_sweeper();
         }
+        if let Ok(i) = &intelli
+            && self.stopping.load(Ordering::SeqCst)
+        {
+            // Opened while the shutdown began: it stops with the others.
+            i.begin_shutdown();
+        }
         intelli
+    }
+
+    /// Begin a graceful shutdown: no tenant opens from now on, the wake
+    /// scanner stops standing (an elected one gives the lock back), and
+    /// every open tenant closes: its change streams end with their final
+    /// frame and its workers start no new round. Returns at once;
+    /// [`finish_shutdown`](Self::finish_shutdown) waits and releases.
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        #[cfg(feature = "postgres")]
+        if let Some(w) = self.wake.lock().as_ref() {
+            w.stop();
+        }
+        for i in self.open_intellis() {
+            i.begin_shutdown();
+        }
+    }
+
+    /// Wait until `deadline` for the wake scanner to end its term and every
+    /// open tenant's workers to end their round, then release the leases,
+    /// claimed outbox rows and crawl leases this process holds, so a
+    /// replacement process takes over at once instead of waiting for them
+    /// to expire (see [`crate::lifecycle`]). Tenants stay open for requests
+    /// still in flight.
+    pub async fn finish_shutdown(&self, deadline: tokio::time::Instant) -> crate::Released {
+        if !self.stopping.load(Ordering::SeqCst) {
+            self.begin_shutdown();
+        }
+        #[cfg(feature = "postgres")]
+        {
+            let wake = self.wake.lock().take();
+            if let Some(w) = wake
+                && tokio::time::timeout_at(deadline, w.stopped()).await.is_err()
+            {
+                tracing::warn!("the wake scanner did not stop in time; its lock goes with the connection");
+            }
+        }
+        let tenants = self.open_intellis();
+        let done = futures::future::join_all(tenants.iter().map(|i| i.finish_shutdown(deadline))).await;
+        let mut out = crate::Released::default();
+        for r in &done {
+            out.add(r);
+        }
+        out
+    }
+
+    /// [`begin_shutdown`](Self::begin_shutdown), then
+    /// [`finish_shutdown`](Self::finish_shutdown) within `grace`.
+    pub async fn shutdown(&self, grace: Duration) -> crate::Released {
+        self.begin_shutdown();
+        self.finish_shutdown(tokio::time::Instant::now() + grace).await
+    }
+
+    /// The hub is shutting down.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    fn open_intellis(&self) -> Vec<Arc<Intelli>> {
+        self.tenants.lock().values().filter_map(|s| s.cell.get().cloned()).collect()
     }
 
     /// Create a tenant's storage (its PostgreSQL schema and migrations)
@@ -446,7 +519,7 @@ impl Hub {
         if let Backend::Postgres(shared) = &self.backend {
             let poll = self.config.engine.wake_poll_secs;
             let Ok(rt) = tokio::runtime::Handle::try_current() else { return false };
-            if poll == 0 {
+            if poll == 0 || self.stopping.load(Ordering::SeqCst) {
                 return false;
             }
             let mut slot = self.wake.lock();
