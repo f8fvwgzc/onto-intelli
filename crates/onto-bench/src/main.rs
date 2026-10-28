@@ -18,6 +18,13 @@
 //! five kinds, so each entity matches ten), timing the commits and how fast
 //! fan-out enqueues the outbox rows. Deliveries are off: rows are enqueued,
 //! not sent.
+//!
+//! `--delivery` runs the webhook delivery scenario (docs/design/EVENTS.md
+//! section 12): a local HTTP receiver on 127.0.0.1 and, for each count in
+//! `--endpoints`, a fresh tenant with that many endpoints; it times each
+//! delivery from the commit to the receiver, one task per commit with
+//! nothing queued and during a burst of about `--rows` deliveries, and the
+//! rows per second the burst drains at.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +40,7 @@ use onto_intelli::{ActionContext, Config, Entity, Intelli};
 
 #[cfg(feature = "count-alloc")]
 mod alloc;
+mod delivery;
 
 #[cfg(feature = "count-alloc")]
 #[global_allocator]
@@ -73,6 +81,26 @@ struct Args {
     /// Entities the fan-out scenario's crawl writes.
     #[arg(long, default_value_t = 100_000)]
     crawl: usize,
+    /// Run the webhook delivery scenario (a local receiver on 127.0.0.1).
+    #[arg(long)]
+    delivery: bool,
+    /// Endpoint counts of the delivery scenario, one fresh tenant each (1 to 50).
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 50])]
+    endpoints: Vec<usize>,
+    /// Deliveries in each burst of the delivery scenario (tasks × endpoints).
+    #[arg(long, default_value_t = 20_000)]
+    rows: usize,
+    /// Single-task commits timed in each idle run of the delivery scenario.
+    #[arg(long, default_value_t = 200)]
+    latency_commits: usize,
+    /// Override `[webhooks] max_in_flight_per_tenant` (default 8) in the
+    /// delivery scenario.
+    #[arg(long)]
+    in_flight_tenant: Option<usize>,
+    /// Override `[webhooks] max_in_flight_per_endpoint` (default 4) in the
+    /// delivery scenario.
+    #[arg(long)]
+    in_flight_endpoint: Option<usize>,
 }
 
 const WORDS: &[&str] = &[
@@ -359,6 +387,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.fanout {
         return fanout_bench(&args, &shared, &opts).await;
+    }
+    if args.delivery {
+        return delivery::delivery_bench(&args, &shared, &opts).await;
     }
     let mut report: Vec<String> = Vec::new();
 

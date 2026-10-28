@@ -268,7 +268,8 @@ $ curl -H "authorization: Bearer $ONTO_TOKEN" http://127.0.0.1:50071/v1/webhooks
 
 The commit was at `ts` 1793179889107: fan-out enqueued the row 30 ms later
 and the receiver had it 49 ms after the commit (debug build, one
-observation, not a benchmark).
+observation; the release benchmark is under "Webhook delivery to a local
+receiver" in Benchmarks).
 
 How delivery behaves (configured in `[webhooks]`; tested in
 `crates/onto-intelli/tests/webhooks*.rs`, not exercised in this run):
@@ -909,11 +910,66 @@ enqueues the outbox rows and nothing is sent.
   cursor keeps its place, so nothing is lost while it catches up, and an
   endpoint whose backlog passes `pending_cap` pauses until it drains.
 
+### Webhook delivery to a local receiver
+
+```text
+./target/release/onto-bench --url postgres://onto:onto@127.0.0.1:5441/onto --delivery
+```
+
+One HTTP/1.1 receiver on `127.0.0.1` (allow-listed with `[[webhooks.allow]]`)
+answers every request 200 with an empty body and verifies nothing, so it
+stands in for a fast receiver. For 1, 10 and 50 endpoints, a fresh tenant
+gets that many endpoints on it, each subscribed to `entity.create` of tasks,
+so every new task is delivered once per endpoint. Fan-out and delivery run in
+the benchmark's process with the default `[webhooks]` limits (4 requests in
+flight per endpoint, 8 per tenant) and a pool of 16 PostgreSQL connections.
+Latency is from the moment the commit returns to the moment the receiver has
+read the whole request.
+
+- **idle**: one task per commit; the next commit waits until every endpoint
+  has the previous one. 200 timed commits after 10 untimed ones.
+- **burst**: 20,000 deliveries' worth of tasks (20,000, 2,000 and 400 tasks)
+  written in commits of 100 back to back; rows per second is 20,000 divided
+  by the time from the start of the first commit to the last request read.
+
+| Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |
+|---|---|---:|---:|---:|---:|---:|
+| commit → receiver, idle | 1 endpoint, one task per commit, nothing queued | 200 | 22.529 | 34.800 | 23.001 | 41.755 |
+| commit → receiver, idle | 10 endpoints, one task per commit, nothing queued | 2000 | 57.908 | 107.409 | 61.441 | 130.152 |
+| commit → receiver, idle | 50 endpoints, one task per commit, nothing queued | 10000 | 265.881 | 805.470 | 296.315 | 4266.878 |
+| commit → receiver, burst | 1 endpoint, 20,000 tasks in commits of 100 | 20000 | 47943.601 | 91706.262 | 47944.277 | 92583.479 |
+| commit → receiver, burst | 10 endpoints, 2,000 tasks in commits of 100 | 20000 | 53469.667 | 103465.760 | 53418.105 | 104507.846 |
+| commit → receiver, burst | 50 endpoints, 400 tasks in commits of 100 | 20000 | 52938.785 | 102390.822 | 51394.102 | 103217.075 |
+
+| Endpoints | Rows | Commits took | Last row received after | Rows/s | Repeated deliveries |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 20,000 | 3.8 s | 96.4 s | **208** | 0 |
+| 10 | 20,000 | 0.3 s | 104.8 s | **191** | 0 |
+| 50 | 20,000 | 0.1 s | 103.3 s | **194** | 0 |
+
+- Delivery drains at about 200 rows per second per tenant here, whatever the
+  number of endpoints. The burst latencies are queueing: a row waits for the
+  rows ahead of it, so p50 is about half the drain time.
+- Where the time goes, from the kept tenants' `changes`, `outbox` and
+  `delivery_attempts` rows (store clock, millisecond resolution): fan-out
+  enqueued each burst's 20,000 rows within 0.8 to 4.6 s of its first row;
+  the HTTP exchange took 0 ms at the median (7 to 24 ms at most); sending
+  took 96 to 105 s. The limit is the delivery worker's own work per row and
+  per pass (store reads and writes around each request), not fan-out and not
+  the receiver. That work was not profiled.
+- More concurrency did not help: with 32 in flight per tenant (10 endpoints,
+  4 each) the same burst drained at **128 rows/s** (idle p50 56.1 ms, p99
+  89.5 ms), slower than with the default 8.
+- Idle latency grows with the endpoints a change fans out to, since one
+  commit makes a row per endpoint and they are sent 8 at a time. Split for
+  the idle runs (medians): commit to enqueue 17, 36 and 118 ms; enqueue to
+  send 14, 34 and 145 ms (1, 10 and 50 endpoints).
+- Every row was delivered once; a receiver must still dedupe on the event id,
+  since delivery is at least once.
+
 ### Not measured
 
-- Delivery throughput (rows sent per second to a receiver) and delivery
-  latency under load: onto-bench has no delivery scenario yet. The single
-  observations above (49 ms from commit to receiver for a change, 66 ms for
-  a writeback, about 65 ms from a trigger's commit to its webhook effect)
-  come from a debug build with one receiver and are not benchmarks.
+- Delivery to receivers that answer slowly or fail (retries, the breaker),
+  over a network, from several processes, and with `[traces] deliveries`
+  on (the benchmark turns traces off).
 - Automation run throughput.

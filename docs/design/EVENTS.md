@@ -1314,7 +1314,12 @@ commit.
 
 ## 18. Remaining open questions (not owner decisions; settle during the build)
 
-- Is 50 ms the right per-page evaluation budget? Set from the step 6 benchmark.
+- Is 50 ms the right per-page evaluation budget? Set from the step 6 benchmark. Not answered by
+  the step 6 numbers: `onto-bench --changes` times commits and the lag of pages of one record
+  (delivery lag p50 7.1 ms at step 6, 6.5 ms in the step 13 run, with 50 other subscribers and
+  about 4 ms of it the commit), not how long a full page takes to filter, so nothing showed a page
+  reaching 50 ms or a split costing more than it saves. 50 ms stays the default; settle it with a
+  backfill scenario that times full pages.
 - Should `entity.hidden` also be sent for link records whose end becomes hidden (phase 1: no)?
 - `changes_meta.floor` reports a false `reset` at the exact retention edge; acceptable, or add an
   end-of-seq cursor form?
@@ -1706,6 +1711,15 @@ Build step 13 (docs):
   measured. In `--remote` mode the CLI prints a server error's code twice (`error: permission
   denied: permission denied: …`, `error: invalid: invalid: …`): `remote_error` wraps the
   server's message, which already starts with the code, in an `Error` whose display adds it again.
+- Fixed after step 13 (delivery benchmark): `onto-bench --delivery` sends to a local HTTP receiver
+  on 127.0.0.1 with 1, 10 and 50 endpoints (`--endpoints`), timing commit to receiver with one
+  task per commit and during a burst of `--rows` deliveries (20,000), and the burst's rows per
+  second; `--in-flight-tenant`/`--in-flight-endpoint` override the limits. onto-bench now enables
+  onto-intelli's `outbound` feature (the delivery worker is behind it; no new crates). Release
+  build, M2 Pro: idle p50 22.5/57.9/265.9 ms, p99 34.8/107.4/805.5 ms; about 200 rows/s per
+  tenant at every endpoint count (208/191/194), 128 rows/s with 32 in flight. Fan-out and the
+  HTTP exchange are fast; the worker's per-row store work limits it (not profiled). Numbers in
+  docs/AUTOMATE.md.
 - Fixed after step 13 (traces): `traceparent` is sent on every delivery and writeback, and rows
   carry the trace of the call or run that enqueued them (see "Traces" at the end).
 - Fixed after step 13 (server lifecycle): `onto serve` shuts down gracefully on SIGTERM (Unix) and

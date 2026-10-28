@@ -14,7 +14,7 @@ default = ["count-alloc"]
 count-alloc = []
 
 [dependencies]
-onto-intelli = { workspace = true, features = ["postgres"] }
+onto-intelli = { workspace = true, features = ["postgres", "outbound"] }
 tokio.workspace = true
 serde_json.workspace = true
 clap.workspace = true
