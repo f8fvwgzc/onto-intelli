@@ -1323,11 +1323,6 @@ commit.
 - Should `entity.hidden` also be sent for link records whose end becomes hidden (phase 1: no)?
 - `changes_meta.floor` reports a false `reset` at the exact retention edge; acceptable, or add an
   end-of-seq cursor form?
-- `automation` traces carry the time they were written and durations of 0 (seen on PostgreSQL in
-  docs run 2; see the build notes): both stores' `run_claim` set `started_at` on the stored row and
-  return only ids, so the `RunRow` the consumer executes and traces keeps `started_at = 0`, and
-  `run_trace` falls back to the process clock at trace time. Return the claim's `started_at`, or
-  build the trace from the stored row?
 
 ---
 
@@ -1774,7 +1769,9 @@ Traces (after step 13; B.7 and section 11):
   `would_run`; not `skipped`, which a rerun may still run), written by the consumer after the
   run's commit, recovery, settling or cancellation: kind `automation`, id the run's
   `trace_id`, name `automation.run:<name>`, `otel_trace_id` the trigger's trace, the run's
-  store-clock start and end; the root span holds the run id, state, mode, depth, attempts and
+  store-clock start and end (`run_claim` returns only ids, so a row executed in the same round has
+  no `started_at` yet and `trace_run` reads the stored row's times; docs run 2 caught traces
+  stamped at write time with 0 ms durations before this); the root span holds the run id, state, mode, depth, attempts and
   the trigger's cursor, op and kind (no entity id: observers see attributes unredacted), and a
   child span per effect holds its index, kind, target, ok, receipt and outbox id, never its plan
   or payload. The run's reason and effect errors are error texts.

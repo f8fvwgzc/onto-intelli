@@ -1035,6 +1035,10 @@ async fn a_run_is_traced_and_continues_the_trace_of_its_trigger() {
         (Some(OTEL), Some("automation:resolve_blocked"))
     );
     assert_eq!(t["request_id"], run["id"]);
+    // Its times are the run's, as the store stamped them.
+    let (start, end) = (run["started_at"].as_i64().unwrap(), run["finished_at"].as_i64().unwrap());
+    assert_eq!(t["ts"].as_i64(), Some(start), "{t}");
+    assert_eq!(t["duration_ms"].as_f64(), Some((end - start) as f64), "{t}");
     let spans = d["spans"].as_array().unwrap();
     let root = spans.iter().find(|s| s["parent_id"].is_null()).unwrap();
     assert_eq!(

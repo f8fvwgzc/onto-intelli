@@ -826,11 +826,13 @@ abded65700000002  abded65700000001  effect.action:create_task        ok  {"index
 abded65700000003  abded65700000001  effect.webhook:pager             ok  {"index":1,"kind":"webhook","ok":true,"outbox":"obx_1a182b101250000282f8c","receipt":null,"target":"pager"}
 ```
 
-This trace's `ts` is when it was written (1793194000698) and its duration,
-and every span's, is 0 ms, although the run took 10 ms (`started_at`
-1793194000670, `finished_at` …680): the claim's store-clock `started_at`
-does not reach the row the trace is built from. Until that is fixed, read a
-run's times from the run row, not from its trace.
+In this run the trace's `ts` was when it was written (1793194000698) and its
+duration, and every span's, was 0 ms, although the run took 10 ms
+(`started_at` 1793194000670, `finished_at` …680): the claim's store-clock
+`started_at` did not reach the row the trace was built from. That is fixed
+since: a trace takes the run's times from the stored run row, so `ts` is the
+run's `started_at` and the duration ends at its `finished_at`
+(`a_run_is_traced_and_continues_the_trace_of_its_trigger` checks both).
 
 A failing endpoint: `down` (`http://127.0.0.1:18093/hooks/down`, a port
 nothing listens on, filter `kind = issue`). With `[traces] deliveries` at
@@ -1036,10 +1038,9 @@ as.
   written under, so `trace.list {otel_trace_id}` finds the runs a call
   started and their deliveries together, and the call too when its caller
   sent `traceparent`; a call made without one is the trace whose id that
-  is (`trace.get`). The trace's time is when it was written and its
-  durations are 0 (section 5, not fixed yet); the run row has the run's
-  times. A
-  rerun is traced again under a new id. Delivery attempts are traced as
+  is (`trace.get`). The trace's time is the run's: `ts` is its
+  `started_at` and the duration ends at its `finished_at`, both from the
+  store clock. A rerun is traced again under a new id. Delivery attempts are traced as
   `[traces] deliveries` says (section 2). Section 5 shows both kinds.
 - **Counters.** `system.stats` (`GET /v1/stats`) has, under `outbound`:
   `lag`, how far each change consumer is behind (`consumers`, by name:

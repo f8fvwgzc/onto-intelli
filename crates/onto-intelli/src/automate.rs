@@ -290,6 +290,17 @@ impl Intelli {
         if matches!(run.state, RunState::Running | RunState::Retry | RunState::Skipped) || !self.traces_enabled() {
             return;
         }
+        // The store stamps a row's times when it claims and settles it; a row
+        // built in this round still has none, so the trace takes them from the store.
+        if run.started_at == 0
+            && let Ok(Some(stored)) = self.ontology().store().run_get(&run.id)
+        {
+            let mut run = run.clone();
+            run.started_at = stored.started_at;
+            run.finished_at = stored.finished_at.or(run.finished_at);
+            self.send_trace(run_trace(&run, self.default_workspace()));
+            return;
+        }
         self.send_trace(run_trace(run, self.default_workspace()));
     }
 
