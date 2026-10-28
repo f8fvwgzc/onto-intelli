@@ -679,12 +679,37 @@ struct RunsIn {
 #[derive(Deserialize)]
 struct TestIn {
     name: String,
-    /// Test against this entity as if it was just updated.
+    /// Test against this entity as if it was just updated (refused for a
+    /// trigger with a state guard or `props`: see [`synthetic_check`]).
     #[serde(default)]
     id: Option<String>,
     /// Test against this change.
     #[serde(default)]
     cursor: Option<String>,
+}
+
+/// `{"id"}` tests a synthetic update that names no changed fields and moves
+/// no state, so a trigger with a state guard or `props` could never admit it
+/// (and templates reading the move could not render): such a test needs a
+/// real change, named by its cursor.
+fn synthetic_check(name: &str, def: &Automation, i: &TestIn) -> Result<()> {
+    let cursor = i.cursor.as_deref().map(str::trim).is_some_and(|c| !c.is_empty());
+    let Some(id) = i.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(()) };
+    if cursor {
+        return Ok(());
+    }
+    let t = def.change_trigger();
+    let guard = match (t.state.is_some(), !t.props.is_empty()) {
+        (true, true) => "a state guard and props",
+        (true, false) => "a state guard",
+        (false, true) => "props",
+        (false, false) => return Ok(()),
+    };
+    Err(Error::invalid(format!(
+        "automation.test: automation {name}'s trigger has {guard}, and id tests {id} as a synthetic update that \
+         changes no field and moves no state; pass cursor (the change to test) instead: changes.poll with \
+         ids = [\"{id}\"] (onto watch --once --ids {id}) lists its changes"
+    )))
 }
 
 #[derive(Deserialize)]
@@ -908,6 +933,7 @@ impl Intelli {
                 let schema = onto.schema();
                 let name = i.name.trim().to_string();
                 let def = defined(&schema, &name)?.clone();
+                synthetic_check(&name, &def, &i)?;
                 let r = self.test_record(p, &i)?;
                 let run_p = def.principal(&name);
                 // The trigger as the run principal would see it.

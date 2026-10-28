@@ -146,8 +146,16 @@ async fn automation_routes_over_http_and_grpc() {
     assert_eq!((st, &out["enabled"]), (200, &json!(true)), "{out}");
     let (st, got) = h.get("/v1/automations/resolve_blocked").await;
     assert_eq!((st, got["status"].as_str()), (200, Some("active")), "{got}");
-    // A dry run writes nothing.
+    // A state-guarded trigger is tested by cursor: `id` (a synthetic update
+    // that moves no state) is refused, naming the guard.
     let (st, t) = h.post("/v1/automations/resolve_blocked/test", json!({ "id": "issue:auto1" })).await;
+    assert_eq!((st, t["error"]["code"].as_str()), (400, Some("invalid_argument")), "{t}");
+    assert!(t["error"]["message"].as_str().unwrap().contains("pass cursor"), "{t}");
+    // A dry run writes nothing.
+    let (st, page) = h.get("/v1/changes?after=0.0&ids=issue:auto1").await;
+    assert_eq!(st, 200, "{page}");
+    let created = page["changes"].as_array().unwrap().last().unwrap()["cursor"].clone();
+    let (st, t) = h.post("/v1/automations/resolve_blocked/test", json!({ "cursor": created })).await;
     assert_eq!((st, t["verdict"].as_str()), (200, Some("would_run")), "{t}");
 
     // The tenant's consumer runs it on a change.
@@ -195,7 +203,7 @@ async fn automation_routes_over_http_and_grpc() {
     let t = json_of(
         auto.test(grpc_req(pb::AutomationTestRequest {
             name: "resolve_blocked".into(),
-            id: "issue:auto1".into(),
+            cursor: created.as_str().unwrap().into(),
             ..Default::default()
         }))
         .await

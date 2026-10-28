@@ -977,17 +977,21 @@ impl Backend {
 }
 
 /// A server's error answer as an engine error.
+/// The server's error as a local [`Error`]. The server's message is already
+/// the `Display` of its error, prefix included ("permission denied: ..."), so
+/// the prefix the local variant adds is taken off first: the code reads once.
 fn remote_error(body: &Value) -> Error {
-    let msg = body["error"]["message"].as_str().unwrap_or("request failed").to_string();
+    let msg = body["error"]["message"].as_str().unwrap_or("request failed");
+    let bare = |prefix: &str| msg.strip_prefix(prefix).unwrap_or(msg).to_string();
     match body["error"]["code"].as_str() {
-        Some("not_found") => Error::NotFound(msg),
-        Some("invalid_argument") => Error::Invalid(msg),
-        Some("permission_denied") => Error::Denied(msg),
-        Some("conflict") => Error::Conflict(msg),
-        Some("resource_exhausted") => Error::Limited(msg),
-        Some("unavailable") => Error::Unavailable(msg),
+        Some("not_found") => Error::NotFound(bare("not found: ")),
+        Some("invalid_argument") => Error::Invalid(bare("invalid: ")),
+        Some("permission_denied") => Error::Denied(bare("permission denied: ")),
+        Some("conflict") => Error::Conflict(bare("conflict: ")),
+        Some("resource_exhausted") => Error::Limited(bare("limited: ")),
+        Some("unavailable") => Error::Unavailable(bare("unavailable: ")),
         Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
-        _ => Error::Other(msg),
+        _ => Error::Other(msg.to_string()),
     }
 }
 
@@ -3490,6 +3494,33 @@ mod tests {
     fn command_line_definition_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn remote_errors_name_their_code_once() {
+        use super::Error;
+        use serde_json::json;
+        // Every variant the server sends: its message is the server-side
+        // Display, so it already starts with the code's words.
+        for e in [
+            Error::NotFound("entity Order/1".into()),
+            Error::Invalid("bad template".into()),
+            Error::Denied("principal lacks automation.manage".into()),
+            Error::Conflict("version moved".into()),
+            Error::Limited("quota spent; retry in 5 s".into()),
+            Error::Unavailable("store is down".into()),
+        ] {
+            let body = json!({ "error": { "code": e.code(), "message": e.to_string() } });
+            let local = super::remote_error(&body);
+            assert_eq!(local.to_string(), e.to_string(), "{}", e.code());
+            assert_eq!(local.code(), e.code());
+        }
+        // A message without the prefix (another server, a proxy) is kept whole.
+        let body = json!({ "error": { "code": "permission_denied", "message": "no" } });
+        assert_eq!(super::remote_error(&body).to_string(), "permission denied: no");
+        // Internal errors carry no prefix and keep the message as sent.
+        let body = json!({ "error": { "code": "internal", "message": "storage: boom" } });
+        assert_eq!(super::remote_error(&body).to_string(), "storage: boom");
     }
 
     #[test]

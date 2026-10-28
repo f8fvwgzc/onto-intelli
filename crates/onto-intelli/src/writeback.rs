@@ -45,8 +45,8 @@ use crate::hub::SecretBox;
 use crate::intelli::Intelli;
 use crate::net::{Reach, join_route};
 use crate::webhooks::{
-    BREAKER_PREFIX, Endpoint, NS_CONTROL, SecretRef, check_endpoint_url, generate_secret, is_reference, resolve_text,
-    signing_key, url_origin, valid_name,
+    BREAKER_PREFIX, Endpoint, NS_CONTROL, SecretRef, check_endpoint_url_as, generate_secret, is_reference,
+    resolve_text, signing_key, url_origin, valid_name,
 };
 
 /// KV namespace of targets (key: the target name).
@@ -153,8 +153,13 @@ impl Target {
     /// The base URL, resolved and checked against `reach`, with a trailing
     /// `/` so routes join under it. Errors name references, never values.
     pub fn base(&self, reach: &Reach) -> Result<url::Url> {
+        self.base_as(reach, "base_url")
+    }
+
+    /// [`Target::base`], naming a literal URL by `field` in errors.
+    fn base_as(&self, reach: &Reach, field: &str) -> Result<url::Url> {
         let raw = resolve_text(&self.base_url, &self.base_what())?;
-        let mut base = check_endpoint_url(&self.base_url, &raw, reach)?;
+        let mut base = check_endpoint_url_as(&self.base_url, &raw, field, reach)?;
         if !base.path().ends_with('/') {
             let path = format!("{}/", base.path());
             base.set_path(&path);
@@ -165,11 +170,16 @@ impl Target {
     /// The request URL of `route`: the base joined with the route's path,
     /// on the base's scheme, host and port.
     pub fn request_url(&self, route: &str, reach: &Reach) -> Result<url::Url> {
+        self.request_url_as(route, reach, "base_url")
+    }
+
+    /// [`Target::request_url`], naming a literal base URL by `field`.
+    fn request_url_as(&self, route: &str, reach: &Reach, field: &str) -> Result<url::Url> {
         let path = self
             .routes
             .get(route)
             .ok_or_else(|| Error::invalid(format!("writeback target {} has no route {route}", self.name)))?;
-        join_route(&self.base(reach)?, path)
+        join_route(&self.base_as(reach, field)?, path)
     }
 
     /// The HMAC key requests are signed with, if the target has a secret.
@@ -191,8 +201,12 @@ fn scope(workspaces: &[String]) -> ScopePrincipal {
 #[derive(Deserialize)]
 struct AddIn {
     name: String,
-    #[serde(alias = "url")]
-    base_url: String,
+    /// The base URL; `url` is accepted in its place, and refusals name the
+    /// field the caller used.
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
     /// Plaintext (sealed here) or an operator reference; none: unsigned.
     #[serde(default)]
     secret: Option<String>,
@@ -268,13 +282,20 @@ impl Intelli {
     /// Check a base URL input (as [`Intelli::reach`] judges it now; names are
     /// resolved and judged at every request) and every route under it.
     /// Errors name references, never their values.
-    fn check_target_input(&self, raw: &str, routes: &BTreeMap<String, String>, restricted: bool) -> Result<String> {
+    /// `field` is the input field the URL came in (`base_url` or `url`).
+    fn check_target_input(
+        &self,
+        field: &str,
+        raw: &str,
+        routes: &BTreeMap<String, String>,
+        restricted: bool,
+    ) -> Result<String> {
         let raw = raw.trim();
         if raw.is_empty() {
-            return Err(Error::invalid("base_url: a writeback target needs an https URL"));
+            return Err(Error::invalid(format!("{field}: a writeback target needs an https URL")));
         }
         let stored = if is_reference(raw) {
-            SecretRef::parse(raw).map_err(|e| Error::invalid(format!("base_url: {e}")))?.stored()
+            SecretRef::parse(raw).map_err(|e| Error::invalid(format!("{field}: {e}")))?.stored()
         } else {
             raw.to_string()
         };
@@ -300,7 +321,7 @@ impl Intelli {
                     "routes: route name '{route}' must be 1 to 40 of a-z, 0-9, _ and -"
                 )));
             }
-            probe.request_url(route, &reach)?;
+            probe.request_url_as(route, &reach, field)?;
         }
         Ok(stored)
     }
@@ -410,7 +431,15 @@ impl Intelli {
                 }
                 let routes: BTreeMap<String, String> =
                     i.routes.into_iter().map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
-                let base_url = self.check_target_input(&i.base_url, &routes, i.restricted)?;
+                let (field, raw) = match (&i.base_url, &i.url) {
+                    (Some(_), Some(_)) => {
+                        return Err(Error::invalid("writeback.add: give base_url or url (its alias), not both"));
+                    }
+                    (Some(b), None) => ("base_url", b.as_str()),
+                    (None, Some(u)) => ("url", u.as_str()),
+                    (None, None) => ("base_url", ""),
+                };
+                let base_url = self.check_target_input(field, raw, &routes, i.restricted)?;
                 let (secret, generated) = self.target_secret(&name, i.secret.as_deref(), i.generate_secret)?;
                 // The store's clock, after every row of an earlier target of
                 // this name: rows created for this one are never older.

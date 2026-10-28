@@ -260,8 +260,14 @@ pub fn resolve_text(raw: &str, what: &str) -> Result<String> {
 /// reference, the error names the reference only: the refused host or
 /// address is part of the value.
 pub fn check_endpoint_url(raw: &str, url: &str, reach: &crate::net::Reach) -> Result<url::Url> {
+    check_endpoint_url_as(raw, url, "url", reach)
+}
+
+/// [`check_endpoint_url`], naming a literal URL by `field`: the input field
+/// the caller gave it in (a writeback target's `base_url`, say).
+pub fn check_endpoint_url_as(raw: &str, url: &str, field: &str, reach: &crate::net::Reach) -> Result<url::Url> {
     if !is_reference(raw) {
-        return crate::net::check_target_url(url, "url", reach);
+        return crate::net::check_target_url(url, field, reach);
     }
     let what = format!("the URL in {}", raw.trim());
     crate::net::check_target_url(url, &what, reach).map_err(|_| {

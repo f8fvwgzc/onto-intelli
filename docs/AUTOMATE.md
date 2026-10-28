@@ -241,8 +241,11 @@ timestamp tolerance, so this check passed each delivery's own
 ```
 
 Two things this list shows. The `ops` endpoint filters on `kind = issue` and
-still receives `onto.schema.change` records (schema changes reach every
-subscription, so a mirror can follow renames). And deliveries are not
+still receives `onto.schema.change` records. That is intended: a schema
+change is tenant-wide, so a filter's `kinds`, `workspaces`, `ids`, `rels`
+and `props` do not narrow it, and a mirror sees the renames it must follow.
+`ops` and `sources` still apply: an endpoint whose `ops` leave out
+`schema.change` does not receive them. `gap` records pass every filter. And deliveries are not
 ordered per endpoint: rows `…234c60` (the create of `issue:pay-2`, cursor
 6.0) and `…257f31` (its update, cursor 11.0) were claimed together and
 reached the receiver in the opposite order. Order by `cursor` if it matters.
@@ -529,9 +532,13 @@ $ curl -X POST -H "authorization: Bearer $ONTO_TOKEN" -H 'content-type: applicat
 ```
 
 Pass the change's `cursor`. The other form, `{"id": "issue:pay-3"}`, tests
-the entity as if it was just updated, without a state transition, so a
-trigger with a `state` guard does not admit it and `{trigger.state.from}`
-has no value: it answered `verdict: error` with `invalid_template` here.
+the entity as if it was just updated: a synthetic update that changes no
+field and moves no state. A trigger with a `state` guard or `props` could
+never admit it, so for such an automation (`escalate_blocked` here) the
+`id` form is refused with `invalid_argument`, naming the guard and asking
+for a `cursor`; `onto watch --once --ids issue:pay-3` lists that entity's
+changes. For a trigger without either, `id` tests the entity's current
+fields.
 
 ### An expired enablement
 

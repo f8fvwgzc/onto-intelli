@@ -667,15 +667,19 @@ async fn dry_runs_render_as_the_run_and_the_caller_and_write_nothing() {
     let i = open(|_| {}).await;
     define(&i, "resolve_blocked", resolve_blocked(false)).await;
     issue(&i, "1", "blocked", "high").await;
+    // An unguarded trigger: `id` tests the entity's current fields.
+    let mut plain = resolve_blocked(false);
+    plain["trigger"] = json!({ "on": "change", "kinds": ["issue"], "ops": ["entity.update"] });
+    define(&i, "resolve_any", plain).await;
     let seq = i.ontology().store().head().unwrap();
-    let t = ok(&i, &admin(), "automation.test", json!({ "name": "resolve_blocked", "id": "issue:1" })).await;
+    let t = ok(&i, &admin(), "automation.test", json!({ "name": "resolve_any", "id": "issue:1" })).await;
     assert_eq!(t["verdict"], "would_run", "{t}");
-    assert_eq!(t["matched"], false, "an entity is not a state move: {t}");
+    assert_eq!(t["matched"], true, "{t}");
     assert_eq!(t["effects"][0]["plan"]["preview"][0], "update issue:1: state blocked → resolved");
     assert_eq!(i.ontology().store().head().unwrap(), seq, "nothing was written");
     // A caller who cannot see the subject renders nothing of it.
     let outsider = Principal::named("user:o", &["viewer"], &["elsewhere"]).unwrap();
-    let e = i.call(&outsider, "automation.test", json!({ "name": "resolve_blocked", "id": "issue:1" })).await;
+    let e = i.call(&outsider, "automation.test", json!({ "name": "resolve_any", "id": "issue:1" })).await;
     assert!(e.is_err(), "the caller does not see issue:1");
     // By cursor: the change itself.
     set_state(&i, "1", "triaged").await;
@@ -684,6 +688,41 @@ async fn dry_runs_render_as_the_run_and_the_caller_and_write_nothing() {
     let t = ok(&i, &admin(), "automation.test", json!({ "name": "resolve_blocked", "cursor": head["cursor"] })).await;
     assert_eq!(t["matched"], true, "{t}");
     assert_eq!(t["trigger"]["state"]["from"], "triaged");
+}
+
+/// A synthetic update (`{"id"}`) moves no state and changes no field, so a
+/// trigger with a state guard or `props` is tested by cursor only: `id` is
+/// refused up front, naming the guard and the way to find a cursor, instead
+/// of a `matched: false` result whose templates cannot render.
+#[tokio::test]
+async fn a_guarded_trigger_is_tested_by_cursor_not_by_id() {
+    let i = open(|_| {}).await;
+    // The webhook effect reads {trigger.state.from}.
+    endpoint(&i, "https://hooks.example.com/ops", json!({ "roles": ["member"], "workspaces": ["acme"] })).await;
+    define(&i, "resolve_blocked", resolve_blocked(true)).await;
+    let mut by_props = resolve_blocked(false);
+    by_props["trigger"] = json!({ "on": "change", "kinds": ["issue"], "props": ["priority"] });
+    define(&i, "on_priority", by_props).await;
+    issue(&i, "1", "blocked", "high").await;
+    let seq = i.ontology().store().head().unwrap();
+    for (name, guard) in [("resolve_blocked", "a state guard"), ("on_priority", "props")] {
+        let e = i.call(&admin(), "automation.test", json!({ "name": name, "id": "issue:1" })).await.unwrap_err();
+        assert_eq!(e.code(), "invalid_argument", "{name}: {e}");
+        let msg = e.to_string();
+        assert!(msg.contains(&format!("trigger has {guard},")), "{name}: {msg}");
+        assert!(msg.contains("pass cursor"), "{name}: {msg}");
+        assert!(msg.contains("--ids issue:1"), "{name}: {msg}");
+        assert!(!msg.contains("invalid_template"), "{name}: {msg}");
+    }
+    assert_eq!(i.ontology().store().head().unwrap(), seq, "nothing was written");
+    // The real change by cursor: matched, and the state move renders.
+    set_state(&i, "1", "triaged").await;
+    set_state(&i, "1", "blocked").await;
+    let head = ok(&i, &admin(), "changes.head", json!({})).await;
+    let input = json!({ "name": "resolve_blocked", "cursor": head["cursor"], "id": "issue:1" });
+    let t = ok(&i, &admin(), "automation.test", input).await;
+    assert_eq!((t["matched"].as_bool(), t["verdict"].as_str()), (Some(true), Some("would_run")), "{t}");
+    assert_eq!(t["effects"][1]["plan"]["payload"]["from"], "triaged", "{t}");
 }
 
 #[tokio::test]

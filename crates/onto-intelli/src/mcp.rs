@@ -268,7 +268,7 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
         (
             "test_automation",
             "automation.test",
-            "Dry-run an automation against a change (cursor) or an entity as if it was just updated (id): whether its trigger admits it, its conditions, the action plan and the webhook payloads, rendered as the run principal and you together. Writes nothing.",
+            "Dry-run an automation against a change (cursor) or an entity as if it was just updated (id; a trigger with a state guard or props needs a cursor): whether its trigger admits it, its conditions, the action plan and the webhook payloads, rendered as the run principal and you together. Writes nothing.",
             obj(
                 json!({
                     "name": s("Automation name"),

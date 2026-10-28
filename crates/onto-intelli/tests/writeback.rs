@@ -430,6 +430,36 @@ async fn targets_are_managed_by_admins_of_every_workspace_they_serve() {
     assert!(!added.payload.to_string().contains("abc"), "audit events name the host only: {:?}", added.payload);
 }
 
+/// A refused base URL names the field the caller gave it in: `base_url`, or
+/// `url` (its alias), never the other one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writeback_refusals_name_the_field_the_caller_used() {
+    let i = open(true).await;
+    for field in ["base_url", "url"] {
+        for (bad, why) in [
+            ("ftp://desk.example.com/", "scheme ftp is not https"),
+            ("https://169.254.169.254/", "link-local"),
+            ("https://user:pw@desk.example.com/", "may not carry credentials"),
+            ("", "needs an https URL"),
+        ] {
+            let input = json!({ "name": "x", field: bad, "routes": { "a": "a" } });
+            let e = i.call(&lead(), "writeback.add", input).await.unwrap_err();
+            assert_eq!(e.code(), "invalid_argument", "{field} {bad}: {e}");
+            let msg = e.to_string();
+            assert!(msg.contains(why), "{field} {bad}: {msg}");
+            assert!(msg.starts_with(&format!("invalid: {field}")), "names {field}: {msg}");
+        }
+    }
+    // Missing altogether: named by its canonical field.
+    let e = i.call(&lead(), "writeback.add", json!({ "name": "x", "routes": { "a": "a" } })).await.unwrap_err();
+    assert!(e.to_string().starts_with("invalid: base_url:"), "{e}");
+    // Both: refused, naming both.
+    let both = json!({ "name": "x", "base_url": "https://a.example.com/", "url": "https://b.example.com/",
+                       "routes": { "a": "a" } });
+    let e = i.call(&lead(), "writeback.add", both).await.unwrap_err();
+    assert!(e.to_string().contains("give base_url or url"), "{e}");
+}
+
 /// SEC3-R: a writeback target removed and added again with the same version
 /// and principal (registered within the same millisecond, say) is a new
 /// incarnation: an automation that reaches it is stale.

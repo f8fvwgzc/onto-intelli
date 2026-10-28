@@ -521,7 +521,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "automation.test",
         false,
-        "A dry run of an automation against a change (cursor) or an entity as if it was just updated (id), rendered and planned as the run principal and the caller together: whether the trigger admits it, the conditions, the plan and the webhook payloads. Writes nothing. Input: {name, cursor? | id?}.",
+        "A dry run of an automation against a change (cursor) or an entity as if it was just updated (id; refused for a trigger with a state guard or props, which need a cursor), rendered and planned as the run principal and the caller together: whether the trigger admits it, the conditions, the plan and the webhook payloads. Writes nothing. Input: {name, cursor? | id?}.",
     ),
     a(
         "automation.enable",
