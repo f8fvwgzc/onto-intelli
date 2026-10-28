@@ -260,3 +260,29 @@ reauth_secs = 60                   # streams re-authenticate their request this 
 max_subscribers = 200              # streams per tenant per process
 max_subscribers_per_principal = 20
 max_subscribers_process = 2000
+
+# Webhook delivery from the outbox (docs/design/EVENTS.md Part B): signed
+# CloudEvents (Standard Webhooks signatures). Each change is enqueued once per
+# endpoint and delivered at least once; receivers dedupe on the event id.
+# Delivery concurrency limits are per process.
+[webhooks]
+enabled = true                     # false: this process sends nothing (rows wait in the outbox)
+max_endpoints = 50                 # per tenant
+timeout_secs = 10
+poll_secs = 20                     # fallback poll; commits that enqueue rows wake the worker at once
+max_attempts = 15
+backoff_base_secs = 10             # retry delay min(base * 2^(attempt-1), max) with jitter; Retry-After up to max
+backoff_max_secs = 3600
+max_payload_bytes = 262144         # larger bodies are not sent (dead: payload_too_large)
+max_in_flight_per_endpoint = 4     # per process
+max_in_flight_per_tenant = 8       # per process
+max_in_flight_process = 64
+pause_after_failures = 20          # consecutive failures pause an endpoint ...
+pause_secs = 300                   # ... this long, then one probe (a failed probe doubles it, up to 1 h)
+pending_cap = 100000
+retain_days = 14                   # finished rows and attempt logs
+# Operator rules: a host that may resolve into private CIDRs (never for
+# endpoints a project registered; link-local and metadata ranges never).
+# [[webhooks.allow]]
+# host = "hooks.internal.example"  # or "*.internal.example"
+# cidrs = ["10.20.0.0/16"]

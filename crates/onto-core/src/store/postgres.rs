@@ -49,6 +49,7 @@ use crate::changes::{
 use crate::graph::LinkKey;
 use crate::leases::{Fence, Lease, Timer, Wake, lease_lost};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
+use crate::outbox::{Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, replay_states};
 use crate::time::{new_id, now_ms};
 use crate::{Error, Result};
 
@@ -73,6 +74,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (8, "audit_no_delete", include_str!("../../migrations/0008_audit_no_delete.sql")),
     (9, "changes", include_str!("../../migrations/0009_changes.sql")),
     (10, "leases", include_str!("../../migrations/0010_leases.sql")),
+    (11, "outbox", include_str!("../../migrations/0011_outbox.sql")),
 ];
 /// This build's writer version. A tenant whose `head.min_writer` is higher
 /// refuses this build's writes (builds before this one never read it; the
@@ -1236,6 +1238,7 @@ impl Store for PgStore {
         let del_e = b.del_entities.clone();
         let del_l = b.del_links.clone();
         let fence = b.fence.clone();
+        let outbox = (!b.outbox.is_empty()).then(|| outbox_json(&b.outbox)).transpose()?;
         let wake = match b.wake {
             Some(delay) => {
                 self.ensure_sys()?;
@@ -1473,6 +1476,10 @@ impl Store for PgStore {
                 .bind(c.2)
                 .execute(&mut *tx)
                 .await?;
+            }
+            if let Some(rows) = &outbox {
+                // Unique by construction: a duplicate fails the commit (Conflict).
+                insert_outbox(&mut tx, &tables, rows, false).await?;
             }
             if bumps {
                 seq += 1;
@@ -2141,6 +2148,315 @@ impl Store for PgStore {
         })
     }
 
+    fn keeps_outbox(&self) -> bool {
+        true
+    }
+
+    fn outbox_enqueue(
+        &self,
+        rows: &[OutboxRow],
+        advance: Option<(&str, Cursor)>,
+        fence: Option<&Fence>,
+    ) -> Result<usize> {
+        for r in rows {
+            crate::outbox::check_row(r)?;
+        }
+        if rows.is_empty() && advance.is_none() {
+            return Ok(0);
+        }
+        if !rows.is_empty() {
+            self.ensure_sys()?;
+        }
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (sys, chan, tenant) = (self.sys.clone(), self.wake_channel.clone(), self.tenant.clone());
+        let doc = (!rows.is_empty()).then(|| outbox_json(rows)).transpose()?;
+        let advance = advance.map(|(n, c)| (n.to_string(), c));
+        let fence = fence.cloned();
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &t, f).await?;
+            }
+            let n = match &doc {
+                Some(doc) => insert_outbox(&mut tx, &t, doc, true).await?,
+                None => 0,
+            };
+            if let Some((name, cursor)) = &advance {
+                sqlx::query(sql(format!(
+                    "INSERT INTO {c} (name, seq, n, updated_at) VALUES ($1, $2, $3, {now}) \
+                     ON CONFLICT (name) DO UPDATE SET seq = EXCLUDED.seq, n = EXCLUDED.n, updated_at = EXCLUDED.updated_at",
+                    c = t.consumers,
+                    now = t.now
+                )))
+                .bind(name)
+                .bind(cursor.seq as i64)
+                .bind(cursor.n.min(i32::MAX as u32) as i32)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if n > 0 {
+                bump_wake(&mut tx, &sys, &chan, &tenant, 0).await?;
+            }
+            tx.commit().await?;
+            Ok(n)
+        })
+    }
+
+    /// One statement (docs/design/EVENTS.md B.1): `FOR UPDATE SKIP LOCKED`
+    /// keeps concurrent claims disjoint.
+    fn outbox_claim(
+        &self,
+        limit: usize,
+        lease_ms: i64,
+        holder: &str,
+        skip_targets: &[String],
+    ) -> Result<Vec<OutboxRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (holder, skip) = (holder.to_string(), skip_targets.to_vec());
+        self.block(async move {
+            let rows = sqlx::query(sql(format!(
+                "UPDATE {o} SET state = 'inflight', claim = $3 || ':' || gen_random_uuid()::text, \
+                 lease_until = {now} + $2, attempts = attempts + 1 \
+                 WHERE id IN (SELECT id FROM {o} \
+                   WHERE ((state IN ('pending', 'retry') AND next_at <= {now}) \
+                      OR (state = 'inflight' AND lease_until < {now})) \
+                   AND NOT (target = ANY($4::text[])) \
+                   ORDER BY next_at, id LIMIT $1 FOR UPDATE SKIP LOCKED) \
+                 RETURNING {OUTBOX_COLS}",
+                o = t.outbox,
+                now = t.now
+            )))
+            .bind(limit.clamp(1, 1000) as i64)
+            .bind(lease_ms.max(0))
+            .bind(&holder)
+            .bind(&skip)
+            .fetch_all(&pool)
+            .await?;
+            let mut out: Vec<OutboxRow> = rows.iter().map(outbox_row).collect::<Result<_>>()?;
+            out.sort_by(|a, b| a.next_at.cmp(&b.next_at).then_with(|| a.id.cmp(&b.id)));
+            Ok(out)
+        })
+    }
+
+    fn outbox_finish(
+        &self,
+        id: &str,
+        claim: &str,
+        attempt: &Attempt,
+        next: OutboxState,
+        delay_ms: i64,
+    ) -> Result<bool> {
+        let retry = next == OutboxState::Retry;
+        if retry {
+            self.ensure_sys()?;
+        }
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (sys, chan, tenant) = (self.sys.clone(), self.wake_channel.clone(), self.tenant.clone());
+        let (id, claim) = (id.to_string(), claim.to_string());
+        let attempt = attempt.clone();
+        let doc = serde_json::to_string(&json!({ "state": next, "result": &attempt }))?;
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            let attempts: Option<i32> = sqlx::query_scalar(sql(format!(
+                "UPDATE {o} SET state = $3, claim = NULL, lease_until = NULL, last_status = $4, last_error = $5, \
+                 next_at = CASE WHEN $3 = 'retry' THEN {now} + $6 ELSE next_at END, \
+                 delivered_at = CASE WHEN $3 = 'delivered' THEN {now} ELSE delivered_at END \
+                 WHERE id = $1 AND claim = $2 RETURNING attempts",
+                o = t.outbox,
+                now = t.now
+            )))
+            .bind(&id)
+            .bind(&claim)
+            .bind(next.as_str())
+            .bind(attempt.status.map(i32::from))
+            .bind(&attempt.error)
+            .bind(delay_ms.max(0))
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(n) = attempts else { return Ok(false) };
+            sqlx::query(sql(format!(
+                "INSERT INTO {a} (outbox_id, claim, attempt, ts, doc) VALUES ($1, $2, $3, {now}, $4::jsonb)",
+                a = t.attempts,
+                now = t.now
+            )))
+            .bind(&id)
+            .bind(&claim)
+            .bind(n)
+            .bind(&doc)
+            .execute(&mut *tx)
+            .await?;
+            if retry {
+                bump_wake(&mut tx, &sys, &chan, &tenant, delay_ms).await?;
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn outbox_release(&self, id: &str, claim: &str) -> Result<bool> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (id, claim) = (id.to_string(), claim.to_string());
+        self.block(async move {
+            let n = sqlx::query(sql(format!(
+                "UPDATE {} SET attempts = greatest(attempts - 1, 0), \
+                 state = CASE WHEN attempts <= 1 THEN 'pending' ELSE 'retry' END, claim = NULL, lease_until = NULL \
+                 WHERE id = $1 AND claim = $2",
+                t.outbox
+            )))
+            .bind(&id)
+            .bind(&claim)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            Ok(n > 0)
+        })
+    }
+
+    fn outbox_get(&self, id: &str) -> Result<Option<OutboxRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let id = id.to_string();
+        self.block(async move {
+            let row = sqlx::query(sql(format!("SELECT {OUTBOX_COLS} FROM {} WHERE id = $1", t.outbox)))
+                .bind(&id)
+                .fetch_optional(&pool)
+                .await?;
+            row.as_ref().map(outbox_row).transpose()
+        })
+    }
+
+    fn outbox_list(&self, q: &OutboxQuery) -> Result<Vec<OutboxRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let q = q.clone();
+        let states: Vec<String> = q.states.iter().map(|s| s.as_str().to_string()).collect();
+        self.block(async move {
+            let rows = sqlx::query(sql(format!(
+                "SELECT {OUTBOX_COLS} FROM {} WHERE ($1::text IS NULL OR target = $1) \
+                 AND (cardinality($2::text[]) = 0 OR state = ANY($2)) AND ($3::text IS NULL OR source = $3) \
+                 AND ($4::text IS NULL OR receipt = $4) AND ($5::text IS NULL OR run = $5) \
+                 AND ($6::bigint IS NULL OR created_at >= $6) ORDER BY created_at DESC, id DESC LIMIT $7",
+                t.outbox
+            )))
+            .bind(&q.target)
+            .bind(&states)
+            .bind(&q.source)
+            .bind(&q.receipt)
+            .bind(&q.run)
+            .bind(q.since)
+            .bind(q.limit() as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.iter().map(outbox_row).collect()
+        })
+    }
+
+    fn outbox_reset(&self, target: &str, sel: &OutboxSelect, states: &[OutboxState]) -> Result<usize> {
+        self.ensure_sys()?;
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (sys, chan, tenant) = (self.sys.clone(), self.wake_channel.clone(), self.tenant.clone());
+        let target = target.to_string();
+        let states: Vec<String> = replay_states(states).iter().map(|s| s.as_str().to_string()).collect();
+        let (ids, since): (Option<Vec<String>>, Option<i64>) = match sel {
+            OutboxSelect::Ids(ids) => (Some(ids.clone()), None),
+            OutboxSelect::Since(t) => (None, Some(*t)),
+        };
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            let n = sqlx::query(sql(format!(
+                "UPDATE {o} SET state = 'pending', attempts = 0, next_at = {now}, claim = NULL, lease_until = NULL, \
+                 delivered_at = NULL WHERE target = $1 AND state = ANY($2) \
+                 AND ($3::text[] IS NULL OR id = ANY($3)) AND ($4::bigint IS NULL OR created_at >= $4)",
+                o = t.outbox,
+                now = t.now
+            )))
+            .bind(&target)
+            .bind(&states)
+            .bind(&ids)
+            .bind(since)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if n > 0 {
+                bump_wake(&mut tx, &sys, &chan, &tenant, 0).await?;
+            }
+            tx.commit().await?;
+            Ok(n as usize)
+        })
+    }
+
+    fn outbox_attempts(&self, id: &str, limit: usize) -> Result<Vec<AttemptRecord>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let id = id.to_string();
+        self.block(async move {
+            let rows: Vec<(String, i32, i64, String)> = sqlx::query_as(sql(format!(
+                "SELECT outbox_id, attempt, ts, doc::text FROM {} WHERE outbox_id = $1 \
+                 ORDER BY ts DESC, attempt DESC LIMIT $2",
+                t.attempts
+            )))
+            .bind(&id)
+            .bind(limit.clamp(1, 1000) as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.into_iter()
+                .map(|(outbox_id, attempt, ts, doc)| {
+                    let d: AttemptDoc = parse(&doc)?;
+                    Ok(AttemptRecord {
+                        outbox_id,
+                        attempt: attempt.max(0) as u32,
+                        ts,
+                        state: d.state,
+                        result: d.result,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn outbox_next_due(&self) -> Result<Option<i64>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            Ok(sqlx::query_scalar(sql(format!(
+                "SELECT min(CASE WHEN state = 'inflight' THEN lease_until ELSE next_at END) FROM {} \
+                 WHERE state IN ('pending', 'retry', 'inflight')",
+                t.outbox
+            )))
+            .fetch_one(&pool)
+            .await?)
+        })
+    }
+
+    fn outbox_vacuum(&self, before_ms: i64) -> Result<u64> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            let n = sqlx::query(sql(format!(
+                "DELETE FROM {} WHERE state IN ('delivered', 'dead', 'cancelled') AND created_at < $1",
+                t.outbox
+            )))
+            .bind(before_ms)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            // The attempt log refuses DELETE except to retention (0011, as 0008).
+            sqlx::query("SELECT set_config('onto.retention', 'on', true)").execute(&mut *tx).await?;
+            sqlx::query(sql(format!("DELETE FROM {} WHERE ts < $1", t.attempts)))
+                .bind(before_ms)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(n)
+        })
+    }
+
     fn indexes_vectors(&self) -> bool {
         true
     }
@@ -2412,6 +2728,8 @@ struct Tables {
     leases: String,
     consumers: String,
     timers: String,
+    outbox: String,
+    attempts: String,
     /// The tenant schema's `now_ms()` (the database clock).
     now: String,
 }
@@ -2446,9 +2764,101 @@ impl Tables {
             leases: s.t("leases"),
             consumers: s.t("consumers"),
             timers: s.t("timers"),
+            outbox: s.t("outbox"),
+            attempts: s.t("delivery_attempts"),
             now: s.t("now_ms()"),
         }
     }
+}
+
+/// The columns of an outbox row, in [`outbox_row`]'s order.
+const OUTBOX_COLS: &str = "id, created_at, kind, target, dedupe, source, workspace, receipt, run, cursor_seq, \
+     cursor_n, event_type, payload::text, cause::text, state, attempts, next_at, claim, lease_until, last_status, \
+     last_error, delivered_at, otel_trace_id";
+
+fn outbox_row(r: &sqlx::postgres::PgRow) -> Result<OutboxRow> {
+    let kind: String = r.try_get(2)?;
+    let (seq, n): (Option<i64>, Option<i32>) = (r.try_get(9)?, r.try_get(10)?);
+    let payload: String = r.try_get(12)?;
+    let cause: Option<String> = r.try_get(13)?;
+    let state: String = r.try_get(14)?;
+    let status: Option<i32> = r.try_get(19)?;
+    Ok(OutboxRow {
+        id: r.try_get(0)?,
+        created_at: r.try_get(1)?,
+        kind: kind.parse()?,
+        target: r.try_get(3)?,
+        dedupe: r.try_get(4)?,
+        source: r.try_get(5)?,
+        workspace: r.try_get(6)?,
+        receipt: r.try_get(7)?,
+        run: r.try_get(8)?,
+        cursor: seq.map(|s| Cursor::new(s as u64, n.unwrap_or(0).max(0) as u32)),
+        event_type: r.try_get(11)?,
+        payload: parse(&payload)?,
+        cause: cause.as_deref().map(parse).transpose()?,
+        state: state.parse().map_err(|_| Error::Storage(format!("corrupt row: outbox state '{state}'")))?,
+        attempts: r.try_get::<i32, _>(15)?.max(0) as u32,
+        next_at: r.try_get(16)?,
+        claim: r.try_get(17)?,
+        lease_until: r.try_get(18)?,
+        last_status: status.map(|s| s.clamp(0, u16::MAX as i32) as u16),
+        last_error: r.try_get(20)?,
+        delivered_at: r.try_get(21)?,
+        otel_trace_id: r.try_get(22)?,
+    })
+}
+
+/// The insertable fields of outbox rows as one JSON array (`jsonb_to_recordset`).
+fn outbox_json(rows: &[OutboxRow]) -> Result<String> {
+    let v: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id, "kind": r.kind.as_str(), "target": r.target, "dedupe": r.dedupe,
+                "source": r.source, "workspace": r.workspace, "receipt": r.receipt, "run": r.run,
+                "cursor_seq": r.cursor.map(|c| c.seq as i64), "cursor_n": r.cursor.map(|c| c.n.min(i32::MAX as u32)),
+                "event_type": r.event_type, "payload": r.payload, "cause": r.cause, "otel_trace_id": r.otel_trace_id,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Insert outbox rows (`doc` from [`outbox_json`]) with the database
+/// clock's times. `skip_existing`: rows whose key exists are skipped;
+/// otherwise a duplicate fails the transaction (unique violation, `Conflict`).
+async fn insert_outbox(
+    tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>,
+    t: &Tables,
+    doc: &str,
+    skip_existing: bool,
+) -> Result<usize> {
+    let n = sqlx::query(sql(format!(
+        "INSERT INTO {o} (id, created_at, kind, target, dedupe, source, workspace, receipt, run, cursor_seq, cursor_n, \
+         event_type, payload, cause, state, attempts, next_at, otel_trace_id) \
+         SELECT r.id, {now}, r.kind, r.target, r.dedupe, r.source, r.workspace, r.receipt, r.run, r.cursor_seq, \
+         r.cursor_n, r.event_type, coalesce(r.payload, 'null'::jsonb), r.cause, 'pending', 0, {now}, r.otel_trace_id \
+         FROM jsonb_to_recordset($1::jsonb) AS r(id text, kind text, target text, dedupe text, source text, \
+         workspace text, receipt text, run text, cursor_seq bigint, cursor_n int, event_type text, payload jsonb, \
+         cause jsonb, otel_trace_id text){}",
+        if skip_existing { " ON CONFLICT DO NOTHING" } else { "" },
+        o = t.outbox,
+        now = t.now
+    )))
+    .bind(doc)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(n as usize)
+}
+
+/// An attempt as the attempt log stores it.
+#[derive(serde::Deserialize)]
+struct AttemptDoc {
+    state: OutboxState,
+    #[serde(default)]
+    result: Attempt,
 }
 
 fn split3(keys: &[LinkKey]) -> (Vec<String>, Vec<String>, Vec<String>) {

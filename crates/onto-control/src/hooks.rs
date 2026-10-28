@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use onto_core::Result;
 use onto_core::time::{fmt_date, now_ms};
 use onto_intelli::Hub;
-use onto_intelli::hub::{TenantHooks, TenantSettings};
+use onto_intelli::hub::{Secret, SecretBox, TenantHooks, TenantSettings};
 use onto_intelli::limits::{MonthToDate, UsageMeter};
 use onto_intelli::token::TokenUsage;
 use onto_intelli::trace::TraceSettings;
@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 
 use crate::llm::{limits_of, month_start, month_total};
 use crate::model::{Project, UsageDay};
-use crate::{Control, ControlStore};
+use crate::{Control, ControlStore, Vault};
 
 /// How often queued usage is written.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(10);
@@ -205,7 +205,40 @@ impl TenantHooks for ControlHooks {
             meter: Some(meter),
             version: project.settings_version.max(0) as u64,
             traces: trace_settings_of(&project),
+            secrets: c
+                .vault
+                .clone()
+                .map(|vault| Arc::new(VaultSecrets { vault, project_id: project.id.clone() }) as Arc<dyn SecretBox>),
         })
+    }
+}
+
+/// A project's outbound secrets (webhook signing secrets, …), sealed with
+/// the vault ([`Vault::seal_for`]) under AAD `onto/<purpose>/v1/<project>/<name>`.
+pub struct VaultSecrets {
+    vault: Arc<Vault>,
+    project_id: String,
+}
+
+impl VaultSecrets {
+    pub fn new(vault: Arc<Vault>, project_id: impl Into<String>) -> Self {
+        Self { vault, project_id: project_id.into() }
+    }
+}
+
+impl SecretBox for VaultSecrets {
+    fn seal(&self, purpose: &str, name: &str, plain: &[u8]) -> Result<String> {
+        use base64::Engine as _;
+        let blob = self.vault.seal_for(purpose, &self.project_id, name, plain)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+    }
+
+    fn open(&self, purpose: &str, name: &str, sealed: &str) -> Result<Secret> {
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(sealed.trim())
+            .map_err(|_| onto_core::Error::invalid("a sealed secret is base64"))?;
+        Ok(Secret::new(self.vault.open_for(purpose, &self.project_id, name, &blob)?))
     }
 }
 

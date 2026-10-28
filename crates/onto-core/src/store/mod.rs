@@ -30,6 +30,9 @@ use crate::changes::{
 use crate::graph::LinkKey;
 use crate::leases::{Fence, Lease, Timer, Wake, lease_lost, no_leases};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
+use crate::outbox::{
+    Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, no_outbox, replay_states,
+};
 use crate::time::now_ms;
 use crate::trace::{
     self, MetricsQuery, ScoreRow, SessionPage, SessionQuery, TraceDetail, TraceMetrics, TracePage, TraceQuery,
@@ -159,6 +162,11 @@ pub struct WriteBatch {
     /// commit (store clock): a store with a shared wake table bumps the
     /// tenant's row in the same transaction ([`crate::leases`]).
     pub wake: Option<i64>,
+    /// Outbox rows inserted in the same transaction ([`crate::outbox`]);
+    /// the store sets their `created_at` and `next_at` by its clock. Keys
+    /// are unique by construction: a duplicate `(target, dedupe)` fails the
+    /// whole write with `Error::Conflict`.
+    pub outbox: Vec<OutboxRow>,
 }
 
 impl WriteBatch {
@@ -224,6 +232,7 @@ impl WriteBatch {
             && self.link_versions.is_empty()
             && self.kv.is_empty()
             && self.reembed.is_empty()
+            && self.outbox.is_empty()
     }
 }
 
@@ -403,6 +412,91 @@ pub trait Store: Send + Sync {
         Ok(true)
     }
 
+    // ── outbox (docs/design/EVENTS.md B.1); stores without one refuse ──
+    // Times are the store's clock. Rows committed with a graph change come
+    // through `WriteBatch::outbox`; none of these goes through the commit log.
+
+    /// Does this store keep an outbox?
+    fn keeps_outbox(&self) -> bool {
+        false
+    }
+    /// Insert rows unless their `(target, dedupe)` exists (those are
+    /// skipped), and move the consumer `advance.0` to `advance.1`, in one
+    /// transaction; with a fence, only while that lease is held at its epoch
+    /// (otherwise "lease lost" and nothing is written). Returns the rows
+    /// inserted. Bumps the tenant's wake row when it inserted any.
+    fn outbox_enqueue(
+        &self,
+        _rows: &[OutboxRow],
+        _advance: Option<(&str, Cursor)>,
+        _fence: Option<&Fence>,
+    ) -> Result<usize> {
+        Err(no_outbox())
+    }
+    /// Claim up to `limit` due rows (pending or retry whose `next_at` passed,
+    /// or inflight whose lease ended), earliest first, skipping rows of
+    /// `skip_targets` and rows another claim is taking right now: each gets
+    /// state `inflight`, a fresh claim token starting with `holder`, a lease
+    /// of `lease_ms` and one more attempt.
+    fn outbox_claim(
+        &self,
+        _limit: usize,
+        _lease_ms: i64,
+        _holder: &str,
+        _skip_targets: &[String],
+    ) -> Result<Vec<OutboxRow>> {
+        Err(no_outbox())
+    }
+    /// Record an attempt and move the row to `next` (`retry`: due `delay_ms`
+    /// from now; `delivered` also stamps `delivered_at`), only while `claim`
+    /// is still the row's claim token. Returns false (and changes nothing)
+    /// when it is not: the lease expired and another worker claimed it.
+    fn outbox_finish(
+        &self,
+        _id: &str,
+        _claim: &str,
+        _attempt: &Attempt,
+        _next: OutboxState,
+        _delay_ms: i64,
+    ) -> Result<bool> {
+        Err(no_outbox())
+    }
+    /// Give a claimed row back unsent (kill switch, paused endpoint, a lease
+    /// too short to send it in): its attempt is not counted. Only while
+    /// `claim` is its token.
+    fn outbox_release(&self, _id: &str, _claim: &str) -> Result<bool> {
+        Err(no_outbox())
+    }
+    /// One row.
+    fn outbox_get(&self, _id: &str) -> Result<Option<OutboxRow>> {
+        Err(no_outbox())
+    }
+    /// Rows matching `q`, newest first (ties by id, descending).
+    fn outbox_list(&self, _q: &OutboxQuery) -> Result<Vec<OutboxRow>> {
+        Err(no_outbox())
+    }
+    /// Replay: rows of `target` selected by `sel` whose state is one of
+    /// [`replay_states(states)`](crate::outbox::replay_states) go back to
+    /// `pending`, due now, with no attempts and no claim. They keep their
+    /// id, so receivers see the same event id again. Returns how many.
+    fn outbox_reset(&self, _target: &str, _sel: &OutboxSelect, _states: &[OutboxState]) -> Result<usize> {
+        Err(no_outbox())
+    }
+    /// The attempts of a row, newest first, at most `limit`.
+    fn outbox_attempts(&self, _id: &str, _limit: usize) -> Result<Vec<AttemptRecord>> {
+        Err(no_outbox())
+    }
+    /// When the next row is due: the earliest `next_at` of pending and retry
+    /// rows, or `lease_until` of inflight ones.
+    fn outbox_next_due(&self) -> Result<Option<i64>> {
+        Err(no_outbox())
+    }
+    /// Delete finished rows (delivered, dead, cancelled) created before
+    /// `before_ms`, and attempts logged before it. Returns the rows deleted.
+    fn outbox_vacuum(&self, _before_ms: i64) -> Result<u64> {
+        Err(no_outbox())
+    }
+
     /// Newest first.
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>>;
     fn kv_put(&self, ns: &str, key: &str, value: &Value, expires_at: Option<i64>) -> Result<()>;
@@ -537,6 +631,11 @@ struct MemInner {
     consumers: HashMap<String, Cursor>,
     /// name -> (due_at, doc)
     timers: HashMap<String, (i64, Value)>,
+    /// id -> row
+    outbox: HashMap<String, OutboxRow>,
+    /// (target, dedupe) of every row in `outbox`
+    outbox_keys: HashSet<(String, String)>,
+    attempts: Vec<AttemptRecord>,
 }
 
 struct MemLease {
@@ -546,6 +645,43 @@ struct MemLease {
 }
 
 impl MemInner {
+    /// Insert outbox rows (times by the store's clock); with `strict`, a
+    /// duplicate key fails before anything is inserted, otherwise it is skipped.
+    fn outbox_insert(&mut self, rows: &[OutboxRow], strict: bool) -> Result<usize> {
+        if strict {
+            let mut seen = HashSet::new();
+            for r in rows {
+                let key = (r.target.clone(), r.dedupe.clone());
+                if self.outbox_keys.contains(&key) || self.outbox.contains_key(&r.id) || !seen.insert(key) {
+                    return Err(Error::Conflict(format!(
+                        "duplicate key: outbox row ({}, {}) exists",
+                        r.target, r.dedupe
+                    )));
+                }
+            }
+        }
+        let now = now_ms();
+        let mut n = 0;
+        for r in rows {
+            let key = (r.target.clone(), r.dedupe.clone());
+            if self.outbox_keys.contains(&key) || self.outbox.contains_key(&r.id) {
+                continue;
+            }
+            let mut r = r.clone();
+            r.created_at = now;
+            r.next_at = now;
+            r.state = OutboxState::Pending;
+            r.attempts = 0;
+            r.claim = None;
+            r.lease_until = None;
+            r.delivered_at = None;
+            self.outbox_keys.insert(key);
+            self.outbox.insert(r.id.clone(), r);
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// The fence's lease is held by its holder at its epoch right now.
     fn check_fence(&self, f: &Fence) -> Result<()> {
         match self.leases.get(&f.name) {
@@ -585,6 +721,8 @@ impl MemoryStore {
         if let Some(f) = &batch.fence {
             inner.check_fence(f)?;
         }
+        // Before anything else is written: a duplicate key fails the write.
+        inner.outbox_insert(&batch.outbox, true)?;
         for e in &batch.events {
             if inner.events.len() >= self.max_events {
                 inner.events.pop_front();
@@ -863,6 +1001,184 @@ impl Store for MemoryStore {
             }
             _ => Ok(false),
         }
+    }
+
+    fn keeps_outbox(&self) -> bool {
+        true
+    }
+
+    fn outbox_enqueue(
+        &self,
+        rows: &[OutboxRow],
+        advance: Option<(&str, Cursor)>,
+        fence: Option<&Fence>,
+    ) -> Result<usize> {
+        for r in rows {
+            crate::outbox::check_row(r)?;
+        }
+        let mut inner = self.inner.lock();
+        if let Some(f) = fence {
+            inner.check_fence(f)?;
+        }
+        let n = inner.outbox_insert(rows, false)?;
+        if let Some((name, cursor)) = advance {
+            inner.consumers.insert(name.to_string(), cursor);
+        }
+        Ok(n)
+    }
+
+    fn outbox_claim(
+        &self,
+        limit: usize,
+        lease_ms: i64,
+        holder: &str,
+        skip_targets: &[String],
+    ) -> Result<Vec<OutboxRow>> {
+        let now = now_ms();
+        let mut inner = self.inner.lock();
+        let mut due: Vec<(i64, String)> = inner
+            .outbox
+            .values()
+            .filter(|r| !skip_targets.contains(&r.target))
+            .filter(|r| match r.state {
+                OutboxState::Pending | OutboxState::Retry => r.next_at <= now,
+                OutboxState::Inflight => r.lease_until.is_some_and(|l| l < now),
+                _ => false,
+            })
+            .map(|r| (r.next_at, r.id.clone()))
+            .collect();
+        due.sort();
+        due.truncate(limit);
+        let mut out = Vec::with_capacity(due.len());
+        for (_, id) in due {
+            if let Some(r) = inner.outbox.get_mut(&id) {
+                r.state = OutboxState::Inflight;
+                r.claim = Some(format!("{holder}:{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)));
+                r.lease_until = Some(now.saturating_add(lease_ms.max(0)));
+                r.attempts += 1;
+                out.push(r.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn outbox_finish(
+        &self,
+        id: &str,
+        claim: &str,
+        attempt: &Attempt,
+        next: OutboxState,
+        delay_ms: i64,
+    ) -> Result<bool> {
+        let now = now_ms();
+        let mut inner = self.inner.lock();
+        let Some(r) = inner.outbox.get_mut(id).filter(|r| r.claim.as_deref() == Some(claim)) else {
+            return Ok(false);
+        };
+        r.state = next;
+        r.claim = None;
+        r.lease_until = None;
+        r.last_status = attempt.status;
+        r.last_error = attempt.error.clone();
+        if next == OutboxState::Retry {
+            r.next_at = now.saturating_add(delay_ms.max(0));
+        }
+        if next == OutboxState::Delivered {
+            r.delivered_at = Some(now);
+        }
+        let rec = AttemptRecord {
+            outbox_id: id.to_string(),
+            attempt: r.attempts,
+            ts: now,
+            state: next,
+            result: attempt.clone(),
+        };
+        inner.attempts.push(rec);
+        if inner.attempts.len() > self.max_events {
+            inner.attempts.remove(0);
+        }
+        Ok(true)
+    }
+
+    fn outbox_release(&self, id: &str, claim: &str) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let Some(r) = inner.outbox.get_mut(id).filter(|r| r.claim.as_deref() == Some(claim)) else {
+            return Ok(false);
+        };
+        r.attempts = r.attempts.saturating_sub(1);
+        r.state = if r.attempts == 0 { OutboxState::Pending } else { OutboxState::Retry };
+        r.claim = None;
+        r.lease_until = None;
+        Ok(true)
+    }
+
+    fn outbox_get(&self, id: &str) -> Result<Option<OutboxRow>> {
+        Ok(self.inner.lock().outbox.get(id).cloned())
+    }
+
+    fn outbox_list(&self, q: &OutboxQuery) -> Result<Vec<OutboxRow>> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<OutboxRow> = inner.outbox.values().filter(|r| q.matches(r)).cloned().collect();
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        rows.truncate(q.limit());
+        Ok(rows)
+    }
+
+    fn outbox_reset(&self, target: &str, sel: &OutboxSelect, states: &[OutboxState]) -> Result<usize> {
+        let states = replay_states(states);
+        let now = now_ms();
+        let mut inner = self.inner.lock();
+        let mut n = 0;
+        for r in inner.outbox.values_mut() {
+            let picked = match sel {
+                OutboxSelect::Ids(ids) => ids.contains(&r.id),
+                OutboxSelect::Since(t) => r.created_at >= *t,
+            };
+            if r.target == target && picked && states.contains(&r.state) {
+                r.state = OutboxState::Pending;
+                r.attempts = 0;
+                r.next_at = now;
+                r.claim = None;
+                r.lease_until = None;
+                r.delivered_at = None;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    fn outbox_attempts(&self, id: &str, limit: usize) -> Result<Vec<AttemptRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner.attempts.iter().rev().filter(|a| a.outbox_id == id).take(limit).cloned().collect())
+    }
+
+    fn outbox_next_due(&self) -> Result<Option<i64>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .outbox
+            .values()
+            .filter_map(|r| match r.state {
+                OutboxState::Pending | OutboxState::Retry => Some(r.next_at),
+                OutboxState::Inflight => r.lease_until,
+                _ => None,
+            })
+            .min())
+    }
+
+    fn outbox_vacuum(&self, before_ms: i64) -> Result<u64> {
+        let mut inner = self.inner.lock();
+        let MemInner { outbox, outbox_keys, attempts, .. } = &mut *inner;
+        let mut n = 0u64;
+        outbox.retain(|_, r| {
+            let gone = !r.state.is_open() && r.created_at < before_ms;
+            if gone {
+                outbox_keys.remove(&(r.target.clone(), r.dedupe.clone()));
+                n += 1;
+            }
+            !gone
+        });
+        attempts.retain(|a| a.ts >= before_ms);
+        Ok(n)
     }
 
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>> {

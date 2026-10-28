@@ -40,6 +40,7 @@ pub mod metrics;
 pub mod model;
 pub mod modeling;
 pub mod objects;
+pub mod outbox;
 pub mod packs;
 pub mod policy;
 pub mod profile;

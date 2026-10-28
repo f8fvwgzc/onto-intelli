@@ -43,6 +43,8 @@ pub struct Config {
     /// Reading the change feed (`changes.poll`). Capture itself is a tenant
     /// property (`changes.capture`), not process configuration.
     pub changes: ChangesConfig,
+    /// Webhook delivery from the outbox (docs/design/EVENTS.md Part B).
+    pub webhooks: WebhooksConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -798,6 +800,119 @@ impl ChangesConfig {
             keep_ms: (self.retain_days > 0).then(|| self.retain_days as i64 * 86_400_000),
             keep_rows: (self.retain_max_rows > 0).then_some(self.retain_max_rows),
         }
+    }
+}
+
+/// `[webhooks]`: delivering the outbox (docs/design/EVENTS.md Part B). Each
+/// row is enqueued once per endpoint and delivered at least once; receivers
+/// dedupe on the event id. Delivery concurrency limits are per process.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhooksConfig {
+    /// Run the delivery worker in this process (`false`: the process kill
+    /// switch; rows wait in the outbox).
+    pub enabled: bool,
+    /// Endpoints per tenant (enforced when one is added).
+    pub max_endpoints: usize,
+    /// Seconds one request may take.
+    pub timeout_secs: u64,
+    /// The worker looks for due rows at least this often (it also wakes on
+    /// commits that enqueue rows).
+    pub poll_secs: u64,
+    /// Attempts before a row is dead.
+    pub max_attempts: u32,
+    /// Retry delay: `min(base * 2^(attempt-1), max)` with ±20% jitter;
+    /// `Retry-After` is honoured up to the max.
+    pub backoff_base_secs: u64,
+    pub backoff_max_secs: u64,
+    /// Bodies larger than this are not sent (`dead: payload_too_large`).
+    pub max_payload_bytes: usize,
+    /// Requests in flight per endpoint in this process.
+    pub max_in_flight_per_endpoint: usize,
+    /// Requests in flight per tenant in this process.
+    pub max_in_flight_per_tenant: usize,
+    /// Requests in flight in this process, all tenants together.
+    pub max_in_flight_process: usize,
+    /// Consecutive failures that pause an endpoint (the breaker opens) …
+    pub pause_after_failures: u32,
+    /// … for this long; then one probe is sent (half-open). A failed probe
+    /// doubles the pause, up to an hour.
+    pub pause_secs: u64,
+    /// Undelivered rows an endpoint may have before fan-out pauses it.
+    pub pending_cap: u64,
+    /// Finished rows and attempt logs older than this are removed.
+    pub retain_days: u64,
+    /// Operator rules: a host that may resolve into private CIDRs. Never
+    /// applied to endpoints or targets a project registered.
+    pub allow: Vec<AllowConfig>,
+}
+
+/// `[[webhooks.allow]]`: `host` (`hooks.internal.example` or
+/// `*.suffix`) may resolve only into `cidrs`. Link-local and metadata
+/// ranges are never reachable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllowConfig {
+    pub host: String,
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_endpoints: 50,
+            timeout_secs: 10,
+            poll_secs: 20,
+            max_attempts: 15,
+            backoff_base_secs: 10,
+            backoff_max_secs: 3600,
+            max_payload_bytes: 262_144,
+            max_in_flight_per_endpoint: 4,
+            max_in_flight_per_tenant: 8,
+            max_in_flight_process: 64,
+            pause_after_failures: 20,
+            pause_secs: 300,
+            pending_cap: 100_000,
+            retain_days: 14,
+            allow: Vec::new(),
+        }
+    }
+}
+
+impl WebhooksConfig {
+    /// Every limit and time is at least 1, the backoff maximum is not below
+    /// its base, and the allow rules parse.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [
+            ("max_endpoints", self.max_endpoints as u64),
+            ("timeout_secs", self.timeout_secs),
+            ("poll_secs", self.poll_secs),
+            ("max_attempts", self.max_attempts as u64),
+            ("backoff_base_secs", self.backoff_base_secs),
+            ("backoff_max_secs", self.backoff_max_secs),
+            ("max_payload_bytes", self.max_payload_bytes as u64),
+            ("max_in_flight_per_endpoint", self.max_in_flight_per_endpoint as u64),
+            ("max_in_flight_per_tenant", self.max_in_flight_per_tenant as u64),
+            ("max_in_flight_process", self.max_in_flight_process as u64),
+            ("pause_after_failures", self.pause_after_failures as u64),
+            ("pause_secs", self.pause_secs),
+            ("pending_cap", self.pending_cap),
+            ("retain_days", self.retain_days),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("webhooks.{name} = {v} (at least 1)")));
+        }
+        if self.backoff_max_secs < self.backoff_base_secs {
+            return Err(Error::Config("webhooks.backoff_max_secs is below backoff_base_secs".into()));
+        }
+        self.allow_rules()?;
+        Ok(())
+    }
+
+    /// The parsed `[[webhooks.allow]]` rules.
+    pub fn allow_rules(&self) -> Result<Vec<crate::net::AllowRule>> {
+        self.allow.iter().map(|a| crate::net::AllowRule::new(&a.host, &a.cidrs)).collect()
     }
 }
 

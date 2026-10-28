@@ -40,7 +40,7 @@ section 7.
 | D10 | Runs are claimed first (`INSERT … ON CONFLICT (automation, trigger_key) DO NOTHING RETURNING id`) in their own statement, then executed in one `transact` that re-plans against the locked graph and commits the graph edits, receipt, outbox rows and the finished run row together, fenced by the consumer lease epoch. | A duplicate trigger is skipped before any work, never retried; a crash leaves a `running` row that recovery re-executes safely, because the second commit is atomic. |
 | D11 | No sync external effects in phase 1. Writeback is async through the outbox, HTTP only, with `Idempotency-Key: <receipt>:<effect>`. A writeback effect makes the plan not reversible, so it needs a person's confirmation unless the action type declares `unattended` for agents or automations (a schema-governed, approved declaration). | Without 2PC, sync external writes can run twice or run with no record. Compensation is not an inverse, so "reversible" would be a false word. |
 | D12 | Leases, outbox claims and timers use the database clock (`now_ms()` in SQL), and every lease has an epoch that commits check (fencing). | Process clocks skew; a paused process can wake up believing it still holds a lease. |
-| D13 | Webhook envelope: CloudEvents 1.0 structured JSON; signature: Standard Webhooks (`webhook-id`, `webhook-timestamp`, `webhook-signature`). Owner to confirm as the platform-wide format for all four cores (section 16). | Published standards with verifier libraries in most languages, instead of an onto-only format. |
+| D13 | Webhook envelope: CloudEvents 1.0 structured JSON; signature: Standard Webhooks (`webhook-id`, `webhook-timestamp`, `webhook-signature`). Decided by the owner on 2026-10-28 as the platform-wide format for all four cores (section 16 item 1). | Published standards with verifier libraries in most languages, instead of an onto-only format. |
 | D14 | Mutating outbound configuration (endpoints, targets, enablement) requires the caller to dominate the principal the configuration acts as (section 6.1). | Admin roles are scoped to workspaces (policy.rs:23-24, 177-179); `is_privileged()` alone lets a narrower admin redirect a broader endpoint. |
 | D15 | Service principal ids are reserved: `automation:`, `webhook:`, `connector:`, `system`. No credential may act as them. | `act_for` (auth.rs:211-258) accepts any `x-onto-act-as` id today, so a service token could read and undo every receipt an automation wrote. |
 | D16 | `env:` and `file:` references are allowed only to the operator credential itself (config token or dev, no `act-as`), checked by an allowlist of actions that accept references. Errors never echo resolved values. | `guard_project_call` acts only when `credential.is_project()` (auth.rs:716); an impersonating config token is not a project credential. |
@@ -524,7 +524,7 @@ pub enum SecretRef { Env(String), File(PathBuf), Sealed(String) } // "env:X" | "
 
 ### B.3 Envelope and signature
 
-CloudEvents 1.0, structured JSON (owner to confirm platform-wide, section 16 item 1):
+CloudEvents 1.0, structured JSON (the platform-wide format, decided by the owner on 2026-10-28; section 16 item 1):
 
 ```json
 { "specversion": "1.0", "id": "obx_…", "source": "onto-intelli://acme", "type": "onto.entity.update",
@@ -1030,6 +1030,11 @@ CREATE CONSTRAINT TRIGGER commits_capture AFTER INSERT ON {schema}.commits
 (`commit_touches_schema` checks the commit's `kv` list for the live-schema KV keys; written in the
 same migration.)
 
+(As built, the migrations are numbered after the branch's own: `0010_leases.sql` holds `now_ms`,
+`leases`, `consumers` and `timers` (build step 7), `0011_outbox.sql` holds `outbox` and
+`delivery_attempts` (build step 8), and the Automate tables come in the next free number (build step
+10). Released migrations are never edited.)
+
 `0010_outbox.sql`: `now_ms()` (`SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint`);
 `outbox` (columns of B.1, `claim TEXT`, `UNIQUE (target, dedupe)`, partial index on `next_at` for
 `pending|retry|inflight`, indexes on `(target, created_at)` and `receipt`); `delivery_attempts`
@@ -1222,12 +1227,15 @@ cross-tenant subscriptions.
 
 ## 16. Decisions that need the owner
 
-1. **Platform-wide webhook format.** Phase 1 implements CloudEvents 1.0 with Standard Webhooks
-   signatures (D13). Confirm it becomes the shared format for Tutela, attache, onto-intelli and
-   texc-symphony, or name another before build step 8 ships.
-2. **Service principals.** `automation:<name>` and `webhook:<name>` are identities, which Tutela
-   owns. Phase 1 declares them locally with a 30-day enablement TTL and reserved id prefixes. Accept
-   that for phase 1, or require Tutela-minted principals before build step 11?
+Items 1 and 2 were decided by the owner on 2026-10-28 (the design's defaults); items 3 to 5 stay open.
+
+1. **Platform-wide webhook format.** *Decided 2026-10-28:* CloudEvents 1.0 structured JSON with
+   Standard Webhooks signatures (D13) is the shared format for Tutela, attache, onto-intelli and
+   texc-symphony. (The question was: confirm it, or name another before build step 8 ships.)
+2. **Service principals.** *Decided 2026-10-28:* phase 1 declares `automation:<name>` and
+   `webhook:<name>` locally, with a 30-day enablement TTL (`[automation] enable_ttl_days = 30`) and
+   the reserved id prefixes of section 6.2, until Tutela issues them. (The question was: accept that
+   for phase 1, or require Tutela-minted principals before build step 11.)
 3. **Schedules.** Should cron schedules live in texc-symphony (recommended: onto keeps only
    ontology-native triggers) or in onto Automate?
 4. **SQL writeback ownership.** Writing into customer databases is integration work. Should it live
@@ -1407,3 +1415,31 @@ Each critique point was checked against the code before deciding.
     capture off; generated secrets need a sealer, otherwise `env:`/`file:`; per-process in-flight
     limits documented; half-open breaker; Records types (which do not exist in code yet) get a
     `Schema::captures` hook so they are excluded when they land.
+
+## Build notes
+
+Choices made while building, where this document was silent or out of date.
+
+Build step 8 (outbox and delivery):
+
+- Migrations: `0011_outbox.sql` (section 9 named it `0010_outbox.sql`; 0010 was already taken).
+  `delivery_attempts` is keyed by `(outbox_id, claim)`, so a replayed row's attempts never collide
+  with its earlier ones; it is append-only like the audit trail (retention alone deletes).
+- Store additions beyond B.1: `outbox_claim` also takes the targets to skip (disabled, paused,
+  breaker-open or at their in-flight limit), so their rows are not claimed and released every pass;
+  `outbox_release` gives a claimed row back unsent without counting the attempt (kill switch, a lease
+  too short to finish in); `outbox_get`, `outbox_attempts`, `outbox_next_due` (for the wake row) and
+  `outbox_vacuum` (`[webhooks] retain_days`). A claim token is `<holder>:<uuid>`.
+- `changes_get(cursor)` is `Ontology::change_at(principal, cursor, fields)`: the record as the
+  endpoint principal sees it now, `NotVisible` (row `cancelled: not_visible`) or `Expired` (row
+  `dead: expired`). The delivery worker already renders change rows; fan-out (step 9) enqueues them.
+- Breakers live in `webhook.control` (`breaker:<endpoint>`), not in the endpoint value, so a pause
+  never bumps the endpoint `version` (which is part of automation closure hashes) and never races an
+  admin's update. Consecutive failures are counted per process; the open state is shared.
+- A signing secret without the `whsec_` prefix is used as its bytes (a `whsec_` secret is base64
+  after the prefix); the Rust, TypeScript and Python verifiers do the same. The verifiers accept a
+  body whose envelope `id` is absent and refuse one whose `id` is not the `webhook-id`.
+- Errors that are policy refusals (a URL the SSRF guard refuses, including at DNS time) make the row
+  `dead`; a secret reference that does not resolve is retried, since an operator can fix it.
+- Deferred: delivery traces (B.7 `[traces] deliveries`); only `traceparent` is sent in step 8.
+

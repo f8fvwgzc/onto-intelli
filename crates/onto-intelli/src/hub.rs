@@ -56,6 +56,41 @@ pub struct TenantSettings {
     pub version: u64,
     /// Trace retention and content capture (`None` fields: `[traces]`).
     pub traces: crate::trace::TraceSettings,
+    /// Seals and opens the tenant's outbound secrets (webhook signing
+    /// secrets); `None` without `ONTO_MASTER_KEY`: plaintext and generated
+    /// secrets are refused, the operator registers `env:` or `file:` ones.
+    pub secrets: Option<Arc<dyn SecretBox>>,
+}
+
+/// A secret in memory: never printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(Vec<u8>);
+
+impl Secret {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
+/// Envelope encryption of a tenant's outbound secrets (the control plane's
+/// vault). `purpose` (`webhook-secret`, …) and `name` (the endpoint) are
+/// bound to the sealed value, with the project, so a sealed value cannot be
+/// moved to another endpoint or project. Errors never contain the secret.
+pub trait SecretBox: Send + Sync {
+    /// The sealed value (base64), stored as `sealed:v1:<value>`.
+    fn seal(&self, purpose: &str, name: &str, plain: &[u8]) -> Result<String>;
+    /// The plaintext of a value [`seal`](Self::seal) returned for the same purpose and name.
+    fn open(&self, purpose: &str, name: &str, sealed: &str) -> Result<Secret>;
 }
 
 impl std::fmt::Debug for TenantSettings {
@@ -66,6 +101,7 @@ impl std::fmt::Debug for TenantSettings {
             .field("meter", &self.meter.is_some())
             .field("version", &self.version)
             .field("traces", &self.traces)
+            .field("secrets", &self.secrets.is_some())
             .finish()
     }
 }
@@ -231,6 +267,7 @@ impl Hub {
         intelli.set_limits(s.limits);
         intelli.set_meter(s.meter);
         intelli.set_trace_settings(s.traces);
+        intelli.set_secrets(s.secrets);
     }
 
     pub fn config(&self) -> &Config {

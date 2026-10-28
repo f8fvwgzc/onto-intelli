@@ -206,6 +206,11 @@ pub struct Intelli {
     closing: watch::Sender<bool>,
     /// When an open stream last sent a heartbeat (ms; 0 = never).
     stream_touch: AtomicI64,
+    /// Seals and opens outbound secrets (the control plane's vault).
+    secrets: parking_lot::RwLock<Option<Arc<dyn crate::hub::SecretBox>>>,
+    /// Wakes the delivery worker: a commit enqueued outbox rows, or another
+    /// process committed.
+    outbox_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Intelli {
@@ -233,6 +238,7 @@ impl Intelli {
         config.traces.check()?;
         config.mcp.check()?;
         config.changes.check()?;
+        config.webhooks.check()?;
         let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,
@@ -252,7 +258,18 @@ impl Intelli {
         let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
         let crawl = config.connectors.clone();
         let changes = ChangeHub::new(&onto, config.changes.clone());
+        let outbox_wake = Arc::new(tokio::sync::Notify::new());
+        let wake = outbox_wake.clone();
+        onto.on_change(move |c| {
+            // Rows this process enqueued, or another process's commit (which
+            // may have enqueued some): look for due rows now.
+            if c.outbox > 0 || c.request_id == "sync" {
+                wake.notify_one();
+            }
+        });
         let me = Arc::new(Self {
+            secrets: parking_lot::RwLock::new(None),
+            outbox_wake,
             changes,
             closing: watch::Sender::new(false),
             stream_touch: AtomicI64::new(0),
@@ -284,6 +301,8 @@ impl Intelli {
         if me.onto.store().keeps_changes() {
             spawn_change_retention(&me);
         }
+        #[cfg(feature = "outbound")]
+        crate::webhooks::spawn_delivery(&me, me.outbox_wake.clone())?;
         Ok(me)
     }
 
@@ -364,6 +383,21 @@ impl Intelli {
     /// with `tenant_closed`). The hub calls it when it forgets the tenant.
     pub fn close(&self) {
         self.closing.send_replace(true);
+    }
+
+    /// The tenant's sealer of outbound secrets (`None` without a master key).
+    pub fn secrets(&self) -> Option<Arc<dyn crate::hub::SecretBox>> {
+        self.secrets.read().clone()
+    }
+
+    /// Set by the hub from the tenant's settings.
+    pub fn set_secrets(&self, s: Option<Arc<dyn crate::hub::SecretBox>>) {
+        *self.secrets.write() = s;
+    }
+
+    /// Wake the delivery worker (rows were enqueued or replayed).
+    pub fn wake_outbox(&self) {
+        self.outbox_wake.notify_one();
     }
 
     pub fn is_closing(&self) -> bool {

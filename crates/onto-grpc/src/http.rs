@@ -76,7 +76,7 @@ use serde_json::{Value, json};
 
 use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, AuthError, Caller, Credential, guard_project_call, workspace_header};
+use crate::auth::{Auth, AuthError, Caller, Credential, guard_call, workspace_header};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -205,7 +205,7 @@ pub(crate) async fn run(state: &AppState, headers: &HeaderMap, action: &str, inp
         Err(r) => return *r,
     };
     let mut input = with_workspace(input, headers);
-    if let Err(e) = guard_project_call(&c.credential, action, &mut input, state.auth.allow_private_urls()).await {
+    if let Err(e) = guard_call(&c.credential, &c.principal, action, &mut input, state.auth.allow_private_urls()).await {
         return error_response(&e);
     }
     let ctx = crate::observe::trace_ctx(headers, &c, "http");
@@ -888,7 +888,7 @@ async fn changes_stream(s: AppState, headers: HeaderMap, input: Value) -> Respon
         Err(r) => return *r,
     };
     let mut input = input;
-    if let Err(e) = guard_project_call(&c.credential, ACTION, &mut input, s.auth.allow_private_urls()).await {
+    if let Err(e) = guard_call(&c.credential, &c.principal, ACTION, &mut input, s.auth.allow_private_urls()).await {
         return error_response(&e);
     }
     if let Err(e) = intelli.admit(&c.principal, ACTION, &input) {

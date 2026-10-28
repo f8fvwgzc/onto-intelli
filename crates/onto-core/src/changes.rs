@@ -637,6 +637,16 @@ impl ChangeFilter {
     }
 }
 
+/// One record as one reader sees it now ([`Ontology::change_at`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChangeAt {
+    Visible(Box<ChangeRecord>),
+    /// The reader may not see it now, or there is no record at the cursor.
+    NotVisible,
+    /// The cursor is below the floor: the record was removed by retention.
+    Expired,
+}
+
 /// One page of the change feed for one reader.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChangePage {
@@ -1216,6 +1226,29 @@ impl Ontology {
             }
         }
         Ok(ChangePage { changes, next, head, floor, expired: false })
+    }
+
+    /// The record at `cursor` as `p` sees it now (outbox rows that hold only
+    /// a cursor are rendered with it when they are sent): `Expired` when the
+    /// cursor is below the floor, `NotVisible` when `p` may not see it now
+    /// (or it does not exist).
+    pub fn change_at(&self, p: &Principal, cursor: Cursor, fields: FieldMode) -> Result<ChangeAt> {
+        let after = match (cursor.seq, cursor.n) {
+            (seq, n) if n > 0 => Cursor::new(seq, n - 1),
+            (0, _) => Cursor::default(),
+            (seq, _) => Cursor::new(seq - 1, u32::MAX),
+        };
+        let f = ChangeFilter { fields, ..Default::default() };
+        // Valid from the cursor's own commit: its records are kept while it
+        // is the floor's, so the exact retention edge is not a false expiry.
+        let page = self.changes_page_valid_from(p, after, cursor.seq, &f, 1)?;
+        if page.expired {
+            return Ok(ChangeAt::Expired);
+        }
+        Ok(match page.changes.into_iter().next() {
+            Some(r) if r.cursor == cursor => ChangeAt::Visible(Box::new(r)),
+            _ => ChangeAt::NotVisible,
+        })
     }
 
     /// The newest position of the change feed.

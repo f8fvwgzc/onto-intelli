@@ -44,6 +44,8 @@ export { parseSse } from "./sse.ts";
 export type { SseMessage } from "./sse.ts";
 export { Changes } from "./changes.ts";
 export type { ChangesTransport, PollOptions, SubscribeOptions } from "./changes.ts";
+export { WEBHOOK_TOLERANCE_SECS, WebhookVerificationError, signWebhook, signingKey, verifyWebhook } from "./webhooks.ts";
+export type { CloudEvent, VerifyOptions, WebhookHeaders } from "./webhooks.ts";
 
 export const VERSION = "0.2.0";
 

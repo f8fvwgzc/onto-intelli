@@ -126,6 +126,7 @@ impl Ontology {
                 request_id: "sync".into(),
                 entities: Vec::new(),
                 links: report.links,
+                outbox: 0,
             };
             for l in self.inner.listeners.read().clone() {
                 l(&change);

@@ -117,6 +117,13 @@ pub struct ChangeSet {
     pub request_id: String,
     pub entities: Vec<Id>,
     pub links: usize,
+    /// Outbox rows the commit inserted (delivery workers wake on them).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub outbox: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,11 +206,17 @@ pub(crate) struct Extra {
     pub fence: Option<crate::leases::Fence>,
     /// Background work is due this many milliseconds after the commit ([`WriteBatch::wake`]).
     pub wake: Option<i64>,
+    /// Outbox rows inserted in the same commit ([`WriteBatch::outbox`]).
+    pub outbox: Vec<crate::outbox::OutboxRow>,
 }
 
 impl Extra {
     fn is_empty(&self) -> bool {
-        self.kv.is_empty() && self.redirects.is_empty() && self.events.is_empty() && self.schema.is_none()
+        self.kv.is_empty()
+            && self.redirects.is_empty()
+            && self.events.is_empty()
+            && self.schema.is_none()
+            && self.outbox.is_empty()
     }
 }
 
@@ -1386,6 +1399,18 @@ impl Ontology {
             staged.batch.fence = Some(fence);
         }
         staged.batch.wake = extra.wake;
+        if !extra.outbox.is_empty() {
+            if !self.inner.store.keeps_outbox() {
+                return Err(crate::outbox::no_outbox());
+            }
+            for r in &extra.outbox {
+                crate::outbox::check_row(r)?;
+            }
+            // The tenant has deliveries due now (closed tenants are woken).
+            staged.batch.wake = Some(staged.batch.wake.map_or(0, |w| w.min(0)));
+        }
+        let outbox = extra.outbox.len();
+        staged.batch.outbox = extra.outbox;
         let seq = self.inner.store.write(&staged.batch)?;
         if staged.batch.changes_state() {
             self.inner.seq.store(seq, Ordering::SeqCst);
@@ -1450,7 +1475,7 @@ impl Ontology {
         let wrote = schema_changed
             || !(staged.batch.put_entities.is_empty() && staged.batch.del_entities.is_empty() && links == 0);
         let revision = if wrote { self.inner.revision.fetch_add(1, Ordering::SeqCst) + 1 } else { self.revision() };
-        if wrote {
+        if wrote || outbox > 0 {
             let change = ChangeSet {
                 revision,
                 seq: self.seq(),
@@ -1458,6 +1483,7 @@ impl Ontology {
                 request_id: ctx.request_id.clone(),
                 entities: staged.touched.clone(),
                 links,
+                outbox,
             };
             let listeners = self.inner.listeners.read().clone();
             for l in listeners {

@@ -221,6 +221,7 @@ mod hooks {
             meter: Some(meter.clone()),
             version: 2,
             traces: onto_intelli::trace::TraceSettings { retention_days: Some(3), capture_content: Some(false) },
+            secrets: None,
         };
         assert_eq!(t.call(&p, "intelli.ask", q.clone()).await.unwrap()["provider"], "mock", "until refreshed");
         assert!((t.trace_retention_days(), t.captures_content()) == (30, true));

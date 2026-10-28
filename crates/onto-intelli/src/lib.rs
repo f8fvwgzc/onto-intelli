@@ -48,6 +48,7 @@ pub mod resolve;
 pub mod seed;
 pub mod token;
 pub mod trace;
+pub mod webhooks;
 
 pub use onto_core as core;
 pub use onto_core::{

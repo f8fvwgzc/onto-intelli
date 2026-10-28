@@ -719,25 +719,69 @@ fn token_tenant(id: &str, allowed: &[String], asked: Option<String>) -> std::res
     }
 }
 
-/// Calls a project credential (API key, console session) may not make,
-/// because they would act on the server rather than the project: a
-/// connector whose URL is `env:VAR` (it would read the server's
-/// environment) or a filesystem path, a repository connector whose git URL
-/// fails the SSRF rules (`https://` resolving only to public addresses,
-/// unless `allow_private`, which is `console.allow_private_urls`), and a
-/// PostgreSQL connector whose URL fails them (a TCP host resolving only to
-/// public addresses, no Unix socket, no `host`/`hostaddr`/`port`/`options`
-/// or SSL file parameters). A connector such a credential registers is
-/// marked `restricted` in `input`, whatever the input said, so every crawl
-/// checks its URL again and connects only to the addresses it checked.
-/// Operators (config tokens, the CLI) are not limited.
-pub async fn guard_project_call(
+/// Actions whose inputs may hold server references (`env:VAR`,
+/// `file:/path`; docs/design/EVENTS.md section 6.3). In every other action
+/// such a string is plain data: nothing resolves it.
+pub const REF_ACTIONS: &[&str] =
+    &["connector.add", "webhook.add", "webhook.update", "webhook.rotate_secret", "writeback.add"];
+
+/// The first string in `v` (at any depth) that is an `env:` or `file:` reference.
+fn first_reference(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if onto_intelli::webhooks::is_reference(s) => {
+            // Only the reference's name: `env:VAR` or `file:/path` (never a value).
+            Some(s.trim().chars().take(200).collect())
+        }
+        Value::Array(a) => a.iter().find_map(first_reference),
+        Value::Object(m) => m.values().find_map(first_reference),
+        _ => None,
+    }
+}
+
+/// The checks a call gets before it runs, from what authenticated it
+/// (docs/design/EVENTS.md section 6.3):
+///
+/// * Only the operator may register server references: in
+///   [`REF_ACTIONS`], an `env:`/`file:` string anywhere in the input needs
+///   a config token or development mode, without `x-onto-act-as` (an
+///   impersonating config token acts for someone else, not as the
+///   operator). Everyone else is refused; the error names the reference,
+///   never a value.
+/// * Project credentials (API keys, console sessions) additionally may not
+///   act on the server: a connector on a filesystem path, a repository
+///   connector whose git URL fails the SSRF rules (`https://` resolving only
+///   to public addresses, unless `allow_private`, which is
+///   `console.allow_private_urls`), or a database connector whose URL fails
+///   them (a TCP host resolving only to public addresses, no Unix socket, no
+///   parameter that moves the connection or reads a file). What such a
+///   credential registers in [`REF_ACTIONS`] is marked `restricted` in
+///   `input`, whatever the input said, so every use checks its URL again,
+///   reaches public addresses only and ignores operator allow rules.
+pub async fn guard_call(
     credential: &Credential,
+    principal: &Principal,
     action: &str,
     input: &mut Value,
     allow_private: bool,
 ) -> Result<()> {
-    if !credential.is_project() || action != "connector.add" {
+    if !REF_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    let operator = matches!(credential, Credential::Config | Credential::Dev) && principal.via.is_none();
+    if !operator && let Some(r) = first_reference(input) {
+        let who = if principal.via.is_some() { "a call with x-onto-act-as" } else { "this credential" };
+        return Err(Error::Denied(format!(
+            "{r} is a server reference: {who} may not register env: or file: references (operators can, with a \
+             config token without x-onto-act-as or the CLI)"
+        )));
+    }
+    if !credential.is_project() {
+        return Ok(());
+    }
+    if action != "connector.add" {
+        if let Value::Object(m) = input {
+            m.insert("restricted".into(), Value::Bool(true));
+        }
         return Ok(());
     }
     let refuse = |why: &str| {
@@ -807,6 +851,60 @@ mod tests {
     use super::*;
     use onto_control::{ControlOptions, KeyRequest, KeyScope};
     use onto_intelli::config::{ConsoleConfig, TokenConfig};
+
+    /// A principal without act-as.
+    fn proj() -> Principal {
+        Principal::admin("user:p")
+    }
+
+    #[tokio::test]
+    async fn only_the_operator_registers_server_references() {
+        // SAFETY: test-only variable that no other test reads.
+        unsafe { std::env::set_var("ONTO_TEST_GUARD_HOOK_SECRET", "s3cr3t-value-never-echoed") };
+        let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "t".into() };
+        let mut acting = Principal::admin("user:7");
+        acting.via = Some("ops-token".into());
+        let add = || {
+            serde_json::json!({ "name": "ops", "url": "https://hooks.example.com/in",
+                "secret": "env:ONTO_TEST_GUARD_HOOK_SECRET", "restricted": false })
+        };
+        for action in REF_ACTIONS {
+            // The operator: a config token without act-as, or development mode.
+            for c in [Credential::Config, Credential::Dev] {
+                let mut input = add();
+                guard_call(&c, &proj(), action, &mut input, false).await.unwrap();
+                assert_eq!(input["restricted"], false, "{action}: operators are not restricted");
+            }
+            // An impersonating config token, a session, an API key, a console session.
+            let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
+            for (c, p) in [
+                (Credential::Config, acting.clone()),
+                (Credential::Session, proj()),
+                (key.clone(), proj()),
+                (console, proj()),
+            ] {
+                for input in [add(), serde_json::json!({ "name": "ops", "nested": [{ "path": " FILE:/etc/hook" }] })] {
+                    let mut input = input;
+                    let e = guard_call(&c, &p, action, &mut input, false).await.unwrap_err();
+                    let m = e.to_string();
+                    assert!(matches!(e, Error::Denied(_)), "{action} {c:?}: {m}");
+                    assert!(m.contains("env:ONTO_TEST_GUARD_HOOK_SECRET") || m.contains("FILE:/etc/hook"), "{m}");
+                    assert!(!m.contains("s3cr3t"), "errors never echo a resolved value: {m}");
+                }
+            }
+        }
+        // Project credentials' registrations are restricted, whatever the input said.
+        for action in ["webhook.add", "webhook.update", "writeback.add"] {
+            let mut input =
+                serde_json::json!({ "name": "ops", "url": "https://hooks.example.com/in", "restricted": false });
+            guard_call(&key, &proj(), action, &mut input, false).await.unwrap();
+            assert_eq!(input["restricted"], true, "{action}");
+        }
+        // Elsewhere an env: string is plain data.
+        let mut input = serde_json::json!({ "text": "env:HOME" });
+        guard_call(&key, &acting, "entity.create", &mut input, false).await.unwrap();
+        assert_eq!(input, serde_json::json!({ "text": "env:HOME" }));
+    }
 
     fn auth() -> Auth {
         let cfg = AuthConfig {
@@ -1174,16 +1272,16 @@ mod tests {
             ),
         ] {
             let mut input = add(kind, public);
-            guard_project_call(&key, "connector.add", &mut input, false).await.unwrap();
+            guard_call(&key, &proj(), "connector.add", &mut input, false).await.unwrap();
             assert_eq!(input["restricted"], true, "{kind}");
             for bad in [private, param, "env:DB_URL"] {
                 let mut input = add(kind, bad);
-                let e = guard_project_call(&key, "connector.add", &mut input, false).await.unwrap_err();
+                let e = guard_call(&key, &proj(), "connector.add", &mut input, false).await.unwrap_err();
                 assert!(matches!(e, Error::Denied(_)), "{kind} {bad}: {e}");
             }
             // Operators are not limited.
             let mut input = add(kind, private);
-            assert!(guard_project_call(&Credential::Config, "connector.add", &mut input, false).await.is_ok());
+            assert!(guard_call(&Credential::Config, &proj(), "connector.add", &mut input, false).await.is_ok());
         }
     }
 
@@ -1193,7 +1291,7 @@ mod tests {
         let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
         let guard = |c: &Credential, action: &str, mut input: Value, allow_private: bool| {
             let (c, action) = (c.clone(), action.to_string());
-            async move { guard_project_call(&c, &action, &mut input, allow_private).await.map(|_| input) }
+            async move { guard_call(&c, &proj(), &action, &mut input, allow_private).await.map(|_| input) }
         };
         for c in [&key, &console] {
             // A PostgreSQL URL to a public address is accepted, and marked restricted.
@@ -1258,9 +1356,15 @@ mod tests {
             }
         }
         let env = serde_json::json!({ "name": "x", "url": "env:DATABASE_URL" });
+        // A browser session is not the operator: server references are refused to it
+        // (docs/design/EVENTS.md 6.3), while its other connectors are not restricted.
+        let e = guard(&Credential::Session, "connector.add", env.clone(), false).await.unwrap_err();
+        assert!(matches!(e, Error::Denied(_)), "{e}");
         for c in [Credential::Config, Credential::Dev, Credential::Session] {
-            let out = guard(&c, "connector.add", env.clone(), false).await.expect("operators are not limited");
-            assert!(out.get("restricted").is_none(), "operator connectors are not restricted");
+            if c != Credential::Session {
+                let out = guard(&c, "connector.add", env.clone(), false).await.expect("operators are not limited");
+                assert!(out.get("restricted").is_none(), "operator connectors are not restricted");
+            }
             let local = serde_json::json!({ "name": "x", "kind": "repo", "url": "https://127.0.0.1/r" });
             assert!(guard(&c, "connector.add", local, false).await.is_ok());
             let pg = serde_json::json!({ "name": "x", "url": "postgres://onto@127.0.0.1:5441/onto" });
