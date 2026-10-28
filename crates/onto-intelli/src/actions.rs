@@ -563,8 +563,12 @@ pub const ACTIONS: &[ActionInfo] = &[
         false,
         "Check a writeback target without sending anything (a request could write): its references resolve, and its base URL and every route (or one) pass the outbound rules. Admins of every workspace it serves. Input: {name, route?}.",
     ),
-    a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
-    a("system.health", false, "Liveness and version."),
+    a("system.stats", false, "Graph, memory, cache, token, ingestion, outbox and run statistics."),
+    a(
+        "system.health",
+        false,
+        "Liveness and version, the webhook and automation switches and paused counts, and change capture.",
+    ),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
     a(
         "trace.list",
@@ -834,6 +838,7 @@ impl Intelli {
     }
 
     /// Does `[traces] calls` make a trace of `action`?
+    /// (Secret-bearing actions are traced without content: [`secret_bearing`].)
     fn traces_call(&self, action: &str) -> bool {
         match self.config().traces.calls.as_str() {
             "all" => true,
@@ -857,7 +862,11 @@ impl Intelli {
             other => ("call", other.to_string()),
         };
         let mut row = trace::base_row(&ctx, p, kind, &name, &ws);
-        if tracer.captures() {
+        // Outbound configuration carries signing secrets (given, generated
+        // and rotated ones are returned once) and receivers' URLs: its call
+        // traces keep no input or output, whatever capture_content says.
+        let capture = tracer.captures() && !secret_bearing(action);
+        if capture {
             let mut m = Map::new();
             if let Some(q) = input.get("question").and_then(Value::as_str).and_then(|q| tracer.text(q)) {
                 m.insert("question".into(), Value::String(q));
@@ -888,7 +897,7 @@ impl Intelli {
                         row.name = format!("action.undo:{t}");
                     }
                 }
-                row.output = tracer.text(&v.to_string()).map(|o| json!({ "output": o }));
+                row.output = if capture { tracer.text(&v.to_string()).map(|o| json!({ "output": o })) } else { None };
                 if let Some(e) = tracer.llm_error() {
                     trace::fail(&mut row, "llm_error", &e);
                 }
@@ -1432,6 +1441,7 @@ impl Intelli {
                 "revision": onto.revision(),
                 "llm": self.llm().name(),
                 "llm_available": self.llm().unavailable().is_none(),
+                "outbound": self.outbound_health(),
             })),
             "system.actions" => Ok(json!({ "actions": ACTIONS })),
             a if a.starts_with("trace.") => self.trace_action(p, a, input),
@@ -2073,4 +2083,13 @@ pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str
         a if assurance::GRAPH_READS.contains(&a) => assurance::graph_read(onto, p, a, input),
         other => Err(Error::invalid(format!("{other} is not a read-only graph action"))),
     }
+}
+
+/// Actions whose input or output may hold a signing secret, a credential or
+/// a receiver's URL with its token: webhook endpoints, writeback targets and
+/// connectors. Their call traces record no content.
+pub(crate) fn secret_bearing(action: &str) -> bool {
+    crate::webhooks::CALLS.contains(&action)
+        || crate::writeback::CALLS.contains(&action)
+        || action.starts_with("connector.")
 }

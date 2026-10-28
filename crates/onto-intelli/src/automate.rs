@@ -10,8 +10,10 @@
 //!   commits it ([`onto_core::Ontology::commit_run`]): graph edits, receipt,
 //!   outbox rows and the finished run row in one commit. A duplicate trigger
 //!   is settled by the claim and never retried.
-//! * **Recovery.** A new lease holder executes every `running` row of an
-//!   older epoch again: nothing of their commit happened.
+//! * **Recovery.** At the start of every round the lease holder executes
+//!   every `running` row of its epoch or an older one again: rounds never
+//!   overlap, so such a row is one whose execution ended in an error (or
+//!   whose process stopped), and nothing of its commit happened.
 //! * **Guards.** Depth (`min(max_depth, [automation] max_depth)`, refused),
 //!   rate limits per tenant and automation per minute and the per-subject
 //!   budget per hour (`skipped`, rerunnable), self-triggering
@@ -20,7 +22,10 @@
 //!   not valid or needs a person's confirmation is `refused`.
 //! * **Retries.** `Unavailable` and contention `Conflict` move a run to
 //!   `retry` with a timer (`retry:<run>`, `min(base * 2^(attempt - 1), max)`)
-//!   until `retry_max_attempts`; everything else is final. The breaker
+//!   (committed with the row) until `retry_max_attempts`; everything else
+//!   is final. A process that runs no consumer (`[automation] enabled =
+//!   false` or `workers = false`) leaves retry timers out of the tenant's
+//!   wake row: they wait for a process that runs one. The breaker
 //!   pauses an automation after `pause_after_failures` consecutive failed
 //!   runs.
 //! * **Enablement.** A person who may approve schema changes and dominates
@@ -86,17 +91,16 @@ const RETRIES_PER_ROUND: usize = 32;
 pub const RUN_NOTE: &str = "A run's graph edits, receipt, outbox rows and run row commit together. Webhook effects \
 are enqueued once and delivered at least once; external effects are not reversible.";
 
-/// The consumer's state in this process: its lease holder id, the epoch it
-/// last held (a new epoch means recovery is due) and its run budgets.
+/// The consumer's state in this process: its lease holder id and its run
+/// budgets. Rounds hold it, so they never overlap.
 pub(crate) struct Runtime {
     holder: Option<String>,
-    epoch: Option<u64>,
     budget: Budget,
 }
 
 impl Runtime {
     pub(crate) fn new() -> Self {
-        Self { holder: None, epoch: None, budget: Budget::default() }
+        Self { holder: None, budget: Budget::default() }
     }
 }
 
@@ -108,7 +112,7 @@ pub struct RoundReport {
     pub idle: bool,
     /// A full page: go again now.
     pub more: bool,
-    /// `running` rows of an older epoch executed again.
+    /// `running` rows claimed but never committed, executed again.
     pub recovered: usize,
     /// Runs resumed from their retry timers.
     pub retried: usize,
@@ -140,22 +144,29 @@ pub fn spawn_automation_workers(me: &Arc<Intelli>, notify: Arc<Notify>) {
                     break;
                 }
                 let me2 = me.clone();
-                let again = match tokio::task::spawn_blocking(move || me2.automation_round()).await {
-                    Ok(Ok(r)) => r.more,
+                let (again, idle) = match tokio::task::spawn_blocking(move || me2.automation_round()).await {
+                    Ok(Ok(r)) => (r.more, r.idle),
                     Ok(Err(e)) => {
                         tracing::warn!("automation consumer: {e}");
-                        false
+                        (false, false)
                     }
                     Err(e) => {
                         tracing::warn!("automation consumer: {e}");
-                        false
+                        (false, false)
                     }
                 };
-                // Wake for the next retry timer if it is due before the poll.
-                let store = me.ontology().store().clone();
-                let wait = match (store.timers_next(), store.clock_ms()) {
-                    (Ok(Some(due)), Ok(now)) => Duration::from_millis((due - now).clamp(0, 3_600_000) as u64).min(poll),
-                    _ => poll,
+                // An idle round (the switch is off, nothing is enabled, or
+                // another process holds the lease) waits for the poll: a due
+                // timer is that holder's. Otherwise wake for the next retry
+                // timer if it is due before the poll.
+                let wait = if idle {
+                    poll
+                } else {
+                    let store = me.ontology().store().clone();
+                    match (store.timers_next(), store.clock_ms()) {
+                        (Ok(Some(due)), Ok(now)) => retry_wait(due, now, poll),
+                        _ => poll,
+                    }
                 };
                 (again, wait)
             };
@@ -171,6 +182,21 @@ pub fn spawn_automation_workers(me: &Arc<Intelli>, notify: Arc<Notify>) {
         }
     });
 }
+
+/// How long the consumer sleeps when the next retry timer is due at `due`
+/// (store clock `now`): until then, at most `poll`. A timer still due after
+/// a round that ran is one the round could not settle (an error): look again
+/// in a second, not in a busy loop.
+fn retry_wait(due: i64, now: i64, poll: Duration) -> Duration {
+    if due <= now {
+        return Duration::from_secs(1).min(poll);
+    }
+    Duration::from_millis((due - now).min(3_600_000) as u64).min(poll)
+}
+
+/// How long a rerun's timer waits for its row to reach `retry` before a
+/// round deletes it as stale (the rerun writes the timer first).
+const RERUN_GRACE_MS: i64 = 10_000;
 
 /// The position just before the floor's commit (the oldest records kept).
 fn floor_edge(floor: u64) -> Cursor {
@@ -258,11 +284,13 @@ impl Intelli {
     /// runtime. Tests and tools may call it directly.
     pub fn automation_round(&self) -> Result<RoundReport> {
         let mut rt = self.automation_runtime().lock();
+        self.count_automation_round();
         let onto = self.ontology();
         let store = onto.store().clone();
         let cfg = self.config().automation.clone();
         let mut report = RoundReport::default();
         if !store.keeps_runs() || !store.keeps_changes() || !store.fences() || !cfg.enabled {
+            self.set_wants_automation(false);
             report.idle = true;
             return Ok(report);
         }
@@ -298,6 +326,8 @@ impl Intelli {
             }
         }
         onto.set_wake_for_automations(enabled_any && !kill);
+        // Commits wake this consumer only while something is enabled.
+        self.set_wants_automation(enabled_any && !kill);
         if actives.is_empty() && !kill && store.runs_running(u64::MAX, 1)?.is_empty() && !self.retries_due()? {
             report.idle = true;
             return Ok(report);
@@ -310,14 +340,13 @@ impl Intelli {
         };
         let fence = Fence::new(CONSUMER_LEASE, &holder, epoch);
         let retry = self.retry_policy();
-        if rt.epoch != Some(epoch) {
-            // Newly held: what an earlier holder claimed but never committed.
-            let recovered = onto.recover_runs(&fence, &retry, kill)?;
-            report.recovered = recovered.len();
-            for r in recovered.iter().filter(|r| r.state == RunState::Failed) {
-                self.breaker(&r.automation)?;
-            }
-            rt.epoch = Some(epoch);
+        // Every round: what was claimed but never committed, by an earlier
+        // holder or by this one (an execution that ended in an error, or a
+        // lease lost and taken again at the same epoch).
+        let recovered = onto.recover_runs(&fence, &retry, kill)?;
+        report.recovered = recovered.len();
+        for r in recovered.iter().filter(|r| r.state == RunState::Failed) {
+            self.breaker(&r.automation)?;
         }
         report.retried = self.run_retries(&fence, &actives)?;
 
@@ -431,7 +460,8 @@ impl Intelli {
                 continue;
             }
             report.executed += 1;
-            self.execute(&row, &a.def, &fence)?;
+            let span = tracing::info_span!("automation.run", automation = %a.name, run = %row.id);
+            span.in_scope(|| self.execute(&row, &a.def, &fence))?;
         }
         if !settled_rows.is_empty() {
             let ids = onto.record_runs(&settled_rows, Some(&fence))?;
@@ -466,17 +496,26 @@ impl Intelli {
         let onto = self.ontology();
         let store = onto.store();
         let mut n = 0;
+        let now = now_ms();
         for t in store.timers_due(RETRIES_PER_ROUND)? {
             let Some(id) = t.name.strip_prefix(RETRY_PREFIX) else { continue };
-            let row = store.run_get(id)?.filter(|r| r.state == RunState::Retry);
-            if let Some(row) = row {
+            let row = store.run_get(id)?;
+            // A rerun writes its timer before it moves the row to `retry`:
+            // keep a fresh timer of a row that is not there yet.
+            let rerun_pending = row.as_ref().is_some_and(|r| matches!(r.state, RunState::Skipped | RunState::Failed))
+                && t.doc.get("at").and_then(Value::as_i64).is_some_and(|at| now - at < RERUN_GRACE_MS);
+            if rerun_pending {
+                continue;
+            }
+            if let Some(row) = row.filter(|r| r.state == RunState::Retry) {
                 match actives.iter().find(|a| a.name == row.automation) {
                     Some(a) => {
                         let mut running = row.clone().with_state(RunState::Running, None);
                         running.epoch = fence.epoch;
                         if store.run_update(&running, &[RunState::Retry], Some(fence))? {
                             n += 1;
-                            self.execute(&running, &a.def, fence)?;
+                            let span = tracing::info_span!("automation.run", automation = %a.name, run = %running.id);
+                            span.in_scope(|| self.execute(&running, &a.def, fence))?;
                         }
                     }
                     None => {
@@ -937,14 +976,26 @@ impl Intelli {
                 }
                 let reason = Some(format!("rerun by {}", p.id));
                 let queued = row.clone().with_state(RunState::Retry, reason);
-                if !store.run_update(&queued, &[RunState::Skipped, RunState::Failed], None)? {
-                    return Err(Error::Conflict(format!("run {id} changed meanwhile; read it again")));
+                {
+                    // The timer first, then the row: a row in `retry` always
+                    // has the timer that resumes it. No round of this process
+                    // runs in between; another process's round keeps a fresh
+                    // timer whose row is not in `retry` yet (RERUN_GRACE_MS).
+                    let _rounds = self.automation_runtime().lock();
+                    let timer = format!("{RETRY_PREFIX}{id}");
+                    store.timers_set(&timer, 0, &json!({ "run": id, "automation": row.automation, "at": now_ms() }))?;
+                    match store.run_update(&queued, &[RunState::Skipped, RunState::Failed], None) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = store.timers_delete(&timer, None);
+                            return Err(Error::Conflict(format!("run {id} changed meanwhile; read it again")));
+                        }
+                        Err(e) => {
+                            let _ = store.timers_delete(&timer, None);
+                            return Err(e);
+                        }
+                    }
                 }
-                store.timers_set(
-                    &format!("{RETRY_PREFIX}{id}"),
-                    0,
-                    &json!({ "run": id, "automation": row.automation }),
-                )?;
                 let target = format!("{}{}", automate::PRINCIPAL_PREFIX, row.automation);
                 onto.commit_automation(
                     &ctx,
@@ -1022,6 +1073,17 @@ mod tests {
     fn the_floor_edge_is_just_before_the_floor() {
         assert_eq!(floor_edge(0), Cursor::default());
         assert_eq!(floor_edge(5), Cursor::new(4, u32::MAX));
+    }
+
+    #[test]
+    fn a_due_timer_never_makes_the_consumer_spin() {
+        let poll = Duration::from_secs(20);
+        // Overdue after a round that ran: a second, not zero.
+        assert_eq!(retry_wait(1_000, 5_000, poll), Duration::from_secs(1));
+        assert_eq!(retry_wait(5_000, 5_000, poll), Duration::from_secs(1));
+        assert_eq!(retry_wait(5_250, 5_000, poll), Duration::from_millis(250));
+        assert_eq!(retry_wait(i64::MAX, 0, poll), poll);
+        assert_eq!(retry_wait(0, 5_000, Duration::from_millis(300)), Duration::from_millis(300));
     }
 
     #[test]

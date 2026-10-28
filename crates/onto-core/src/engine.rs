@@ -90,14 +90,9 @@ pub struct ActionContext {
 
 impl ActionContext {
     pub fn new(principal: Principal, workspace: impl Into<String>) -> Self {
-        Self {
-            principal,
-            workspace: workspace.into(),
-            request_id: new_id("req"),
-            intent: None,
-            source: None,
-            cause: None,
-        }
+        // A request a trusted service marked as part of a cascade keeps it.
+        let cause = principal.cause.clone();
+        Self { principal, workspace: workspace.into(), request_id: new_id("req"), intent: None, source: None, cause }
     }
 
     pub fn system(workspace: impl Into<String>) -> Self {
@@ -222,6 +217,8 @@ pub(crate) struct Extra {
     pub outbox: Vec<crate::outbox::OutboxRow>,
     /// Automation run rows settled in the same commit ([`WriteBatch::runs`]).
     pub runs: Vec<crate::runs::RunRow>,
+    /// Timers set in the same commit ([`WriteBatch::timers`]).
+    pub timers: Vec<(String, i64, Value)>,
 }
 
 impl Extra {
@@ -232,6 +229,7 @@ impl Extra {
             && self.schema.is_none()
             && self.outbox.is_empty()
             && self.runs.is_empty()
+            && self.timers.is_empty()
     }
 }
 
@@ -1461,6 +1459,15 @@ impl Ontology {
             return Err(crate::runs::no_runs());
         }
         staged.batch.runs = extra.runs;
+        if !extra.timers.is_empty() {
+            if !self.inner.store.fences() {
+                return Err(Error::Unavailable("this store keeps no timers".into()));
+            }
+            // The tenant has work due when the earliest timer is (closed tenants are woken).
+            let first = extra.timers.iter().map(|(_, d, _)| (*d).max(0)).min().unwrap_or(0);
+            staged.batch.wake = Some(staged.batch.wake.map_or(first, |w| w.min(first)));
+        }
+        staged.batch.timers = extra.timers;
         let seq = self.inner.store.write(&staged.batch)?;
         if staged.batch.changes_state() {
             self.inner.seq.store(seq, Ordering::SeqCst);

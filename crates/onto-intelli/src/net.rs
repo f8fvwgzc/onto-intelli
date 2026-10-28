@@ -40,6 +40,12 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || a >= 240) // 240.0.0.0/4 reserved
 }
 
+/// 64:ff9b:1::/48, the local-use NAT64 prefix (RFC 8215).
+fn local_nat64(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1
+}
+
 fn public_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return public_v4(v4);
@@ -48,6 +54,11 @@ fn public_v6(ip: Ipv6Addr) -> bool {
     // NAT64 (64:ff9b::/96): the IPv4 address in the last 32 bits.
     if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
         return public_v4(Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8));
+    }
+    // Local-use NAT64 (64:ff9b:1::/48, RFC 8215) embeds IPv4 at the RFC 6052
+    // positions of its prefix length, which this side cannot know: never public.
+    if local_nat64(ip) {
+        return false;
     }
     !(ip.is_loopback()
         || ip.is_unspecified()
@@ -179,7 +190,9 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
 /// Addresses no outbound target may reach, allow-listed or not: link-local
 /// (169.254.0.0/16, fe80::/10), cloud metadata (100.100.100.200,
 /// fd00:ec2::254), 0.0.0.0/8, multicast, broadcast and reserved
-/// (240.0.0.0/4), and their IPv4-mapped and NAT64 forms.
+/// (240.0.0.0/4), and their IPv4-mapped and NAT64 forms. The local-use NAT64
+/// prefix 64:ff9b:1::/48 is denied whole (fail closed: where its embedded
+/// address sits depends on the translator's prefix length).
 pub fn always_denied(ip: IpAddr) -> bool {
     match canonical(ip) {
         IpAddr::V4(v4) => {
@@ -193,7 +206,8 @@ pub fn always_denied(ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             let s = v6.segments();
-            (s[0] & 0xffc0) == 0xfe80
+            local_nat64(v6)
+                || (s[0] & 0xffc0) == 0xfe80
                 || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
                 || v6.is_multicast()
                 || v6.is_unspecified()
@@ -560,6 +574,11 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "64:ff9b::a9fe:a9fe",
+            // Local-use NAT64 (RFC 8215): 169.254.169.254 and 127.0.0.1 at the
+            // /48 positions, and at the /96 ones.
+            "64:ff9b:1:a9fe:a9:fe00::",
+            "64:ff9b:1::a9fe:a9fe",
+            "64:ff9b:1:7f00:0:100::",
             "2001:db8::1",
         ] {
             assert!(!public_ip(bad.parse().unwrap()), "{bad}");
@@ -618,6 +637,9 @@ mod tests {
             "240.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1:a9fe:a9:fe00::",
+            "64:ff9b:1::a9fe:a9fe",
+            "64:ff9b:1:7f00:0:100::",
             "::",
         ] {
             assert!(always_denied(bad.parse().unwrap()), "{bad}");
@@ -661,6 +683,11 @@ mod tests {
         assert!(reach.judge("localhost", &ips(&["127.0.0.1"])).is_err(), "localhost is not the allow-listed literal");
         assert!(reach.judge("::ffff:127.0.0.1", &ips(&["::ffff:127.0.0.1"])).is_err());
         assert!(reach.judge("[64:ff9b::7f00:1]", &ips(&["64:ff9b::7f00:1"])).is_err(), "NAT64 of loopback");
+        // Local-use NAT64 (RFC 8215) of metadata and loopback, with no rule: refused.
+        let open = Reach { allow: Default::default(), restricted: false, allow_private: false };
+        for a in ["64:ff9b:1:a9fe:a9:fe00::", "64:ff9b:1::a9fe:a9fe", "64:ff9b:1:7f00:0:100::"] {
+            assert!(open.judge("nat64.example", &ips(&[a])).is_err(), "{a}");
+        }
         assert!(reach.judge("127.0.0.1", &ips(&["127.0.0.1"])).is_ok());
         assert!(reach.judge("x", &[]).is_err());
         // Restricted targets ignore every rule.

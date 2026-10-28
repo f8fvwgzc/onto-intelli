@@ -173,6 +173,10 @@ pub struct WriteBatch {
     /// refused (`Conflict`, `run_settled`), so a run is completed at most
     /// once. The store stamps `finished_at` of final rows by its clock.
     pub runs: Vec<RunRow>,
+    /// Timers set (or moved) in the same transaction: `(name, delay_ms,
+    /// doc)`, due `delay_ms` after the commit by the store's clock (a run
+    /// moved to `retry` and its `retry:<run>` timer commit together).
+    pub timers: Vec<(String, i64, Value)>,
 }
 
 impl WriteBatch {
@@ -244,6 +248,7 @@ impl WriteBatch {
             && self.reembed.is_empty()
             && self.outbox.is_empty()
             && self.runs.is_empty()
+            && self.timers.is_empty()
     }
 }
 
@@ -507,6 +512,13 @@ pub trait Store: Send + Sync {
     fn outbox_open_counts(&self) -> Result<Vec<(String, u64)>> {
         Err(no_outbox())
     }
+    /// Open rows of each of `targets`, counted up to `cap` (fan-out compares
+    /// them with its pending cap every round, so a count never reads more
+    /// than `cap` rows of a target).
+    fn outbox_open_counts_for(&self, targets: &[String], cap: u64) -> Result<Vec<(String, u64)>> {
+        let all: std::collections::HashMap<String, u64> = self.outbox_open_counts()?.into_iter().collect();
+        Ok(targets.iter().map(|t| (t.clone(), all.get(t).copied().unwrap_or(0).min(cap))).collect())
+    }
     /// Delete finished rows (delivered, dead, cancelled) created before
     /// `before_ms`, and attempts logged before it. Returns the rows deleted.
     fn outbox_vacuum(&self, _before_ms: i64) -> Result<u64> {
@@ -546,6 +558,12 @@ pub trait Store: Send + Sync {
     /// `running` rows claimed under an epoch below `epoch` (what a new
     /// holder of the consumer lease recovers), oldest first, at most `limit`.
     fn runs_running(&self, _epoch: u64, _limit: usize) -> Result<Vec<RunRow>> {
+        Err(no_runs())
+    }
+    /// Retention: delete final runs (succeeded, failed, skipped, refused,
+    /// would_run, cancelled) started before `before_ms`. Returns how many.
+    /// Run rows are not the audit trail (the `automation.run` events are).
+    fn runs_vacuum(&self, _before_ms: i64) -> Result<u64> {
         Err(no_runs())
     }
 
@@ -803,6 +821,10 @@ impl MemoryStore {
         }
         inner.outbox_insert(&batch.outbox, true)?;
         inner.runs_settle(&batch.runs)?;
+        let now = now_ms();
+        for (name, delay, doc) in &batch.timers {
+            inner.timers.insert(name.clone(), (now.saturating_add(*delay), doc.clone()));
+        }
         for e in &batch.events {
             if inner.events.len() >= self.max_events {
                 inner.events.pop_front();
@@ -1146,6 +1168,21 @@ impl Store for MemoryStore {
         out.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
         out.truncate(limit);
         Ok(out)
+    }
+
+    fn runs_vacuum(&self, before_ms: i64) -> Result<u64> {
+        let mut inner = self.inner.lock();
+        let gone: Vec<(String, (String, String))> = inner
+            .runs
+            .values()
+            .filter(|r| r.state.is_final() && r.started_at < before_ms)
+            .map(|r| (r.id.clone(), (r.automation.clone(), r.trigger_key.clone())))
+            .collect();
+        for (id, key) in &gone {
+            inner.runs.remove(id);
+            inner.run_keys.remove(key);
+        }
+        Ok(gone.len() as u64)
     }
 
     fn keeps_outbox(&self) -> bool {

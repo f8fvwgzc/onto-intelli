@@ -647,6 +647,9 @@ mod runtime {
         fn runs_running(&self, epoch: u64, limit: usize) -> Result<Vec<RunRow>> {
             self.inner.runs_running(epoch, limit)
         }
+        fn runs_vacuum(&self, before_ms: i64) -> Result<u64> {
+            self.inner.runs_vacuum(before_ms)
+        }
         fn events(&self, filter: &EventFilter) -> Result<Vec<Event>> {
             self.inner.events(filter)
         }
@@ -1231,6 +1234,164 @@ mod runtime {
             assert!(done.receipt.is_none());
             assert_eq!(f.outbox_of(&run.id), 0, "nothing is sent for a refused run");
             assert_eq!(f.issue_state().as_deref(), Some("blocked"));
+        }
+    }
+
+    // ── review round 1 (phase 1 steps 8-12) ─────────────────────────────────
+
+    fn retry_timer(f: &Fixture, run: &RunRow) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.o.store().timers_due(100).unwrap().iter().any(|t| t.name == format!("retry:{}", run.id))
+    }
+
+    /// C-1 and C-2: an execution whose commit and whose retry commit both fail
+    /// leaves the row `running` with no timer; the same holder (same epoch)
+    /// recovers it on its next round. A retry row and its timer commit
+    /// together, so a failed retry commit writes no timer either.
+    fn check_failed_execution_is_recovered_by_the_same_holder(f: Fixture) {
+        let retry = RetryPolicy { base_ms: 1, max_ms: 10, max_attempts: 5 };
+        let fence = f.lease("worker-a", 60_000);
+        let mut run = f.block();
+        assert!(f.claim(&mut run, &fence));
+        // The commit fails (unavailable), then so does moving it to retry.
+        f.flaky.fail_next(2, true);
+        let err = f.o.execute_run(&run, &f.def, &fence, &retry).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+        let left = f.o.store().run_get(&run.id).unwrap().unwrap();
+        assert_eq!(left.state, RunState::Running, "nothing settled it");
+        assert!(!retry_timer(&f, &run), "no timer without its retry row");
+        // Same holder, same epoch: the next round's recovery executes it.
+        let again = f.lease("worker-a", 60_000);
+        assert_eq!(again.epoch, fence.epoch, "a renewing holder keeps its epoch");
+        let done = f.o.recover_runs(&again, &retry, false).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].state, RunState::Succeeded, "{:?}", done[0].reason);
+        assert_eq!(f.issue_state().as_deref(), Some("resolved"));
+        assert_eq!(f.outbox_of(&run.id), 1);
+        assert!(f.o.recover_runs(&again, &retry, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_execution_is_recovered_by_the_same_holder() {
+        check_failed_execution_is_recovered_by_the_same_holder(memory(resolve_blocked()));
+    }
+
+    #[test]
+    fn a_failed_execution_is_recovered_by_the_same_holder_postgres() {
+        if let Some(f) = postgres("run_same_holder", resolve_blocked()) {
+            check_failed_execution_is_recovered_by_the_same_holder(f);
+        }
+    }
+
+    /// C-2: a run moved to `retry` and its `retry:<run>` timer commit
+    /// together; a refused retry commit writes no timer.
+    fn check_retry_row_and_timer(f: Fixture) {
+        let retry = RetryPolicy { base_ms: 1, max_ms: 10, max_attempts: 5 };
+        let fence = f.lease("worker-a", 60_000);
+        let mut second = f.block();
+        assert!(f.claim(&mut second, &fence));
+        f.flaky.fail_next(1, true);
+        let row = f.o.execute_run(&second, &f.def, &fence, &retry).unwrap();
+        assert_eq!(row.state, RunState::Retry);
+        assert_eq!(f.o.store().run_get(&second.id).unwrap().unwrap().state, RunState::Retry);
+        assert!(retry_timer(&f, &second), "the retry row has its timer");
+        // A retry commit that is refused writes no timer.
+        let mut third = second.clone();
+        third.id = "run_settled_elsewhere".into();
+        third.trigger_key = "9999.0".into();
+        let err = f.o.retry_run(&third, Some(&f.def), Some(&fence), 0).unwrap_err();
+        assert!(runs::is_settled(&err), "{err}");
+        assert!(!retry_timer(&f, &third));
+    }
+
+    #[test]
+    fn a_retry_row_and_its_timer_commit_together() {
+        check_retry_row_and_timer(memory(resolve_blocked()));
+    }
+
+    #[test]
+    fn a_retry_row_and_its_timer_commit_together_postgres() {
+        if let Some(f) = postgres("run_retry_timer", resolve_blocked()) {
+            check_retry_row_and_timer(f);
+        }
+    }
+
+    /// C-3: the commit runs the locked schema's definition, and only under
+    /// the closure the run was enabled with.
+    fn check_closure_at_commit(f: Fixture) {
+        let fence = f.lease("worker-a", 60_000);
+        let ctx = ActionContext::new(admin(), "acme");
+        let mut run = f.block();
+        assert!(f.claim(&mut run, &fence));
+        assert_eq!(
+            runs::status(&f.o.schema(), &Enablements::load(&**f.o.store()).unwrap(), NAME, 0, false),
+            Status::Active
+        );
+        // After the claim, someone changes what the action does.
+        let mut at = serde_json::to_value(&f.o.schema().action_types["resolve"]).unwrap();
+        at["description"] = json!("Resolve, differently.");
+        f.o.schema_apply(&ctx, set(json!({ "changes": [{ "op": "put_action_type", "name": "resolve", "def": at }] })))
+            .unwrap();
+        let done = f.o.commit_run(&run, &f.def, Some(&fence)).unwrap();
+        assert_eq!(done.run.state, RunState::Cancelled, "{:?}", done.run.reason);
+        let reason = done.run.reason.unwrap();
+        assert!(reason.contains("stale_definition: action_type:resolve"), "{reason}");
+        assert!(done.receipt.is_none());
+        assert_eq!(f.issue_state().as_deref(), Some("blocked"), "the unapproved definition never ran");
+        assert_eq!(f.outbox_of(&run.id), 0);
+        assert_eq!(f.events("automation.run", &run.id), 1, "the cancellation is audited");
+
+        // A deleted automation cancels its claimed runs the same way.
+        let f = memory(resolve_blocked());
+        let fence = f.lease("worker-a", 60_000);
+        let mut run = f.block();
+        assert!(f.claim(&mut run, &fence));
+        f.o.schema_apply(&ctx, set(json!({ "changes": [{ "op": "delete_automation", "name": NAME }] }))).unwrap();
+        let done = f.o.commit_run(&run, &f.def, Some(&fence)).unwrap();
+        assert_eq!(done.run.state, RunState::Cancelled);
+        assert!(done.run.reason.unwrap().contains("was deleted"));
+        assert_eq!(f.issue_state().as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn a_closure_change_after_the_claim_cancels_the_run() {
+        check_closure_at_commit(memory(resolve_blocked()));
+    }
+
+    #[test]
+    fn a_closure_change_after_the_claim_cancels_the_run_postgres() {
+        if let Some(f) = postgres("run_closure_commit", resolve_blocked()) {
+            check_closure_at_commit(f);
+        }
+    }
+
+    /// CP-4: retention removes final run rows (never running or retry ones),
+    /// and a trigger they settled can be claimed again only by a new key.
+    fn check_runs_vacuum(f: Fixture) {
+        let fence = f.lease("worker-a", 60_000);
+        let mut done = f.block();
+        assert!(f.claim(&mut done, &fence));
+        f.o.commit_run(&done, &f.def, Some(&fence)).unwrap();
+        let mut waiting = done.clone();
+        waiting.id = "run_still_running".into();
+        waiting.trigger_key = "8888.0".into();
+        assert!(f.claim(&mut waiting, &fence));
+        let far = f.o.store().clock_ms().unwrap() + 60_000;
+        assert_eq!(f.o.store().runs_vacuum(far).unwrap(), 1, "the succeeded row only");
+        assert!(f.o.store().run_get(&done.id).unwrap().is_none());
+        assert_eq!(f.o.store().run_get(&waiting.id).unwrap().unwrap().state, RunState::Running);
+        assert_eq!(f.o.store().runs_vacuum(0).unwrap(), 0, "nothing older than the cutoff");
+    }
+
+    #[test]
+    fn retention_deletes_final_runs_only() {
+        check_runs_vacuum(memory(resolve_blocked()));
+    }
+
+    #[test]
+    fn retention_deletes_final_runs_only_postgres() {
+        if let Some(f) = postgres("runs_vacuum", resolve_blocked()) {
+            check_runs_vacuum(f);
         }
     }
 }

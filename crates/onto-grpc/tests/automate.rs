@@ -221,3 +221,65 @@ async fn automation_routes_over_http_and_grpc() {
     let (st, out) = h.post("/v1/automations/kill", json!({ "off": true })).await;
     assert_eq!((st, &out["kill"]), (200, &json!(false)), "{out}");
 }
+
+/// `x-onto-cause-depth` (and `x-onto-cause-run`) from a config token raise
+/// the request's cascade depth: its change records carry it, and a change at
+/// the depth limit starts no run (a loop that leaves onto through a webhook
+/// and comes back with `action.apply` meets the limit). From a caller acting
+/// for someone else under a config token the header still counts (the token
+/// is the trusted service); a non-number or a depth of 0 is no cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cause_depth_headers_count_from_config_tokens() {
+    let (addr, _stop) = start().await;
+    let h = Http { base: format!("http://{addr}"), http: reqwest::Client::new() };
+    let upsert = |body: Value, depth: Option<&str>| {
+        let mut req = h
+            .http
+            .post(format!("{}/v1/call/entity.upsert", h.base))
+            .bearer_auth(OPS)
+            .header("x-onto-tenant", "ws_a")
+            .json(&body);
+        if let Some(d) = depth {
+            req = req.header("x-onto-cause-depth", d).header("x-onto-cause-run", "run_ext 1<script>");
+        }
+        req.send()
+    };
+    let last_cause = || async {
+        let (st, page) = h.get("/v1/changes?after=0.0").await;
+        assert_eq!(st, 200, "{page}");
+        page["changes"].as_array().unwrap().last().unwrap()["cause"].clone()
+    };
+    assert_eq!(
+        upsert(json!({ "id": "issue:c1", "title": "C", "state": "triaged" }), Some("2")).await.unwrap().status(),
+        200
+    );
+    let cause = last_cause().await;
+    assert_eq!((cause["depth"].as_u64(), cause["run"].as_str()), (Some(2), Some("run_ext1script")), "{cause}");
+    assert!(cause.get("automation").is_none(), "an inbound cause names no automation: {cause}");
+    for ignored in ["0", "-4", "two"] {
+        upsert(json!({ "id": "issue:c1", "title": format!("C {ignored}") }), Some(ignored)).await.unwrap();
+        let cause = last_cause().await;
+        assert!(cause.get("depth").is_none() && cause.get("run").is_none(), "{ignored}: {cause}");
+    }
+
+    // At the depth limit (3): the run it would start is refused, not run.
+    let (st, out) = h.post("/v1/schema/apply", definition()).await;
+    assert_eq!(st, 200, "{out}");
+    let (st, out) = h.post("/v1/automations/resolve_blocked/enable", json!({})).await;
+    assert_eq!(st, 200, "{out}");
+    assert_eq!(upsert(json!({ "id": "issue:c1", "state": "blocked" }), Some("3")).await.unwrap().status(), 200);
+    let start = Instant::now();
+    let runs = loop {
+        let (_, runs) = h.get("/v1/automations/resolve_blocked/runs").await;
+        if runs["items"].as_array().is_some_and(|a| !a.is_empty()) {
+            break runs;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "waited for the run: {runs}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let run = &runs["items"][0];
+    assert_eq!(run["state"], "refused", "{run}");
+    assert!(run["reason"].as_str().unwrap().starts_with("depth: the run would be at depth 4"), "{run}");
+    let (_, issue) = h.post("/v1/call/entity.get", json!({ "id": "issue:c1" })).await;
+    assert_eq!(issue["state"], "blocked", "nothing ran: {issue}");
+}

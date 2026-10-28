@@ -64,6 +64,9 @@ class Vector(unittest.TestCase):
             (SECRET, headers(EXPECTED, msg_id="msg_other"), BODY, TS, "no webhook-signature"),
             (OTHER, headers(EXPECTED), BODY, TS, "no webhook-signature"),
             (SECRET, headers("v2,abc"), BODY, TS, "no webhook-signature"),
+            # Non-ASCII (headers decoded as latin-1): a mismatch, never a TypeError.
+            (SECRET, headers("v1,\u00e9\u00e9"), BODY, TS, "no webhook-signature"),
+            (SECRET, headers(EXPECTED + " v1,\udcff"), BODY.replace("2", "3"), TS, "no webhook-signature"),
             (SECRET, {"webhook-id": MSG_ID}, BODY, TS, "missing"),
         ]
         for secret, h, body, now, msg in cases:

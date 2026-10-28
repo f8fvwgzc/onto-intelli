@@ -40,6 +40,32 @@ What these numbers say and do not say:
 - The ring held at most 600 records (about 290 KB) during these runs.
 - The delivery lag includes the commit itself (about 4.5 ms of it at p50).
 - Not measured yet: the per-page filtering time against
-  `changes.eval_budget_ms` (50 ms stays the default until it is), commits on a
-  large graph, and webhook fan-out throughput with 50 endpoints during a
-  100k-entity crawl (build step 9).
+  `changes.eval_budget_ms` (50 ms stays the default until it is) and commits
+  on a large graph.
+
+## Benchmark: webhook fan-out during a crawl
+
+Measured 2026-10-28 with `onto-bench --fanout` (release build), same machine
+and database as above. A crawl writes 100,000 new entities in commits of 500
+(`Ontology::apply`, five kinds in turn) on a fresh tenant with no endpoints,
+then on one with 50 endpoints, each subscribed to `entity.create` of one of
+the five kinds, so every entity matches ten endpoints. Deliveries are off in
+this run: fan-out enqueues the outbox rows and nothing is sent.
+
+```text
+ONTO_BENCH_HOOK_SECRET=unused cargo run --release -p onto-bench -- --url postgres://onto:onto@127.0.0.1:5441/onto --fanout --crawl 100000
+```
+
+| Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |
+|---|---|---:|---:|---:|---:|---:|
+| crawl commit, 0 endpoints | 500 new entities per commit | 200 | 41.995 | 58.213 | 42.681 | 74.240 |
+| crawl commit, 50 endpoints | 500 new entities per commit, fan-out running | 200 | 39.438 | 64.168 | 40.652 | 74.529 |
+
+- The crawl took 8.6 s without endpoints and 8.2 s with 50: fan-out running
+  beside it did not slow the commits measurably (p99 64 ms against 58 ms).
+- Fan-out enqueued 1,000,000 rows (ten per entity) and reached the head of
+  the change feed 99.9 s after the crawl began: about 10,000 rows, or 1,000
+  entities, per second. It runs behind a crawl this fast; each endpoint's
+  cursor keeps its place, so nothing is lost while it catches up, and an
+  endpoint whose backlog passes `pending_cap` pauses until it drains.
+- Delivery throughput was not part of this run.

@@ -102,6 +102,26 @@ tables, and the trigger turns each of its state-changing commits into a
 `gap` record, so change-feed readers see what they missed. A later upgrade
 applies the migrations again, and its first commit records changes again.
 
+Rolling back past `0011_outbox`, `0012_automate` and `0013_outbox_claim`
+(webhooks, automations and writeback): the tables and indexes are additive
+and an older build ignores them; delete the `schema_migrations` rows with
+`version >= 11` (or `>= 9`, as above) first. The schema needs one more step.
+An older build reads the head schema version whole when it opens a tenant:
+a version whose `changes` hold `put_automation` or `delete_automation`
+(builds before step 10 do not know them), or a head schema with an action
+type that has a `writeback` effect (builds before step 12 count it as no
+effect), makes it refuse the tenant. Before starting such a build:
+
+1. Remove what it does not know with `schema.apply`: `delete_automation`
+   for every automation, and `put_action_type` without the `writeback`
+   effects (or `delete_action_type`) for action types that have one.
+2. Apply one more ordinary schema change (for example a `put_glossary_term`),
+   so the head version's `changes` hold only operations the older build
+   knows; removing the automations alone leaves `delete_automation` in the
+   head.
+
+Rolling forward again needs nothing: the newer build reads every version.
+
 **Reserved tenant ids.** Since the change feed, `{prefix}_sys` (`onto_sys`)
 is the deployment's shared schema (the `wake` table), so the tenant ids
 `sys` and `_sys` (any case) are refused. A tenant created under such an id

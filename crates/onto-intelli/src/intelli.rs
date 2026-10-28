@@ -1,7 +1,7 @@
 //! The orchestrator: deterministic retrieval first, the LLM only for reasoning.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -218,6 +218,20 @@ pub struct Intelli {
     automation_wake: Arc<tokio::sync::Notify>,
     /// The automation consumer's state in this process.
     automation: parking_lot::Mutex<crate::automate::Runtime>,
+    /// Which workers commits wake, and how often they ran.
+    wants: Arc<Wants>,
+}
+
+/// Commits wake the fan-out only while the tenant has an enabled change
+/// subscription, and the automation consumer only while it has an enabled
+/// automation; their rounds keep these up to date (they start on, so the
+/// first commit wakes both). Actions that change what they want wake them
+/// explicitly, and both poll as well.
+struct Wants {
+    fanout: AtomicBool,
+    automation: AtomicBool,
+    fanout_rounds: AtomicU64,
+    automation_rounds: AtomicU64,
 }
 
 impl Intelli {
@@ -275,15 +289,27 @@ impl Intelli {
         let fanout = fanout_wake.clone();
         let automation_wake = Arc::new(tokio::sync::Notify::new());
         let automation = automation_wake.clone();
+        let wants = Arc::new(Wants {
+            fanout: AtomicBool::new(true),
+            automation: AtomicBool::new(true),
+            fanout_rounds: AtomicU64::new(0),
+            automation_rounds: AtomicU64::new(0),
+        });
+        let wanted = wants.clone();
         onto.on_change(move |c| {
             // Rows this process enqueued, or another process's commit (which
             // may have enqueued some): look for due rows now.
             if c.outbox > 0 || c.request_id == "sync" {
                 wake.notify_one();
             }
-            // Any commit may hold records a subscription or an automation wants.
-            fanout.notify_one();
-            automation.notify_one();
+            // A commit may hold records a subscription or an automation
+            // wants: wake only the workers that have one.
+            if wanted.fanout.load(Ordering::Relaxed) {
+                fanout.notify_one();
+            }
+            if wanted.automation.load(Ordering::Relaxed) {
+                automation.notify_one();
+            }
         });
         let me = Arc::new(Self {
             secrets: parking_lot::RwLock::new(None),
@@ -291,6 +317,7 @@ impl Intelli {
             fanout_wake,
             automation_wake,
             automation: parking_lot::Mutex::new(crate::automate::Runtime::new()),
+            wants,
             changes,
             closing: watch::Sender::new(false),
             stream_touch: AtomicI64::new(0),
@@ -319,8 +346,9 @@ impl Intelli {
         if me.traces.is_some() {
             spawn_trace_retention(&me);
         }
-        if me.onto.store().keeps_changes() {
-            spawn_change_retention(&me);
+        let store = me.onto.store();
+        if store.keeps_changes() || store.keeps_outbox() || store.keeps_runs() {
+            spawn_retention(&me);
         }
         #[cfg(feature = "outbound")]
         crate::webhooks::spawn_delivery(&me, me.outbox_wake.clone())?;
@@ -430,6 +458,113 @@ impl Intelli {
 
     pub(crate) fn automation_runtime(&self) -> &parking_lot::Mutex<crate::automate::Runtime> {
         &self.automation
+    }
+
+    /// Wakes the fan-out of change subscriptions.
+    pub(crate) fn wake_fanout(&self) {
+        self.fanout_wake.notify_one();
+    }
+
+    /// Whether commits wake the fan-out (an enabled change subscription).
+    pub(crate) fn set_wants_fanout(&self, on: bool) {
+        self.wants.fanout.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether commits wake the automation consumer (an enabled automation).
+    pub(crate) fn set_wants_automation(&self, on: bool) {
+        self.wants.automation.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_fanout_round(&self) {
+        self.wants.fanout_rounds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_automation_round(&self) {
+        self.wants.automation_rounds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Switches and paused counts of webhooks and automations, and whether
+    /// the change feed captures (docs/design/EVENTS.md section 11), for
+    /// `system.health`. A store error leaves the field `null`.
+    pub fn outbound_health(&self) -> Value {
+        let onto = &self.onto;
+        let store = onto.store();
+        let now = onto_core::time::now_ms();
+        let automation = store.keeps_runs().then(|| {
+            let en = onto_core::automate::Enablements::load(&**store).ok();
+            json!({
+                "process_enabled": self.config.automation.enabled,
+                "kill": onto_core::runs::killed(&**store).ok(),
+                "enabled": en.as_ref().map(|e| e.states.values().filter(|s| s.enabled).count()),
+                "paused": en.as_ref().map(|e| e.states.values().filter(|s| s.enabled && s.paused.is_some()).count()),
+            })
+        });
+        let webhooks = store.keeps_outbox().then(|| {
+            let eps = crate::webhooks::Endpoint::list(onto).ok();
+            let control: Vec<(String, Value)> =
+                store.kv_scan(crate::webhooks::NS_CONTROL, "").unwrap_or_default().into_iter().collect();
+            let held = |name: &str| {
+                control.iter().any(|(k, v)| {
+                    (k == &format!("{}{name}", crate::webhooks::BACKLOG_PREFIX) && !v.is_null())
+                        || (k == &format!("{}{name}", crate::webhooks::BREAKER_PREFIX)
+                            && serde_json::from_value::<crate::webhooks::BreakerState>(v.clone())
+                                .is_ok_and(|b| b.is_open()))
+                })
+            };
+            json!({
+                "process_enabled": self.config.webhooks.enabled,
+                "kill": crate::webhooks::killed(onto).ok(),
+                "endpoints": eps.as_ref().map(Vec::len),
+                "paused": eps.as_ref().map(|eps| eps
+                    .iter()
+                    .filter(|e| e.enabled && (e.paused.as_ref().is_some_and(|p| p.until.is_none_or(|u| u > now)) || held(&e.name)))
+                    .count()),
+            })
+        });
+        json!({
+            "changes": { "capture": onto.capture_enabled() },
+            "automation": automation,
+            "webhooks": webhooks,
+        })
+    }
+
+    /// Outbox rows not yet finished per target, and runs per state over the
+    /// last hour (at most the newest 500 counted), for `system.stats`.
+    fn outbound_stats(&self) -> Value {
+        let store = self.onto.store();
+        let open: Option<serde_json::Map<String, Value>> = store
+            .keeps_outbox()
+            .then(|| store.outbox_open_counts().ok())
+            .flatten()
+            .map(|v| v.into_iter().map(|(t, n)| (t, json!(n))).collect());
+        let runs = store.keeps_runs().then(|| {
+            let q = onto_core::runs::RunQuery {
+                since: Some(store.clock_ms().unwrap_or_else(|_| onto_core::time::now_ms()) - 3_600_000),
+                limit: Some(onto_core::runs::MAX_LIST),
+                ..Default::default()
+            };
+            store.runs_list(&q).ok().map(|rows| {
+                let mut by: std::collections::BTreeMap<&'static str, u64> = Default::default();
+                for r in &rows {
+                    *by.entry(r.state.as_str()).or_default() += 1;
+                }
+                json!({ "states": by, "counted": rows.len(), "capped": rows.len() >= onto_core::runs::MAX_LIST })
+            })
+        });
+        json!({ "outbox_open": open, "runs_1h": runs.flatten() })
+    }
+
+    /// Rounds the fan-out and the automation consumer ran in this process
+    /// since the tenant opened (what commits and polls cost), and whether
+    /// commits wake them now.
+    pub fn worker_rounds(&self) -> Value {
+        let w = &self.wants;
+        json!({
+            "fanout": w.fanout_rounds.load(Ordering::Relaxed),
+            "automation": w.automation_rounds.load(Ordering::Relaxed),
+            "commits_wake_fanout": w.fanout.load(Ordering::Relaxed),
+            "commits_wake_automation": w.automation.load(Ordering::Relaxed),
+        })
     }
 
     pub fn is_closing(&self) -> bool {
@@ -597,6 +732,27 @@ impl Intelli {
     /// Blocking: the retention task runs it on the blocking pool.
     pub fn vacuum_changes(&self) -> Result<onto_core::changes::ChangeVacuum> {
         self.onto.store().vacuum_changes(&self.config.changes.retention())
+    }
+
+    /// Delete finished outbox rows and attempt logs older than `[webhooks]
+    /// retain_days`, and final run rows older than `[automation]
+    /// retain_days`, by the store's clock (whatever the delivery and
+    /// automation switches of this process are). Returns `(outbox, runs)`.
+    /// Blocking: the retention task runs it on the blocking pool.
+    pub fn vacuum_outbound(&self) -> Result<(u64, u64)> {
+        let store = self.onto.store();
+        let now = store.clock_ms()?;
+        let outbox = if store.keeps_outbox() {
+            store.outbox_vacuum(crate::config::retention_cutoff(now, self.config.webhooks.retain_days))?
+        } else {
+            0
+        };
+        let runs = if store.keeps_runs() {
+            store.runs_vacuum(crate::config::retention_cutoff(now, self.config.automation.retain_days))?
+        } else {
+            0
+        };
+        Ok((outbox, runs))
     }
 
     pub fn default_workspace(&self) -> &str {
@@ -1343,6 +1499,8 @@ impl Intelli {
                 "available": llm.unavailable().is_none(),
                 "unavailable_reason": llm.unavailable(),
             },
+            "outbound": self.outbound_stats(),
+            "workers": self.worker_rounds(),
             "ledger": self.ledger(),
             "caches": {
                 "answers": self.answers.stats(),
@@ -1374,11 +1532,13 @@ fn spawn_trace_retention(me: &Arc<Intelli>) {
     });
 }
 
-/// Trim the change feed ([`Intelli::vacuum_changes`]) 5 minutes after the
-/// tenant opens, then hourly, for as long as it is open. Every process with
-/// the tenant open runs it; a pass is one transaction that locks the floor,
-/// so passes from several replicas only repeat the same trim.
-fn spawn_change_retention(me: &Arc<Intelli>) {
+/// Trim the change feed ([`Intelli::vacuum_changes`]), the outbox and the
+/// run rows ([`Intelli::vacuum_outbound`]) 5 minutes after the tenant opens,
+/// then hourly, for as long as it is open (a tenant that idles out before an
+/// hour still gets its pass). Every process with the tenant open runs it; a
+/// change pass is one transaction that locks the floor, so passes from
+/// several replicas only repeat the same trim.
+fn spawn_retention(me: &Arc<Intelli>) {
     let weak = Arc::downgrade(me);
     tokio::spawn(async move {
         let mut wait = Duration::from_secs(300);
@@ -1386,11 +1546,22 @@ fn spawn_change_retention(me: &Arc<Intelli>) {
             tokio::time::sleep(wait).await;
             wait = Duration::from_secs(3600);
             let Some(me) = weak.upgrade() else { break };
-            match tokio::task::spawn_blocking(move || me.vacuum_changes()).await {
-                Ok(Ok(v)) if v.deleted > 0 => tracing::info!(rows = v.deleted, floor = v.floor, "change retention"),
+            let me2 = me.clone();
+            if me.onto.store().keeps_changes() {
+                match tokio::task::spawn_blocking(move || me2.vacuum_changes()).await {
+                    Ok(Ok(v)) if v.deleted > 0 => {
+                        tracing::info!(rows = v.deleted, floor = v.floor, "change retention")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("change retention: {e}"),
+                    Err(e) => tracing::warn!("change retention: {e}"),
+                }
+            }
+            match tokio::task::spawn_blocking(move || me.vacuum_outbound()).await {
+                Ok(Ok((outbox, runs))) if outbox + runs > 0 => tracing::info!(outbox, runs, "outbox and run retention"),
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("change retention: {e}"),
-                Err(e) => tracing::warn!("change retention: {e}"),
+                Ok(Err(e)) => tracing::warn!("outbox and run retention: {e}"),
+                Err(e) => tracing::warn!("outbox and run retention: {e}"),
             }
         }
     });

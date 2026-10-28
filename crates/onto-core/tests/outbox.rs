@@ -48,6 +48,9 @@ fn protocol(store: &dyn Store) {
     assert_eq!(store.outbox_enqueue(&[row("other", "test:0")], None, None).unwrap(), 1, "keys are per target");
     // Backlogs per target (fan-out pauses an endpoint past its cap).
     assert_eq!(store.outbox_open_counts().unwrap(), vec![("ops".to_string(), 6), ("other".to_string(), 1)]);
+    // Fan-out's per-endpoint counts stop at its cap.
+    let capped = store.outbox_open_counts_for(&["ops".into(), "none".into(), "other".into()], 4).unwrap();
+    assert_eq!(capped, vec![("ops".to_string(), 4), ("none".to_string(), 0), ("other".to_string(), 1)]);
     let stored = store.outbox_get(&rows[0].id).unwrap().unwrap();
     assert_eq!(stored.state, OutboxState::Pending);
     assert!(stored.created_at > 0 && stored.next_at >= stored.created_at, "{stored:?}");

@@ -32,9 +32,9 @@ use onto_core::time::now_ms;
 use onto_core::{ActionContext, Error, Ontology, Principal, Result, one_or_many};
 
 use super::{
-    BACKLOG_PREFIX, BREAKER_PREFIX, BreakerState, DELIVERY_NOTE, Endpoint, KILL_KEY, NS_CONTROL, NS_ENDPOINT,
-    SecretRef, check_endpoint_url, consumer_name, enqueue_test, generate_secret, is_reference, killed, resolve_text,
-    valid_name,
+    BACKLOG_PREFIX, BREAKER_PREFIX, BreakerState, DELIVERY_NOTE, Endpoint, KILL_KEY, MIN_KEY_BYTES, NS_CONTROL,
+    NS_ENDPOINT, SecretRef, check_endpoint_url, check_secret, consumer_name, enqueue_test, generate_secret,
+    is_reference, killed, resolve_text, valid_name,
 };
 use crate::actions::parse;
 use crate::changes::FilterIn;
@@ -346,7 +346,10 @@ impl Intelli {
             Some(s) if s.starts_with("sealed:") => {
                 Err(Error::invalid("secret: give the secret itself (it is sealed here), not a sealed value"))
             }
-            Some(s) => Ok((SecretRef::seal(sealer.as_deref(), name, s.as_bytes())?, None)),
+            Some(s) => {
+                check_secret(s.as_bytes(), "secret")?;
+                Ok((SecretRef::seal(sealer.as_deref(), name, s.as_bytes())?, None))
+            }
         }
     }
 
@@ -498,6 +501,11 @@ impl Intelli {
                 let url = self.check_url_input(&i.url, i.restricted)?;
                 let filter = i.filter.map(FilterIn::into_filter).transpose().map_err(|e| prefixed(action, e))?;
                 let (secret, generated) = self.secret_input(&name, i.secret.as_deref())?;
+                // The store's clock: rows created for this endpoint are never
+                // older (an earlier endpoint of this name keeps its rows), and
+                // the version starts there, so an endpoint removed and added
+                // again never hashes like the old one in an automation closure.
+                let created_at = super::incarnation_start(onto, &name)?;
                 let ep = Endpoint {
                     name: name.clone(),
                     url,
@@ -509,14 +517,17 @@ impl Intelli {
                     enabled: !i.disabled,
                     paused: None,
                     restricted: i.restricted,
-                    version: 1,
+                    version: created_at.max(1) as u64,
                     created_by: p.id.clone(),
-                    created_at: now_ms(),
+                    created_at,
                 };
                 if ep.filter.is_some() {
                     self.start_cursor(&name)?;
                 }
                 self.put_endpoint(&ctx, &ep, action, json!({}))?;
+                if ep.filter.is_some() {
+                    self.wake_fanout();
+                }
                 let mut out = json!({
                     "endpoint": self.endpoint_view(p, &ep, None, None),
                     "note": DELIVERY_NOTE,
@@ -600,6 +611,7 @@ impl Intelli {
                 self.put_endpoint(&ctx, &ep, action, json!({ "changed": changed }))?;
                 if ep.enabled {
                     self.wake_outbox();
+                    self.wake_fanout();
                 }
                 let mut out = json!({ "endpoint": self.endpoint_view(p, &ep, None, None), "changed": changed });
                 if let Some(s) = generated {
@@ -628,7 +640,8 @@ impl Intelli {
                 onto.commit_config(&ctx, kv, ConfigEvent::new(action, Some(&ep.principal_id()), payload))?;
                 Ok(json!({
                     "removed": ep.name,
-                    "note": "rows not yet sent to it are cancelled when the worker reaches them",
+                    "note": "rows not yet sent to it are cancelled when the worker reaches them; an endpoint added \
+                             later under this name never sees, replays or receives them",
                 }))
             }
             "webhook.test" => {
@@ -637,6 +650,19 @@ impl Intelli {
                 admin_check(onto, &ctx, "send test deliveries")?;
                 let ep = load(onto, i.name.trim())?;
                 dominance_check(onto, &ctx, action, &ep)?;
+                // A secret an operator reference resolves to is checked as a
+                // supplied one is (one that does not resolve yet is reported by
+                // the delivery, which retries).
+                if let Ok(keys) = ep.signing_keys(now_ms(), self.secrets().as_deref())
+                    && keys.iter().any(|k| k.len() < MIN_KEY_BYTES)
+                {
+                    return Err(Error::invalid(format!(
+                        "webhook.test: the signing secret of endpoint {} ({}) gives a key under {MIN_KEY_BYTES} bytes; \
+                         rotate it (webhook.rotate_secret)",
+                        ep.name,
+                        ep.secret.describe()
+                    )));
+                }
                 let out = enqueue_test(onto, &ctx, &ep.name)?;
                 self.wake_outbox();
                 Ok(out)
@@ -688,20 +714,23 @@ impl Intelli {
                 dominance_check(onto, &ctx, action, &ep)?;
                 if let Some(id) = i.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     let row =
-                        onto.store().outbox_get(id)?.filter(|r| r.target == ep.name).ok_or_else(|| {
+                        onto.store().outbox_get(id)?.filter(|r| ep.owns(r)).ok_or_else(|| {
                             Error::not_found(format!("delivery {id} of webhook endpoint {}", ep.name))
                         })?;
                     let attempts = onto.store().outbox_attempts(id, i.limit.unwrap_or(50).clamp(1, 500))?;
                     return Ok(json!({ "row": row.listed(), "attempts": attempts, "note": DELIVERY_NOTE }));
                 }
+                // Rows of this endpoint only: not those of an earlier one of
+                // the same name (or of a writeback target that had it).
                 let q = OutboxQuery {
                     target: Some(ep.name.clone()),
                     states: states(&i.states)?,
-                    since: i.since,
+                    since: Some(i.since.unwrap_or(ep.created_at).max(ep.created_at)),
                     limit: i.limit,
                     ..Default::default()
                 };
-                let items: Vec<_> = onto.store().outbox_list(&q)?.into_iter().map(|r| r.listed()).collect();
+                let items: Vec<_> =
+                    onto.store().outbox_list(&q)?.into_iter().filter(|r| ep.owns(r)).map(|r| r.listed()).collect();
                 Ok(json!({ "name": ep.name, "items": items, "note": DELIVERY_NOTE }))
             }
             "webhook.replay" => {
@@ -710,14 +739,26 @@ impl Intelli {
                 admin_check(onto, &ctx, "replay webhook deliveries")?;
                 let ep = load(onto, i.name.trim())?;
                 dominance_check(onto, &ctx, action, &ep)?;
+                // Only this endpoint's rows (never an earlier endpoint's of the same name).
                 let sel = match (i.ids.is_empty(), i.since) {
-                    (false, None) => OutboxSelect::Ids(i.ids.clone()),
-                    (true, Some(t)) => OutboxSelect::Since(t),
+                    (false, None) => {
+                        let mut own = Vec::new();
+                        for id in &i.ids {
+                            if onto.store().outbox_get(id.trim())?.is_some_and(|r| ep.owns(&r)) {
+                                own.push(id.trim().to_string());
+                            }
+                        }
+                        OutboxSelect::Ids(own)
+                    }
+                    (true, Some(t)) => OutboxSelect::Since(t.max(ep.created_at)),
                     (false, Some(_)) => return Err(Error::invalid("webhook.replay: give ids or since, not both")),
                     (true, None) => return Err(Error::invalid("webhook.replay: give ids or since")),
                 };
                 let st = states(&i.states)?;
-                let n = onto.store().outbox_reset(&ep.name, &sel, &st)?;
+                let n = match &sel {
+                    OutboxSelect::Ids(ids) if ids.is_empty() => 0,
+                    _ => onto.store().outbox_reset(&ep.name, &sel, &st)?,
+                };
                 let payload = json!({
                     "name": ep.name,
                     "ids": i.ids.len(),
@@ -769,6 +810,7 @@ impl Intelli {
                     let payload = json!({ "name": ep.name, "cleared": cleared });
                     onto.commit_config(&ctx, kv, ConfigEvent::new(action, Some(&ep.principal_id()), payload))?;
                     self.wake_outbox();
+                    self.wake_fanout();
                 }
                 let note = if ep.enabled {
                     "resumed; an endpoint still over its backlog cap is paused again by fan-out"
@@ -837,9 +879,15 @@ impl Intelli {
                     // hidden (they show what the endpoint's principal sees),
                     // as do rows of writeback targets the caller may not
                     // manage; rows of removed ones only to tenant-wide admins.
+                    // A row older than the endpoint or target of its name
+                    // belongs to a removed one.
                     let ok = match r.kind {
-                        OutboxKind::Webhook => endpoints.get(&r.target).map(|ep| dominates(p, &ep.principal)),
-                        OutboxKind::Writeback => targets.get(&r.target).map(|t| dominates(p, &t.scope())),
+                        OutboxKind::Webhook => {
+                            endpoints.get(&r.target).filter(|ep| ep.owns(&r)).map(|ep| dominates(p, &ep.principal))
+                        }
+                        OutboxKind::Writeback => {
+                            targets.get(&r.target).filter(|t| t.owns(&r)).map(|t| dominates(p, &t.scope()))
+                        }
                     }
                     .unwrap_or(everywhere);
                     if ok {

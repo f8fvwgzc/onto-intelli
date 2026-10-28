@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use onto_intelli::config::AllowConfig;
 use onto_intelli::core::EventFilter;
 use onto_intelli::core::changes::ChangeRetention;
-use onto_intelli::core::outbox::{OutboxQuery, OutboxState};
+use onto_intelli::core::outbox::{OutboxKind, OutboxQuery, OutboxRow, OutboxState, SOURCE_AUTOMATION};
 use onto_intelli::hub::{Secret, SecretBox};
 use onto_intelli::webhooks::{self, BACKLOG_PREFIX, Endpoint, NS_CONTROL};
 use onto_intelli::{Config, Intelli, Principal, Result, Role};
@@ -179,7 +179,11 @@ async fn endpoints_are_managed_through_their_actions() {
     assert!(secret.starts_with("whsec_"), "{added}");
     let ep = &added["endpoint"];
     assert_eq!(ep["principal"], json!({ "roles": ["viewer"], "workspaces": ["acme"] }), "{ep}");
-    assert_eq!((ep["status"].as_str(), ep["version"].as_u64()), (Some("active"), Some(1)));
+    // The version starts at the registration time (ms by the store's clock),
+    // so an endpoint removed and added again never hashes like the old one.
+    let v0 = ep["version"].as_u64().unwrap();
+    assert_eq!(ep["status"].as_str(), Some("active"));
+    assert!(v0 > 1_000_000_000_000 && v0 as i64 == ep["created_at"].as_i64().unwrap().max(1), "{ep}");
     assert!(ep["secret"].as_str().unwrap().starts_with("sealed"), "{ep}");
 
     // The listing never shows the secret again.
@@ -223,7 +227,10 @@ async fn endpoints_are_managed_through_their_actions() {
     verify(&last, &secret);
     verify(&last, &new_secret);
     let up = ok(&i, &lead(), "webhook.update", json!({ "name": "ops", "disabled": true })).await;
-    assert_eq!((up["endpoint"]["status"].as_str(), up["endpoint"]["version"].as_u64()), (Some("disabled"), Some(3)));
+    assert_eq!(
+        (up["endpoint"]["status"].as_str(), up["endpoint"]["version"].as_u64()),
+        (Some("disabled"), Some(v0 + 2))
+    );
     assert!(i.call(&lead(), "webhook.update", json!({ "name": "ops" })).await.is_err(), "nothing to change");
     let res = ok(&i, &lead(), "webhook.resume", json!({ "name": "ops" })).await;
     assert!(res["note"].as_str().unwrap().contains("disabled"), "{res}");
@@ -431,6 +438,8 @@ async fn a_kind_rename_rewrites_endpoint_filters_in_the_schema_commit() {
     .await;
     add(&i, "other", &rx.url("/"), json!({ "kinds": "person" }), json!({ "roles": "viewer", "workspaces": "acme" }))
         .await;
+    let version = |name: &str| Endpoint::load(i.ontology(), name).unwrap().unwrap().version;
+    let (ops0, other0) = (version("ops"), version("other"));
     ok(
         &i,
         &lead(),
@@ -440,9 +449,9 @@ async fn a_kind_rename_rewrites_endpoint_filters_in_the_schema_commit() {
     .await;
     let ep = Endpoint::load(i.ontology(), "ops").unwrap().unwrap();
     assert_eq!(ep.filter.as_ref().unwrap().kinds, vec!["chore", "person"]);
-    assert_eq!(ep.version, 2, "a rewritten filter is a new version");
+    assert_eq!(ep.version, ops0 + 1, "a rewritten filter is a new version");
     let other = Endpoint::load(i.ontology(), "other").unwrap().unwrap();
-    assert_eq!(other.version, 1, "untouched");
+    assert_eq!(other.version, other0, "untouched");
     // The rewrite is part of the schema change's commit and its audit event.
     let change = events(&i, "schema.change");
     let last = change.last().unwrap();
@@ -527,4 +536,185 @@ async fn a_narrower_admin_cannot_manage_a_broader_endpoint() {
     assert_eq!(who["capabilities"]["configure_outbound"], true);
     let who = ok(&i, &Principal::member("user:m", "acme"), "system.whoami", json!({})).await;
     assert_eq!(who["capabilities"]["configure_outbound"], false);
+}
+
+// ── review round 1 (phase 1 steps 8-12) ────────────────────────────────
+
+/// SEC-1: call traces of endpoint configuration keep no secret and no URL
+/// path or query, given, generated or rotated, for any admin who reads them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traces_of_endpoint_calls_hold_no_secrets() {
+    let i = open(|_| {}).await;
+    assert!(i.config().traces.enabled && i.config().traces.capture_content, "the default trace settings");
+    let given = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    let mut ids = Vec::new();
+    let mut secrets = vec![given.to_string()];
+    for (action, input) in [
+        (
+            "webhook.add",
+            json!({ "name": "ops", "url": "http://127.0.0.1:9/hooks/ops?token=t0p", "secret": given,
+                    "principal": { "roles": "admin", "workspaces": "*" } }),
+        ),
+        ("webhook.add", json!({ "name": "billing", "url": "http://127.0.0.1:9/hooks/billing?token=t0p" })),
+        ("webhook.rotate_secret", json!({ "name": "billing" })),
+        (
+            "writeback.add",
+            json!({ "name": "desk", "base_url": "https://desk.example.com/api?token=t0p",
+                                   "routes": { "close": "close" }, "generate_secret": true }),
+        ),
+    ] {
+        let t = i.call_traced(&lead(), action, input, onto_intelli::trace::TraceCtx::default()).await;
+        let out = t.result.unwrap_or_else(|e| panic!("{action}: {e}"));
+        if let Some(s) = out["secret"].as_str() {
+            secrets.push(s.to_string());
+        }
+        ids.push(t.trace_id.expect("write actions are traced"));
+    }
+    assert_eq!(secrets.len(), 4, "given, generated, rotated and generated again");
+    i.flush_traces().await;
+    let narrow = Principal::new("user:acme-admin", vec![Role::Admin], vec!["acme".into()]);
+    for p in [lead(), narrow] {
+        for id in &ids {
+            let got = ok(&i, &p, "trace.get", json!({ "id": id })).await.to_string();
+            for s in &secrets {
+                assert!(!got.contains(s.as_str()), "{}: a secret in trace {id}: {got}", p.id);
+            }
+            assert!(!got.contains("whsec_") && !got.contains("t0p") && !got.contains("/hooks/"), "{got}");
+        }
+    }
+}
+
+/// SEC-2: rows are bound to the endpoint they were made for, not its name: a
+/// narrower admin who registers a freed name never lists, replays or
+/// receives the rows of the endpoint before it, and rows still waiting for
+/// the old endpoint are cancelled, not sent to the new URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_endpoint_name_never_inherits_the_old_rows() {
+    let (a, b) = (Receiver::start(vec![]).await, Receiver::start(vec![]).await);
+    let i = open(|_| {}).await;
+    let store = i.ontology().store().clone();
+    let broad = json!({ "roles": "admin", "workspaces": "*" });
+    ok(&i, &lead(), "webhook.add", json!({ "name": "ops", "url": a.url("/"), "principal": broad })).await;
+    let row = |dedupe: &str| {
+        let mut r =
+            OutboxRow::new(OutboxKind::Webhook, "ops", dedupe, SOURCE_AUTOMATION, "secretws", "onto.issue.resolved");
+        r.payload = json!({ "title": "TOP SECRET from secretws" });
+        r
+    };
+    let first = row("run_x:0");
+    store.outbox_enqueue(std::slice::from_ref(&first), None, None).unwrap();
+    i.wake_outbox();
+    until("the first row reaches A", || a.hits().len() == 1).await;
+    // A second row waits (deliveries held) when the endpoint is removed.
+    ok(&i, &lead(), "webhook.kill", json!({ "on": true })).await;
+    let second = row("run_y:0");
+    store.outbox_enqueue(std::slice::from_ref(&second), None, None).unwrap();
+    ok(&i, &lead(), "webhook.remove", json!({ "name": "ops" })).await;
+    let narrow = Principal::new("user:acme-admin", vec![Role::Admin], vec!["acme".into()]);
+    let mine = json!({ "roles": "viewer", "workspaces": "acme" });
+    ok(&i, &narrow, "webhook.add", json!({ "name": "ops", "url": b.url("/"), "principal": mine })).await;
+    let d = ok(&i, &narrow, "webhook.deliveries", json!({ "name": "ops" })).await;
+    assert_eq!(d["items"], json!([]), "{d}");
+    for id in [&first.id, &second.id] {
+        let e = i.call(&narrow, "webhook.deliveries", json!({ "name": "ops", "id": id })).await.unwrap_err();
+        assert_eq!(e.code(), "not_found", "{e}");
+    }
+    let ob = ok(&i, &narrow, "outbox.list", json!({})).await;
+    assert!(!ob.to_string().contains("TOP SECRET"), "{ob}");
+    assert!(ob["hidden"].as_u64().unwrap() >= 2, "{ob}");
+    for input in [json!({ "name": "ops", "since": 0 }), json!({ "name": "ops", "ids": [first.id.clone()] })] {
+        let r = ok(&i, &narrow, "webhook.replay", input).await;
+        assert_eq!(r["replayed"], 0, "{r}");
+    }
+    // Deliveries resume: the waiting row is cancelled, never sent to B.
+    ok(&i, &lead(), "webhook.kill", json!({ "off": true })).await;
+    let id = second.id.clone();
+    until("the old endpoint's row is cancelled", || {
+        store.outbox_get(&id).unwrap().is_some_and(|r| r.state == OutboxState::Cancelled)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(b.hits().is_empty(), "B received an earlier endpoint's row");
+    // A tenant-wide admin still sees the old rows (they belong to no endpoint now).
+    let all = ok(&i, &lead(), "outbox.list", json!({})).await;
+    assert!(all.to_string().contains(&first.id), "{all}");
+    // Rows made for the new endpoint are its own.
+    let test = ok(&i, &narrow, "webhook.test", json!({ "name": "ops" })).await;
+    until("B gets its own test delivery", || b.hits().len() == 1).await;
+    let d = ok(&i, &narrow, "webhook.deliveries", json!({ "name": "ops" })).await;
+    assert_eq!(d["items"].as_array().unwrap().len(), 1, "{d}");
+    assert_eq!(d["items"][0]["id"], test["id"]);
+}
+
+/// SEC-3: an endpoint removed and added again (same principal, new URL)
+/// makes an enabled automation that reaches it stale until a person
+/// enables it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_endpoint_added_again_stops_the_automations_that_reach_it() {
+    let i = open(|cfg| cfg.automation.workers = false).await;
+    let p = json!({ "roles": "member", "workspaces": "acme" });
+    let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    ok(
+        &i,
+        &lead(),
+        "webhook.add",
+        json!({ "name": "ops", "url": "https://first.example.com/in", "secret": secret, "principal": p }),
+    )
+    .await;
+    let def = json!({
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"] },
+        "effects": [{ "webhook": { "endpoint": "ops", "event": "issue.changed", "payload": { "id": "{trigger.id}" } } }]
+    });
+    ok(&i, &lead(), "schema.apply", json!({ "changes": [{ "op": "put_automation", "name": "tell", "def": def }] }))
+        .await;
+    ok(&i, &lead(), "automation.enable", json!({ "name": "tell" })).await;
+    let got = ok(&i, &lead(), "automation.get", json!({ "name": "tell" })).await;
+    assert_eq!(got["status"], "active", "{got}");
+    ok(&i, &lead(), "webhook.remove", json!({ "name": "ops" })).await;
+    ok(
+        &i,
+        &lead(),
+        "webhook.add",
+        json!({ "name": "ops", "url": "https://elsewhere.example.net/in", "secret": secret, "principal": p }),
+    )
+    .await;
+    let got = ok(&i, &lead(), "automation.get", json!({ "name": "tell" })).await;
+    assert_eq!(
+        (got["status"].as_str(), got["reason"].as_str()),
+        (Some("inactive"), Some("stale_definition: endpoint:ops")),
+        "{got}"
+    );
+    assert_eq!(got["closure"]["changed_since_enabled"], json!(["endpoint:ops"]));
+}
+
+/// SEC-6: a supplied signing secret must give a 24 to 64 byte key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn weak_signing_secrets_are_refused() {
+    let i = open(|_| {}).await;
+    let url = "http://127.0.0.1:9/in";
+    let long = format!("whsec_{}", base64::engine::general_purpose::STANDARD.encode([7u8; 65]));
+    for weak in ["whsec_", "x", "whsec_!!!notbase64", "short-raw-secret", long.as_str()] {
+        let e =
+            i.call(&lead(), "webhook.add", json!({ "name": "weak", "url": url, "secret": weak })).await.unwrap_err();
+        assert_eq!(e.code(), "invalid_argument", "{weak}: {e}");
+        assert!(weak.len() <= 6 || !e.to_string().contains(&weak[6..]), "the error never echoes the secret: {e}");
+        let e = i
+            .call(&lead(), "writeback.add", json!({ "name": "wb", "base_url": "https://desk.example.com/", "routes": { "c": "c" }, "secret": weak }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "invalid_argument", "writeback {weak}: {e}");
+    }
+    ok(&i, &lead(), "webhook.add", json!({ "name": "ok", "url": url, "secret": "a-raw-secret-of-24-bytes" })).await;
+    let e = i.call(&lead(), "webhook.rotate_secret", json!({ "name": "ok", "secret": "whsec_" })).await.unwrap_err();
+    assert_eq!(e.code(), "invalid_argument", "{e}");
+    let e = i.call(&lead(), "webhook.update", json!({ "name": "ok", "secret": "tiny" })).await.unwrap_err();
+    assert_eq!(e.code(), "invalid_argument", "{e}");
+    // An operator reference whose value is weak is caught by webhook.test.
+    unsafe { std::env::set_var("ONTO_TEST_WEAK_HOOK_SECRET", "too-short") };
+    ok(&i, &lead(), "webhook.add", json!({ "name": "ref", "url": url, "secret": "env:ONTO_TEST_WEAK_HOOK_SECRET" }))
+        .await;
+    let e = i.call(&lead(), "webhook.test", json!({ "name": "ref" })).await.unwrap_err();
+    assert_eq!(e.code(), "invalid_argument", "{e}");
+    assert!(e.to_string().contains("env:ONTO_TEST_WEAK_HOOK_SECRET") && !e.to_string().contains("too-short"), "{e}");
 }

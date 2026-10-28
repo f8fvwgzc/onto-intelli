@@ -884,6 +884,14 @@ impl Default for WebhooksConfig {
     }
 }
 
+/// The longest any `retain_days` may be (a hundred years).
+pub const MAX_RETAIN_DAYS: u64 = 36_500;
+
+/// The store-clock cutoff `retain_days` before `now` (saturating).
+pub fn retention_cutoff(now: i64, retain_days: u64) -> i64 {
+    now.saturating_sub((retain_days.min(MAX_RETAIN_DAYS) as i64).saturating_mul(86_400_000))
+}
+
 impl WebhooksConfig {
     /// Every limit and time is at least 1, the backoff maximum is not below
     /// its base, and the allow rules parse.
@@ -906,6 +914,9 @@ impl WebhooksConfig {
         ];
         if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("webhooks.{name} = {v} (at least 1)")));
+        }
+        if self.retain_days > MAX_RETAIN_DAYS {
+            return Err(Error::Config(format!("webhooks.retain_days = {} (1 to 36500)", self.retain_days)));
         }
         if self.backoff_max_secs < self.backoff_base_secs {
             return Err(Error::Config("webhooks.backoff_max_secs is below backoff_base_secs".into()));
@@ -957,6 +968,9 @@ pub struct AutomationConfig {
     pub retry_base_secs: u64,
     pub retry_max_secs: u64,
     pub retry_max_attempts: u32,
+    /// Days final run rows are kept (1 to 36500); the `automation.run`
+    /// events are the audit trail and stay.
+    pub retain_days: u64,
 }
 
 impl Default for AutomationConfig {
@@ -975,6 +989,7 @@ impl Default for AutomationConfig {
             retry_base_secs: 10,
             retry_max_secs: 3600,
             retry_max_attempts: 8,
+            retain_days: 30,
         }
     }
 }
@@ -995,9 +1010,13 @@ impl AutomationConfig {
             ("retry_base_secs", self.retry_base_secs),
             ("retry_max_secs", self.retry_max_secs),
             ("retry_max_attempts", self.retry_max_attempts as u64),
+            ("retain_days", self.retain_days),
         ];
         if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("automation.{name} = {v} (at least 1)")));
+        }
+        if self.retain_days > MAX_RETAIN_DAYS {
+            return Err(Error::Config(format!("automation.retain_days = {} (1 to 36500)", self.retain_days)));
         }
         if self.retry_max_secs < self.retry_base_secs {
             return Err(Error::Config("automation.retry_max_secs is below retry_base_secs".into()));
@@ -1182,6 +1201,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retain_days_are_bounded_and_cutoffs_saturate() {
+        let mut w = WebhooksConfig { retain_days: 36_501, ..Default::default() };
+        assert!(w.check().unwrap_err().to_string().contains("webhooks.retain_days = 36501 (1 to 36500)"));
+        w.retain_days = u64::MAX;
+        assert!(w.check().is_err());
+        w.retain_days = 36_500;
+        assert!(w.check().is_ok());
+        assert_eq!(AutomationConfig::default().retain_days, 30);
+        let mut a = AutomationConfig { retain_days: 0, ..Default::default() };
+        assert!(a.check().unwrap_err().to_string().contains("automation.retain_days = 0 (at least 1)"));
+        a.retain_days = 106_751_991_168;
+        assert!(a.check().is_err());
+        // The cutoff never overflows, and is never in the future.
+        let now = 1_793_000_000_000;
+        assert_eq!(retention_cutoff(now, 14), now - 14 * 86_400_000);
+        for days in [u64::MAX, 106_751_991_168, 1 << 62] {
+            let c = retention_cutoff(now, days);
+            assert!(c <= now && c == now - 36_500 * 86_400_000, "{days}: {c}");
+        }
+        assert_eq!(retention_cutoff(i64::MIN + 5, 1), i64::MIN);
+    }
 
     #[test]
     fn example_config_parses() {

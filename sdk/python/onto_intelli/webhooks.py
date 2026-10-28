@@ -102,8 +102,10 @@ def verify_webhook(
     ok = False
     for secret in candidates:
         expected = sign_webhook(secret, msg_id, ts, body)[3:]
+        want = expected.encode("ascii")
         for g in given:
-            ok = hmac.compare_digest(expected, g) or ok
+            # Bytes, so a non-ASCII header value is a mismatch, not a TypeError.
+            ok = hmac.compare_digest(want, g.encode("utf-8", "surrogateescape")) or ok
     if not ok:
         raise WebhookVerificationError("no webhook-signature matches")
     try:

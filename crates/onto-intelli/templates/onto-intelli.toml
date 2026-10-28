@@ -280,7 +280,7 @@ max_in_flight_process = 64
 pause_after_failures = 20          # consecutive failures pause an endpoint ...
 pause_secs = 300                   # ... this long, then one probe (a failed probe doubles it, up to 1 h)
 pending_cap = 100000
-retain_days = 14                   # finished rows and attempt logs
+retain_days = 14                   # finished rows and attempt logs (1 to 36500; trimmed 5 min after a tenant opens, then hourly)
 # Operator rules: a host that may resolve into private CIDRs (never for
 # endpoints a project registered; link-local and metadata ranges never).
 # [[webhooks.allow]]
@@ -305,6 +305,7 @@ lease_secs = 60
 retry_base_secs = 10               # retry delay min(base * 2^attempt, max)
 retry_max_secs = 3600
 retry_max_attempts = 8
+retain_days = 30                   # final run rows (1 to 36500); the automation.run events stay
 
 # HTTP writeback effects of action types (docs/design/EVENTS.md Part D): an
 # action type's `writeback = { target, route, body }` effect posts the body to

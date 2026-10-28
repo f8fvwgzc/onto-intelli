@@ -12,9 +12,13 @@
 //!   row together, fenced by the consumer's lease epoch. The store refuses a
 //!   commit whose run row is no longer `running`, so a run is completed at
 //!   most once.
-//! * **Recovery.** A `running` row means nothing of its commit happened: a
-//!   new lease holder executes every `running` row of an older epoch again
-//!   ([`Ontology::recover_runs`]).
+//! * **Recovery.** A `running` row means nothing of its commit happened: at
+//!   the start of every round the lease holder executes every `running` row
+//!   of its epoch or an older one again ([`Ontology::recover_runs`]).
+//! * **Closure at commit.** The commit runs the definition of the locked
+//!   schema, and only while the automation's closure still hashes as the
+//!   run's (`closure_hash`); otherwise the run is `cancelled:
+//!   stale_definition: …` with nothing else written.
 //! * **Outcomes.** Conditions or preconditions that no longer hold at the
 //!   commit make the run `failed: precondition_changed`; a plan that needs a
 //!   person's confirmation is `refused` (automations run only low-risk,
@@ -475,6 +479,24 @@ pub fn is_settled(e: &Error) -> bool {
     matches!(e, Error::Conflict(m) if m.starts_with(RUN_SETTLED))
 }
 
+/// Why `run` may not commit under `schema` now (`None`: it may): its
+/// automation was deleted, or its closure is no longer the one the run was
+/// claimed under (the enablement's).
+fn stale_at_commit(schema: &Schema, en: &Enablements, run: &RunRow) -> Option<String> {
+    let Some(def) = schema.automations.get(&run.automation) else {
+        return Some(format!("stale_definition: automation:{} was deleted", run.automation));
+    };
+    let now = automate::closure(schema, &run.automation, def, &en.endpoints, &en.targets);
+    if now.hash == run.closure_hash {
+        return None;
+    }
+    let changed = match en.states.get(&run.automation).filter(|s| s.closure_hash == run.closure_hash) {
+        Some(st) => st.bound().changed(&now),
+        None => vec!["enablement".to_string()],
+    };
+    Some(format!("stale_definition: {}", changed.join(", ")))
+}
+
 impl Ontology {
     /// The context a run of `def` writes with: the service principal
     /// `automation:<name>` with its `run_as`, `request_id = run.id`, intent and
@@ -653,28 +675,51 @@ impl Ontology {
     /// one commit, fenced by `fence`. A condition or precondition that no
     /// longer holds makes the run `failed: precondition_changed`; a plan that
     /// needs confirmation makes it `refused`; shadow mode records `would_run`
-    /// with the plan and writes nothing else. Errors (a lost lease,
+    /// with the plan and writes nothing else. The definition evaluated is
+    /// the locked schema's (`def` names the run context only); a deleted
+    /// automation or a closure that no longer hashes as `run.closure_hash`
+    /// makes the run `cancelled: stale_definition: …`. Errors (a lost lease,
     /// unavailability, an invalid template, a refused endpoint) leave the row
     /// as it was: the caller decides between retry and failure
     /// ([`execute_run`](Self::execute_run)).
     pub fn commit_run(&self, run: &RunRow, def: &Automation, fence: Option<&Fence>) -> Result<RunResult> {
         let ctx = self.run_ctx(run, def);
-        let endpoints = automate::outbound_refs(&**self.store(), NS_WEBHOOK_ENDPOINT)?;
+        let en = Enablements::load(&**self.store())?;
         let (result, (row, receipt)) = self.transact(&ctx, |o, g| {
             let schema = o.schema();
-            let verdict = o.evaluate_on(g, &schema, run, def, &endpoints, None)?;
             let mut row = run.clone();
             let mut muts = Vec::new();
             let mut extra = Extra::default();
             let mut receipt = None;
+            // The definition the commit runs is the locked schema's, and only
+            // while its closure is still the one the run was enabled under
+            // (C.5): a schema or outbound change since the round started
+            // cancels the run, and the next round pauses the automation.
+            let verdict = match stale_at_commit(&schema, &en, run) {
+                Some(why) => Err(why),
+                None => {
+                    let def = &schema.automations[&run.automation];
+                    Ok(o.evaluate_on(g, &schema, run, def, &en.endpoints, None)?)
+                }
+            };
+            let mode = schema.automations.get(&run.automation).map_or(def.mode, |d| d.mode);
+            let verdict = match verdict {
+                Err(why) => {
+                    row.state = RunState::Cancelled;
+                    row.reason = Some(format!("cancelled: {why}"));
+                    None
+                }
+                Ok(v) => Some(v),
+            };
             match verdict {
-                Verdict::Ready(p) if def.mode == Mode::Shadow => {
+                None => {}
+                Some(Verdict::Ready(p)) if mode == Mode::Shadow => {
                     row.state = RunState::WouldRun;
                     row.reason = Some("shadow mode: nothing was written".into());
                     row.effects =
                         p.effects.into_iter().map(|e| RunEffect { receipt: None, outbox: None, ..e }).collect();
                 }
-                Verdict::Ready(p) => {
+                Some(Verdict::Ready(p)) => {
                     let p = *p;
                     row.state = RunState::Succeeded;
                     row.reason = None;
@@ -686,11 +731,11 @@ impl Ontology {
                     extra.outbox = p.outbox;
                     receipt = p.receipt;
                 }
-                Verdict::NotMet(why) | Verdict::Invalid(why) => {
+                Some(Verdict::NotMet(why) | Verdict::Invalid(why)) => {
                     row.state = RunState::Failed;
                     row.reason = Some(format!("{PRECONDITION_CHANGED}: {}", why.join("; ")));
                 }
-                Verdict::NeedsConfirmation(why) => {
+                Some(Verdict::NeedsConfirmation(why)) => {
                     row.state = RunState::Refused;
                     row.reason = Some(format!("needs_confirmation: {why}"));
                 }
@@ -728,6 +773,35 @@ impl Ontology {
     /// with its `automation.run` event in one commit, fenced by `fence`. The
     /// store refuses it when the row is no longer `running`.
     pub fn finish_run(&self, row: &RunRow, def: Option<&Automation>, fence: Option<&Fence>) -> Result<()> {
+        self.settle_run(row, def, fence, Vec::new())
+    }
+
+    /// Move `row` (a `running` row) to `retry` with its `retry:<run>` timer,
+    /// due after `delay_ms`, and its `automation.run` event in one commit,
+    /// fenced by `fence`: a run is never left in `retry` without the timer
+    /// that resumes it.
+    pub fn retry_run(
+        &self,
+        row: &RunRow,
+        def: Option<&Automation>,
+        fence: Option<&Fence>,
+        delay_ms: i64,
+    ) -> Result<()> {
+        let timer = (
+            format!("{RETRY_PREFIX}{}", row.id),
+            delay_ms.max(0),
+            json!({ "run": row.id, "automation": row.automation }),
+        );
+        self.settle_run(row, def, fence, vec![timer])
+    }
+
+    fn settle_run(
+        &self,
+        row: &RunRow,
+        def: Option<&Automation>,
+        fence: Option<&Fence>,
+        timers: Vec<(String, i64, Value)>,
+    ) -> Result<()> {
         let ctx = match def {
             Some(d) => self.run_ctx(row, d),
             None => {
@@ -754,7 +828,13 @@ impl Ontology {
             );
             Ok((
                 Vec::new(),
-                Extra { events: vec![ev], runs: vec![row.clone()], fence: fence.cloned(), ..Default::default() },
+                Extra {
+                    events: vec![ev],
+                    runs: vec![row.clone()],
+                    fence: fence.cloned(),
+                    timers: timers.clone(),
+                    ..Default::default()
+                },
                 (),
             ))
         })
@@ -794,7 +874,7 @@ impl Ontology {
     /// Execute a claimed `running` row once (one more attempt), fenced by
     /// `fence`: commit it, or settle it. `Unavailable` and contention
     /// `Conflict` errors move it to `retry` with a timer (`retry:<run>`, due
-    /// after `min(base * 2^(attempt - 1), max)`) until `max_attempts`; every
+    /// after `min(base * 2^(attempt - 1), max)`, committed with the row) until `max_attempts`; every
     /// other error makes it `failed` with the error (which never holds a
     /// secret or a resolved reference). A lost lease is returned: the row
     /// stays `running` for the next holder's recovery. A row another
@@ -810,13 +890,13 @@ impl Ontology {
             Err(e) if retryable(&e) && run.attempts < retry.max_attempts => {
                 let delay = retry.delay_ms(run.attempts);
                 let row = run.with_state(RunState::Retry, Some(format!("retry in {} s: {e}", delay / 1000)));
-                self.finish_run(&row, Some(def), Some(fence))?;
-                self.store().timers_set(
-                    &format!("{RETRY_PREFIX}{}", row.id),
-                    delay,
-                    &json!({ "run": row.id, "automation": row.automation }),
-                )?;
-                Ok(row)
+                // The row and its timer commit together; if this fails too,
+                // the row stays `running` and the next round recovers it.
+                match self.retry_run(&row, Some(def), Some(fence), delay) {
+                    Ok(()) => Ok(row),
+                    Err(e) if is_settled(&e) => Ok(self.store().run_get(&row.id)?.unwrap_or(row)),
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => {
                 let reason =
@@ -831,15 +911,19 @@ impl Ontology {
         }
     }
 
-    /// Recovery by a new holder of the consumer lease (`fence`): every
-    /// `running` row of an older epoch is executed again, or cancelled when
-    /// its automation is no longer active. A `running` row means nothing of
-    /// its commit happened, so this completes each one at most once.
+    /// Recovery by the holder of the consumer lease (`fence`), at the start
+    /// of every round: every `running` row of its epoch or an older one is
+    /// executed again, or cancelled when its automation is no longer active.
+    /// Rounds of one holder never overlap, so a `running` row at the start of
+    /// a round is one whose execution ended in an error (or whose process
+    /// stopped): nothing of its commit happened, so this completes each one
+    /// at most once. The same holder keeps its epoch when it renews, or takes
+    /// the lease again after losing it, so its own epoch is included.
     /// Returns the rows as they ended.
     pub fn recover_runs(&self, fence: &Fence, retry: &RetryPolicy, killed_process: bool) -> Result<Vec<RunRow>> {
         let mut out = Vec::new();
         loop {
-            let rows = self.store().runs_running(fence.epoch, 100)?;
+            let rows = self.store().runs_running(fence.epoch.saturating_add(1), 100)?;
             if rows.is_empty() {
                 break;
             }

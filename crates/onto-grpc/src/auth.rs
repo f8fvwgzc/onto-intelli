@@ -629,7 +629,8 @@ impl Auth {
         let tenant = token_tenant(&base.id, &tenants, tenant)?;
         // In dev mode anything goes; otherwise only the roles the token may grant.
         let limit = self.dev.is_none() || token.is_some();
-        let principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
+        let mut principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
+        principal.cause = inbound_cause(&credential, h);
         Ok(Caller { principal, tenant, credential, session: None })
     }
 
@@ -717,6 +718,33 @@ fn token_tenant(id: &str, allowed: &[String], asked: Option<String>) -> std::res
             ))),
         },
     }
+}
+
+/// The cascade depth a trusted service says a request is at.
+pub const CAUSE_DEPTH: &str = "x-onto-cause-depth";
+/// The run (in the trusted service) a request belongs to.
+pub const CAUSE_RUN: &str = "x-onto-cause-run";
+
+/// The inbound cause of a request (docs/design/EVENTS.md C.6): only a config
+/// token (a trusted service such as texc-symphony) may send it, and only to
+/// raise the depth (`max(0, header)`; a depth of 0 is no cause). Every other
+/// credential's headers are ignored. The run id is kept to 100 characters of
+/// `[A-Za-z0-9_.:-]`.
+pub fn inbound_cause(credential: &Credential, h: &HeaderMap) -> Option<onto_intelli::core::changes::RunCause> {
+    if *credential != Credential::Config {
+        return None;
+    }
+    let depth = header(h, CAUSE_DEPTH)?.parse::<i64>().ok()?.clamp(0, u8::MAX as i64) as u8;
+    if depth == 0 {
+        return None;
+    }
+    let run: String = header(h, CAUSE_RUN)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        .take(100)
+        .collect();
+    Some(onto_intelli::core::changes::RunCause { automation: String::new(), run, depth })
 }
 
 /// Actions whose inputs may hold server references (`env:VAR`,
@@ -849,6 +877,26 @@ pub fn workspace_header(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cause_headers_count_only_from_config_tokens_and_only_upward() {
+        let mut h = HeaderMap::new();
+        h.insert(CAUSE_DEPTH, "2".parse().unwrap());
+        h.insert(CAUSE_RUN, "run_ext-9".parse().unwrap());
+        let c = inbound_cause(&Credential::Config, &h).unwrap();
+        assert_eq!((c.depth, c.run.as_str(), c.automation.as_str()), (2, "run_ext-9", ""));
+        let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "x".into() };
+        let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
+        for other in [key, console, Credential::Session, Credential::Dev] {
+            assert!(inbound_cause(&other, &h).is_none(), "{other:?}");
+        }
+        for (raw, want) in [("0", None), ("-3", None), ("x", None), ("999", Some(255u8)), (" 3 ", Some(3))] {
+            h.insert(CAUSE_DEPTH, raw.parse().unwrap());
+            assert_eq!(inbound_cause(&Credential::Config, &h).map(|c| c.depth), want, "{raw}");
+        }
+        h.remove(CAUSE_DEPTH);
+        assert!(inbound_cause(&Credential::Config, &h).is_none(), "no header, no cause");
+    }
     use onto_control::{ControlOptions, KeyRequest, KeyScope};
     use onto_intelli::config::{ConsoleConfig, TokenConfig};
 

@@ -77,6 +77,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (10, "leases", include_str!("../../migrations/0010_leases.sql")),
     (11, "outbox", include_str!("../../migrations/0011_outbox.sql")),
     (12, "automate", include_str!("../../migrations/0012_automate.sql")),
+    (13, "outbox_claim", include_str!("../../migrations/0013_outbox_claim.sql")),
 ];
 /// This build's writer version. A tenant whose `head.min_writer` is higher
 /// refuses this build's writes (builds before this one never read it; the
@@ -1243,6 +1244,11 @@ impl Store for PgStore {
         let outbox = (!b.outbox.is_empty()).then(|| outbox_json(&b.outbox)).transpose()?;
         let runs = (!b.runs.is_empty()).then(|| runs_json(&b.runs)).transpose()?;
         let run_ids: Vec<String> = b.runs.iter().map(|r| r.id.clone()).collect();
+        let timers: Vec<(String, i64, String)> = b
+            .timers
+            .iter()
+            .map(|(n, d, doc)| Ok((n.clone(), *d, serde_json::to_string(doc)?)))
+            .collect::<Result<_>>()?;
         let wake = match b.wake {
             Some(delay) => {
                 self.ensure_sys()?;
@@ -1263,6 +1269,20 @@ impl Store for PgStore {
                 if n != run_ids.len() {
                     return Err(settled(&run_ids.join(", ")));
                 }
+            }
+            // Timers commit with what they wait for (a run in `retry` and its timer).
+            for (name, delay, doc) in &timers {
+                sqlx::query(sql(format!(
+                    "INSERT INTO {tm} (name, due_at, doc) VALUES ($1, {now} + $2, $3::jsonb) \
+                     ON CONFLICT (name) DO UPDATE SET due_at = EXCLUDED.due_at, doc = EXCLUDED.doc",
+                    tm = tables.timers,
+                    now = tables.now
+                )))
+                .bind(name)
+                .bind(*delay)
+                .bind(doc)
+                .execute(&mut *tx)
+                .await?;
             }
             let mut seq: i64 = 0;
             if bumps {
@@ -1644,6 +1664,21 @@ impl Store for PgStore {
             .fetch_all(&pool)
             .await?;
             rows.iter().map(run_row).collect()
+        })
+    }
+
+    fn runs_vacuum(&self, before_ms: i64) -> Result<u64> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            Ok(sqlx::query(sql(format!(
+                "DELETE FROM {} WHERE state NOT IN ('running', 'retry') AND started_at < $1",
+                t.runs
+            )))
+            .bind(before_ms)
+            .execute(&pool)
+            .await?
+            .rows_affected())
         })
     }
 
@@ -2350,14 +2385,24 @@ impl Store for PgStore {
         let t = Tables::of(self);
         let (holder, skip) = (holder.to_string(), skip_targets.to_vec());
         self.block(async move {
+            // The clock is read once; due rows and expired leases each come
+            // from their own index in claim order (0013), so a claim reads
+            // O(limit) rows however long the backlog is.
             let rows = sqlx::query(sql(format!(
-                "UPDATE {o} SET state = 'inflight', claim = $3 || ':' || gen_random_uuid()::text, \
-                 lease_until = {now} + $2, attempts = attempts + 1 \
-                 WHERE id IN (SELECT id FROM {o} \
-                   WHERE ((state IN ('pending', 'retry') AND next_at <= {now}) \
-                      OR (state = 'inflight' AND lease_until < {now})) \
+                "WITH clock AS (SELECT {now} AS now), \
+                 ready AS (SELECT id, next_at AS due FROM {o} \
+                   WHERE state IN ('pending', 'retry') AND next_at <= (SELECT now FROM clock) \
                    AND NOT (target = ANY($4::text[])) \
-                   ORDER BY next_at, id LIMIT $1 FOR UPDATE SKIP LOCKED) \
+                   ORDER BY next_at, id LIMIT $1 FOR UPDATE SKIP LOCKED), \
+                 leased AS (SELECT id, lease_until AS due FROM {o} \
+                   WHERE state = 'inflight' AND lease_until < (SELECT now FROM clock) \
+                   AND NOT (target = ANY($4::text[])) \
+                   ORDER BY lease_until, id LIMIT $1 FOR UPDATE SKIP LOCKED), \
+                 pick AS (SELECT id FROM (SELECT id, due FROM ready UNION ALL SELECT id, due FROM leased) u \
+                   ORDER BY due, id LIMIT $1) \
+                 UPDATE {o} SET state = 'inflight', claim = $3 || ':' || gen_random_uuid()::text, \
+                 lease_until = (SELECT now FROM clock) + $2, attempts = attempts + 1 \
+                 WHERE id IN (SELECT id FROM pick) \
                  RETURNING {OUTBOX_COLS}",
                 o = t.outbox,
                 now = t.now
@@ -2576,6 +2621,28 @@ impl Store for PgStore {
                  GROUP BY target ORDER BY target",
                 t.outbox
             )))
+            .fetch_all(&pool)
+            .await?;
+            Ok(rows.into_iter().map(|(t, n)| (t, n.max(0) as u64)).collect())
+        })
+    }
+
+    fn outbox_open_counts_for(&self, targets: &[String], cap: u64) -> Result<Vec<(String, u64)>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let targets = targets.to_vec();
+        self.block(async move {
+            let rows: Vec<(String, i64)> = sqlx::query_as(sql(format!(
+                "SELECT n.name, (SELECT count(*) FROM (SELECT 1 FROM {o} \
+                   WHERE target = n.name AND state IN ('pending', 'retry', 'inflight') LIMIT $2) x) \
+                 FROM unnest($1::text[]) WITH ORDINALITY AS n(name, ord) ORDER BY n.ord",
+                o = t.outbox
+            )))
+            .bind(&targets)
+            .bind(cap.min(i64::MAX as u64) as i64)
             .fetch_all(&pool)
             .await?;
             Ok(rows.into_iter().map(|(t, n)| (t, n.max(0) as u64)).collect())

@@ -106,6 +106,13 @@ pub struct Principal {
     /// as the source of its audit events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// The cascade a trusted service says this request belongs to
+    /// (`x-onto-cause-depth` and `x-onto-cause-run` from a config token,
+    /// docs/design/EVENTS.md C.6): contexts built for it carry it, so its
+    /// changes keep the depth and a loop through another service still
+    /// meets the depth limit. Never read from or written to JSON.
+    #[serde(skip)]
+    pub cause: Option<crate::changes::RunCause>,
 }
 
 fn all_workspaces() -> Vec<String> {
@@ -114,7 +121,7 @@ fn all_workspaces() -> Vec<String> {
 
 impl Principal {
     pub fn new(id: impl Into<String>, roles: Vec<Role>, workspaces: Vec<String>) -> Self {
-        Self { id: id.into(), roles, workspaces, entity: None, via: None }
+        Self { id: id.into(), roles, workspaces, entity: None, via: None, cause: None }
     }
 
     pub fn system() -> Self {

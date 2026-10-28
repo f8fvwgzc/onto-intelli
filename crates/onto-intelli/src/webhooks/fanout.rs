@@ -221,6 +221,7 @@ fn gap(me: &Intelli, name: &str, from: Cursor, floor: u64, head: Cursor, fence: 
 }
 
 fn round(me: &Intelli, holder: &str) -> Result<Round> {
+    me.count_fanout_round();
     let onto = me.ontology();
     let store = onto.store();
     let cfg = &me.config().webhooks;
@@ -228,6 +229,7 @@ fn round(me: &Intelli, holder: &str) -> Result<Round> {
     eps.sort_by(|a, b| a.name.cmp(&b.name));
     let subscribed = eps.iter().any(|e| e.enabled);
     onto.set_wake_on_change(subscribed);
+    me.set_wants_fanout(subscribed);
     if !subscribed {
         return Ok(Round::Idle);
     }
@@ -242,14 +244,15 @@ fn round(me: &Intelli, holder: &str) -> Result<Round> {
         cursors.insert(ep.name.clone(), store.consumer_get(&consumer_name(&ep.name))?);
     }
     let meta = store.changes_meta()?;
-    let open: HashMap<String, u64> = store.outbox_open_counts()?.into_iter().collect();
+    let cap = cfg.pending_cap.max(1);
+    let names: Vec<String> = eps.iter().filter(|e| e.enabled).map(|e| e.name.clone()).collect();
+    let open: HashMap<String, u64> = store.outbox_open_counts_for(&names, cap)?.into_iter().collect();
     let backlogged: HashMap<String, Value> = store
         .kv_scan(NS_CONTROL, BACKLOG_PREFIX)?
         .into_iter()
         .filter(|(_, v)| !v.is_null())
         .filter_map(|(k, v)| k.strip_prefix(BACKLOG_PREFIX).map(|n| (n.to_string(), v)))
         .collect();
-    let cap = cfg.pending_cap.max(1);
 
     let mut subs: Vec<Sub> = Vec::new();
     let mut filters: Vec<ChangeFilter> = Vec::new();

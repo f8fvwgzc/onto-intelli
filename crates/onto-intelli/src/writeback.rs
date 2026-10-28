@@ -38,7 +38,6 @@ use serde_json::{Value, json};
 use onto_core::automate::NS_WRITEBACK_TARGET;
 use onto_core::outbox::ConfigEvent;
 use onto_core::policy::{Role, ScopePrincipal, dominates};
-use onto_core::time::now_ms;
 use onto_core::{ActionContext, Error, Ontology, Principal, Result, one_or_many};
 
 use crate::actions::parse;
@@ -92,6 +91,15 @@ pub struct Target {
 }
 
 impl Target {
+    /// Is `row` this target's: a writeback row of its name created since it
+    /// was registered (a target removed and added again never sends the
+    /// rows of the one before)?
+    pub fn owns(&self, row: &onto_core::outbox::OutboxRow) -> bool {
+        row.kind == onto_core::outbox::OutboxKind::Writeback
+            && row.target == self.name
+            && row.created_at >= self.created_at
+    }
+
     /// `writeback:<name>` (the audit target of its events; not a principal
     /// anything acts as).
     pub fn audit_id(&self) -> String {
@@ -315,6 +323,7 @@ impl Intelli {
                 Err(Error::invalid("secret: give the secret itself (it is sealed here), not a sealed value"))
             }
             (Some(s), _) => {
+                crate::webhooks::check_secret(s.as_bytes(), "secret")?;
                 Ok((Some(SecretRef::seal_for(sealer.as_deref(), SECRET_PURPOSE, name, s.as_bytes())?), None))
             }
         }
@@ -397,7 +406,9 @@ impl Intelli {
                     i.routes.into_iter().map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
                 let base_url = self.check_target_input(&i.base_url, &routes, i.restricted)?;
                 let (secret, generated) = self.target_secret(&name, i.secret.as_deref(), i.generate_secret)?;
-                let now = now_ms();
+                // The store's clock, after every row of an earlier target of
+                // this name: rows created for this one are never older.
+                let now = crate::webhooks::incarnation_start(onto, &name)?;
                 let t = Target {
                     name: name.clone(),
                     base_url,
@@ -489,8 +500,16 @@ impl Intelli {
                         }
                     })
                     .collect();
-                if let Err(e) = t.signing_keys(self.secrets().as_deref()) {
-                    problems.push(e.to_string());
+                match t.signing_keys(self.secrets().as_deref()) {
+                    Err(e) => problems.push(e.to_string()),
+                    Ok(keys) if keys.iter().any(|k| k.len() < crate::webhooks::MIN_KEY_BYTES) => {
+                        problems.push(format!(
+                            "the signing secret ({}) gives a key under {} bytes",
+                            t.secret.as_ref().map(SecretRef::describe).unwrap_or_default(),
+                            crate::webhooks::MIN_KEY_BYTES
+                        ))
+                    }
+                    Ok(_) => {}
                 }
                 Ok(json!({
                     "name": t.name,

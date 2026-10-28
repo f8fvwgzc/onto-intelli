@@ -370,8 +370,9 @@ impl Cause {
             request_id: ctx.request_id.clone(),
             source: ctx.source.clone(),
             intent: ctx.intent.clone(),
-            automation: run.map(|r| r.automation.clone()),
-            run: run.map(|r| r.run.clone()),
+            // An inbound cause (a trusted service's request) names no automation.
+            automation: run.map(|r| r.automation.clone()).filter(|a| !a.is_empty()),
+            run: run.map(|r| r.run.clone()).filter(|r| !r.is_empty()),
             depth: run.map(|r| r.depth).unwrap_or(0),
             migration: ctx.intent.as_deref() == Some(MIGRATION_INTENT),
         }

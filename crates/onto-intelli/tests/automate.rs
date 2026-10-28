@@ -705,3 +705,162 @@ async fn empty_inputs_fail_cleanly() {
     let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
     assert_eq!(ok(&i, &agent, "system.whoami", json!({})).await["capabilities"]["automate"], false);
 }
+
+// ── review round 1 (phase 1 steps 8-12) ──────────────────────────────────
+
+/// C-1: a run claimed by this process whose execution ended in an error
+/// (left `running` at the current epoch) is executed by the next round of
+/// the same holder, which keeps its epoch.
+#[tokio::test]
+async fn a_run_left_running_by_an_error_is_executed_by_the_next_round() {
+    use onto_intelli::core::automate::Enablements;
+    use onto_intelli::core::changes::{ChangeOp, Cursor};
+    use onto_intelli::core::leases::Fence;
+    use onto_intelli::core::runs::{CONSUMER_LEASE, RunRow, RunTrigger};
+
+    let i = open(|_| {}).await;
+    define(&i, "resolve_blocked", resolve_blocked(false)).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    drain(&i); // takes the lease
+    let store = i.ontology().store().clone();
+    let lease = store.lease_get(CONSUMER_LEASE).unwrap().unwrap();
+    // The state a round leaves when execute errors after the claim: the
+    // trigger's run claimed at the current epoch, nothing committed.
+    set_state(&i, "1", "blocked").await;
+    let page = store.changes_since(Cursor::default(), 1000).unwrap();
+    let (stored, entity) = page
+        .changes
+        .iter()
+        .rev()
+        .find(|(c, _)| c.record.op == ChangeOp::EntityUpdate && c.record.id == "issue:1")
+        .cloned()
+        .unwrap();
+    let r = stored.joined(entity);
+    let en = Enablements::load(&*store).unwrap();
+    let schema = i.ontology().schema();
+    let def = &schema.automations["resolve_blocked"];
+    let mut run =
+        RunRow::new("resolve_blocked", &en.states["resolve_blocked"].closure_hash, 0, def, RunTrigger::of(&r));
+    run.epoch = lease.epoch;
+    let fence = Fence::new(CONSUMER_LEASE, &lease.holder, lease.epoch);
+    assert_eq!(store.run_claim(std::slice::from_ref(&run), Some(&fence)).unwrap().len(), 1);
+    let reports = drain(&i);
+    assert_eq!(reports.iter().map(|r| r.recovered).sum::<usize>(), 1, "{reports:?}");
+    assert_eq!(store.lease_get(CONSUMER_LEASE).unwrap().unwrap().epoch, lease.epoch, "the same epoch");
+    let got = ok(&i, &admin(), "automation.runs", json!({ "id": run.id })).await;
+    assert_eq!(got["run"]["state"], "succeeded", "{got}");
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("resolved"));
+    assert_eq!(runs(&i, "resolve_blocked").await.len(), 1, "the trigger ran once");
+}
+
+/// C-2: a rerun writes its timer before it moves the row to `retry`, and a
+/// round keeps a fresh rerun timer whose row is not in `retry` yet (another
+/// process's rerun in between), but drops a stale one.
+#[tokio::test]
+async fn a_rerun_timer_waits_for_its_row() {
+    let i = open(|_| {}).await;
+    let mut def = resolve_blocked(false);
+    def["rate"] = json!({ "per_minute": 1 });
+    define(&i, "resolve_blocked", def).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    issue(&i, "2", "triaged", "high").await;
+    set_state(&i, "1", "blocked").await;
+    set_state(&i, "2", "blocked").await;
+    drain(&i);
+    let skipped: Vec<Value> =
+        runs(&i, "resolve_blocked").await.into_iter().filter(|r| r["state"] == "skipped").collect();
+    let id = skipped[0]["id"].as_str().unwrap().to_string();
+    let store = i.ontology().store().clone();
+    let timer = format!("retry:{id}");
+    let due = |name: &str| store.timers_due(100).unwrap().iter().any(|t| t.name == name);
+    // Another process's rerun has written its timer, not yet the row.
+    let now = onto_intelli::core::time::now_ms();
+    store.timers_set(&timer, 0, &json!({ "run": id, "automation": "resolve_blocked", "at": now })).unwrap();
+    drain(&i);
+    assert!(due(&timer), "a fresh rerun timer is kept");
+    assert_eq!(ok(&i, &admin(), "automation.runs", json!({ "id": id })).await["run"]["state"], "skipped");
+    // A stale one (its rerun never moved the row) goes.
+    store.timers_set(&timer, 0, &json!({ "run": id, "automation": "resolve_blocked", "at": now - 60_000 })).unwrap();
+    drain(&i);
+    assert!(!due(&timer), "a stale timer is dropped");
+    // A rerun leaves the row in retry with its timer, and the next round runs it.
+    let r = ok(&i, &admin(), "automation.rerun", json!({ "id": id })).await;
+    assert_eq!(r["state"], "retry");
+    assert!(due(&timer), "the retry row has its timer");
+    drain(&i);
+    assert_eq!(ok(&i, &admin(), "automation.runs", json!({ "id": id })).await["run"]["state"], "succeeded");
+}
+
+/// CP-2: commits wake the fan-out and the automation consumer only while
+/// the tenant has a subscription or an enabled automation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commits_wake_only_workers_that_have_work() {
+    let i = open(|cfg| cfg.automation.workers = true).await;
+    let rounds = |w: &str| i.worker_rounds()[w].as_u64().unwrap();
+    until("both workers ran a first round", || {
+        let w = i.worker_rounds();
+        w["automation"].as_u64() > Some(0)
+            && w["fanout"].as_u64() > Some(0)
+            && w["commits_wake_automation"] == false
+            && w["commits_wake_fanout"] == false
+    })
+    .await;
+    let (a0, f0) = (rounds("automation"), rounds("fanout"));
+    for n in 0..50 {
+        issue(&i, &n.to_string(), "triaged", "high").await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (a1, f1) = (rounds("automation"), rounds("fanout"));
+    assert!(a1 - a0 <= 2 && f1 - f0 <= 2, "50 commits ran {} automation and {} fan-out rounds", a1 - a0, f1 - f0);
+    // An enabled automation: commits wake the consumer again.
+    define(&i, "resolve_blocked", resolve_blocked(false)).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    until("the consumer wants commits", || i.worker_rounds()["commits_wake_automation"] == true).await;
+    set_state(&i, "1", "blocked").await;
+    until("the run", || state_of(&i, "issue:1").as_deref() == Some("resolved")).await;
+}
+
+/// CP-1: with automations off in this process, a due retry timer neither
+/// spins the consumer nor keeps the delivery worker awake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_due_timer_does_not_spin_a_process_with_automations_off() {
+    let i = open(|cfg| {
+        cfg.automation.workers = true;
+        cfg.automation.enabled = false;
+        cfg.webhooks.enabled = true;
+    })
+    .await;
+    let store = i.ontology().store().clone();
+    store.timers_set("retry:run_left_over", 0, &json!({ "run": "run_left_over" })).unwrap();
+    i.wake_outbox();
+    let a0 = i.worker_rounds()["automation"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let a1 = i.worker_rounds()["automation"].as_u64().unwrap();
+    assert!(a1 - a0 <= 2, "{} automation rounds in 1.5 s", a1 - a0);
+    assert!(store.timers_due(10).unwrap().iter().any(|t| t.name == "retry:run_left_over"), "left for a consumer");
+}
+
+/// COMP-2: `system.health` reports the switches and paused counts, and
+/// `system.stats` the open outbox rows and the runs of the last hour.
+#[tokio::test]
+async fn health_and_stats_show_switches_paused_counts_and_runs() {
+    let i = open(|cfg| cfg.automation.pause_after_failures = 1).await;
+    endpoint(&i, "https://hooks.example.com/in", json!({ "roles": ["member"], "workspaces": ["acme"] })).await;
+    define(&i, "echo", failing_def()).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "echo" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    ok(&i, &admin(), "entity.upsert", json!({ "id": "issue:1", "props": { "description": "v1" } })).await;
+    drain(&i);
+    ok(&i, &admin(), "automation.kill", json!({ "on": true })).await;
+    ok(&i, &admin(), "webhook.kill", json!({ "on": true })).await;
+    let h = ok(&i, &admin(), "system.health", json!({})).await;
+    let o = &h["outbound"];
+    assert_eq!(o["changes"]["capture"], true, "{h}");
+    assert_eq!((o["automation"]["kill"].as_bool(), o["automation"]["paused"].as_u64()), (Some(true), Some(1)), "{h}");
+    assert_eq!((o["webhooks"]["kill"].as_bool(), o["webhooks"]["endpoints"].as_u64()), (Some(true), Some(1)), "{h}");
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    assert_eq!(s["outbound"]["runs_1h"]["states"]["failed"], 1, "{s}");
+    assert!(s["workers"]["automation"].is_u64(), "{s}");
+}

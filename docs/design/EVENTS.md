@@ -962,6 +962,7 @@ lease_secs = 60
 retry_base_secs = 10
 retry_max_secs = 3600
 retry_max_attempts = 8
+retain_days = 30                  # final run rows (1 to 36500); review round 1
 
 [writeback]
 enabled = false
@@ -1314,6 +1315,12 @@ commit.
 - Should `entity.hidden` also be sent for link records whose end becomes hidden (phase 1: no)?
 - `changes_meta.floor` reports a false `reset` at the exact retention edge; acceptable, or add an
   end-of-seq cursor form?
+- Section 11 observability still open after review round 1 (built: the `automation.run` and
+  `webhook.deliver` spans, `system.health` switches, paused counts and capture, `system.stats`
+  open outbox rows per target, runs per state over 1 h and worker rounds): traces of kind
+  `automation` and `delivery` with `[traces] deliveries = failures|all|off`, change lag per
+  consumer and endpoint, gap records over 24 h, the latest gap in `system.health`, outbox
+  pending/retry/dead split by state, and the same counters in `GET /v1/admin/tenants`.
 
 ---
 
@@ -1634,3 +1641,49 @@ Build step 12 (HTTP writeback):
   `POST /v1/writeback/targets/{name}/test`. Section 7 lists no CLI, MCP or UI for writeback;
   docs come with step 13.
 - Deferred: delivery traces and the outbox counters (as in step 8).
+
+Review round 1 (phase 1 steps 8-12):
+
+- Recovery runs at the start of every consumer round and takes `running` rows of the holder's own
+  epoch too: rounds never overlap (the runtime mutex), and a holder that renews, or loses and
+  retakes the lease, keeps its epoch, so a run whose execution ended in an error is executed again
+  by the next round rather than only by another process.
+- A run moved to `retry` and its `retry:<run>` timer commit in one transaction
+  (`WriteBatch::timers`, `Ontology::retry_run`). `automation.rerun` writes the timer first, then
+  moves the row; a round keeps a rerun timer whose row is not in `retry` yet for 10 s (another
+  process's rerun in between) and drops it after.
+- `commit_run` evaluates the locked schema's definition, and only while the automation's closure
+  still hashes as the run's `closure_hash`: otherwise the run is `cancelled: stale_definition:
+  <items>` (or `… was deleted`) with nothing else written, and the next round pauses the
+  automation with its `automation.stale` event (C.5).
+- Retention: one task per open tenant, 5 minutes after it opens and then hourly, trims the change
+  feed, the outbox and its attempt log (`[webhooks] retain_days`), and final run rows (new
+  `[automation] retain_days`, default 30; `Store::runs_vacuum`), whatever the delivery switches
+  are. Both `retain_days` are 1 to 36500 and the cutoffs saturate.
+- Wake-ups: commits wake the fan-out only while the tenant has an enabled change subscription and
+  the automation consumer only while it has an enabled automation (the workers' rounds keep the
+  flags; actions that change them wake the worker; both poll). The delivery worker sleeps on
+  outbox rows only; retry timers count toward the tenant's wake row only from a process that runs
+  the consumer (`[automation] enabled` and `workers`), so `enabled = false` leaves pending retries
+  waiting for a process that runs one. An idle consumer round waits for its poll; a timer still
+  due after a round that ran is looked at again after a second.
+- Outbox rows belong to the endpoint or target incarnation they were made for: a row of a name
+  created before the current endpoint (target) of that name registered is not listed by
+  `webhook.deliveries`, not replayed, shown by `outbox.list` only to tenant-wide admins, and
+  cancelled rather than sent. Registration waits until the store clock is past the newest row
+  of the name. An endpoint's `version` starts at its registration time in ms, as a target's does.
+- Call traces of `webhook.*`, `outbox.list`, `writeback.*` and `connector.*` keep no input or
+  output (signing secrets, receiver URLs, credentials).
+- Supplied signing secrets give a key of 24 to 64 bytes (`whsec_` base64, or other text as its
+  bytes); `webhook.test` and `writeback.test` check a referenced secret's key the same way.
+- Errors of a request whose URL came from an `env:`/`file:` reference name the reference and the
+  kind of failure (timeout, TLS, DNS, connect), never the client's text.
+- 64:ff9b:1::/48 (local-use NAT64) is never public and always denied.
+- Inbound `x-onto-cause-depth` / `x-onto-cause-run` (C.6) are read by onto-grpc from config tokens
+  only: the principal carries the cause (never serialized), every context built for the request
+  copies it, and its change records and CloudEvents carry the depth (an inbound cause names no
+  automation). A depth of 0, a negative or a non-number is no cause.
+- `0013_outbox_claim.sql`: claim indexes per state and an open-rows index. A claim reads due rows
+  and expired leases from their own indexes with the clock read once; fan-out counts each
+  subscribed endpoint's open rows up to its pending cap (`Store::outbox_open_counts_for`).
+

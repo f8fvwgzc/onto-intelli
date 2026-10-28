@@ -291,6 +291,27 @@ pub fn signing_key(secret: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// The shortest HMAC key a signing secret may give (Standard Webhooks keys
+/// are 24 to 64 bytes).
+pub const MIN_KEY_BYTES: usize = 24;
+/// The longest key a `whsec_` secret may hold.
+pub const MAX_WHSEC_KEY_BYTES: usize = 64;
+
+/// Refuse a signing secret that signs with a weak or broken key: a `whsec_`
+/// secret must be base64 of 24 to 64 bytes, any other text at least 24
+/// bytes. `what` names it in the error (never its value).
+pub fn check_secret(secret: &[u8], what: &str) -> Result<()> {
+    let key = signing_key(secret).map_err(|e| Error::invalid(format!("{what}: {e}")))?;
+    let whsec = secret.starts_with(SECRET_PREFIX.as_bytes());
+    if key.len() < MIN_KEY_BYTES || (whsec && key.len() > MAX_WHSEC_KEY_BYTES) {
+        return Err(Error::invalid(format!(
+            "{what}: a signing secret needs a key of {MIN_KEY_BYTES} to {MAX_WHSEC_KEY_BYTES} bytes (a whsec_ secret \
+             is base64 of the key, other text is used as its bytes); leave it out to generate one"
+        )));
+    }
+    Ok(())
+}
+
 /// One Standard Webhooks signature: `v1,` and base64 of
 /// HMAC-SHA256(key, `"<id>.<timestamp>.<body>"`).
 #[cfg(feature = "outbound")]
@@ -416,6 +437,16 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Endpoint {
+    /// Is `row` this endpoint's: a webhook row of its name created since it
+    /// was registered? Rows are keyed by name only, so an endpoint removed
+    /// and added again (perhaps by a narrower admin, with another URL) never
+    /// lists, replays or receives the rows of the one before.
+    pub fn owns(&self, row: &onto_core::outbox::OutboxRow) -> bool {
+        row.kind == onto_core::outbox::OutboxKind::Webhook
+            && row.target == self.name
+            && row.created_at >= self.created_at
+    }
+
     /// An endpoint with only a name and a principal (dominance checks of
     /// what a call would configure).
     pub fn bare(name: &str, principal: ScopePrincipal) -> Self {
@@ -484,6 +515,28 @@ impl Endpoint {
     }
 }
 
+/// When an endpoint or writeback target `name` registered now starts (the
+/// store's clock): strictly after every row left from an earlier one of that
+/// name (waiting out the millisecond if one was made in it), so
+/// [`Endpoint::owns`] and `Target::owns` tell its rows from theirs.
+pub(crate) fn incarnation_start(onto: &Ontology, name: &str) -> Result<i64> {
+    let store = onto.store();
+    let mut now = store.clock_ms()?;
+    if !store.keeps_outbox() {
+        return Ok(now);
+    }
+    let q = onto_core::outbox::OutboxQuery { target: Some(name.to_string()), limit: Some(1), ..Default::default() };
+    let Some(newest) = store.outbox_list(&q)?.first().map(|r| r.created_at) else { return Ok(now) };
+    for _ in 0..1000 {
+        if now > newest {
+            return Ok(now);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        now = store.clock_ms()?;
+    }
+    Err(Error::Unavailable(format!("{name}: the store clock is behind rows made for an earlier {name}")))
+}
+
 /// Is the tenant's kill switch on?
 pub fn killed(onto: &Ontology) -> Result<bool> {
     Ok(onto.store().kv_get(NS_CONTROL, KILL_KEY)?.is_some_and(|v| v.get("on").and_then(Value::as_bool) == Some(true)))
@@ -511,8 +564,13 @@ pub fn envelope(row: &OutboxRow, tenant: &str, subject: Option<&str>, data: Valu
         m.insert("cursor".into(), json!(c.to_string()));
     }
     if let Some(c) = &row.cause {
-        m.insert("causeautomation".into(), json!(c.automation));
-        m.insert("causerun".into(), json!(c.run));
+        // A cascade a trusted service started names no automation here.
+        if !c.automation.is_empty() {
+            m.insert("causeautomation".into(), json!(c.automation));
+        }
+        if !c.run.is_empty() {
+            m.insert("causerun".into(), json!(c.run));
+        }
         m.insert("causedepth".into(), json!(c.depth));
     }
     m.insert("data".into(), data);

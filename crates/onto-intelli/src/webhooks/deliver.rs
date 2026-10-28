@@ -62,6 +62,9 @@ struct Worker {
     writeback_on: bool,
     /// `[writeback] timeout_secs`.
     writeback_timeout: Duration,
+    /// This process runs the automation consumer (`[automation] enabled` and
+    /// `workers`): its retry timers count toward the tenant's wake row.
+    consumer: bool,
     holder: String,
     reach: Reach,
     tenant: String,
@@ -109,6 +112,7 @@ pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
         webhooks_on: cfg.enabled,
         writeback_on: wb.enabled,
         writeback_timeout,
+        consumer: me.config().automation.enabled && me.config().automation.workers,
         reach: open,
         endpoints: Mutex::new(HashMap::new()),
         tenant_slots: Arc::new(Semaphore::new(cfg.max_in_flight_per_tenant.max(1))),
@@ -118,22 +122,12 @@ pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
     let mut closing = me.closing_signal();
     tokio::spawn(async move {
         let poll = Duration::from_secs(worker.cfg.poll_secs.max(1));
-        let mut vacuumed = Instant::now();
+        // Retention is the tenant's periodic task (Intelli::vacuum_outbound).
         loop {
             let wait = {
                 let Some(me) = worker.weak.upgrade() else { break };
                 if me.is_closing() {
                     break;
-                }
-                if vacuumed.elapsed() >= Duration::from_secs(3600) {
-                    vacuumed = Instant::now();
-                    let store = me.ontology().store().clone();
-                    let before = now_ms() - worker.cfg.retain_days as i64 * 86_400_000;
-                    match blocking(move || store.outbox_vacuum(before)).await {
-                        Ok(n) if n > 0 => tracing::info!(rows = n, "outbox retention"),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("outbox retention: {e}"),
-                    }
                 }
                 match worker.drain(&me).await {
                     Ok(next) => next.map_or(poll, |d| d.min(poll)),
@@ -227,7 +221,15 @@ impl Worker {
             let mut tasks = tokio::task::JoinSet::new();
             for row in rows {
                 let (w, me) = (self.clone(), me.clone());
-                tasks.spawn(async move { w.send(&me, row, claimed).await });
+                // No URL and no secret in the span: the row's target and id.
+                let span = tracing::info_span!(
+                    "webhook.deliver",
+                    target = %row.target,
+                    id = %row.id,
+                    attempt = row.attempts,
+                    kind = row.kind.as_str()
+                );
+                tasks.spawn(tracing::Instrument::instrument(async move { w.send(&me, row, claimed).await }, span));
             }
             while let Some(r) = tasks.join_next().await {
                 if let Err(e) = r {
@@ -241,18 +243,18 @@ impl Worker {
     /// was bumped meanwhile, then drain again) and say when to look again.
     async fn settle(&self, onto: &Ontology, seen: Option<u64>) -> Result<Option<Duration>> {
         let store = onto.store().clone();
+        let consumer = self.consumer;
         blocking(move || {
-            let next = match (store.outbox_next_due()?, store.timers_next().unwrap_or(None)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            let outbox = store.outbox_next_due()?;
+            let timers = if consumer { store.timers_next().unwrap_or(None) } else { None };
+            let (wake, own) = next_due(outbox, timers, consumer);
             if let Some(seen) = seen
-                && !store.wake_settle(seen, next)?
+                && !store.wake_settle(seen, wake)?
             {
                 return Ok(Some(Duration::ZERO));
             }
             let now = store.clock_ms()?;
-            Ok(next.map(|n| Duration::from_millis((n - now).max(0) as u64 + 5)))
+            Ok(own.map(|n| Duration::from_millis((n - now).max(0) as u64 + 5)))
         })
         .await
     }
@@ -292,8 +294,9 @@ impl Worker {
         if kill {
             return self.release(me, &row, "kill switch").await;
         }
-        let Some(t) = target else {
-            // Removed by a person: what was waiting for it is not sent.
+        let Some(t) = target.filter(|t| t.owns(&row)) else {
+            // Removed by a person (perhaps added again since): what was
+            // waiting for it is not sent.
             let a = Attempt {
                 error: Some("target_removed: the writeback target no longer exists".into()),
                 ..Default::default()
@@ -385,8 +388,9 @@ impl Worker {
         if kill {
             return release("kill switch").await;
         }
-        let Some(ep) = ep else {
-            // Removed by a person: what was waiting for it is not sent.
+        let Some(ep) = ep.filter(|e| e.owns(&row)) else {
+            // Removed by a person (perhaps added again since): what was
+            // waiting for it is not sent.
             let a =
                 Attempt { error: Some("endpoint_removed: the endpoint no longer exists".into()), ..Default::default() };
             return self.finish(me, &row, a, OutboxState::Cancelled, 0).await;
@@ -509,7 +513,9 @@ impl Worker {
     /// connection errors, honouring `Retry-After`) or dead (a refused
     /// address, other answers). A 410 is returned unrecorded for the caller
     /// to settle. `reference` names the URL when it came from an operator
-    /// reference: a refused host or address (part of its value) is not echoed.
+    /// reference: then no error text of the client is stored (a refused
+    /// address, a DNS name or a TLS name mismatch would echo part of the
+    /// reference's value), only what kind of failure it was.
     async fn exchange(
         &self,
         me: &Arc<Intelli>,
@@ -523,13 +529,7 @@ impl Worker {
         let duration_ms = started.elapsed().as_millis() as u64;
         match sent {
             Err(e) => {
-                let refused = chain(&e).contains("refused:");
-                let error = match reference {
-                    Some(what) if refused => {
-                        format!("refused: {what} resolves to an address the outbound rules refuse")
-                    }
-                    _ => chain(&e),
-                };
+                let (error, refused) = send_error(&chain(&e), e.is_timeout(), e.is_connect(), reference);
                 let a = Attempt { error: Some(error), duration_ms, ..Default::default() };
                 if refused {
                     self.finish(me, row, a, OutboxState::Dead, 0).await
@@ -754,6 +754,19 @@ impl Worker {
     }
 }
 
+/// When the tenant next has work, from the earliest due outbox row and the
+/// earliest retry timer: `(wake row, this worker)`. The worker waits on
+/// outbox rows only (retry timers are the automation consumer's); the wake
+/// row also counts timers, but only from a process that runs the consumer,
+/// so a process with automations off never keeps a tenant awake for them.
+fn next_due(outbox: Option<i64>, timers: Option<i64>, consumer: bool) -> (Option<i64>, Option<i64>) {
+    let wake = match (outbox, timers.filter(|_| consumer)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    (wake, outbox)
+}
+
 /// Releases an endpoint's in-flight slot (and its probe) when a send ends.
 struct Done {
     w: Arc<Worker>,
@@ -779,6 +792,34 @@ fn traced(req: reqwest::RequestBuilder, row: &OutboxRow) -> reqwest::RequestBuil
         Some(t) => req.header("traceparent", format!("00-{t}-{:016x}-01", nonzero_span())),
         None => req,
     }
+}
+
+/// What an attempt records of a failed send, and whether the outbound rules
+/// refused the address. With `reference` (the URL came from an operator
+/// `env:`/`file:` reference) the client's text is never stored: it may hold
+/// the host (a DNS failure, a certificate that is not valid for the name),
+/// which is part of the reference's value; the error names the reference
+/// and the kind of failure only.
+fn send_error(text: &str, timeout: bool, connect: bool, reference: Option<&str>) -> (String, bool) {
+    let refused = text.contains("refused:");
+    let Some(what) = reference else { return (text.to_string(), refused) };
+    if refused {
+        return (format!("refused: {what} resolves to an address the outbound rules refuse"), true);
+    }
+    let lower = text.to_ascii_lowercase();
+    // TLS first: a certificate error names DNS names too.
+    let kind = if timeout {
+        "timeout"
+    } else if ["certificate", "tls", "ssl", "handshake"].iter().any(|w| lower.contains(w)) {
+        "TLS error"
+    } else if lower.contains("dns") || lower.contains("resolv") || lower.contains("lookup") {
+        "DNS error"
+    } else if connect {
+        "connect error"
+    } else {
+        "request error"
+    };
+    (format!("the request to {what} failed: {kind}"), false)
 }
 
 /// The error and its sources, without the request URL.
@@ -822,4 +863,46 @@ fn nonzero_span() -> u64 {
     let mut b = [0u8; 8];
     let _ = getrandom::fill(&mut b);
     u64::from_le_bytes(b).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_worker_waits_on_outbox_rows_and_wakes_for_timers_only_with_a_consumer() {
+        // A due retry timer and no consumer here: neither the wake row nor
+        // the worker's own sleep counts it (no busy loop, no wake churn).
+        assert_eq!(next_due(None, Some(5), false), (None, None));
+        assert_eq!(next_due(Some(9), Some(5), false), (Some(9), Some(9)));
+        // A process that runs the consumer keeps the tenant's wake row for it,
+        // but the delivery worker itself still waits on its own rows only.
+        assert_eq!(next_due(None, Some(5), true), (Some(5), None));
+        assert_eq!(next_due(Some(9), Some(5), true), (Some(5), Some(9)));
+        assert_eq!(next_due(Some(3), None, true), (Some(3), Some(3)));
+    }
+
+    #[test]
+    fn errors_of_a_referenced_url_never_echo_its_host() {
+        let tls = "error sending request: client error (Connect): invalid peer certificate: certificate not valid \
+                   for name \"review-hidden-host.example\"; certificate is only valid for DnsName(\"other.example\")";
+        let (e, refused) = send_error(tls, false, true, Some("the URL in env:HOOK_URL"));
+        assert!(!refused);
+        assert_eq!(e, "the request to the URL in env:HOOK_URL failed: TLS error");
+        assert!(!e.contains("review-hidden-host") && !e.contains("other.example"));
+        let dns = "error sending request: client error (Connect): dns error: failed to lookup address \
+                   information: review-hidden-host.invalid";
+        let (e, _) = send_error(dns, false, true, Some("the URL in env:HOOK_URL"));
+        assert_eq!(e, "the request to the URL in env:HOOK_URL failed: DNS error");
+        let (e, _) = send_error("operation timed out", true, false, Some("the URL in file:/run/hook"));
+        assert_eq!(e, "the request to the URL in file:/run/hook failed: timeout");
+        let (e, _) = send_error("tcp connect error: 10.1.2.3:443", false, true, Some("the URL in env:X"));
+        assert_eq!(e, "the request to the URL in env:X failed: connect error");
+        let (e, refused) =
+            send_error("client error (Connect): refused: 10.0.0.7 is private", false, true, Some("the URL in env:X"));
+        assert!(refused && e.starts_with("refused: the URL in env:X") && !e.contains("10.0.0.7"), "{e}");
+        // A URL typed into the endpoint is the caller's own: its text is kept.
+        let (e, refused) = send_error(tls, false, true, None);
+        assert!(!refused && e.contains("certificate not valid"));
+    }
 }
