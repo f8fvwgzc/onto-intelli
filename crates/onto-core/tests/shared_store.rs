@@ -250,3 +250,35 @@ fn history_is_append_only() {
     let msg = res.unwrap_err().to_string();
     assert!(msg.contains("append-only"), "{msg}");
 }
+
+/// KV rows of one namespace that expired before the cutoff go, `limit` at
+/// a time; later ones, live ones and other namespaces stay.
+fn purge_suite(store: &dyn onto_core::store::Store) {
+    let now = onto_core::time::now_ms();
+    let (long_ago, lately, cutoff) = (now - 7_200_000, now - 1_800_000, now - 3_600_000);
+    for (ns, key, exp) in [
+        ("auth.revoked", "old1", Some(long_ago)),
+        ("auth.revoked", "old2", Some(long_ago)),
+        ("auth.revoked", "old3", Some(long_ago)),
+        ("auth.revoked", "lately", Some(lately)),
+        ("auth.revoked", "live", Some(now + 600_000)),
+        ("auth.revoked", "kept", None),
+        ("other", "old", Some(long_ago)),
+    ] {
+        store.kv_put(ns, key, &json!(1), exp).unwrap();
+    }
+    assert_eq!(store.kv_purge_expired("auth.revoked", cutoff, 2).unwrap(), 2, "one batch");
+    assert_eq!(store.kv_purge_expired("auth.revoked", cutoff, 2).unwrap(), 1, "the rest");
+    assert_eq!(store.kv_purge_expired("auth.revoked", cutoff, 2).unwrap(), 0, "not what expired after the cutoff");
+    let keys: Vec<String> = store.kv_scan("auth.revoked", "").unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, ["kept", "live"], "an expired row is not read, deleted or not");
+    assert_eq!(store.kv_purge_expired("auth.revoked", now, 10).unwrap(), 1, "the one that expired lately");
+    assert_eq!(store.kv_purge_expired("other", cutoff, 2).unwrap(), 1, "the other namespace was left alone");
+}
+
+#[test]
+fn expired_kv_rows_are_purged_one_namespace_at_a_time() {
+    purge_suite(&onto_core::store::MemoryStore::default());
+    let Some(pg) = common::TestTenant::new("kv_purge") else { return };
+    purge_suite(&pg.store());
+}

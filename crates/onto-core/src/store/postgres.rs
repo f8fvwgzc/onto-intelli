@@ -1220,10 +1220,13 @@ impl Store for PgStore {
             let Some(row) = row else { return Ok(None) };
             let value: String = row.try_get(0)?;
             let exp: Option<i64> = row.try_get(1)?;
-            if exp.is_some_and(|e| e <= now_ms()) {
-                sqlx::query(sql(format!("DELETE FROM {tk} WHERE ns = $1 AND key = $2")))
+            let now = now_ms();
+            if exp.is_some_and(|e| e <= now) {
+                // Not a row put again since it was read.
+                sqlx::query(sql(format!("DELETE FROM {tk} WHERE ns = $1 AND key = $2 AND expires_at <= $3")))
                     .bind(&ns)
                     .bind(&key)
+                    .bind(now)
                     .execute(&pool)
                     .await?;
                 return Ok(None);
@@ -1249,6 +1252,29 @@ impl Store for PgStore {
             }
             tx.commit().await?;
             Ok(())
+        })
+    }
+
+    fn kv_purge_expired(&self, ns: &str, before: i64, limit: usize) -> Result<u64> {
+        let pool = self.pool.clone();
+        let tk = self.t("kv");
+        let ns = ns.to_string();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.block(async move {
+            // The outer condition again: a key put again since the inner
+            // select keeps its new row.
+            let deleted = sqlx::query(sql(format!(
+                "DELETE FROM {tk} WHERE ns = $1 AND expires_at IS NOT NULL AND expires_at <= $2 \
+                 AND key IN (SELECT key FROM {tk} WHERE ns = $1 \
+                 AND expires_at IS NOT NULL AND expires_at <= $2 LIMIT $3)"
+            )))
+            .bind(&ns)
+            .bind(before)
+            .bind(limit)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            Ok(deleted)
         })
     }
 

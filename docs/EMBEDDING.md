@@ -159,17 +159,48 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
   impersonating token plus `{act_as, roles, entity, tenant}`) and hands it to
   the iframe with `postMessage` (`onto:session`). The answer carries the
   session's `jti`: `POST /v1/auth/session/revoke {jti}` (the backend's
-  token, with or without `x-onto-tenant`) revokes it and every session
-  minted from it, `DELETE /v1/auth/session` (the session itself) signs out
-  its whole login, on every replica within 10 seconds. A session may mint
-  another one, which never outlives it and carries the same `sid`.
+  token) revokes it and every session minted from it, `DELETE
+  /v1/auth/session` (the session itself) signs out its whole login, on
+  every replica within 10 seconds. A session may mint another one, which
+  never outlives it and carries the same `sid`; that one mints no further
+  sessions (403). A token for every tenant (`"*"`) revokes an id with or
+  without `x-onto-tenant`. A token limited to some tenants revokes it for
+  the sessions of all of its tenants only (the answer lists them); with
+  one tenant it needs no `x-onto-tenant`, with several it must
+  name one of them (403 otherwise), as for any request. The id carries the
+  session's expiry: the revocation lasts until that expiry plus 60
+  seconds, whatever `auth.session_max_ttl_secs` is set to later (and at
+  most 366 days ahead); `expires_at`
+  matters only for ids without one (minted by earlier builds).
+- Upgrading from an earlier build: replicas still on it ignore revocations
+  limited to some tenants, so during a rolling deploy (or after rolling
+  back) such a revoke holds only on upgraded replicas; a token for every
+  tenant is not affected. Sessions minted by earlier builds from a
+  session that was itself minted from a session are not cut off by
+  revoking the middle one: revoke the login's `sid` instead. A client that
+  renewed by minting from its last renewed session now gets 403: mint from
+  the first session (or have the backend mint a new one).
+  `auth.session_max_ttl_secs` above 365 days is lowered to 365 days. If it
+  was above 366 days, rotate the session secret when upgrading: sessions
+  minted before carry no expiry in their id, so their revocation lasts at
+  most 366 days while they may live longer.
+- Signing out from any session of a login ends the whole login (the
+  session it was minted from and its other sessions too): the user signs
+  out, not one copy of a token, and every session of a login is the same
+  principal in the same tenant anyway.
+- Revocations of every tenant's sessions live in the default tenant's KV
+  store (namespace `auth.revoked`), so session authentication reads the
+  default tenant: it is in the same database as every tenant, a failed read
+  refuses the session (503) rather than accepting it, and reads are cached
+  (an id read as not revoked is read again after 10 seconds).
 - A token whose `tenants` names some tenants (not `"*"`) never reaches the
   default tenant: with one tenant, a request without `x-onto-tenant`
   addresses that one; with several, it must name one.
 - `GET /livez` and `GET /readyz` (one query on PostgreSQL) answer without a
   token, for probes; `/healthz` needs one.
 - Agents (role `agent`) change the graph through action types only:
-  `entity.upsert`, `link.create`, `graph.apply` and the other raw writes are
+  `entity.upsert`, `link.create`, `graph.apply` and the other raw writes
+  (`pack.install` with `sample` too: the sample's entities and links) are
   refused to them unless `[governance] agent_raw_writes = true`, and an
   agent's `confirm=true` does not confirm a high-risk or irreversible action
   (a person applies it).

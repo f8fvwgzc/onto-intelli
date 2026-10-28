@@ -65,39 +65,127 @@ pub const REVOKED_NS: &str = "auth.revoked";
 
 /// Revoked session and login ids in the default tenant's KV store, whatever
 /// the sessions' tenants, kept until the sessions would have expired: every
-/// replica sees them.
-struct HubRevocations(std::sync::Weak<Hub>);
+/// replica sees them. A revocation for every tenant is keyed by the id; one
+/// for the sessions of some tenants (a service token limited to them) by
+/// `<id>@<tenant>`, once per tenant. Expired rows are deleted at most every
+/// [`PRUNE_EVERY_MS`], after a revoke that finds them due, on a task of
+/// their own and [`PRUNE_BATCH`] rows at a time.
+///
+/// Session authentication in every tenant therefore reads the default
+/// tenant. That is kept on purpose: every tenant lives in the same database,
+/// so the default tenant is as reachable as the session's own; a failed read
+/// refuses the session (503) rather than accepting it; and reads are cached
+/// ([`auth::REVOCATION_TTL`]): two primary-key reads (the id, the id for
+/// the session's tenant) per session id at most every 10 seconds.
+struct HubRevocations {
+    hub: std::sync::Weak<Hub>,
+    /// When expired rows were last deleted (Unix ms).
+    pruned: std::sync::atomic::AtomicI64,
+}
+
+/// How often a revoke deletes the expired revocations.
+const PRUNE_EVERY_MS: i64 = 10 * 60 * 1000;
+
+/// Expired revocations deleted per statement.
+const PRUNE_BATCH: usize = 1_000;
+
+/// How long past its expiry a revocation is kept before it is deleted: a
+/// replica whose clock is ahead must not delete rows the others still
+/// read as live (reads skip expired rows anyway).
+const PRUNE_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+/// Delete expired revocations with `purge(limit)`, [`PRUNE_BATCH`] rows a
+/// statement, until a statement deletes fewer; how many statements ran.
+fn purge_in_batches(purge: impl Fn(usize) -> Result<u64>) -> usize {
+    let mut statements = 0;
+    loop {
+        statements += 1;
+        match purge(PRUNE_BATCH) {
+            Ok(n) if n as usize >= PRUNE_BATCH => continue,
+            Ok(_) => return statements,
+            Err(e) => {
+                tracing::warn!("deleting expired session revocations: {e}");
+                return statements;
+            }
+        }
+    }
+}
+
+/// Record `key` revoked until `exp` (Unix seconds), never shortening a
+/// revocation already there: revoking an id without an expiry again, after
+/// the limit was lowered, keeps the later of the two.
+fn write_revocation(store: &dyn onto_intelli::core::store::Store, key: &str, exp: u64) -> Result<()> {
+    let kept = store.kv_get(REVOKED_NS, key)?.and_then(|v| v.get("expires_at").and_then(serde_json::Value::as_u64));
+    let exp = kept.map_or(exp, |kept| kept.max(exp));
+    let until = i64::try_from(exp).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
+    store.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
+}
 
 impl HubRevocations {
+    fn new(hub: &Arc<Hub>) -> Self {
+        Self { hub: Arc::downgrade(hub), pruned: std::sync::atomic::AtomicI64::new(0) }
+    }
+
     /// The default tenant's: one place for every tenant's sessions, so a
     /// revocation never depends on the tenant the caller happened to name.
     async fn store(&self) -> Result<Arc<dyn onto_intelli::core::store::Store>> {
-        let hub = self.0.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
+        let hub = self.hub.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
         let intelli = hub.resolve(None).await?;
         Ok(intelli.ontology().store().clone())
+    }
+
+    /// Whether this revoke deletes the expired rows: once per [`PRUNE_EVERY_MS`].
+    fn prune_due(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = onto_intelli::core::time::now_ms();
+        let last = self.pruned.load(Ordering::Relaxed);
+        now - last >= PRUNE_EVERY_MS
+            && self.pruned.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 }
 
 impl auth::Revocations for HubRevocations {
-    fn revoke<'a>(&'a self, jti: &'a str, exp: u64) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    fn revoke<'a>(
+        &'a self,
+        id: &'a str,
+        tenants: Option<&'a [String]>,
+        exp: u64,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let store = self.store().await?;
-            let (jti, until) = (jti.to_string(), (exp as i64).saturating_mul(1000));
-            tokio::task::spawn_blocking(move || {
-                store.kv_put(REVOKED_NS, &jti, &serde_json::json!({ "expires_at": exp }), Some(until))
-            })
-            .await
-            .map_err(|e| Error::Other(format!("revoking a session: {e}")))?
+            let keys: Vec<String> = match tenants {
+                None => vec![id.to_string()],
+                Some(tenants) => tenants.iter().map(|t| auth::scoped_id(id, Some(t))).collect(),
+            };
+            let written = store.clone();
+            tokio::task::spawn_blocking(move || keys.iter().try_for_each(|key| write_revocation(&*written, key, exp)))
+                .await
+                .map_err(|e| Error::Other(format!("revoking a session: {e}")))??;
+            // Off the request: the revoke has answered by the time this runs.
+            if self.prune_due() {
+                let before = onto_intelli::core::time::now_ms() - PRUNE_MARGIN_MS;
+                tokio::task::spawn_blocking(move || {
+                    purge_in_batches(|limit| store.kv_purge_expired(REVOKED_NS, before, limit))
+                });
+            }
+            Ok(())
         })
     }
 
-    fn is_revoked<'a>(&'a self, jti: &'a str) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+    fn is_revoked<'a>(
+        &'a self,
+        id: &'a str,
+        tenant: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let store = self.store().await?;
-            let jti = jti.to_string();
-            tokio::task::spawn_blocking(move || store.kv_get(REVOKED_NS, &jti).map(|v| v.is_some()))
-                .await
-                .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
+            let (id, scoped) = (id.to_string(), auth::scoped_id(id, tenant));
+            // Two primary-key reads: the id, and the id for this tenant.
+            tokio::task::spawn_blocking(move || {
+                Ok(store.kv_get(REVOKED_NS, &id)?.is_some() || store.kv_get(REVOKED_NS, &scoped)?.is_some())
+            })
+            .await
+            .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
         })
     }
 }
@@ -112,7 +200,7 @@ pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Rou
     let cfg = hub.config().clone();
     let table = Arc::new(RouteTable::build(&cfg)?);
     let auth = Arc::new(auth::Auth::from_config_with(&cfg.auth, opts.dev, opts.control.clone())?);
-    auth.set_revocations(Arc::new(HubRevocations(Arc::downgrade(&hub))));
+    auth.set_revocations(Arc::new(HubRevocations::new(&hub)));
     let mut router = axum::Router::new();
     if cfg.grpc.reflection {
         let builder = || {
@@ -262,6 +350,31 @@ fn public_url_ok(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expired_revocations_are_deleted_in_batches_until_one_comes_back_short() {
+        use std::cell::RefCell;
+        let answers = RefCell::new(vec![Ok(3), Ok(super::PRUNE_BATCH as u64)]);
+        assert_eq!(super::purge_in_batches(|_| answers.borrow_mut().pop().unwrap()), 2, "a full batch, then 3 rows");
+        let failing = |_| Err(onto_intelli::Error::Unavailable("down".into()));
+        assert_eq!(super::purge_in_batches(failing), 1, "an error stops it");
+    }
+
+    #[test]
+    fn a_repeated_revocation_never_shortens_the_first() {
+        use onto_intelli::core::store::{MemoryStore, Store};
+        let store = MemoryStore::default();
+        let now = onto_intelli::core::time::now_ms() as u64 / 1000;
+        let expiry =
+            |store: &MemoryStore| store.kv_get(super::REVOKED_NS, "old-id").unwrap().unwrap()["expires_at"].clone();
+        // Revoked for 30 days, then again after the limit was lowered to an hour.
+        super::write_revocation(&store, "old-id", now + 30 * 86_400).unwrap();
+        super::write_revocation(&store, "old-id", now + 3_600).unwrap();
+        assert_eq!(expiry(&store), now + 30 * 86_400);
+        // A later expiry still extends it.
+        super::write_revocation(&store, "old-id", now + 60 * 86_400).unwrap();
+        assert_eq!(expiry(&store), now + 60 * 86_400);
+    }
+
     #[test]
     fn public_urls() {
         for ok in ["https://onto.example.com", "http://127.0.0.1:50051", "http://localhost", "http://[::1]:8080/x"] {

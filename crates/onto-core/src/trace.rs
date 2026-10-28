@@ -190,12 +190,16 @@ pub struct SpanRow {
 }
 
 impl SpanRow {
-    /// See [`TraceRow::redact`].
+    /// See [`TraceRow::redact`]. The error text goes from the attributes too
+    /// (a generation span keeps the LLM's error there as well).
     pub fn redact(&mut self) {
         self.input = None;
         self.output = None;
         if self.error.is_some() {
             self.error = Some(REDACTED.into());
+        }
+        if let Some(e) = self.attrs.get_mut("error").filter(|e| e.is_string()) {
+            *e = Value::String(REDACTED.into());
         }
     }
 }

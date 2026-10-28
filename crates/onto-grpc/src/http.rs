@@ -35,13 +35,17 @@
 //! * `GET  /v1/schema/lint`     lint findings (`?checks=a,b&include_dismissed=true`)
 //! * `GET  /v1/packs`           industry packs; `GET /v1/packs/{id}` one pack with its lint
 //! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
-//! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose)
+//! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose,
+//!   and write a sample only with `governance.agent_raw_writes`)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
-//!   A session minting a session cannot outlive itself and belongs to the same login (`sid`).
+//!   A session minting a session cannot outlive itself and belongs to the same login (`sid`);
+//!   a session minted from a session mints none (403).
 //!   `DELETE` signs out: it revokes the presented session's login, every session minted in it.
 //! * `POST /v1/auth/session/revoke`  `{jti}`: a config token revokes a session it minted, and every
-//!   session minted from that one (a `sid` works too), whatever the tenant
+//!   session minted from that one (a `sid` works too): whatever the tenant for a token of every
+//!   tenant (`"*"`), in all of its own tenants for a token limited to some (the answer lists them;
+//!   with several, the request still names one with `x-onto-tenant`)
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
 //! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits
@@ -417,8 +421,15 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
     let principal = c.principal.clone();
     // A session minting a session cannot outlive itself (renewal ends when
     // the first session would have) and stays in its login, so revoking the
-    // first one revokes this one too.
+    // first one revokes this one too. Only the first session of a login
+    // mints: revoking any other session's id then leaves no session minted
+    // from it behind.
     let parent = c.session.as_ref();
+    if parent.is_some_and(crate::auth::SessionInfo::is_derived) {
+        return error_response(&Error::Denied(
+            "a session minted from a session cannot mint sessions; mint from the session it came from".into(),
+        ));
+    }
     let (token, minted, tenant) = match &c.credential {
         Credential::Console { .. } => {
             return error_response(&Error::Denied(
@@ -448,7 +459,10 @@ async fn session(State(s): State<AppState>, headers: HeaderMap, body: Option<Jso
 }
 
 /// Sign out: the presented session's login is revoked, so the session, the
-/// one it was minted from and every other one minted in that login.
+/// one it was minted from and every other one minted in that login. That
+/// is the point of signing out (the user's login ends, not one copy of its
+/// token), and it gives a derived session no power it lacks: it is the same
+/// principal in the same tenant as the rest of its login.
 async fn session_logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
@@ -457,7 +471,7 @@ async fn session_logout(State(s): State<AppState>, headers: HeaderMap) -> Respon
     let Some((login, exp)) = c.session.as_ref().and_then(|si| Some((si.login()?.to_string(), si.exp))) else {
         return error_response(&Error::invalid("DELETE /v1/auth/session revokes a session token: present one"));
     };
-    match s.auth.revoke_session(&login, exp).await {
+    match s.auth.revoke_session(&login, None, exp).await {
         Ok(()) => Json(json!({ "revoked": login })).into_response(),
         Err(e) => error_response(&e),
     }
@@ -468,31 +482,43 @@ struct RevokeIn {
     /// A session's `jti` (which is also the `sid` of the sessions minted
     /// from it), or a `sid`.
     jti: String,
-    /// Unix seconds the session expires at (from the mint response). The id
-    /// stays revoked at least as long as any session could live anyway.
+    /// Only for ids minted before ids carried their expiry: Unix seconds the
+    /// session expires at (from the mint response). Such an id stays revoked
+    /// at least as long as any session could live anyway.
     #[serde(default)]
     expires_at: Option<u64>,
 }
 
 /// A service (a config token) revokes a session it minted for a user, and
-/// the sessions minted from it. Session ids name no tenant: the revocation
-/// holds whatever tenant the request names.
+/// the sessions minted from it. Session ids name no tenant: a token for
+/// every tenant revokes the id whatever tenant the request names; a token
+/// limited to some tenants revokes it for the sessions of those tenants only.
 async fn session_revoke(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return auth_error_response(&e),
     };
-    if !matches!(c.credential, Credential::Config | Credential::Dev) {
-        return error_response(&Error::Denied("only a service token ([[auth.tokens]]) revokes sessions by id".into()));
-    }
+    let tenants = match &c.credential {
+        Credential::Config { tenants } if !tenants.iter().any(|t| t == "*") => Some(tenants.clone()),
+        Credential::Config { .. } | Credential::Dev => None,
+        _ => {
+            return error_response(&Error::Denied(
+                "only a service token ([[auth.tokens]]) revokes sessions by id".into(),
+            ));
+        }
+    };
     let input: RevokeIn = match serde_json::from_value(body_or_empty(body)) {
         Ok(i) => i,
         Err(e) => return error_response(&Error::invalid(format!("revoke: {e}"))),
     };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let exp = input.expires_at.unwrap_or(now + s.hub.config().auth.session_max_ttl_secs);
-    match s.auth.revoke_session(&input.jti, exp).await {
-        Ok(()) => Json(json!({ "revoked": input.jti })).into_response(),
+    // Without expires_at, revoke_session keeps an old-format id as long as
+    // a session minted now could live (the limit as clamped).
+    let exp = input.expires_at.unwrap_or(0);
+    match s.auth.revoke_session(&input.jti, tenants.as_deref(), exp).await {
+        Ok(()) => match tenants {
+            Some(tenants) => Json(json!({ "revoked": input.jti, "tenants": tenants })).into_response(),
+            None => Json(json!({ "revoked": input.jti })).into_response(),
+        },
         Err(e) => error_response(&e),
     }
 }
@@ -574,7 +600,7 @@ async fn admin_tenants(State(s): State<AppState>, headers: HeaderMap) -> Respons
 
 fn credential_kind(c: &Credential) -> &'static str {
     match c {
-        Credential::Config => "token",
+        Credential::Config { .. } => "token",
         Credential::ApiKey { .. } => "api_key",
         Credential::Console { .. } => "console",
         Credential::Session => "session",

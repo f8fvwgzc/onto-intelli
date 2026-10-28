@@ -216,6 +216,13 @@ async fn deterministic_cached_and_failing_asks() {
     assert_eq!(g.status, "error");
     assert!(g.error.as_deref().unwrap().contains("upstream 503"));
     assert_eq!(d.trace.llm_calls, 1, "a failed call is still a call");
+    // An observer who is not an admin reads none of the error text, not even
+    // in the generation span's attributes.
+    let observer = Principal::named("v", &["viewer", "observer"], &["*"]).unwrap();
+    let seen = i.call(&observer, "trace.get", json!({ "id": r.trace_id })).await.unwrap();
+    let llm = seen["spans"].as_array().unwrap().iter().find(|s| s["name"] == "llm").unwrap();
+    assert_eq!(llm["attrs"]["error"], onto_intelli::core::trace::REDACTED, "{llm}");
+    assert!(!seen.to_string().contains("overloaded"), "{seen}");
 }
 
 #[tokio::test]
