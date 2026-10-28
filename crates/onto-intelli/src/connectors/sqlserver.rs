@@ -419,9 +419,10 @@ pub const GRANTS_SQL: &str = "SELECT pr.name, pr.type, p.class, COALESCE(os.name
      WHERE p.class IN (0, 1, 3) \
      AND (p.permission_name = 'SELECT' OR (p.permission_name = 'CONTROL' AND p.state = 'D'))";
 
-/// Whether the crawl account sees every permission and role membership:
-/// without VIEW DEFINITION on the database, SQL Server shows it only its own
-/// rows (and its roles'), so a DENY to someone else would look absent.
+/// Whether the crawl account has VIEW DEFINITION on the database, which it
+/// needs to see every permission and role membership (necessary, not
+/// sufficient: see [`table_readers`]). Without it, SQL Server shows it only
+/// its own rows (and its roles'), so a DENY to someone else would look absent.
 pub const VISIBILITY_SQL: &str = "SELECT CAST(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION') AS int)";
 
 /// The crawl note when grants cannot be mapped.
@@ -435,8 +436,8 @@ pub fn sees_all_permissions(answer: Option<i64>) -> bool {
 
 /// The readers of each table, and the crawl note when there are none to
 /// trust: `answer` is [`VISIBILITY_SQL`]'s, and unless the crawl account
-/// sees every permission row (`perms` and `members` may then miss DENYs),
-/// no table has readers.
+/// has VIEW DEFINITION (necessary, not sufficient: `perms` and `members`
+/// miss DENYs without it), no table has readers.
 pub fn grant_readers(
     answer: Option<i64>,
     perms: &[SelectPermission],
@@ -475,13 +476,19 @@ enum Unread {
     Failed(Error),
 }
 
+/// A catalog read's error, by its SQL Server error number (`None` for one
+/// the server did not send: I/O, TLS, the protocol).
+fn unread(code: Option<u32>, e: impl std::fmt::Display) -> Unread {
+    match code {
+        Some(code) if PERMISSION_ERRORS.contains(&code) => Unread::Denied(format!("sqlserver: {e}")),
+        _ => Unread::Failed(Error::Unavailable(format!("sqlserver: {e}"))),
+    }
+}
+
 /// `sql`'s rows, its error sorted into [`Unread`].
 async fn catalog_rows(c: &mut Conn, sql: &str) -> std::result::Result<Vec<tiberius::Row>, Unread> {
     let read = async { c.simple_query(sql).await?.into_first_result().await };
-    read.await.map_err(|e| match e.code() {
-        Some(code) if PERMISSION_ERRORS.contains(&code) => Unread::Denied(format!("sqlserver: {e}")),
-        _ => Unread::Failed(Error::Unavailable(format!("sqlserver: {e}"))),
-    })
+    read.await.map_err(|e| unread(e.code(), &e))
 }
 
 /// What mapping grants reads: [`VISIBILITY_SQL`]'s answer, [`GRANTS_SQL`]
@@ -924,8 +931,8 @@ mod tests {
         let key = ("dbo".to_string(), "orders".to_string());
         let (readers, note) = grant_readers(Some(1), &perms, &[]);
         assert_eq!((readers[&key].clone(), note), (vec!["analysts".to_string(), "public".to_string()], None));
-        // Without VIEW DEFINITION the same rows (a DENY may be missing) map
-        // to no readers at all, and the crawl says why.
+        // Without VIEW DEFINITION (necessary, not sufficient) the same rows
+        // (a DENY may be missing) map to no readers at all, and the crawl says why.
         for answer in [Some(0), None] {
             let (readers, note) = grant_readers(answer, &perms, &[]);
             assert!(readers.is_empty(), "{answer:?}: {readers:?}");
@@ -1004,12 +1011,20 @@ mod tests {
 
     #[test]
     fn only_permission_errors_restrict_instead_of_failing() {
+        let denied = |code| matches!(unread(code, "x"), Unread::Denied(_));
         for code in [229, 230, 297, 300, 916] {
-            assert!(PERMISSION_ERRORS.contains(&code), "{code}");
+            assert!(denied(Some(code)), "{code}");
         }
-        // A lock timeout, a deadlock, a missing object, a database that will not open.
-        for code in [1222, 1205, 208, 4060] {
-            assert!(!PERMISSION_ERRORS.contains(&code), "{code}");
+        // A lock timeout, a deadlock, a missing object, a database that will
+        // not open, and errors the server did not send.
+        for code in [Some(1222), Some(1205), Some(208), Some(4060), None] {
+            assert!(!denied(code), "{code:?}");
+        }
+        let io = tiberius::error::Error::Io { kind: std::io::ErrorKind::ConnectionReset, message: "reset".into() };
+        let others =
+            [io, tiberius::error::Error::Tls("handshake".into()), tiberius::error::Error::Protocol("eof".into())];
+        for e in others {
+            assert!(matches!(unread(e.code(), &e), Unread::Failed(_)), "{e}");
         }
     }
 
