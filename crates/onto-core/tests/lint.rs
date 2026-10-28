@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, json};
 
+use onto_core::automate::{AutomationState, Enablements};
 use onto_core::graph::Graph;
 use onto_core::lint::{self, CHECKS, LintDecision, LintQuery, NS_FEEDBACK, Severity};
 use onto_core::reason::{self, ReasonOptions};
@@ -188,10 +189,19 @@ name = "linked_step"
 description = "Links chain."
 when = [["?x", "linked", "?y"], ["?y", "anything", "?z"]]
 then = ["?x", "linked", "?z"]
+
+[action_types.promote]
+description = "Raise a person's level."
+parameters.who = { type = "entity", kinds = ["person"], required = true }
+[[action_types.promote.effects]]
+patch = { id = "{who}", props = { level = "senior" } }
 "#;
 
 /// The fixture, plus what schema compile would refuse: a rule on an unknown
-/// class and a shape with an unknown property.
+/// class, a shape with an unknown property, and an automation that triggers
+/// every automation check once (an unknown action parameter, admin in every
+/// workspace, its own action re-triggers it with allow_self, enabled with
+/// another closure, and change-triggered like every automation).
 fn fixture() -> Schema {
     let mut s = Schema::from_toml(FIXTURE).unwrap();
     s.rules.push(Rule {
@@ -214,7 +224,33 @@ fn fixture() -> Schema {
             ..Default::default()
         },
     );
+    s.automations.insert(
+        "relabel".into(),
+        serde_json::from_value(json!({
+            "description": "Re-level a person when they change.",
+            "run_as": { "roles": ["admin"], "workspaces": ["*"] },
+            "allow_self": true,
+            "trigger": { "on": "change", "kinds": ["person"], "ops": ["entity.update"] },
+            "effects": [{ "action": { "type": "promote", "params": { "who": "{trigger.id}", "bogus": "x" } } }]
+        }))
+        .unwrap(),
+    );
     s
+}
+
+/// `relabel` enabled with a closure that no longer matches.
+fn fixture_enabled() -> Enablements {
+    let mut e = Enablements::default();
+    e.states.insert(
+        "relabel".into(),
+        AutomationState {
+            enabled: true,
+            closure_hash: "0".repeat(64),
+            closure: [("automation:relabel".to_string(), "0".repeat(64))].into(),
+            ..Default::default()
+        },
+    );
+    e
 }
 
 fn entity(kind: &str, key: &str) -> Entity {
@@ -266,8 +302,8 @@ fn fixture_graph(s: &Schema) -> Graph {
 fn fixture_triggers_each_check_once() {
     let s = fixture();
     let g = fixture_graph(&s);
-    let r = lint::lint(&s, Some(&g), &all);
-    assert!(r.not_run.is_empty());
+    let r = lint::lint_with(&s, Some(&g), &all, None, Some(&fixture_enabled())).unwrap();
+    assert!(r.not_run.is_empty(), "{:?}", r.not_run);
     assert_eq!(r.checks_run.len(), CHECKS.len());
     let expected: BTreeMap<&str, &str> = [
         ("missing_description", "object_type:lonely"),
@@ -287,6 +323,11 @@ fn fixture_triggers_each_check_once() {
         ("unused_interface", "interface:dormant"),
         ("duplicate_label", "object_type:ghost, object_type:person"),
         ("unknown_rule_class", "rule:martians"),
+        ("automation_reference", "automation:relabel"),
+        ("automation_privilege", "automation:relabel"),
+        ("automation_loop", "automation:relabel"),
+        ("automation_closure_changed", "automation:relabel"),
+        ("automation_gap_blind", "automation:relabel"),
         ("unused_type", "object_type:ghost"),
         ("unused_link_type", "link_type:knows"),
     ]
@@ -302,7 +343,7 @@ fn fixture_triggers_each_check_once() {
         assert!(!f.message.is_empty() && !f.fix.is_empty(), "{f:#?}");
     }
     assert_eq!(r.findings.len(), CHECKS.len(), "{:#?}", r.findings);
-    assert_eq!((r.counts.error, r.counts.warning, r.counts.info), (6, 5, 8));
+    assert_eq!((r.counts.error, r.counts.warning, r.counts.info), (7, 9, 8));
 
     // Messages carry the evidence.
     let msg = |check: &str| r.findings.iter().find(|f| f.check == check).unwrap().message.clone();
@@ -314,12 +355,20 @@ fn fixture_triggers_each_check_once() {
     assert!(msg("keyword_collision").contains("reserved keyword"), "{}", msg("keyword_collision"));
     assert!(msg("shape_reference").contains("unknown property nope"), "{}", msg("shape_reference"));
     assert!(msg("unknown_rule_class").contains("a martian"), "{}", msg("unknown_rule_class"));
+    assert!(msg("automation_reference").contains("action type promote has no parameter bogus"));
+    let privilege = msg("automation_privilege");
+    assert!(privilege.contains("runs as admin") && privilege.contains("every workspace"), "{privilege}");
+    assert!(msg("automation_loop").contains("can trigger itself (allow_self = true)"), "{}", msg("automation_loop"));
+    let stale = msg("automation_closure_changed");
+    assert!(stale.contains("action_type:promote, automation:relabel changed"), "{stale}");
+    assert!(msg("automation_gap_blind").contains("gap records never trigger runs"));
 
-    // Without a graph the graph checks are listed as not run, never dropped silently.
+    // Without a graph the graph checks are listed as not run, never dropped
+    // silently; so is the check that needs the stored enablements.
     let r = lint::lint(&s, None, &all);
     let not_run: Vec<&str> = r.not_run.iter().map(|n| n.check.as_str()).collect();
-    assert_eq!(not_run, ["unused_type", "unused_link_type"]);
-    assert_eq!(r.findings.len(), CHECKS.len() - 2);
+    assert_eq!(not_run, ["automation_closure_changed", "unused_type", "unused_link_type"]);
+    assert_eq!(r.findings.len(), CHECKS.len() - 3);
 
     // Graph checks count only what the reader may see.
     let hide_vehicles = |e: &Entity| !e.id.starts_with("vehicle:");

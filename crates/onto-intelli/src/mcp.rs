@@ -42,7 +42,7 @@ fn schema_change_props() -> Value {
     json!({
         "changes": {
             "type": "array",
-            "description": "Schema changes, each {op, ...}: put_object_type {name, def}, delete_object_type {name}, rename_object_type {from, to}, put_property {object_type, name, def: {type, required?, values?}}, delete_property {object_type, name}, put_link_type {name, def: {from, to, inverse?, cardinality?}}, delete_link_type {name}, rename_link_type {from, to}, put_action_type {name, def}, put_rule {def: {name, chain, infer}}, put_metric {name, def}, put_interface {name, def}, delete_* {name}. Changes that break data in use need migrations.",
+            "description": "Schema changes, each {op, ...}: put_object_type {name, def}, delete_object_type {name}, rename_object_type {from, to}, put_property {object_type, name, def: {type, required?, values?}}, delete_property {object_type, name}, put_link_type {name, def: {from, to, inverse?, cardinality?}}, delete_link_type {name}, rename_link_type {from, to}, put_action_type {name, def}, put_rule {def: {name, chain, infer}}, put_metric {name, def}, put_interface {name, def}, put_shape {name, def}, put_automation {name, def: {run_as, trigger, conditions?, effects}} (defines a change-triggered automation; a person enables it separately), delete_* {name}. Changes that break data in use need migrations.",
             "items": { "type": "object", "properties": { "op": { "type": "string" } }, "required": ["op"] }
         },
         "migrations": {

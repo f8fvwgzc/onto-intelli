@@ -45,6 +45,8 @@ pub struct Config {
     pub changes: ChangesConfig,
     /// Webhook delivery from the outbox (docs/design/EVENTS.md Part B).
     pub webhooks: WebhooksConfig,
+    /// Change-triggered automations (docs/design/EVENTS.md Part C).
+    pub automation: AutomationConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -916,6 +918,92 @@ impl WebhooksConfig {
     }
 }
 
+/// `[automation]`: change-triggered automations (docs/design/EVENTS.md
+/// Part C). Definitions are schema (`[automations.<name>]`, `put_automation`);
+/// whether one runs is its enablement, which expires after
+/// `enable_ttl_days` so a person re-enables it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutomationConfig {
+    /// Run automations in this process (`false`: the process kill switch).
+    pub enabled: bool,
+    /// Start the automation workers (onto-cli's local commands turn them off
+    /// outside `serve`).
+    pub workers: bool,
+    /// Automations per tenant schema, enforced when a schema change is
+    /// applied or proposed (never when a stored schema is loaded).
+    pub max_automations: usize,
+    /// Cascade depth limit: a change at depth `d` triggers runs at `d + 1`;
+    /// runs over `min(max_depth, the automation's max_depth)` are refused.
+    pub max_depth: u8,
+    /// Runs per tenant per minute; over it triggers become `skipped` runs.
+    pub max_runs_per_minute: u32,
+    /// Runs per automation per minute when its `rate.per_minute` is unset.
+    pub default_rate_per_minute: u32,
+    /// Runs per (automation, subject) per hour when its
+    /// `rate.per_subject_per_hour` is unset (kept per process: approximate
+    /// across lease handoffs).
+    pub default_per_subject_per_hour: u32,
+    /// Consecutive failed runs that pause an automation.
+    pub pause_after_failures: u32,
+    /// Days an enablement lasts before a person must enable it again.
+    pub enable_ttl_days: u32,
+    /// The automation consumer's lease (renewed at a third of it).
+    pub lease_secs: u64,
+    /// Retry delay `min(base * 2^attempt, max)` for runs that failed on
+    /// unavailability or contention.
+    pub retry_base_secs: u64,
+    pub retry_max_secs: u64,
+    pub retry_max_attempts: u32,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workers: true,
+            max_automations: 100,
+            max_depth: 3,
+            max_runs_per_minute: 600,
+            default_rate_per_minute: 60,
+            default_per_subject_per_hour: 10,
+            pause_after_failures: 5,
+            enable_ttl_days: 30,
+            lease_secs: 60,
+            retry_base_secs: 10,
+            retry_max_secs: 3600,
+            retry_max_attempts: 8,
+        }
+    }
+}
+
+impl AutomationConfig {
+    /// Every limit and time is at least 1 and the retry maximum is not below
+    /// its base.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [
+            ("max_automations", self.max_automations as u64),
+            ("max_depth", self.max_depth as u64),
+            ("max_runs_per_minute", self.max_runs_per_minute as u64),
+            ("default_rate_per_minute", self.default_rate_per_minute as u64),
+            ("default_per_subject_per_hour", self.default_per_subject_per_hour as u64),
+            ("pause_after_failures", self.pause_after_failures as u64),
+            ("enable_ttl_days", self.enable_ttl_days as u64),
+            ("lease_secs", self.lease_secs),
+            ("retry_base_secs", self.retry_base_secs),
+            ("retry_max_secs", self.retry_max_secs),
+            ("retry_max_attempts", self.retry_max_attempts as u64),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("automation.{name} = {v} (at least 1)")));
+        }
+        if self.retry_max_secs < self.retry_base_secs {
+            return Err(Error::Config("automation.retry_max_secs is below retry_base_secs".into()));
+        }
+        Ok(())
+    }
+}
+
 /// `[[console.oidc]]`: one OpenID Connect provider (Clerk, Auth0, Supabase
 /// Auth, Google, Keycloak, Okta, Entra, ...).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1086,6 +1174,24 @@ mod tests {
         assert!(cfg.traces.check().is_ok());
         let bad = Config::from_toml("[traces]\ncalls = 'some'\n").unwrap();
         assert!(bad.traces.check().unwrap_err().to_string().contains("writes, all, none"));
+    }
+
+    #[test]
+    fn automation_section_defaults_and_checks() {
+        let example = Config::from_toml(EXAMPLE_CONFIG).unwrap();
+        let d = AutomationConfig::default();
+        let a = &example.automation;
+        assert!(a.enabled && a.workers);
+        assert_eq!(
+            (a.max_automations, a.max_depth, a.enable_ttl_days, a.pause_after_failures),
+            (d.max_automations, d.max_depth, d.enable_ttl_days, d.pause_after_failures)
+        );
+        assert_eq!((d.max_automations, d.max_depth, d.enable_ttl_days), (100, 3, 30));
+        assert!(a.check().is_ok());
+        let zero = Config::from_toml("[automation]\nmax_automations = 0\n").unwrap();
+        assert!(zero.automation.check().unwrap_err().to_string().contains("automation.max_automations = 0"));
+        let inverted = Config::from_toml("[automation]\nretry_base_secs = 60\nretry_max_secs = 10\n").unwrap();
+        assert!(inverted.automation.check().unwrap_err().to_string().contains("retry_max_secs"));
     }
 
     #[test]

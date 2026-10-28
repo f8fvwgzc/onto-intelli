@@ -477,7 +477,8 @@ message HealthStatus {
 // rename_object_type {from, to} · put_property {object_type, name, def, migrations?} ·
 // delete_property {object_type, name, migrations?} · rename_property {object_type, from, to} ·
 // put_link_type {name, def, migrations?} · delete_link_type {name, migrations?} ·
-// rename_link_type {from, to} · put_interface/put_action_type/put_metric {name, def} ·
+// rename_link_type {from, to} · put_interface/put_action_type/put_metric/put_shape {name, def} ·
+// put_automation {name, def} (a change-triggered automation; enabled separately) ·
 // put_rule {def} · delete_* {name} · put_glossary_term {section, word, target} ·
 // delete_glossary_term {section, word} · set_analysis {def}.
 // Migrations: {action: delete_entities|retype|map_states|set_default|convert|drop_values|

@@ -286,3 +286,22 @@ retain_days = 14                   # finished rows and attempt logs
 # [[webhooks.allow]]
 # host = "hooks.internal.example"  # or "*.internal.example"
 # cidrs = ["10.20.0.0/16"]
+
+# Change-triggered automations (docs/design/EVENTS.md Part C). Definitions
+# are schema ([automations.<name>], put_automation through schema.apply or a
+# proposal) and are visible to everyone who can read the schema; a person who
+# may approve schema changes enables each one, and the enablement expires.
+[automation]
+enabled = true                     # false: this process runs no automations
+workers = true
+max_automations = 100              # per tenant, at schema.apply/propose (never when a schema loads)
+max_depth = 3                      # cascade limit (an automation's own max_depth may lower it)
+max_runs_per_minute = 600          # per tenant; over it, triggers become skipped runs (rerunnable)
+default_rate_per_minute = 60       # per automation, when rate.per_minute is unset
+default_per_subject_per_hour = 10  # per (automation, subject), when rate.per_subject_per_hour is unset
+pause_after_failures = 5           # consecutive failed runs pause an automation
+enable_ttl_days = 30               # a person re-enables after this (phase 1 local principals)
+lease_secs = 60
+retry_base_secs = 10               # retry delay min(base * 2^attempt, max)
+retry_max_secs = 3600
+retry_max_attempts = 8

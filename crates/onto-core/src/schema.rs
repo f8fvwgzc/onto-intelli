@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::action_types::ActionType;
+use crate::automate::Automation;
 use crate::metrics::{DerivedDef, MetricDef};
 use crate::quality::Constraints;
 use crate::shape_model::Shape;
@@ -524,6 +525,10 @@ pub struct Schema {
     /// Conditions on the objects of a target, by name (see [`Shape`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shapes: BTreeMap<String, Shape>,
+    /// Change-triggered automations, by name (see [`Automation`]). Readable by
+    /// everyone who can read the schema; enablement is state, not schema.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub automations: BTreeMap<String, Automation>,
     /// inverse name -> canonical relation
     #[serde(skip)]
     inverses: BTreeMap<String, String>,
@@ -550,6 +555,8 @@ struct SchemaFile {
     action_types: BTreeMap<String, ActionType>,
     #[serde(default)]
     shapes: BTreeMap<String, Shape>,
+    #[serde(default)]
+    automations: BTreeMap<String, Automation>,
     /// Package metadata (`[pack]`, see [`crate::packs::PackMeta`]). It
     /// describes the file, never the schema, so it does not change the
     /// schema's name or version.
@@ -604,9 +611,9 @@ impl Schema {
     }
 
     /// Layer another schema file on top: types and relations are added or
-    /// replaced by name, rules are appended (or replaced by name), shapes are
-    /// replaced by name, `[analysis]` replaces when present. A `[pack]` table
-    /// is package metadata and leaves the schema untouched.
+    /// replaced by name, rules are appended (or replaced by name), shapes and
+    /// automations are replaced by name, `[analysis]` replaces when present.
+    /// A `[pack]` table is package metadata and leaves the schema untouched.
     pub fn extend_toml(&mut self, text: &str) -> Result<()> {
         let file: SchemaFile = toml::from_str(text)?;
         if let Some(name) = file.name {
@@ -640,6 +647,7 @@ impl Schema {
         self.metrics.extend(file.metrics);
         self.action_types.extend(file.action_types);
         self.shapes.extend(file.shapes);
+        self.automations.extend(file.automations);
         self.compile()
     }
 
@@ -785,6 +793,11 @@ impl Schema {
         }
         for a in self.action_types.values() {
             a.validate(self).map_err(|e| Error::Config(format!("action type {}: {e}", a.name)))?;
+        }
+        // Structure and references only: limits are enforced where a change
+        // is applied or proposed, so a stored schema always opens.
+        for (name, a) in &self.automations {
+            a.validate(name, self).map_err(|e| Error::Config(format!("automation {name}: {e}")))?;
         }
         self.check_backings()
     }

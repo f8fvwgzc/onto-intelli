@@ -1482,3 +1482,45 @@ Build step 9 (endpoints and fan-out):
 - UI: `pages/automate/AutomatePage.tsx` with `WebhooksTab` (the Automations tab comes with step
   11); whoami gains `configure_outbound` (admins, never agents). CLI: `onto webhook list|add|rm`
   (`--sees` names the principal's workspaces, since `--workspace` is a global flag).
+
+Build step 10 (automation definitions):
+
+- Migration: `0012_automate.sql` (section 9 named it `0011_automate.sql`; 0011 holds the outbox). It
+  holds `automation_runs` only: `timers` is in 0010. Besides the indexes of section 9 it indexes
+  `(started_at DESC, id DESC)` for `automation.runs` without a name.
+- The spec's `closure(schema, def, endpoints, targets)` also takes the automation's name: the name is
+  the principal id (`automation:<name>`), so it is part of the hash. Items are
+  `automation:<name>`, `action_type:<name>`, `endpoint:<name>` and `target:<name>`; a reached item
+  that does not exist hashes as `missing`, so registering it later stops the automation too.
+  Writeback targets are read from the action type document (`effects[].writeback.target`), so the
+  step 12 field enters closures without another change here.
+- Definitions refuse unknown fields (`deny_unknown_fields` on every automation struct): a typo such
+  as `kind` for `kinds` or `condition` for `conditions` would otherwise widen what runs. The cost is
+  that a field added by a later build does not load on an earlier one; that is accepted, since an
+  automation that runs broader than written is worse.
+- Validation (compile) checks structure and references only: names, trigger ops (entity and link
+  ops; `gap`, `entity.hidden` and `schema.change` never start runs), kinds, relations, action types,
+  endpoint and event names, `run_as` (a role, no `system` or `agent`, workspaces), conditions read
+  only `subject`, template roots, secret-looking strings (refused by path, never echoing the value).
+  Parameters, properties and states are checked by lint (`automation_reference`), which reports
+  every problem at once, as `shape_reference` does.
+- `max_automations` is `OntologyOptions::max_automations` (from `[automation]`), checked by
+  `schema.plan`, `schema.apply` and `schema.propose` (and an approval's commit). A change that adds
+  no automation passes even over a lowered limit.
+- `schema.plan` (and proposals, which re-plan for each reader) carries `lint`: the
+  `automation_closure_changed` findings for enabled automations the change would stop (enabled and
+  matching under the active schema, not under the planned one), each also a medium risk reason.
+  `schema.lint` runs the same check on the active schema; without stored enablements (a bare
+  `lint::lint` call) the check is listed in `not_run` when the schema defines automations.
+- `automation_loop` is an approximation from the schema: the changes an action type can write (its
+  entity parameters' kinds, literal states, link relations) are matched against each trigger
+  (kinds, ops, relations, props, workspaces of the writer's `run_as`, sources with the writer's
+  `automation:<name>` source, the state guard). `automation_gap_blind` is a warning on every
+  change-triggered automation, as the review decision says.
+- `[automation]` is parsed and checked now (all of section 8's keys); only `max_automations` is
+  read in this step. Schema locks cover the `automations` section; packs may ship automations
+  (counted and listed by `pack.show`), and installing a pack never enables one.
+- Trigger matching (`ChangeTrigger::matches`, `Automation::admits`, `depth_limit`) is defined here
+  as pure functions over committed records: migrations are skipped unless `include_migrations`,
+  gaps never match, and a run's own changes are skipped unless `allow_self`. Rate limits, the
+  subject budget and the runtime that uses these come with step 11.

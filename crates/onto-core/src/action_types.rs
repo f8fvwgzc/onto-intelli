@@ -200,7 +200,8 @@ pub struct ActionType {
     pub effects: Vec<Effect>,
 }
 
-fn placeholders(s: &str) -> Vec<String> {
+/// The roots of the placeholders in `s` (`{issue.title}` → `issue`).
+pub(crate) fn placeholders(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(start) = rest.find('{') {
@@ -214,7 +215,8 @@ fn placeholders(s: &str) -> Vec<String> {
     out
 }
 
-fn strings_in(v: &Value, out: &mut Vec<String>) {
+/// Every string value in `v`, depth first (object keys are not included).
+pub(crate) fn strings_in(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::String(s) => out.push(s.clone()),
         Value::Array(a) => a.iter().for_each(|x| strings_in(x, out)),

@@ -75,6 +75,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (9, "changes", include_str!("../../migrations/0009_changes.sql")),
     (10, "leases", include_str!("../../migrations/0010_leases.sql")),
     (11, "outbox", include_str!("../../migrations/0011_outbox.sql")),
+    (12, "automate", include_str!("../../migrations/0012_automate.sql")),
 ];
 /// This build's writer version. A tenant whose `head.min_writer` is higher
 /// refuses this build's writes (builds before this one never read it; the

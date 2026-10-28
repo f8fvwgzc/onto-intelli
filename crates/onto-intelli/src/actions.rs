@@ -213,7 +213,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "schema.plan",
         false,
-        "Dry run of a schema change set: validation, diff, impact (entities/links, breaking), migration. Input: SchemaChangeSet.",
+        "Dry run of a schema change set: validation, diff, impact (entities/links, breaking), migration, enabled automations it would stop (lint). Input: SchemaChangeSet.",
     ),
     a(
         "schema.apply",

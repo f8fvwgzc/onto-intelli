@@ -44,6 +44,11 @@ pub struct OntologyOptions {
     pub sync_reads: bool,
     /// How often the follower of a shared store polls when no notice arrives.
     pub follow_interval_ms: u64,
+    /// Most automations a schema change may leave (`[automation]
+    /// max_automations`). Checked when a change is applied or proposed, never
+    /// when a stored schema is loaded, so lowering it cannot stop a tenant
+    /// from opening.
+    pub max_automations: usize,
 }
 
 impl Default for OntologyOptions {
@@ -55,6 +60,7 @@ impl Default for OntologyOptions {
             governance: Governance::default(),
             sync_reads: false,
             follow_interval_ms: 1_000,
+            max_automations: 100,
         }
     }
 }

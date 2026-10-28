@@ -179,7 +179,7 @@ pub(crate) struct LintArgs {
 
 #[derive(Args)]
 pub(crate) struct LockArgs {
-    /// object_types, link_types, interfaces, rules, metrics, action_types, shapes or properties.
+    /// object_types, link_types, interfaces, rules, metrics, action_types, shapes, automations or properties.
     section: String,
     /// The definition (`issue`, `depends_on`, `issue.priority` for a property).
     name: String,
