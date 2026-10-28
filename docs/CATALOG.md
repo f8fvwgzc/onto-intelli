@@ -145,11 +145,12 @@ encrypt the login only, and any other value (`strict` too: TDS 8.0 is not suppor
 refused rather than read as off. `trust_server_certificate` takes `true` or `false` alike; both
 names are read in any case (`Encrypt`, `TrustServerCertificate`). With `map_grants`, only a
 table-level `GRANT SELECT` makes a reader: a column grant does not, nor (fewer readers, never
-more) a grant on a schema or the database. A `DENY` wins: on the table, a column, its schema or
+more) a grant on a schema or the database, which is read but makes no reader. A `DENY` wins: on the table, a column, its schema or
 the database, or membership in `db_denydatareader`, it blocks the denied principal and everyone in
 it through nested roles. As the ACL only lists readers, it fails closed: once anyone is denied,
 `public` is no reader and neither is a granted role that holds a denied principal. A `DENY` to
-`public` leaves no reader. A permission row that cannot be read counts as a `DENY`. A `DENY` of
+`public` leaves no reader. A permission row that cannot be read counts as a `DENY`, and so does
+one in any state but `GRANT` (a column-exception `REVOKE` too). A `DENY` of
 `CONTROL` counts as one of `SELECT`, which it covers. Windows and Entra ID groups (principal types
 `G` and `X`), and role members of a type that cannot be read, are opaque: their members live
 outside the database. A `DENY` to one counts as a `DENY` to everyone, and so does a `DENY` to a
@@ -161,9 +162,19 @@ through nested roles) is no reader.
 role memberships, so a `DENY` to anyone else would look absent. The crawl checks
 (`HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION')`) and, without it, does not read the
 permission catalogs at all: it maps every table as restricted with no readers and says so in the
-crawl's notes. When reading them fails anyway, the crawl goes on the same way, with the error in its
-notes. The crawl account otherwise needs
-only `db_datareader` (or `SELECT` on the crawled schemas).
+crawl's notes. When SQL Server refuses a catalog anyway (a permission error: 229, 230, 297, 300 or
+916), the crawl goes on the same way, with the error in its notes. Any other error reading them (the
+network, a timeout, TLS) fails the crawl, which sets the connector's `last_error` and keeps what the
+last crawl mapped. Mapping no readers restricts every table, view and column of the source to admins,
+and removes the links synced earlier from its join tables (a join table readable by fewer principals
+than the tables it joins is not synced); the next crawl that maps grants brings them back. The crawl
+account otherwise needs only `db_datareader` (or `SELECT` on the crawled schemas).
+
+VIEW DEFINITION alone does not prove the crawl sees every permission row. On SQL Server 2022 and Azure
+SQL, `DENY VIEW SECURITY DEFINITION TO <crawl user>` hides other principals' permissions while the
+check above still passes; on any version, `DENY VIEW DEFINITION ON ROLE::<role> TO <crawl user>` hides
+that principal, its `DENY`s and its memberships. Neither is denied by default; do not deny them to the
+crawl account. Making the check prove visibility is a tracked follow-up.
 
 Drivers: `sqlx-mysql`, `tiberius` (rustls) and the official `mongodb` driver, all MIT or Apache-2.0.
 CI runs the connectors against MySQL 8.4, MariaDB 11.4, SQL Server 2022 and MongoDB 8 containers
