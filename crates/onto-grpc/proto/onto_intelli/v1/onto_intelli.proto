@@ -1146,3 +1146,42 @@ service AutomateService {
   rpc Rerun(AutomationRerunRequest) returns (google.protobuf.Struct);         // automation.rerun
   rpc Kill(AutomationKillRequest) returns (google.protobuf.Struct);           // automation.kill
 }
+
+// ── Writeback: HTTP writeback targets ────────────────────────────────────
+// An action type's writeback = { target, route, body } effect posts its body,
+// rendered strictly when the action is planned, to a registered target
+// through the outbox after the action commits, with Idempotency-Key:
+// <receipt>:<effect> (the receiver must honour it) and Standard Webhooks
+// signature headers when the target has a secret. Each call is enqueued once
+// and delivered at least once. Writeback is not reversible; action.undo does
+// not undo the external write. A plan with a writeback effect needs a
+// person's confirmation unless the action type declares unattended for the
+// caller's kind, and is refused while [writeback] enabled is off. Responses
+// are the JSON of the writeback.* actions.
+
+message WritebackAddRequest {
+  string name = 1;                // [a-z0-9_-], at most 40 (shared with webhook endpoint names)
+  string base_url = 2;            // https (or an operator env:/file: reference)
+  map<string, string> routes = 3; // route name -> relative path under base_url
+  repeated string workspaces = 4; // actions in these workspaces may use it (default: the call's)
+  string secret = 5;              // signing secret (sealed); empty: unsigned
+  bool generate_secret = 6;       // generate a whsec_ secret, returned once
+  string workspace = 7;           // workspace of the audit event
+}
+
+message WritebackNameRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message WritebackTestRequest {
+  string name = 1;
+  string route = 2;               // one route (default: every route); nothing is sent
+}
+
+service WritebackService {
+  rpc Add(WritebackAddRequest) returns (google.protobuf.Struct);              // writeback.add
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // writeback.list
+  rpc Remove(WritebackNameRequest) returns (google.protobuf.Struct);          // writeback.remove
+  rpc Test(WritebackTestRequest) returns (google.protobuf.Struct);            // writeback.test
+}

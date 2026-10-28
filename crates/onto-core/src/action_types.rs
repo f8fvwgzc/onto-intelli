@@ -1,14 +1,24 @@
 //! Action types: governed, parameterized edits declared in the schema.
 //!
 //! An action type has typed parameters, preconditions (submission criteria),
-//! conditional effects (patch, link, unlink, create, delete, event), allowed
-//! roles and a declared risk. Planning renders the effects against the current
-//! graph and derives an inverse for every effect, so each action knows whether
-//! it is reversible before it runs. High-risk or irreversible actions require
-//! explicit confirmation. Applying writes the edits, an audit event and an
-//! undo receipt in one transaction. On request a plan also reports its
-//! consequences: the derived facts that appear and disappear when its edits
-//! are staged on a fork (see [`Ontology::plan_action_consequences`]).
+//! conditional effects (patch, link, unlink, create, delete, event,
+//! writeback), allowed roles and a declared risk. Planning renders the effects
+//! against the current graph and derives an inverse for every graph effect, so
+//! each action knows whether it is reversible before it runs. High-risk or
+//! irreversible actions require explicit confirmation. Applying writes the
+//! edits, an audit event and an undo receipt in one transaction. On request a
+//! plan also reports its consequences: the derived facts that appear and
+//! disappear when its edits are staged on a fork (see
+//! [`Ontology::plan_action_consequences`]).
+//!
+//! A `writeback` effect (docs/design/EVENTS.md Part D) is an HTTP call to a
+//! registered target. It is rendered strictly when the action is planned and
+//! committed as an outbox row with the action, so it is enqueued once and
+//! delivered at least once after the commit, with `Idempotency-Key:
+//! <receipt>:<effect>`. Writeback is not reversible; action.undo does not
+//! undo the external write. A plan with one is not reversible and at least
+//! medium risk, so it needs a person's confirmation, unless the action type
+//! declares `unattended` for the caller's kind (`agent`, `automation`).
 
 use std::collections::BTreeMap;
 
@@ -157,7 +167,27 @@ pub struct EventEffect {
     pub payload: Value,
 }
 
-/// One edit. Exactly one of `patch`, `link`, `unlink`, `create`, `delete`, `event`.
+/// An HTTP call to a registered writeback target (docs/design/EVENTS.md
+/// Part D): `body` is rendered strictly when the action is planned and posted
+/// to the target's `route` through the outbox after the action commits, with
+/// `Idempotency-Key: <receipt>:<effect>`. Not reversible: action.undo does not
+/// undo the external write.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WritebackEffect {
+    /// The target's name (KV `writeback.target`; literal, no placeholders).
+    pub target: String,
+    /// One of the target's route names (literal).
+    pub route: String,
+    /// The JSON body (default `{}`); every placeholder must have a value.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub body: Value,
+}
+
+/// Caller kinds an action type may declare `unattended` for.
+pub const UNATTENDED_KINDS: [&str; 2] = ["agent", "automation"];
+
+/// One edit. Exactly one of `patch`, `link`, `unlink`, `create`, `delete`,
+/// `event`, `writeback`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Effect {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +202,9 @@ pub struct Effect {
     pub delete: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<EventEffect>,
+    /// An HTTP call sent after the commit (not reversible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback: Option<WritebackEffect>,
     /// For `link`: remove other links of the same relation from the source first.
     #[serde(default)]
     pub replace: bool,
@@ -199,6 +232,12 @@ pub struct ActionType {
     pub preconditions: Vec<Check>,
     #[serde(default)]
     pub effects: Vec<Effect>,
+    /// Caller kinds (`agent`, `automation`) that may apply it without the
+    /// confirmation its external (writeback) effects add. Schema, so it is
+    /// approved through governance and part of every automation closure that
+    /// reaches it. Its declared risk still applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unattended: Vec<String>,
 }
 
 /// The roots of the placeholders in `s` (`{issue.title}` → `issue`).
@@ -266,9 +305,21 @@ impl ActionType {
                 e.create.is_some(),
                 e.delete.is_some(),
                 e.event.is_some(),
+                e.writeback.is_some(),
             ];
             if ops.iter().filter(|x| **x).count() != 1 {
-                return Err(format!("effect {i}: exactly one of patch, link, unlink, create, delete, event"));
+                return Err(format!(
+                    "effect {i}: exactly one of patch, link, unlink, create, delete, event, writeback"
+                ));
+            }
+            if let Some(w) = &e.writeback {
+                for (what, v) in [("target", &w.target), ("route", &w.route)] {
+                    if !outbound_name(v) {
+                        return Err(format!(
+                            "effect {i}: writeback {what} '{v}' must be a name (1 to 40 of a-z, 0-9, _ and -)"
+                        ));
+                    }
+                }
             }
             let v = serde_json::to_value(e).map_err(|x| x.to_string())?;
             let mut v = v;
@@ -302,6 +353,11 @@ impl ActionType {
                 }
             }
         }
+        for u in &self.unattended {
+            if !UNATTENDED_KINDS.contains(&u.as_str()) {
+                return Err(format!("unattended: '{u}' is not a caller kind ({})", UNATTENDED_KINDS.join(", ")));
+            }
+        }
         for c in checks {
             for p in c.param.iter().chain(c.other.iter()) {
                 if !self.parameters.contains_key(p) {
@@ -316,6 +372,25 @@ impl ActionType {
             }
         }
         Ok(())
+    }
+}
+
+/// `[a-z0-9_-]`, 1 to 40 characters: writeback target and route names.
+fn outbound_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 40
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The kind of caller `p` is, for `unattended`: `automation` (the service
+/// principal `automation:<name>`), `agent`, or `None` (a person or service).
+pub(crate) fn caller_kind(p: &Principal) -> Option<&'static str> {
+    if p.id.starts_with(crate::automate::PRINCIPAL_PREFIX) {
+        Some("automation")
+    } else if p.is_agent() {
+        Some("agent")
+    } else {
+        None
     }
 }
 
@@ -345,7 +420,50 @@ pub struct ActionPlan {
     /// [`Ontology::plan_action_consequences`]; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consequences: Option<Consequences>,
+    /// External writes (writeback effects), rendered strictly: each is
+    /// committed as an outbox row with the action and sent after the commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<PlannedExternal>,
+    /// With external writes: whether the graph edits alone are reversible
+    /// (`action.undo` with `force` undoes only those; the external write is
+    /// not undone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_reversible: Option<bool>,
 }
+
+/// One planned external write.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedExternal {
+    /// The effect's index in the action type (part of the idempotency key).
+    pub effect: usize,
+    pub target: String,
+    pub route: String,
+    /// The strictly rendered JSON body.
+    pub body: Value,
+}
+
+/// One external write of a receipt: the outbox row that carries it and the
+/// row's state (joined when the receipt is read).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExternalCall {
+    pub effect: usize,
+    pub target: String,
+    pub route: String,
+    /// The outbox row id.
+    pub outbox: String,
+    /// `<receipt>:<effect>`, sent as `Idempotency-Key`.
+    pub idempotency_key: String,
+    pub state: crate::outbox::OutboxState,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// What plans and undo say about external writes (docs/design/EVENTS.md
+/// section 13).
+pub const NOT_REVERSIBLE_NOTE: &str = "Writeback is not reversible; action.undo does not undo the external write.";
+
+/// What a receipt with external writes says (docs/design/EVENTS.md D.1).
+pub const RECEIPT_NOTE: &str = "not reversible: the external write is not undone by action.undo";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActionReceipt {
@@ -365,6 +483,14 @@ pub struct ActionReceipt {
     /// Revision of each touched entity right after the action (`None`: deleted).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub touched: BTreeMap<Id, Option<u64>>,
+    /// The external writes it enqueued (writeback), each enqueued once and
+    /// delivered at least once after the commit. Not reversible: action.undo
+    /// does not undo them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<ExternalCall>,
+    /// With external writes: [`RECEIPT_NOTE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -732,6 +858,56 @@ fn drift(planned: &ActionPlan, fresh: &ActionPlan) -> Option<Vec<String>> {
     (!why.is_empty()).then_some(why)
 }
 
+/// The preview line of a planned external write.
+fn writeback_preview(x: &PlannedExternal) -> String {
+    let mut body = x.body.to_string();
+    if body.len() > 120 {
+        let mut end = 117;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push('…');
+    }
+    format!("writeback {}.{} {body} [async]", x.target, x.route)
+}
+
+/// The outbox rows of `plan`'s external writes under receipt `receipt` (one
+/// per writeback effect, `dedupe = "<receipt>:<effect>"`, the route in
+/// `event_type`, the body as the payload), and what the receipt records of
+/// them.
+pub(crate) fn writeback_rows(
+    receipt: &str,
+    plan: &ActionPlan,
+    ctx: &ActionContext,
+    source: &str,
+    run: Option<&str>,
+) -> (Vec<crate::outbox::OutboxRow>, Vec<ExternalCall>) {
+    use crate::outbox::{OutboxKind, OutboxRow, OutboxState};
+    let mut rows = Vec::new();
+    let mut calls = Vec::new();
+    for x in &plan.external {
+        let key = format!("{receipt}:{}", x.effect);
+        let mut row =
+            OutboxRow::new(OutboxKind::Writeback, &x.target, key.clone(), source, ctx.workspace.clone(), &x.route);
+        row.receipt = Some(receipt.to_string());
+        row.run = run.map(str::to_string);
+        row.cause = ctx.cause.clone();
+        row.payload = x.body.clone();
+        calls.push(ExternalCall {
+            effect: x.effect,
+            target: x.target.clone(),
+            route: x.route.clone(),
+            outbox: row.id.clone(),
+            idempotency_key: key,
+            state: OutboxState::Pending,
+            attempts: 0,
+        });
+        rows.push(row);
+    }
+    (rows, calls)
+}
+
 impl Ontology {
     /// Validate parameters and preconditions and render the edits, without writing.
     pub fn plan_action(&self, ctx: &ActionContext, name: &str, params: &Map<String, Value>) -> Result<ActionPlan> {
@@ -878,6 +1054,7 @@ impl Ontology {
         let mut preview = Vec::new();
         let mut reversible = true;
         let mut risk = at.risk;
+        let mut external: Vec<PlannedExternal> = Vec::new();
         if params_ok {
             let mut env = Templates::new(g, &norm, &p.id, &see, seed);
             for c in &at.preconditions {
@@ -1120,12 +1297,35 @@ impl Ontology {
                         target,
                         ..Default::default()
                     })]);
+                } else if let Some(wb) = &eff.writeback {
+                    match self.plan_writeback(&env, &ctx.workspace, i, wb) {
+                        Ok(x) => {
+                            preview.push(writeback_preview(&x));
+                            external.push(x);
+                        }
+                        Err(message) => checks.push(CheckResult { ok: false, check: "writeback".into(), message }),
+                    }
                 }
             }
         }
-        let valid = checks.iter().all(|c| c.ok) && !mutations.is_empty();
-        if params_ok && mutations.is_empty() && checks.iter().all(|c| c.ok) {
+        let valid = checks.iter().all(|c| c.ok) && (!mutations.is_empty() || !external.is_empty());
+        if params_ok && mutations.is_empty() && external.is_empty() && checks.iter().all(|c| c.ok) {
             warnings.push("nothing to change".into());
+        }
+        let mut needs_confirmation = risk >= Risk::Medium || !reversible;
+        let mut graph_reversible = None;
+        if !external.is_empty() {
+            // An external write is not reversible and at least medium risk,
+            // so it needs a person's confirmation; `unattended` waives what
+            // the external write added for that caller kind only.
+            let waived = caller_kind(p).is_some_and(|k| at.unattended.iter().any(|u| u == k));
+            if !waived {
+                needs_confirmation = true;
+            }
+            graph_reversible = Some(reversible);
+            reversible = false;
+            risk = risk.max(Risk::Medium);
+            warnings.push(NOT_REVERSIBLE_NOTE.into());
         }
         Ok(ActionPlan {
             action: name.to_string(),
@@ -1133,14 +1333,57 @@ impl Ontology {
             valid,
             checks,
             preview,
-            needs_confirmation: risk >= Risk::Medium || !reversible,
+            needs_confirmation,
             mutations,
             inverse,
             risk,
             reversible,
             warnings,
             consequences: None,
+            external,
+            graph_reversible,
         })
+    }
+
+    /// Plan one writeback effect (effect `i`) of an action in `workspace`:
+    /// writeback is on, the target is registered, serves the workspace and
+    /// has the route, and the body renders strictly. `Err` is the failed
+    /// check's message (names and placeholders only, never a value).
+    fn plan_writeback(
+        &self,
+        env: &Templates<'_>,
+        workspace: &str,
+        i: usize,
+        wb: &WritebackEffect,
+    ) -> std::result::Result<PlannedExternal, String> {
+        let what = format!("effect {i}: writeback {}.{}", wb.target, wb.route);
+        if !self.options().writeback {
+            return Err(format!("{what}: writeback is off on this server ([writeback] enabled = false)"));
+        }
+        if !self.store().keeps_outbox() {
+            return Err(format!("{what}: this store keeps no outbox"));
+        }
+        let target = match self.store().kv_get(crate::automate::NS_WRITEBACK_TARGET, &wb.target) {
+            Ok(Some(v)) if !v.is_null() => v,
+            Ok(_) => return Err(format!("{what}: target {} is not registered", wb.target)),
+            Err(e) => return Err(format!("{what}: reading target {}: {e}", wb.target)),
+        };
+        let serves = target
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .is_some_and(|ws| ws.iter().filter_map(Value::as_str).any(|w| w == "*" || w == workspace));
+        if !serves {
+            return Err(format!("{what}: target {} does not serve workspace {workspace}", wb.target));
+        }
+        if target.get("routes").and_then(|r| r.get(&wb.route)).is_none() {
+            return Err(format!("{what}: target {} has no route {}", wb.target, wb.route));
+        }
+        let body = if wb.body.is_null() { json!({}) } else { wb.body.clone() };
+        let body = env.render_strict(&body).map_err(|e| match e {
+            Error::Invalid(m) => format!("{what}: {m}"),
+            other => format!("{what}: {other}"),
+        })?;
+        Ok(PlannedExternal { effect: i, target: wb.target.clone(), route: wb.route.clone(), body })
     }
 
     /// [`plan_action`](Self::plan_action) plus its consequences: the plan's
@@ -1210,6 +1453,8 @@ impl Ontology {
             result: None,
             reason: None,
             touched: BTreeMap::new(),
+            external: Vec::new(),
+            note: None,
         };
         if !receipt.plan.valid {
             let failed: Vec<String> = receipt.plan.checks.iter().filter(|c| !c.ok).map(|c| c.message.clone()).collect();
@@ -1220,22 +1465,23 @@ impl Ontology {
             receipt.reason = Some("dry run".into());
             return Ok(receipt);
         }
+        let not_reversible = if receipt.plan.reversible {
+            ""
+        } else if receipt.plan.external.is_empty() {
+            ", not reversible"
+        } else {
+            ", not reversible (an external write: action.undo does not undo it)"
+        };
         if receipt.plan.needs_confirmation && !opts.confirm {
-            receipt.reason = Some(format!(
-                "risk {:?}{}: pass confirm=true to apply",
-                receipt.plan.risk,
-                if receipt.plan.reversible { "" } else { ", not reversible" }
-            ));
+            receipt.reason = Some(format!("risk {:?}{not_reversible}: pass confirm=true to apply", receipt.plan.risk));
             return Ok(receipt);
         }
         // An agent cannot confirm its own risky action: a person (any
         // principal that is not an agent) applies it with confirm=true.
         if receipt.plan.needs_confirmation && ctx.principal.is_agent() {
             receipt.reason = Some(format!(
-                "risk {:?}{}: {} is an agent and cannot confirm it; a person must apply it with confirm=true",
-                receipt.plan.risk,
-                if receipt.plan.reversible { "" } else { ", not reversible" },
-                ctx.principal.id
+                "risk {:?}{not_reversible}: {} is an agent and cannot confirm it; a person must apply it with confirm=true",
+                receipt.plan.risk, ctx.principal.id
             ));
             return Ok(receipt);
         }
@@ -1278,14 +1524,22 @@ impl Ontology {
             let mut r = receipt.clone();
             r.status = "applied".into();
             r.plan = fresh;
+            let (rows, calls) = writeback_rows(&r.id, &r.plan, ctx, crate::outbox::SOURCE_ACTION, None);
+            r.note = (!calls.is_empty()).then(|| RECEIPT_NOTE.to_string());
+            r.external = calls;
             let mut muts = r.plan.mutations.clone();
+            let mut payload = json!({ "params": r.plan.params, "receipt": r.id, "risk": r.plan.risk });
+            if !r.external.is_empty() {
+                payload["external"] = json!(r.external.iter().map(|x| &x.outbox).collect::<Vec<_>>());
+            }
             muts.push(Mutation::Event(EventInput {
                 action: format!("action.{name}"),
                 target: target.clone(),
-                payload: json!({ "params": r.plan.params, "receipt": r.id, "risk": r.plan.risk }),
+                payload,
                 ..Default::default()
             }));
             let mut x = extra.clone();
+            x.outbox.extend(rows);
             x.kv.insert(0, (RECEIPTS.into(), r.id.clone(), serde_json::to_value(&r)?));
             Ok((muts, x, r))
         });
@@ -1330,11 +1584,27 @@ impl Ontology {
         receipt
     }
 
+    /// A receipt, for its actor or an admin of its workspace. External
+    /// writes carry their outbox rows' current states.
     pub fn action_receipt(&self, p: &Principal, id: &str) -> Result<ActionReceipt> {
         let v = self.store().kv_get(RECEIPTS, id)?.ok_or_else(|| Error::not_found(format!("receipt {id}")))?;
-        let r: ActionReceipt = serde_json::from_value(v)?;
+        let mut r: ActionReceipt = serde_json::from_value(v)?;
         if r.actor != p.id && !(p.is_privileged() && p.in_workspace(&r.workspace)) {
             return Err(Error::not_found(format!("receipt {id}")));
+        }
+        if !r.external.is_empty() && self.store().keeps_outbox() {
+            let q = crate::outbox::OutboxQuery {
+                receipt: Some(r.id.clone()),
+                limit: Some(crate::outbox::MAX_LIST),
+                ..Default::default()
+            };
+            let rows = self.store().outbox_list(&q)?;
+            for x in &mut r.external {
+                if let Some(row) = rows.iter().find(|row| row.id == x.outbox) {
+                    x.state = row.state;
+                    x.attempts = row.attempts;
+                }
+            }
         }
         Ok(r)
     }
@@ -1348,7 +1618,24 @@ impl Ontology {
             "undone" => return Err(Error::Conflict(format!("receipt {id} was already undone"))),
             other => return Err(Error::invalid(format!("receipt {id} is {other}, nothing to undo"))),
         }
-        if !r.plan.reversible {
+        let graph_only = !r.plan.external.is_empty();
+        if graph_only {
+            // The external write is never undone; with force, the graph part is.
+            if r.plan.graph_reversible != Some(true) {
+                return Err(Error::invalid(format!(
+                    "action {} is not reversible (its graph edits cannot be undone, and {})",
+                    r.action,
+                    NOT_REVERSIBLE_NOTE.to_lowercase().trim_end_matches('.')
+                )));
+            }
+            if !force {
+                return Err(Error::invalid(format!(
+                    "action {} made an external write, which is not reversible: action.undo does not undo it. Pass \
+                     force=true to undo the graph edits only",
+                    r.action
+                )));
+            }
+        } else if !r.plan.reversible {
             return Err(Error::invalid(format!("action {} is not reversible", r.action)));
         }
         if !force {
@@ -1367,13 +1654,20 @@ impl Ontology {
             }
         }
         let mut muts: Vec<Mutation> = r.plan.inverse.iter().rev().flat_map(|g| g.iter().cloned()).collect();
-        muts.push(Mutation::Event(EventInput {
-            action: "action.undo".into(),
-            payload: json!({ "receipt": r.id, "action": r.action }),
-            ..Default::default()
-        }));
+        let mut payload = json!({ "receipt": r.id, "action": r.action });
+        if graph_only {
+            payload["external_not_undone"] = json!(r.external.iter().map(|x| &x.outbox).collect::<Vec<_>>());
+        }
+        muts.push(Mutation::Event(EventInput { action: "action.undo".into(), payload, ..Default::default() }));
         r.status = "undone".into();
-        r.reason = Some(format!("undone by {}", ctx.principal.id));
+        r.reason = Some(if graph_only {
+            format!(
+                "graph edits undone by {} (force); the external write was not undone: {NOT_REVERSIBLE_NOTE}",
+                ctx.principal.id
+            )
+        } else {
+            format!("undone by {}", ctx.principal.id)
+        });
         let extra = Extra {
             kv: vec![(RECEIPTS.into(), r.id.clone(), serde_json::to_value(&r)?)],
             redirects: Vec::new(),

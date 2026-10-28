@@ -24,6 +24,7 @@ use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RecallOptions, RememberInput};
 use crate::trace::{self, TraceCtx, Traced};
 use crate::webhooks;
+use crate::writeback;
 use onto_core::trace::{MetricsQuery, ScoreRow, SessionQuery, TraceDetail, TraceQuery};
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -542,6 +543,26 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "The tenant's automation kill switch: on stops every automation (changes made meanwhile never start runs; pending retries are cancelled); off resumes them (admins who may enable every enabled automation). Input: {on | off, workspace?}.",
     ),
+    a(
+        "writeback.add",
+        true,
+        "Register an HTTP writeback target for action types' writeback effects: a base https URL (or an operator env:/file: reference), named routes (relative paths under it), the workspaces whose actions may use it (default the call's) and an optional signing secret (Standard Webhooks headers; plaintext is sealed, generate_secret returns one once). Writeback is not reversible; action.undo does not undo the external write. Each call is enqueued once and delivered at least once with Idempotency-Key: <receipt>:<effect>, which the receiver must honour. Admins of every workspace it serves, never agents. Input: {name, base_url, routes: {name: path}, workspaces?, secret?, generate_secret?, workspace?}.",
+    ),
+    a(
+        "writeback.list",
+        false,
+        "Writeback targets by name: base URL (its origin only, and route names only, for targets the caller may not manage), routes, workspaces, secret reference (never the secret), version; plus whether [writeback] enabled is on. Admins, never agents.",
+    ),
+    a(
+        "writeback.remove",
+        true,
+        "Remove a writeback target: rows not yet sent to it are cancelled, plans that name it are refused and automations that reach it stop. Admins of every workspace it serves. Input: {name, workspace?}.",
+    ),
+    a(
+        "writeback.test",
+        false,
+        "Check a writeback target without sending anything (a request could write): its references resolve, and its base URL and every route (or one) pass the outbound rules. Admins of every workspace it serves. Input: {name, route?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -906,6 +927,9 @@ impl Intelli {
         }
         if automate::CALLS.contains(&action) {
             return blocking(|| self.automate_call(p, action, input));
+        }
+        if writeback::CALLS.contains(&action) {
+            return blocking(|| self.writeback_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {

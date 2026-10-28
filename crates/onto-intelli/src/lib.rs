@@ -50,6 +50,7 @@ pub mod seed;
 pub mod token;
 pub mod trace;
 pub mod webhooks;
+pub mod writeback;
 
 pub use onto_core as core;
 pub use onto_core::{

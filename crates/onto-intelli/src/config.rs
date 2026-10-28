@@ -47,6 +47,8 @@ pub struct Config {
     pub webhooks: WebhooksConfig,
     /// Change-triggered automations (docs/design/EVENTS.md Part C).
     pub automation: AutomationConfig,
+    /// HTTP writeback effects of action types (docs/design/EVENTS.md Part D).
+    pub writeback: WritebackConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -1004,6 +1006,41 @@ impl AutomationConfig {
     }
 }
 
+/// `[writeback]`: HTTP writeback effects of action types (docs/design/EVENTS.md
+/// Part D). Off by default: while it is off, a plan with a writeback effect
+/// is refused and this process sends no writeback rows. Writeback is not
+/// reversible; action.undo does not undo the external write. Rows are
+/// enqueued once and delivered at least once, with `Idempotency-Key:
+/// <receipt>:<effect>`; the receiver must honour it. Retries, backoff, the
+/// breaker, the payload limit and the allow rules are `[webhooks]`'s.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WritebackConfig {
+    /// Plan and send writeback effects in this process.
+    pub enabled: bool,
+    /// Targets per tenant (enforced when one is added).
+    pub max_targets: usize,
+    /// Seconds one request may take.
+    pub timeout_secs: u64,
+}
+
+impl Default for WritebackConfig {
+    fn default() -> Self {
+        Self { enabled: false, max_targets: 20, timeout_secs: 15 }
+    }
+}
+
+impl WritebackConfig {
+    /// Every limit and time is at least 1.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [("max_targets", self.max_targets as u64), ("timeout_secs", self.timeout_secs)];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("writeback.{name} = {v} (at least 1)")));
+        }
+        Ok(())
+    }
+}
+
 /// `[[console.oidc]]`: one OpenID Connect provider (Clerk, Auth0, Supabase
 /// Auth, Google, Keycloak, Okta, Entra, ...).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1192,6 +1229,29 @@ mod tests {
         assert!(zero.automation.check().unwrap_err().to_string().contains("automation.max_automations = 0"));
         let inverted = Config::from_toml("[automation]\nretry_base_secs = 60\nretry_max_secs = 10\n").unwrap();
         assert!(inverted.automation.check().unwrap_err().to_string().contains("retry_max_secs"));
+    }
+
+    #[test]
+    fn writeback_section_defaults_and_checks() {
+        let example = Config::from_toml(EXAMPLE_CONFIG).unwrap();
+        let w = &example.writeback;
+        assert!(!w.enabled, "writeback is off unless an operator turns it on");
+        assert_eq!((w.max_targets, w.timeout_secs), (20, 15));
+        assert!(w.check().is_ok());
+        let on = Config::from_toml(
+            "[writeback]
+enabled = true
+",
+        )
+        .unwrap();
+        assert!(on.writeback.enabled && on.writeback.check().is_ok());
+        let zero = Config::from_toml(
+            "[writeback]
+timeout_secs = 0
+",
+        )
+        .unwrap();
+        assert!(zero.writeback.check().unwrap_err().to_string().contains("writeback.timeout_secs = 0"));
     }
 
     #[test]

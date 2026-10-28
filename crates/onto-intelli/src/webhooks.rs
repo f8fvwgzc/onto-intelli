@@ -179,6 +179,12 @@ impl SecretRef {
     /// (no `ONTO_MASTER_KEY`) plaintext secrets are refused: the operator
     /// registers an `env:` or `file:` reference instead.
     pub fn seal(sealer: Option<&dyn SecretBox>, name: &str, plain: &[u8]) -> Result<Self> {
+        Self::seal_for(sealer, SECRET_PURPOSE, name, plain)
+    }
+
+    /// [`seal`](Self::seal) for another sealing purpose (writeback targets
+    /// seal theirs as `writeback-secret`).
+    pub fn seal_for(sealer: Option<&dyn SecretBox>, purpose: &str, name: &str, plain: &[u8]) -> Result<Self> {
         let Some(sealer) = sealer else {
             return Err(Error::Unavailable(
                 "failed_precondition: no master key (ONTO_MASTER_KEY) to seal secrets; register env:VAR or \
@@ -186,11 +192,24 @@ impl SecretRef {
                     .into(),
             ));
         };
-        Ok(SecretRef::Sealed(sealer.seal(SECRET_PURPOSE, name, plain)?))
+        Ok(SecretRef::Sealed(sealer.seal(purpose, name, plain)?))
     }
 
     /// The secret's text. Errors name the reference, never a value.
     pub fn resolve(&self, sealer: Option<&dyn SecretBox>, name: &str) -> Result<Secret> {
+        self.resolve_for(sealer, SECRET_PURPOSE, &format!("endpoint {name}"), name)
+    }
+
+    /// [`resolve`](Self::resolve) for another sealing purpose; `owner` names
+    /// what the secret belongs to in errors (`endpoint ops`, `writeback
+    /// target helpdesk`).
+    pub fn resolve_for(
+        &self,
+        sealer: Option<&dyn SecretBox>,
+        purpose: &str,
+        owner: &str,
+        name: &str,
+    ) -> Result<Secret> {
         match self {
             SecretRef::Env(var) => std::env::var(var)
                 .ok()
@@ -201,13 +220,11 @@ impl SecretRef {
                 .map(|v| Secret::new(v.trim().as_bytes().to_vec()))
                 .map_err(|_| Error::Unavailable(format!("the secret in file:{} cannot be read", p.display()))),
             SecretRef::Sealed(v) => match sealer {
-                Some(s) => s.open(SECRET_PURPOSE, name, v).map_err(|_| {
-                    Error::Unavailable(format!(
-                        "the sealed secret of endpoint {name} does not open with this master key"
-                    ))
+                Some(s) => s.open(purpose, name, v).map_err(|_| {
+                    Error::Unavailable(format!("the sealed secret of {owner} does not open with this master key"))
                 }),
                 None => Err(Error::Unavailable(format!(
-                    "the secret of endpoint {name} is sealed and this server has no master key (ONTO_MASTER_KEY)"
+                    "the secret of {owner} is sealed and this server has no master key (ONTO_MASTER_KEY)"
                 ))),
             },
         }

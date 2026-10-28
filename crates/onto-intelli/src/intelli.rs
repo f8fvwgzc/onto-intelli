@@ -247,6 +247,7 @@ impl Intelli {
         config.changes.check()?;
         config.webhooks.check()?;
         config.automation.check()?;
+        config.writeback.check()?;
         let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,
@@ -259,6 +260,7 @@ impl Intelli {
                 sync_reads: config.engine.read_consistency == "strong",
                 follow_interval_ms: config.engine.follow_interval_ms,
                 max_automations: config.automation.max_automations,
+                writeback: config.writeback.enabled,
             },
         )?;
         let memory = Memory::open(store.clone(), config.memory.clone())?;

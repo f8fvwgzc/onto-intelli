@@ -1580,3 +1580,57 @@ Build step 11 (automation runtime):
   `system.stats`/`system.health`; the inbound `x-onto-cause-depth`/`x-onto-cause-run` headers
   from config tokens (C.6), which need a cause on the request context in onto-grpc. Until then a
   loop that leaves onto and comes back is bounded by the per-subject budget only.
+
+Build step 12 (HTTP writeback):
+
+- No migration: writeback rows are outbox rows (0011) with `kind = writeback`, `dedupe =
+  "<receipt>:<effect>"` (the effect's index in the action type; sent as `Idempotency-Key`), the
+  route name in `event_type` (B.1 has no route column) and the strictly rendered body as `payload`.
+  They commit with the action (`apply_planned`) or with the automation run (`commit_run`).
+- `[writeback] enabled` reaches onto-core as `OntologyOptions::writeback` and is checked when a
+  plan is made (a failed `writeback` check), never in `compile`, so a stored schema with writeback
+  effects opens on every server. The plan also checks that the target is registered, serves the
+  action's workspace and has the route; a body placeholder without a value is a failed check
+  (`invalid_template`). A plan whose only effect is a writeback is valid.
+- Plan rules: with an external write the plan is `reversible = false` and at least `Medium`
+  (`plan.risk` shows that), and `graph_reversible` keeps whether the graph edits alone could be
+  undone. `unattended` waives only the confirmation the external write added, for the caller's
+  kind (`automation` for `automation:<name>` principals, `agent` for agents); the declared risk
+  and graph edits that are not reversible still need it. The preview line is `writeback
+  <target>.<route> <body> [async]`, and the plan warns with section 13's sentence.
+- Receipts: `external: [{effect, target, route, outbox, idempotency_key, state, attempts}]` and
+  `note = "not reversible: the external write is not undone by action.undo"`. `action.receipt`
+  joins the rows' current states by receipt id (states only: errors and receiver responses stay
+  in `outbox.list`, for admins who manage the target). `action.undo` is refused without `force`;
+  with `force` it undoes the graph edits only, says so in the receipt's reason, and lists the
+  rows it did not undo in the `action.undo` event.
+- Targets: D.2's `base_url` is a string (an `https://` URL or an operator `env:`/`file:`
+  reference), since `SecretRef` holds no plain URLs; `secret` is optional (unsigned without it;
+  plaintext is sealed as `writeback-secret`, `generate_secret` returns one once). A target acts
+  as `{admin, workspaces}`: that is what add, remove and test dominate, and what closures hash
+  (`automate::outbound_refs` falls back to `workspaces` for records without a principal).
+  `version` starts at the registration time in ms, so a target removed and added again never
+  hashes like the old one. There is no update action: remove and add again.
+- Webhook endpoint and writeback target names share one namespace (the outbox's claim skips,
+  breakers and in-flight limits are keyed by target name), so `webhook.add` and `writeback.add`
+  refuse a name the other holds.
+- Request URL: the base gets a trailing `/` before the join, so `https://h/api` with
+  `tickets/close` is `https://h/api/tickets/close` (`Url::join` alone would drop `api`); the host
+  assertion of B.5 holds.
+- Delivery: the B.4 worker sends both kinds; it starts when `[webhooks] enabled` or `[writeback]
+  enabled` is on, and rows of a kind whose switch is off wait in the outbox. Writeback requests
+  use `[writeback] timeout_secs`; retries, backoff, the breaker (`writeback.target.paused` /
+  `resumed` events), the payload limit and `[[webhooks.allow]]` are `[webhooks]`'s. The body is
+  posted as stored with `content-type: application/json` (not a CloudEvent); the signature headers
+  (`webhook-id` = the row id) are sent only when the target has a secret. A 410 is dead like any
+  other 4xx: targets have no enabled flag to clear. Dead rows write `writeback.failed` (receipt,
+  idempotency key, status, reason). The tenant switch `webhook.control/kill` holds writeback rows
+  too.
+- `writeback.test` sends nothing (a request could write to the target): it checks that the
+  references resolve and that the base URL and the routes pass the outbound rules, and names
+  references rather than their values.
+- Surfaces: actions `writeback.add|list|remove|test`, gRPC `WritebackService`, HTTP
+  `GET|POST /v1/writeback/targets`, `DELETE /v1/writeback/targets/{name}`,
+  `POST /v1/writeback/targets/{name}/test`. Section 7 lists no CLI, MCP or UI for writeback;
+  docs come with step 13.
+- Deferred: delivery traces and the outbox counters (as in step 8).

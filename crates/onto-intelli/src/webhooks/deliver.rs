@@ -1,9 +1,14 @@
-//! The delivery worker of one open tenant (docs/design/EVENTS.md B.4).
+//! The delivery worker of one open tenant (docs/design/EVENTS.md B.4, D.3).
 //!
 //! A pass claims due rows (claim tokens, a lease by the store's clock),
 //! sends each with the guarded client within the per-endpoint, per-tenant
 //! and process-wide limits (all per process), records the attempt with the
-//! claim token it was made under, and updates the endpoint's breaker. It
+//! claim token it was made under, and updates the endpoint's breaker.
+//! Webhook rows are signed CloudEvents to endpoints (`[webhooks] enabled`);
+//! writeback rows post their stored body to a writeback target's route with
+//! `Idempotency-Key: <receipt>:<effect>` (`[writeback] enabled`), with the
+//! same outcomes, retries and breaker; a dead writeback row writes a
+//! `writeback.failed` event. It
 //! wakes on commits that enqueue rows, on other processes' commits, and
 //! every `poll_secs` (or sooner, when a retry is due sooner); after a pass
 //! that found nothing more it settles the tenant's wake row, so a closed
@@ -18,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore};
 
 use onto_core::changes::{ChangeAt, FieldMode};
-use onto_core::outbox::{Attempt, ConfigEvent, OutboxRow, OutboxState, SOURCE_CHANGE};
+use onto_core::outbox::{Attempt, ConfigEvent, OutboxKind, OutboxRow, OutboxState, SOURCE_CHANGE};
 use onto_core::time::now_ms;
 use onto_core::{Error, EventInput, Mutation, Ontology, Result};
 
@@ -30,6 +35,7 @@ use super::{
 use crate::config::WebhooksConfig;
 use crate::intelli::Intelli;
 use crate::net::{Reach, guarded_client};
+use crate::writeback::Target;
 
 /// Requests in flight in this process, all tenants together.
 fn process_slots(n: usize) -> Arc<Semaphore> {
@@ -50,6 +56,12 @@ struct EndpointState {
 struct Worker {
     weak: Weak<Intelli>,
     cfg: WebhooksConfig,
+    /// `[webhooks] enabled`: webhook rows are sent by this process.
+    webhooks_on: bool,
+    /// `[writeback] enabled`: writeback rows are sent by this process.
+    writeback_on: bool,
+    /// `[writeback] timeout_secs`.
+    writeback_timeout: Duration,
     holder: String,
     reach: Reach,
     tenant: String,
@@ -58,17 +70,30 @@ struct Worker {
     process: Arc<Semaphore>,
     /// Clients for open and for restricted endpoints.
     clients: (reqwest::Client, reqwest::Client),
+    /// Clients for open and for restricted writeback targets (their timeout).
+    writeback_clients: (reqwest::Client, reqwest::Client),
 }
 
-/// Start the delivery worker of `me` (when `[webhooks] enabled` and the
-/// store keeps an outbox). It holds the tenant only weakly and ends when the
-/// tenant closes.
+/// What a breaker or a dead row is about: an endpoint or a writeback target.
+fn kind_words(kind: OutboxKind) -> (&'static str, &'static str) {
+    match kind {
+        OutboxKind::Webhook => ("webhook", "webhook.endpoint"),
+        OutboxKind::Writeback => ("writeback", "writeback.target"),
+    }
+}
+
+/// Start the delivery worker of `me` (when `[webhooks] enabled` or
+/// `[writeback] enabled`, and the store keeps an outbox). It holds the
+/// tenant only weakly and ends when the tenant closes. Rows of a kind this
+/// process does not send are left in the outbox.
 pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
     let cfg = me.config().webhooks.clone();
+    let wb = me.config().writeback.clone();
     let store = me.ontology().store().clone();
-    if !cfg.enabled || !store.keeps_outbox() {
+    if !(cfg.enabled || wb.enabled) || !store.keeps_outbox() {
         return Ok(());
     }
+    let writeback_timeout = Duration::from_secs(wb.timeout_secs.max(1));
     let allow = Arc::new(cfg.allow_rules()?);
     let allow_private = me.config().console.allow_private_urls;
     let timeout = Duration::from_secs(cfg.timeout_secs);
@@ -80,6 +105,10 @@ pub fn spawn_delivery(me: &Arc<Intelli>, notify: Arc<Notify>) -> Result<()> {
         holder: onto_core::leases::holder_for(store.as_ref()),
         tenant: if tenant.is_empty() { "default".into() } else { tenant },
         clients: (guarded_client(&open, timeout)?, guarded_client(&restricted, timeout)?),
+        writeback_clients: (guarded_client(&open, writeback_timeout)?, guarded_client(&restricted, writeback_timeout)?),
+        webhooks_on: cfg.enabled,
+        writeback_on: wb.enabled,
+        writeback_timeout,
         reach: open,
         endpoints: Mutex::new(HashMap::new()),
         tenant_slots: Arc::new(Semaphore::new(cfg.max_in_flight_per_tenant.max(1))),
@@ -148,6 +177,7 @@ impl Worker {
             let (seen, stop, skip) = {
                 let onto = onto.clone();
                 let cap = self.cfg.max_in_flight_per_endpoint;
+                let (webhooks_on, writeback_on) = (self.webhooks_on, self.writeback_on);
                 let states: HashMap<String, (usize, bool)> =
                     self.endpoints.lock().iter().map(|(k, s)| (k.clone(), (s.in_flight, s.probing))).collect();
                 blocking(move || {
@@ -158,12 +188,20 @@ impl Worker {
                     let now = now_ms();
                     let br = breakers(&onto)?;
                     let mut skip = Vec::new();
+                    let held = |name: &str| {
+                        let (in_flight, probing) = states.get(name).copied().unwrap_or((0, false));
+                        let open = br.get(name).is_some_and(|b| b.is_open() && (b.until > now || probing));
+                        open || in_flight >= cap
+                    };
                     for ep in Endpoint::list(&onto)? {
                         let paused = ep.paused.as_ref().is_some_and(|p| p.until.is_none_or(|u| u > now));
-                        let (in_flight, probing) = states.get(&ep.name).copied().unwrap_or((0, false));
-                        let open = br.get(&ep.name).is_some_and(|b| b.is_open() && (b.until > now || probing));
-                        if !ep.enabled || paused || open || in_flight >= cap {
+                        if !webhooks_on || !ep.enabled || paused || held(&ep.name) {
                             skip.push(ep.name);
+                        }
+                    }
+                    for t in Target::list(&onto)? {
+                        if !writeback_on || held(&t.name) {
+                            skip.push(t.name);
                         }
                     }
                     Ok((seen, false, skip))
@@ -221,15 +259,117 @@ impl Worker {
 
     /// Send one claimed row and record what happened.
     async fn send(self: &Arc<Self>, me: &Arc<Intelli>, row: OutboxRow, claimed: Instant) {
+        match row.kind {
+            OutboxKind::Webhook => self.send_webhook(me, row, claimed).await,
+            OutboxKind::Writeback => self.send_writeback(me, row, claimed).await,
+        }
+    }
+
+    /// Give a claimed row back unsent, without counting the attempt.
+    async fn release(&self, me: &Arc<Intelli>, row: &OutboxRow, reason: &'static str) {
+        let (store, id, claim) = (me.ontology().store().clone(), row.id.clone(), row.claim.clone().unwrap_or_default());
+        tracing::debug!(id, reason, "outbox row released unsent");
+        let _ = blocking(move || store.outbox_release(&id, &claim)).await;
+    }
+
+    /// Send one claimed writeback row: its stored body to the target's
+    /// route, with `Idempotency-Key: <receipt>:<effect>` (the row's dedupe
+    /// key) and, when the target has a secret, the Standard Webhooks headers.
+    async fn send_writeback(self: &Arc<Self>, me: &Arc<Intelli>, row: OutboxRow, claimed: Instant) {
         let onto = me.ontology().clone();
-        let claim = row.claim.clone().unwrap_or_default();
-        let release = |reason: &'static str| {
-            let (store, id, claim) = (onto.store().clone(), row.id.clone(), claim.clone());
-            async move {
-                tracing::debug!(id, reason, "outbox row released unsent");
-                let _ = blocking(move || store.outbox_release(&id, &claim)).await;
+        // The target is read again right before sending: a change applies
+        // to rows not yet sent.
+        let (target, kill) = {
+            let (onto, name) = (onto.clone(), row.target.clone());
+            match blocking(move || Ok((Target::load(&onto, &name)?, killed(&onto)?))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("writeback delivery: {e}");
+                    return self.release(me, &row, "store error").await;
+                }
             }
         };
+        if kill {
+            return self.release(me, &row, "kill switch").await;
+        }
+        let Some(t) = target else {
+            // Removed by a person: what was waiting for it is not sent.
+            let a = Attempt {
+                error: Some("target_removed: the writeback target no longer exists".into()),
+                ..Default::default()
+            };
+            return self.finish(me, &row, a, OutboxState::Cancelled, 0).await;
+        };
+        if !self.writeback_on {
+            // Registered after this pass chose what to skip; the next pass skips it.
+            return self.release(me, &row, "writeback is off in this process").await;
+        }
+        if claimed.elapsed() + self.writeback_timeout + Duration::from_secs(5) >= Duration::from_millis(LEASE_MS as u64)
+        {
+            return self.release(me, &row, "lease too short").await;
+        }
+        let half_open = {
+            let onto = onto.clone();
+            blocking(move || breakers(&onto)).await.unwrap_or_default().get(&t.name).is_some_and(|b| b.is_open())
+        };
+        let Some(_permits) = self.acquire(&t.name, half_open).await else {
+            return self.release(me, &row, "target at its limit").await;
+        };
+        let _done = Done { w: self.clone(), name: t.name.clone(), probe: half_open };
+
+        let body = match serde_json::to_vec(&row.payload) {
+            Ok(b) => b,
+            Err(e) => {
+                let a = Attempt { error: Some(format!("render: {e}")), ..Default::default() };
+                return self.finish(me, &row, a, OutboxState::Dead, 0).await;
+            }
+        };
+        if body.len() > self.cfg.max_payload_bytes {
+            let a = Attempt { error: Some("payload_too_large".into()), ..Default::default() };
+            return self.finish(me, &row, a, OutboxState::Dead, 0).await;
+        }
+        // Where to: errors name references, never values.
+        let reach = Reach { restricted: t.restricted, ..self.reach.clone() };
+        let url = match t.request_url(&row.event_type, &reach) {
+            Ok(u) => u,
+            Err(e) => {
+                let a = Attempt { error: Some(format!("refused: {e}")), ..Default::default() };
+                return self.finish(me, &row, a, OutboxState::Dead, 0).await;
+            }
+        };
+        let keys = match t.signing_keys(me.secrets().as_deref()) {
+            Ok(k) => k,
+            Err(e) => {
+                // An operator can fix a missing variable or file: retry.
+                let a = Attempt { error: Some(e.to_string()), ..Default::default() };
+                return self.failed(me, &row, &t.name, a, None).await;
+            }
+        };
+        let client = if t.restricted { &self.writeback_clients.1 } else { &self.writeback_clients.0 };
+        let mut req = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, format!("onto-intelli/{}", crate::VERSION))
+            .header("idempotency-key", &row.dedupe);
+        if !keys.is_empty() {
+            let ts = now_ms() / 1000;
+            req = req
+                .header("webhook-id", &row.id)
+                .header("webhook-timestamp", ts.to_string())
+                .header("webhook-signature", signature_header(&keys, &row.id, ts, &body));
+        }
+        let req = traced(req.body(body), &row);
+        let reference = super::is_reference(&t.base_url).then(|| t.base_what());
+        if let Some(mut a) = self.exchange(me, &row, &t.name, req, reference.as_deref()).await {
+            a.error = Some("http 410: the target answered gone".into());
+            self.finish(me, &row, a, OutboxState::Dead, 0).await;
+        }
+    }
+
+    /// Send one claimed webhook row and record what happened.
+    async fn send_webhook(self: &Arc<Self>, me: &Arc<Intelli>, row: OutboxRow, claimed: Instant) {
+        let onto = me.ontology().clone();
+        let release = |reason: &'static str| self.release(me, &row, reason);
         // The endpoint is read again right before sending: a URL or secret
         // change applies to rows not yet sent.
         let (ep, kill) = {
@@ -253,6 +393,10 @@ impl Worker {
         };
         if !ep.enabled {
             return release("endpoint disabled").await;
+        }
+        if !self.webhooks_on {
+            // Registered after this pass chose what to skip; the next pass skips it.
+            return release("webhooks are off in this process").await;
         }
         let timeout = Duration::from_secs(self.cfg.timeout_secs);
         // Too little of the lease left to finish before another worker may claim it.
@@ -343,7 +487,7 @@ impl Worker {
         let ts = now_ms() / 1000;
         let signature = signature_header(&keys, &row.id, ts, &body);
         let client = if ep.restricted { &self.clients.1 } else { &self.clients.0 };
-        let mut req = client
+        let req = client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/cloudevents+json")
             .header(reqwest::header::USER_AGENT, format!("onto-intelli/{}", crate::VERSION))
@@ -351,29 +495,48 @@ impl Worker {
             .header("webhook-timestamp", ts.to_string())
             .header("webhook-signature", signature)
             .body(body);
-        if let Some(t) =
-            row.otel_trace_id.as_deref().filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            req = req.header("traceparent", format!("00-{t}-{:016x}-01", nonzero_span()));
+        let req = traced(req, &row);
+        let reference = super::is_reference(&ep.url).then_some(what);
+        if let Some(mut a) = self.exchange(me, &row, &ep.name, req, reference.as_deref()).await {
+            a.error = Some("http 410: the endpoint is gone and was disabled".into());
+            self.disable(me, &ep).await;
+            self.finish(me, &row, a, OutboxState::Dead, 0).await;
         }
+    }
+
+    /// Send `req` for `row` (to endpoint or target `name`) and record the
+    /// outcome: delivered, retried (408, 409, 425, 429, 5xx, timeouts and
+    /// connection errors, honouring `Retry-After`) or dead (a refused
+    /// address, other answers). A 410 is returned unrecorded for the caller
+    /// to settle. `reference` names the URL when it came from an operator
+    /// reference: a refused host or address (part of its value) is not echoed.
+    async fn exchange(
+        &self,
+        me: &Arc<Intelli>,
+        row: &OutboxRow,
+        name: &str,
+        req: reqwest::RequestBuilder,
+        reference: Option<&str>,
+    ) -> Option<Attempt> {
         let started = Instant::now();
         let sent = req.send().await;
         let duration_ms = started.elapsed().as_millis() as u64;
         match sent {
             Err(e) => {
                 let refused = chain(&e).contains("refused:");
-                let error = if refused && super::is_reference(&ep.url) {
-                    // The refused host and address are part of the reference's value.
-                    format!("refused: {what} resolves to an address the outbound rules refuse")
-                } else {
-                    chain(&e)
+                let error = match reference {
+                    Some(what) if refused => {
+                        format!("refused: {what} resolves to an address the outbound rules refuse")
+                    }
+                    _ => chain(&e),
                 };
                 let a = Attempt { error: Some(error), duration_ms, ..Default::default() };
                 if refused {
-                    self.finish(me, &row, a, OutboxState::Dead, 0).await
+                    self.finish(me, row, a, OutboxState::Dead, 0).await
                 } else {
-                    self.failed(me, &row, &ep.name, a, None).await
+                    self.failed(me, row, name, a, None).await
                 }
+                None
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -383,25 +546,22 @@ impl Worker {
                 let mut a = Attempt { status: Some(status), duration_ms, response, ..Default::default() };
                 match classify(status) {
                     Class::Delivered => {
-                        self.succeeded(me, &ep.name).await;
-                        self.finish(me, &row, a, OutboxState::Delivered, 0).await
+                        self.succeeded(me, row.kind, name).await;
+                        self.finish(me, row, a, OutboxState::Delivered, 0).await;
                     }
                     Class::Retry => {
                         a.error = Some(format!("http {status}"));
                         let max = self.cfg.backoff_max_secs as i64 * 1000;
                         let after = retry_after_ms(retry_after.as_deref(), max);
-                        self.failed(me, &row, &ep.name, a, after).await
+                        self.failed(me, row, name, a, after).await;
                     }
-                    Class::Gone => {
-                        a.error = Some("http 410: the endpoint is gone and was disabled".into());
-                        self.disable(me, &ep).await;
-                        self.finish(me, &row, a, OutboxState::Dead, 0).await
-                    }
+                    Class::Gone => return Some(a),
                     Class::Dead => {
                         a.error = Some(format!("http {status}"));
-                        self.finish(me, &row, a, OutboxState::Dead, 0).await
+                        self.finish(me, row, a, OutboxState::Dead, 0).await;
                     }
                 }
+                None
             }
         }
     }
@@ -443,7 +603,7 @@ impl Worker {
             let delay = retry_after.unwrap_or_else(|| backoff_ms(row.attempts, base, max, jitter()));
             self.finish(me, row, a, OutboxState::Retry, delay).await;
         }
-        self.trip(me, name).await;
+        self.trip(me, row.kind, name).await;
     }
 
     async fn finish(&self, me: &Arc<Intelli>, row: &OutboxRow, a: Attempt, next: OutboxState, delay: i64) {
@@ -462,11 +622,25 @@ impl Worker {
             }
         }
         if next == OutboxState::Dead {
-            let payload = json!({
-                "id": row.id, "endpoint": row.target, "event_type": row.event_type,
-                "attempts": row.attempts, "status": a.status, "reason": a.error,
-            });
-            self.event(me, &row.workspace, "webhook.dead", &row.target, payload).await;
+            match row.kind {
+                OutboxKind::Webhook => {
+                    let payload = json!({
+                        "id": row.id, "endpoint": row.target, "event_type": row.event_type,
+                        "attempts": row.attempts, "status": a.status, "reason": a.error,
+                    });
+                    self.event(me, &row.workspace, "webhook.dead", &format!("webhook:{}", row.target), payload).await;
+                }
+                OutboxKind::Writeback => {
+                    // Not reversible, and not sent: a person decides what to do.
+                    let payload = json!({
+                        "id": row.id, "target": row.target, "route": row.event_type, "receipt": row.receipt,
+                        "idempotency_key": row.dedupe, "attempts": row.attempts, "status": a.status,
+                        "reason": a.error,
+                    });
+                    let target = format!("writeback:{}", row.target);
+                    self.event(me, &row.workspace, "writeback.failed", &target, payload).await;
+                }
+            }
         }
     }
 
@@ -477,7 +651,7 @@ impl Worker {
             let ctx = system_ctx(&onto, &ws);
             let ev = EventInput {
                 action,
-                target: Some(format!("webhook:{target}")),
+                target: Some(target),
                 workspace: Some(ctx.workspace.clone()),
                 payload,
                 ..Default::default()
@@ -490,8 +664,8 @@ impl Worker {
         }
     }
 
-    /// A success closes the endpoint's breaker.
-    async fn succeeded(&self, me: &Arc<Intelli>, name: &str) {
+    /// A success closes the endpoint's (or target's) breaker.
+    async fn succeeded(&self, me: &Arc<Intelli>, kind: OutboxKind, name: &str) {
         self.endpoints.lock().entry(name.to_string()).or_default().failures = 0;
         let onto = me.ontology().clone();
         let n = name.to_string();
@@ -499,20 +673,14 @@ impl Worker {
             blocking(move || Ok(breakers(&onto)?.get(&n).is_some_and(|b| b.is_open()))).await.unwrap_or(false);
         if was_open {
             let closed = BreakerState { state: "closed".into(), ..Default::default() };
-            self.put_breaker(
-                me,
-                name,
-                closed,
-                "webhook.endpoint.resumed",
-                json!({ "reason": "a probe was delivered" }),
-            )
-            .await;
+            let action = format!("{}.resumed", kind_words(kind).1);
+            self.put_breaker(me, kind, name, closed, &action, json!({ "reason": "a probe was delivered" })).await;
         }
     }
 
     /// A failure: open the breaker after `pause_after_failures` in a row, or
     /// again (with a doubled pause) when a half-open probe failed.
-    async fn trip(&self, me: &Arc<Intelli>, name: &str) {
+    async fn trip(&self, me: &Arc<Intelli>, kind: OutboxKind, name: &str) {
         let failures = {
             let mut eps = self.endpoints.lock();
             let s = eps.entry(name.to_string()).or_default();
@@ -532,16 +700,26 @@ impl Worker {
         let pause = next_pause(current.filter(|b| b.is_open()).map(|b| b.pause_ms), base);
         let b = BreakerState { state: "open".into(), until: now_ms() + pause, pause_ms: pause, failures };
         let payload = json!({ "reason": "failing", "failures": failures, "pause_ms": pause });
-        self.put_breaker(me, name, b, "webhook.endpoint.paused", payload).await;
+        let action = format!("{}.paused", kind_words(kind).1);
+        self.put_breaker(me, kind, name, b, &action, payload).await;
     }
 
-    async fn put_breaker(&self, me: &Arc<Intelli>, name: &str, b: BreakerState, action: &str, payload: Value) {
+    async fn put_breaker(
+        &self,
+        me: &Arc<Intelli>,
+        kind: OutboxKind,
+        name: &str,
+        b: BreakerState,
+        action: &str,
+        payload: Value,
+    ) {
         let onto = me.ontology().clone();
         let (name, action) = (name.to_string(), action.to_string());
+        let audit = format!("{}:{name}", kind_words(kind).0);
         let r = blocking(move || {
             let ctx = system_ctx(&onto, "");
             let kv = vec![(NS_CONTROL.to_string(), format!("{BREAKER_PREFIX}{name}"), serde_json::to_value(&b)?)];
-            onto.commit_config(&ctx, kv, ConfigEvent::new(action, Some(&format!("webhook:{name}")), payload)).map(drop)
+            onto.commit_config(&ctx, kv, ConfigEvent::new(action, Some(&audit), payload)).map(drop)
         })
         .await;
         if let Err(e) = r {
@@ -592,6 +770,14 @@ impl Drop for Done {
                 s.probing = false;
             }
         }
+    }
+}
+
+/// `req` with a `traceparent` header when `row` carries a trace id.
+fn traced(req: reqwest::RequestBuilder, row: &OutboxRow) -> reqwest::RequestBuilder {
+    match row.otel_trace_id.as_deref().filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
+        Some(t) => req.header("traceparent", format!("00-{t}-{:016x}-01", nonzero_span())),
+        None => req,
     }
 }
 

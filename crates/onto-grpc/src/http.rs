@@ -62,6 +62,11 @@
 //!   enabling (approvers who dominate its run_as; it binds to its closure and expires), disabling.
 //!   A run commits its action, receipt, outbox rows and run row together; webhook effects are
 //!   enqueued once and delivered at least once, and external effects are not reversible.
+//! * `GET  /v1/writeback/targets`  writeback targets; `POST` registers one `{name, base_url,
+//!   routes: {name: path}, workspaces?, secret?, generate_secret?}` (admins of every workspace it
+//!   serves). Writeback is not reversible; action.undo does not undo the external write.
+//! * `DELETE /v1/writeback/targets/{name}`  remove a target; `POST .../{name}/test` `{route?}`
+//!   checks it without sending anything
 //! * `GET  /v1/outbox`          outbound deliveries (`?target=`, `states`, `source`, `receipt`, `run`,
 //!   `since`, `limit`) for targets the caller may manage. Each change is enqueued once per endpoint
 //!   and delivered at least once; receivers dedupe on the event id.
@@ -169,6 +174,9 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/webhooks/{name}/deliveries", get(webhook_deliveries))
         .route("/v1/webhooks/{name}/{verb}", post(webhook_verb))
         .route("/v1/outbox", get(outbox_list))
+        .route("/v1/writeback/targets", get(writeback_list).post(writeback_add))
+        .route("/v1/writeback/targets/{name}", delete(writeback_remove))
+        .route("/v1/writeback/targets/{name}/test", post(writeback_test))
         .route("/v1/automations", get(automations_list))
         .route("/v1/automations/kill", get(automation_get_kill).post(automation_kill))
         .route("/v1/automations/{name}", get(automation_get))
@@ -1129,6 +1137,27 @@ async fn outbox_list(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     run(&s, &headers, "outbox.list", outbox_query(q)).await
+}
+
+async fn writeback_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "writeback.list", json!({})).await
+}
+
+async fn writeback_add(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "writeback.add", body_or_empty(body)).await
+}
+
+async fn writeback_remove(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "writeback.remove", json!({ "name": name })).await
+}
+
+async fn writeback_test(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    run(&s, &headers, "writeback.test", named(body, name)).await
 }
 
 async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {

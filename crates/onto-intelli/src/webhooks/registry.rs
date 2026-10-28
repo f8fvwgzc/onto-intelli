@@ -26,7 +26,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use onto_core::outbox::{ConfigEvent, OutboxQuery, OutboxSelect, OutboxState};
+use onto_core::outbox::{ConfigEvent, OutboxKind, OutboxQuery, OutboxSelect, OutboxState};
 use onto_core::policy::{Role, ScopePrincipal, dominates};
 use onto_core::time::now_ms;
 use onto_core::{ActionContext, Error, Ontology, Principal, Result, one_or_many};
@@ -299,7 +299,9 @@ fn controls(onto: &Ontology) -> Result<(bool, std::collections::HashMap<String, 
 }
 
 impl Intelli {
-    fn reach(&self, restricted: bool) -> Result<Reach> {
+    /// The outbound rules for an endpoint or target (`restricted`: registered
+    /// by a project credential, so no operator allow rule applies).
+    pub(crate) fn reach(&self, restricted: bool) -> Result<Reach> {
         Ok(Reach {
             allow: std::sync::Arc::new(self.config().webhooks.allow_rules()?),
             restricted,
@@ -481,6 +483,11 @@ impl Intelli {
                 dominance_check(onto, &ctx, action, &probe)?;
                 if Endpoint::load(onto, &name)?.is_some() {
                     return Err(Error::Conflict(format!("webhook endpoint {name} exists (webhook.update changes it)")));
+                }
+                if crate::writeback::Target::load(onto, &name)?.is_some() {
+                    return Err(Error::Conflict(format!(
+                        "{name} is a writeback target: endpoints and writeback targets share one namespace"
+                    )));
                 }
                 let max = self.config().webhooks.max_endpoints;
                 if Endpoint::list(onto)?.len() >= max {
@@ -820,17 +827,21 @@ impl Intelli {
                 };
                 let endpoints: std::collections::HashMap<String, Endpoint> =
                     Endpoint::list(onto)?.into_iter().map(|e| (e.name.clone(), e)).collect();
+                let targets: std::collections::HashMap<String, crate::writeback::Target> =
+                    crate::writeback::Target::list(onto)?.into_iter().map(|t| (t.name.clone(), t)).collect();
                 let everywhere = p.workspaces.iter().any(|w| w == "*");
                 let mut hidden = 0usize;
                 let mut items = Vec::new();
                 for r in onto.store().outbox_list(&q)? {
                     // Rows of endpoints the caller may not manage stay
-                    // hidden (they show what the endpoint's principal sees);
-                    // rows of removed targets only to tenant-wide admins.
-                    let ok = match endpoints.get(&r.target) {
-                        Some(ep) => dominates(p, &ep.principal),
-                        None => everywhere,
-                    };
+                    // hidden (they show what the endpoint's principal sees),
+                    // as do rows of writeback targets the caller may not
+                    // manage; rows of removed ones only to tenant-wide admins.
+                    let ok = match r.kind {
+                        OutboxKind::Webhook => endpoints.get(&r.target).map(|ep| dominates(p, &ep.principal)),
+                        OutboxKind::Writeback => targets.get(&r.target).map(|t| dominates(p, &t.scope())),
+                    }
+                    .unwrap_or(everywhere);
                     if ok {
                         items.push(r.listed());
                     } else {

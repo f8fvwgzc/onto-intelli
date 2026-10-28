@@ -49,6 +49,11 @@ pub struct OntologyOptions {
     /// when a stored schema is loaded, so lowering it cannot stop a tenant
     /// from opening.
     pub max_automations: usize,
+    /// Whether action types may plan writeback effects (`[writeback]
+    /// enabled`, off by default): a plan with a writeback effect is refused
+    /// while it is off. Checked when a plan is made, never when a schema is
+    /// compiled or loaded.
+    pub writeback: bool,
 }
 
 impl Default for OntologyOptions {
@@ -61,6 +66,7 @@ impl Default for OntologyOptions {
             sync_reads: false,
             follow_interval_ms: 1_000,
             max_automations: 100,
+            writeback: false,
         }
     }
 }

@@ -1130,4 +1130,107 @@ mod runtime {
             .unwrap_err();
         assert!(err.to_string().contains("writes only"), "{err}");
     }
+
+    // ── writeback (build step 12) ───────────────────────────────────────────
+
+    /// An automation whose action resolves the issue and closes its helpdesk
+    /// ticket (a writeback), with `[writeback] enabled` on and the target
+    /// registered; `unattended` lists the caller kinds the action type waives
+    /// the external write's confirmation for.
+    fn writeback_fixture(store: Arc<dyn Store>, tenant: Option<common::TestTenant>, unattended: &[&str]) -> Fixture {
+        let flaky = Arc::new(FlakyStore::new(store));
+        let opts = OntologyOptions { writeback: true, ..Default::default() };
+        let o = Ontology::open(Schema::enterprise(), flaky.clone(), opts).unwrap();
+        let ctx = ActionContext::new(admin(), "acme");
+        let target = json!({
+            "name": "helpdesk", "base_url": "https://helpdesk.example.com/", "version": 1,
+            "workspaces": ["acme"], "routes": { "close": "tickets/close" },
+        });
+        o.commit_config(
+            &ctx,
+            vec![(automate::NS_WRITEBACK_TARGET.into(), "helpdesk".into(), target)],
+            ConfigEvent::new("writeback.add", Some("writeback:helpdesk"), json!({})),
+        )
+        .unwrap();
+        let at = json!({
+            "parameters": { "issue": { "type": "entity", "kinds": ["issue"], "required": true } },
+            "preconditions": [{ "check": "open", "param": "issue" }],
+            "effects": [
+                { "patch": { "id": "{issue}", "state": "resolved" } },
+                { "writeback": { "target": "helpdesk", "route": "close", "body": { "issue": "{issue}" } } }
+            ],
+            "unattended": unattended,
+        });
+        let mut def = resolve_blocked();
+        def["effects"] = json!([{ "action": { "type": "close_ticket", "params": { "issue": "{trigger.id}" } } }]);
+        let changes = json!({ "changes": [
+            { "op": "put_action_type", "name": "close_ticket", "def": at },
+            put(NAME, def),
+        ] });
+        o.schema_apply(&ctx, set(changes)).unwrap();
+        o.upsert(&ctx, EntityInput::new("issue", "1", "Timeout").state("triaged").prop("priority", "high")).unwrap();
+        let def = o.schema().automations[NAME].clone();
+        enable(&o, NAME);
+        // The target is part of the closure the enablement binds to.
+        let st = o.automation_state(NAME).unwrap().unwrap();
+        assert!(st.closure.contains_key("target:helpdesk"), "{:?}", st.closure);
+        assert_ne!(st.closure["target:helpdesk"], automate::MISSING);
+        Fixture { o, flaky, def, _tenant: tenant }
+    }
+
+    fn check_writeback_run(f: Fixture) {
+        let fence = f.lease("worker-a", 60_000);
+        let mut run = f.block();
+        assert!(f.claim(&mut run, &fence));
+        let before = f.o.store().head().unwrap();
+        let done = f.o.commit_run(&run, &f.def, Some(&fence)).unwrap();
+        assert_eq!(done.run.state, RunState::Succeeded, "{:?}", done.run.reason);
+        assert_eq!(f.o.store().head().unwrap(), before + 1, "edits, receipt, writeback row and run row in one commit");
+        assert_eq!(f.issue_state().as_deref(), Some("resolved"));
+        let receipt = done.receipt.expect("a receipt");
+        assert_eq!(receipt.external.len(), 1);
+        let key = format!("{}:1", receipt.id);
+        assert_eq!(receipt.external[0].idempotency_key, key);
+        let rows = f.o.store().outbox_list(&OutboxQuery { run: Some(run.id.clone()), ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, onto_core::outbox::OutboxKind::Writeback);
+        assert_eq!(
+            (row.target.as_str(), row.dedupe.as_str(), row.source.as_str()),
+            ("helpdesk", key.as_str(), "automation")
+        );
+        assert_eq!(row.receipt.as_deref(), Some(receipt.id.as_str()));
+        assert_eq!(row.payload, json!({ "issue": "issue:1" }));
+        assert_eq!(row.cause.as_ref().map(|c| c.depth), Some(1));
+        assert_eq!(f.o.action_receipt(&admin(), &receipt.id).unwrap().external[0].outbox, row.id);
+    }
+
+    #[test]
+    fn an_unattended_writeback_runs_with_the_run_commit() {
+        check_writeback_run(writeback_fixture(Arc::new(MemoryStore::default()), None, &["automation"]));
+    }
+
+    #[test]
+    fn postgres_commits_an_unattended_writeback_with_the_run() {
+        let Some(t) = common::TestTenant::new("automate_writeback") else { return };
+        let store: Arc<dyn Store> = Arc::new(t.store());
+        check_writeback_run(writeback_fixture(store, Some(t), &["automation"]));
+    }
+
+    #[test]
+    fn a_writeback_not_declared_unattended_for_automations_is_refused() {
+        for unattended in [&[][..], &["agent"][..]] {
+            let f = writeback_fixture(Arc::new(MemoryStore::default()), None, unattended);
+            let fence = f.lease("worker-a", 60_000);
+            let mut run = f.block();
+            assert!(f.claim(&mut run, &fence));
+            let done = f.o.commit_run(&run, &f.def, Some(&fence)).unwrap();
+            assert_eq!(done.run.state, RunState::Refused);
+            let reason = done.run.reason.unwrap();
+            assert!(reason.starts_with("needs_confirmation") && reason.contains("not reversible"), "{reason}");
+            assert!(done.receipt.is_none());
+            assert_eq!(f.outbox_of(&run.id), 0, "nothing is sent for a refused run");
+            assert_eq!(f.issue_state().as_deref(), Some("blocked"));
+        }
+    }
 }

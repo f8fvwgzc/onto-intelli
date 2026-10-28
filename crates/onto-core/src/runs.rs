@@ -34,7 +34,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::action_types::{ActionPlan, ActionReceipt, PlanSeed, RECEIPTS, Templates, audit_target, eval_checks};
+use crate::action_types::{
+    ActionPlan, ActionReceipt, PlanSeed, RECEIPTS, Templates, audit_target, eval_checks, writeback_rows,
+};
 use crate::automate::{
     self, Automation, AutomationState, Enablements, Mode, NS_AUTOMATION_CONTROL, OutboundRef, PRINCIPAL_PREFIX,
 };
@@ -544,13 +546,16 @@ impl Ontology {
                 }
                 if plan.needs_confirmation {
                     return Ok(Verdict::NeedsConfirmation(format!(
-                        "action {} is risk {}{}: automations run only low-risk, reversible action types (a person \
-                         applies it with confirm=true)",
+                        "action {} is risk {}{}: automations run only low-risk, reversible action types, or action \
+                         types that declare unattended = [\"automation\"] for their external writes (a person applies \
+                         it with confirm=true)",
                         a.ty,
                         format!("{:?}", plan.risk).to_lowercase(),
                         if plan.reversible { "" } else { ", not reversible" }
                     )));
                 }
+                // External writes (writeback) commit as outbox rows with the run.
+                let (rows, external) = writeback_rows(&receipt_id, &plan, &ctx, SOURCE_AUTOMATION, Some(&run.id));
                 let receipt = ActionReceipt {
                     id: receipt_id.clone(),
                     action: a.ty.clone(),
@@ -563,12 +568,19 @@ impl Ontology {
                     result: None,
                     reason: None,
                     touched: Default::default(),
+                    note: (!external.is_empty()).then(|| crate::action_types::RECEIPT_NOTE.to_string()),
+                    external,
                 };
                 out.mutations.extend(plan.mutations.iter().cloned());
+                let mut payload =
+                    json!({ "params": plan.params, "receipt": receipt_id, "risk": plan.risk, "run": run.id });
+                if !rows.is_empty() {
+                    payload["external"] = json!(rows.iter().map(|r| &r.id).collect::<Vec<_>>());
+                }
                 out.mutations.push(Mutation::Event(EventInput {
                     action: format!("action.{}", a.ty),
                     target: audit_target(&plan.params),
-                    payload: json!({ "params": plan.params, "receipt": receipt_id, "risk": plan.risk, "run": run.id }),
+                    payload,
                     ..Default::default()
                 }));
                 out.effects.push(RunEffect {
@@ -579,10 +591,11 @@ impl Ontology {
                     receipt: Some(receipt_id.clone()),
                     plan: Some(json!({
                         "preview": plan.preview, "risk": plan.risk, "reversible": plan.reversible,
-                        "warnings": plan.warnings,
+                        "warnings": plan.warnings, "external": plan.external,
                     })),
                     ..Default::default()
                 });
+                out.outbox.extend(rows);
                 out.plan = Some(plan);
                 out.receipt = Some(receipt);
             }

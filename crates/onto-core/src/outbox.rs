@@ -171,9 +171,11 @@ pub struct OutboxRow {
     /// Change-sourced rows: the only content; the body is rendered at send time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<Cursor>,
-    /// The CloudEvent `type` (`onto.entity.update`, `onto.webhook.test`, …).
+    /// The CloudEvent `type` (`onto.entity.update`, `onto.webhook.test`, …);
+    /// for a writeback row, the target route it is posted to.
     pub event_type: String,
-    /// Effect-sourced rows: the body as the run rendered it.
+    /// Effect-sourced rows: the body as the run or action rendered it (a
+    /// writeback row's request body).
     #[serde(default)]
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]

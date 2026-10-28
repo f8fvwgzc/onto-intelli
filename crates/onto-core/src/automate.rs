@@ -869,14 +869,21 @@ pub struct Enablements {
 }
 
 /// `(name, version, principal)` of the records in KV namespace `ns`
-/// (webhook endpoints, writeback targets); records without a principal are
-/// skipped.
+/// (webhook endpoints, writeback targets). A writeback target has no
+/// principal of its own: it acts as `{admin, workspaces}` (who may add or
+/// remove it). Records with neither are skipped.
 pub fn outbound_refs(store: &dyn Store, ns: &str) -> Result<Vec<OutboundRef>> {
     Ok(store
         .kv_scan(ns, "")?
         .into_iter()
         .filter_map(|(name, v)| {
-            let principal: ScopePrincipal = serde_json::from_value(v.get("principal")?.clone()).ok()?;
+            let principal: ScopePrincipal = match v.get("principal") {
+                Some(p) => serde_json::from_value(p.clone()).ok()?,
+                None => {
+                    let ws: Vec<String> = serde_json::from_value(v.get("workspaces")?.clone()).ok()?;
+                    ScopePrincipal::new(vec![crate::policy::Role::Admin], ws)
+                }
+            };
             Some(OutboundRef { name, version: v.get("version").and_then(Value::as_u64).unwrap_or(0), principal })
         })
         .collect())

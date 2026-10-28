@@ -166,6 +166,10 @@ const BUILTIN_ROUTES: &[(&str, &str)] = &[
     ("onto_intelli.v1.AutomateService/Disable", "automation.disable"),
     ("onto_intelli.v1.AutomateService/Rerun", "automation.rerun"),
     ("onto_intelli.v1.AutomateService/Kill", "automation.kill"),
+    ("onto_intelli.v1.WritebackService/Add", "writeback.add"),
+    ("onto_intelli.v1.WritebackService/List", "writeback.list"),
+    ("onto_intelli.v1.WritebackService/Remove", "writeback.remove"),
+    ("onto_intelli.v1.WritebackService/Test", "writeback.test"),
 ];
 
 pub struct Route {
