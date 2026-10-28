@@ -194,6 +194,8 @@ async fn look_alike_tenant_ids_never_share_a_schema() {
     assert!(hub.drop_tenant("acme").is_err());
     assert!(acme.call(&admin, "entity.get", json!({ "id": "team:secret" })).await.is_ok());
     hub.drop_tenant("Acme").unwrap();
+    // cleanup() finds a-b's schema as "a_b", whose drop the identity check refuses.
+    hub.drop_tenant("a-b").unwrap();
     cleanup(&hub, &url, &prefix).await;
 }
 
