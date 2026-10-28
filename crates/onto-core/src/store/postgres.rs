@@ -660,6 +660,14 @@ fn sql(s: String) -> AssertSqlSafe<String> {
     AssertSqlSafe(s)
 }
 
+/// A consumer cursor's `n` as stored: the INT column keeps `u32::MAX` ("after
+/// the whole commit", where [`Cursor::floor_edge`] parks a consumer) clamped
+/// to `i32::MAX`, which no record's place in a commit reaches; it reads back
+/// as `u32::MAX`, so a parked consumer is not taken for an expired one.
+fn stored_n(n: i32) -> u32 {
+    if n == i32::MAX { u32::MAX } else { n.max(0) as u32 }
+}
+
 /// Lock the commit head for a state-changing write and return its sequence.
 /// A tenant that requires a newer writer than this build is refused.
 async fn lock_head(tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>, head: &str) -> Result<i64> {
@@ -2260,7 +2268,26 @@ impl Store for PgStore {
                     .bind(&name)
                     .fetch_optional(&pool)
                     .await?;
-            Ok(row.map(|(seq, n)| Cursor::new(seq as u64, n as u32)))
+            Ok(row.map(|(seq, n)| Cursor::new(seq.max(0) as u64, stored_n(n))))
+        })
+    }
+
+    fn consumer_delete(&self, name: &str, fence: Option<&Fence>) -> Result<bool> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let (name, fence) = (name.to_string(), fence.cloned());
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &t, f).await?;
+            }
+            let n = sqlx::query(sql(format!("DELETE FROM {} WHERE name = $1", t.consumers)))
+                .bind(&name)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            Ok(n > 0)
         })
     }
 
@@ -2287,13 +2314,16 @@ impl Store for PgStore {
             .await?;
             Ok(rows
                 .into_iter()
-                .map(|(name, seq, n, updated_at, head, floor, oldest, now)| ConsumerLag {
-                    name,
-                    cursor: Cursor::new(seq.max(0) as u64, n.max(0) as u32),
-                    behind: head.saturating_sub(seq).max(0) as u64,
-                    age_ms: oldest.map_or(0, |ts| now.saturating_sub(ts).max(0)),
-                    updated_at: Some(updated_at),
-                    expired: seq < floor,
+                .map(|(name, seq, n, updated_at, head, floor, oldest, now)| {
+                    let cursor = Cursor::new(seq.max(0) as u64, stored_n(n));
+                    ConsumerLag {
+                        name,
+                        cursor,
+                        behind: head.saturating_sub(seq).max(0) as u64,
+                        age_ms: oldest.map_or(0, |ts| now.saturating_sub(ts).max(0)),
+                        updated_at: Some(updated_at),
+                        expired: cursor.expired_at(floor.max(0) as u64),
+                    }
                 })
                 .collect())
         })
@@ -2771,8 +2801,11 @@ impl Store for PgStore {
 
     /// From the `outbox_stats` index (0014): the targets that have such rows
     /// by a skip scan (one probe per target), then each (target, state)
-    /// counted up to `cap` as an index range. Delivered and cancelled rows
-    /// are not in the index.
+    /// counted up to `cap` from an index range. Delivered and cancelled rows
+    /// are not in the index. The counts are index-only on an outbox vacuumed
+    /// since its rows last changed; on a busy one PostgreSQL also reads up
+    /// to `cap` heap rows per (target, state), so keep `cap` small
+    /// ([`OUTBOX_STATS_CAP`](crate::outbox::OUTBOX_STATS_CAP)).
     fn outbox_state_counts(&self, cap: u64) -> Result<Vec<(String, OutboxState, u64)>> {
         let pool = self.pool.clone();
         let t = Tables::of(self);

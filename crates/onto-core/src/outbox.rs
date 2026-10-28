@@ -132,8 +132,14 @@ impl OutboxState {
 pub const STATS_STATES: [OutboxState; 4] =
     [OutboxState::Pending, OutboxState::Inflight, OutboxState::Retry, OutboxState::Dead];
 
-/// Rows of one target in one state that a stats count reads at most.
+/// Records a stats count reads at most (gap records).
 pub const STATS_COUNT_CAP: u64 = 10_000;
+
+/// Outbox rows of one target in one state that a stats count reads at
+/// most. On an outbox not vacuumed since its rows last changed, PostgreSQL
+/// counts them from the heap as well as the index, so the cap bounds that
+/// read: at most four times this many rows per target.
+pub const OUTBOX_STATS_CAP: u64 = 1_000;
 
 impl fmt::Display for OutboxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

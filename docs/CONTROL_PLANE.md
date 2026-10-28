@@ -1285,7 +1285,13 @@ As built:
   work continues: the caller's `traceparent` trace, else the trace that
   recorded the causing call. Calls pass that id on to what they enqueue
   (change records' `cause.trace_id`, outbox rows' `otel_trace_id`), and
-  deliveries send it as `traceparent`.
+  deliveries send it as `traceparent`. Beyond the workspace rule, these
+  traces (principals `automation:`, `webhook:`, `writeback:`) show only to
+  callers who may see the run or delivery itself: who dominate the
+  automation's `run_as` (as `automation.runs`), or who may manage the
+  endpoint or target (as `outbox.list`); those of removed ones only to
+  tenant-wide admins. `trace.list` and `trace.session` leave the others
+  out, and `trace.get` answers `not_found`.
 * `eval.run`: each case is a trace of kind `eval` named `eval.case`
   (`metadata.case` is the case's name, tag `eval`, the session and source
   of the caller) with an `eval.pass` score (1 or 0, `source = "eval"`,

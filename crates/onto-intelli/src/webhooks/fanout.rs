@@ -199,7 +199,7 @@ fn set_backlog(me: &Intelli, name: &str, pending: u64, pause: bool, cap: u64) ->
 /// The position just before the floor's commit (the oldest records kept):
 /// a cursor below it may have missed removed records.
 fn floor_edge(floor: u64) -> Cursor {
-    if floor == 0 { Cursor::default() } else { Cursor::new(floor - 1, u32::MAX) }
+    Cursor::floor_edge(floor)
 }
 
 /// The endpoint's cursor expired (below the floor) or is ahead of the head:

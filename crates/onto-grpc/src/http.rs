@@ -599,27 +599,27 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
-/// Open tenants with their estimated memory: an operator's view of the
-/// whole process, so project credentials (API keys, console sessions) and
-/// non-admins are refused.
+/// Open tenants with their estimated memory and outbound counters: an
+/// operator's view of the whole process, so only a privileged principal
+/// acting for itself on a credential for every tenant (a config token with
+/// `tenants = ["*"]`, or dev mode) may read it. Tokens limited to some
+/// tenants, sessions bound to one, project credentials (API keys, console
+/// sessions), callers acting for someone else and non-admins are refused.
 async fn admin_tenants(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return auth_error_response(&e),
     };
-    if c.credential.is_project() || !c.principal.is_privileged() {
+    if !c.is_operator() {
         return error_response(&Error::Denied(format!(
-            "{} may not list the server's tenants (operators only)",
+            "{} may not list the server's tenants (operators only: an admin token for every tenant)",
             c.principal.id
         )));
     }
     let e = &s.hub.config().engine;
-    // The outbound counters read each tenant's store (index reads only).
-    let hub = s.hub.clone();
-    let tenants = match tokio::task::spawn_blocking(move || hub.tenant_report()).await {
-        Ok(t) => t,
-        Err(_) => return error_response(&Error::Unavailable("tenant report failed".into())),
-    };
+    // The outbound counters read each tenant's store (several round trips
+    // per tenant), a bounded number of tenants at a time.
+    let tenants = s.hub.tenant_report().await;
     Json(json!({
         "open": tenants.len(),
         "subscribers_process": onto_intelli::changes::ChangeHub::process_subscribers(),

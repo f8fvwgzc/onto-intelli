@@ -1797,15 +1797,26 @@ Counters (after step 13; section 11):
   outbox (target, state) WHERE state IN ('pending', 'inflight', 'retry', 'dead')`. Lag needs no
   index: one primary-key probe `(seq, n) > cursor ORDER BY seq, n LIMIT 1` per consumer. Outbox
   targets come from a skip scan of `outbox_stats` (one probe per target, at most 1000), then each
-  (target, state) is an index-only range up to the cap. Runs use `automation_runs_started`.
+  (target, state) is an index range up to the cap (index-only once vacuumed). Runs use
+  `automation_runs_started`.
 - Surfaces: `system.stats.outbound` gains `lag {consumers, endpoints}` (endpoint `X` is consumer
   `webhook:X`), `outbox {cap, targets: {<target>: {<state>: n}}}`, `gaps_24h {count, capped,
   latest}`; `outbox_open` is now the open sum of the capped state counts, and `runs_1h` counts the
   newest 10,000 runs (was 500 rows read whole). `system.health.outbound.changes.latest_gap`.
   `GET /v1/admin/tenants` adds `subscribers_process` and, per open tenant, `outbound` (the
   `system.stats.outbound` counters plus `paused {automations, endpoints}`) from
-  `Hub::tenant_report` on a blocking thread; `Hub::tenant_stats` (memory budget, eviction) still
-  reads nothing from the store.
+  `Hub::tenant_report` (blocking threads, 8 tenants at a time, 5 s per tenant); `Hub::tenant_stats`
+  (memory budget, eviction) still reads nothing from the store.
+- Fixed after the docs run (finishing round 1): `GET /v1/admin/tenants` is for operators only (an
+  admin acting for itself on a credential for every tenant); `system.stats.outbound` is scoped by
+  the caller (names, cursors and per-target counts only for what an admin may manage; totals for
+  everyone else); `automation` and `delivery` traces show only to callers who dominate the
+  automation's `run_as` or may manage the endpoint or target; a removed endpoint's consumer row is
+  deleted; `expired` uses the fan-out's rule (`cursor < floor_edge(floor)`) and PostgreSQL reads a
+  clamped `n` back as `u32::MAX`, so a consumer parked at the edge is not taken for an expired one
+  (nor sent its gap again); the outbox state cap is 1,000 (a busy, unvacuumed outbox counts from
+  the heap too); a draining hub serves tenants already open and cuts connections still open at
+  the deadline; docker-compose.yml waits 30 s before SIGKILL.
 - Cost, measured on a scratch tenant with 2,000,000 change records over 24 h (25 gaps), 20
   consumers, 658,200 outbox rows over 20 targets (600,000 delivered, 30,000 dead, 6,000
   pending, 2,000 retry, 200 inflight, 20,000 cancelled) and 60,000 runs over 2 h, PostgreSQL 16

@@ -770,7 +770,17 @@ as.
   shutting down", with the cursor to resume after), lets workers finish the
   round they are in, then releases its leases, the outbox rows it claimed
   and did not settle, and the wake scanner lock, all within
-  `[grpc] shutdown_grace_secs` (20) plus a few seconds, and exits 0. A
+  `[grpc] shutdown_grace_secs` (20) plus a few seconds, and exits 0.
+  Requests already received are served while the tenant they address is
+  open (no tenant opens during the drain: those get 503 "the server is
+  shutting down; retry on another replica"); connections still open at the
+  deadline are cut, so their requests end unanswered. The orchestrator must
+  wait longer than that before it kills the process: Kubernetes waits 30 s
+  by default, but `docker stop` and Docker Compose only 10 s, which kills a
+  process with a slow delivery or request in flight before it releases
+  anything. The `onto` service in docker-compose.yml sets
+  `stop_grace_period: 30s`; with plain Docker use `docker stop -t 30` (or
+  lower `shutdown_grace_secs`). A
   release is fenced: only the holder at the epoch it took the lease at
   gives it back, so a process that lost its lease meanwhile releases
   nothing. The replacement process takes over at once; nothing is skipped,
@@ -808,21 +818,37 @@ as.
 - **Counters.** `system.stats` (`GET /v1/stats`) has, under `outbound`:
   `lag`, how far each change consumer is behind (`consumers`, by name:
   `automation:consumer` and `webhook:<endpoint>`; `endpoints`, by endpoint
-  name), as `behind` (head commit seq minus the cursor's, counting commits
+  name; a removed endpoint's cursor is deleted with it and never reported),
+  as `behind` (head commit seq minus the cursor's, counting commits
   that wrote no records), `age_ms` (age of the oldest record it has not
   read; 0 when there is none), `cursor`, `updated_at` and `expired`
-  (retention removed records it had not read); `outbox`, rows per target
+  (retention removed records it had not read; a consumer resuming just
+  before the floor after its gap was delivered is not expired); `outbox`, rows per target
   split by state (`pending`, `inflight`, `retry`, `dead`; delivered and
   cancelled rows are not counted), each counted up to `outbox.cap`
-  (10,000), and `outbox_open`, their open sum per target; `gaps_24h`, gap
+  (1,000), and `outbox_open`, their open sum per target; `gaps_24h`, gap
   records of the last 24 hours (up to 10,000) with the `latest` gap kept
   (cursor, time, reason, origin, how many entities and links it touched;
   never their ids); and `runs_1h`, runs per state among the newest 10,000
   of the last hour. `system.health` reports the latest gap under
-  `outbound.changes.latest_gap`. `GET /v1/admin/tenants` (operators) gives
+  `outbound.changes.latest_gap`. What `system.stats` shows depends on the
+  caller, as `webhook.list`, `outbox.list` and `automation.runs` do: an
+  admin who is not an agent sees the endpoints and writeback targets it
+  may manage (whose principal it dominates) and their consumers, and a
+  tenant-wide admin also every other consumer and what removed endpoints
+  and targets left (`hidden` counts what was left out); everyone else gets
+  `outbox_open_total` and `gaps_24h` only, never a name, cursor or
+  per-target count. `GET /v1/admin/tenants` (operators only: a privileged
+  principal acting for itself on a config token whose `tenants` is
+  `["*"]`, or dev mode; tokens limited to some tenants, sessions, project
+  credentials and act-as are refused) gives
   the same counters per open tenant under `outbound`, with the paused
-  automations and endpoints. Each count reads an index range bounded by
-  its cap, never a whole table: on a tenant with 2 million change records
+  automations and endpoints, reading up to 8 tenants at a time (a tenant
+  whose counters take over 5 s shows `{"timed_out": true}`). Each count is
+  bounded by its cap, never a whole table: it reads an index range, and on
+  an outbox not vacuumed since its rows last changed PostgreSQL also reads
+  up to the cap of heap rows per target and state (hence the outbox cap of
+  1,000). On a tenant with 2 million change records
   (25 gaps), 658,200 outbox rows (20 endpoints) and 60,000 runs, the four
   store reads took 1.1 ms (20 consumers), 0.7 ms (gaps), 3.1 ms (outbox
   states, 80 counts) and 2.3 ms (runs, capped at 10,000) once warm, from a

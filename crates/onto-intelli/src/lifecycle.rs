@@ -86,10 +86,12 @@ impl Holdings {
         self.leases.lock().remove(name);
     }
 
+    #[cfg_attr(not(feature = "outbound"), allow(dead_code))]
     pub(crate) fn claimed(&self, id: &str, claim: &str) {
         self.claims.lock().insert(id.to_string(), claim.to_string());
     }
 
+    #[cfg_attr(not(feature = "outbound"), allow(dead_code))]
     pub(crate) fn settled(&self, id: &str) {
         self.claims.lock().remove(id);
     }

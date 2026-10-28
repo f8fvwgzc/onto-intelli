@@ -165,7 +165,8 @@ At most `engine.max_open_tenants` (default 512, 0 for no limit) stay open, and
 while the open ones' estimated memory is above `engine.tenant_memory_budget_mb`
 (default 0: no budget) the least recently used close; the one just used
 always stays. A closed tenant opens again on its next request.
-`GET /v1/admin/tenants` (operators) lists the open tenants with their
+`GET /v1/admin/tenants` (operators: an admin config token for every tenant,
+`tenants = ["*"]`, or dev mode) lists the open tenants with their
 `estimated_bytes` (`Ontology::estimated_bytes`, an estimate from their
 contents) and their outbound counters (`outbound`: outbox rows per state,
 change lag per consumer and endpoint, gap records over 24 hours and the
@@ -245,7 +246,9 @@ writes (`UPDATE leases … WHERE name, holder and epoch match`: a holder whose
 epoch is stale releases nothing), gives back the outbox rows it claimed and
 did not settle, and closes the wake scanner's lock session, so the next
 process takes over at once. A process that is killed leaves them to expire
-(60 s at most). Either way consumers resume from their cursors in
+(60 s at most): give the orchestrator a stop timeout above
+`shutdown_grace_secs` plus 5 s (`docker stop` waits only 10 s by default;
+docker-compose.yml sets `stop_grace_period: 30s`). Either way consumers resume from their cursors in
 `consumers` and runs claimed under an older epoch are recovered, so nothing
 is skipped.
 

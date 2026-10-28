@@ -263,3 +263,43 @@ fn postgres_counters_read_their_indexes() {
     );
     assert!(dead.contains("outbox_stats"), "{dead}");
 }
+
+/// Review findings OBS-2 and OBS-1: a consumer parked at the floor's edge
+/// (where the fan-out and the automation consumer leave it once its gap is
+/// handled) reads back exactly there, also on PostgreSQL whose INT column
+/// clamps `n`, and is not expired; one below it is. A deleted consumer is
+/// gone from the lags.
+fn parked_and_deleted_consumers(o: &Ontology) {
+    let store = o.store();
+    for k in 1..5 {
+        o.apply(&ctx(), vec![issue(&k.to_string())]).unwrap();
+    }
+    store.vacuum_changes(&ChangeRetention { keep_ms: None, keep_rows: Some(1) }).unwrap();
+    let floor = store.changes_meta().unwrap().floor;
+    assert!(floor > 1, "retention moved the floor: {floor}");
+    let edge = Cursor::floor_edge(floor);
+    store.consumer_set("webhook:parked", edge, None).unwrap();
+    assert_eq!(store.consumer_get("webhook:parked").unwrap(), Some(edge), "parked exactly at the edge");
+    assert!(!edge.expired_at(floor) && Cursor::new(floor - 1, 0).expired_at(floor));
+    store.consumer_set("webhook:behind", Cursor::new(floor - 1, 0), None).unwrap();
+    let lags = store.consumer_lags().unwrap();
+    let lag = |n: &str| lags.iter().find(|l| l.name == n).cloned().unwrap();
+    assert_eq!((lag("webhook:parked").cursor, lag("webhook:parked").expired), (edge, false), "{lags:?}");
+    assert!(lag("webhook:behind").expired, "{lags:?}");
+
+    assert!(store.consumer_delete("webhook:parked", None).unwrap());
+    assert!(!store.consumer_delete("webhook:parked", None).unwrap(), "already gone");
+    assert_eq!(store.consumer_get("webhook:parked").unwrap(), None);
+    assert!(store.consumer_lags().unwrap().iter().all(|l| l.name != "webhook:parked"));
+}
+
+#[test]
+fn memory_parked_and_deleted_consumers() {
+    parked_and_deleted_consumers(&Ontology::in_memory(Schema::enterprise()));
+}
+
+#[test]
+fn postgres_parked_and_deleted_consumers() {
+    let Some(pg) = common::TestTenant::new("parked") else { return };
+    parked_and_deleted_consumers(&pg.open(Schema::enterprise(), OntologyOptions::default()));
+}

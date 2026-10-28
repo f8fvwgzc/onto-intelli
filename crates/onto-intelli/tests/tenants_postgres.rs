@@ -404,6 +404,27 @@ async fn the_tenant_report_carries_outbound_counters() {
     let i = hub.tenant("a").await.unwrap();
     i.call(&admin, "entity.upsert", json!({ "id": "team:x", "title": "X" })).await.unwrap();
     let store = i.ontology().store().clone();
+    // An endpoint `ops` (the counters report only existing endpoints' cursors).
+    let ep = onto_intelli::webhooks::Endpoint {
+        name: "ops".into(),
+        url: "https://hooks.example.com/in".into(),
+        secret: onto_intelli::webhooks::SecretRef::Env("ONTO_TEST_UNSET_REPORT_SECRET".into()),
+        previous_secret: None,
+        previous_until: None,
+        filter: None,
+        principal: onto_intelli::core::policy::ScopePrincipal::new(vec![onto_intelli::Role::Viewer], vec!["*".into()]),
+        enabled: false,
+        paused: None,
+        restricted: false,
+        version: 1,
+        created_by: "ops".into(),
+        created_at: 0,
+        incarnation: String::new(),
+    };
+    let kv = vec![(onto_intelli::webhooks::NS_ENDPOINT.to_string(), "ops".to_string(), json!(ep))];
+    let ctx = onto_intelli::ActionContext::new(admin.clone(), "acme");
+    let ev = onto_intelli::core::outbox::ConfigEvent::new("webhook.add", Some("ops"), json!({}));
+    i.ontology().commit_config(&ctx, kv, ev).unwrap();
     store.consumer_set("webhook:ops", onto_intelli::core::Cursor::new(0, 0), None).unwrap();
     let mut y = i.ontology().get(&admin, "team:x").unwrap();
     y.id = "team:y".into();
@@ -412,7 +433,7 @@ async fn the_tenant_report_carries_outbound_counters() {
 
     assert!(hub.tenant_stats().iter().all(|t| t.outbound.is_none()));
     let h = hub.clone();
-    let report = tokio::task::spawn_blocking(move || h.tenant_report()).await.unwrap();
+    let report = h.tenant_report().await;
     assert_eq!(report.len(), 1);
     let o = report[0].outbound.as_ref().expect("counters");
     assert_eq!(o["lag"]["endpoints"]["ops"]["behind"].as_u64(), Some(head), "{o}");

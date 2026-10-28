@@ -189,6 +189,21 @@ pub struct Caller {
     /// Set when a session token (not a key or a config token) authenticated
     /// the request: a session it mints may not outlive it.
     pub session: Option<SessionInfo>,
+    /// The credential may address every tenant: a config token whose
+    /// `tenants` is `["*"]`, development mode, or a session not bound to a
+    /// tenant. Only such callers see the whole process (operators).
+    pub all_tenants: bool,
+}
+
+impl Caller {
+    /// An operator of the whole process: a privileged principal acting for
+    /// itself (no act-as) on a credential that may address every tenant.
+    pub fn is_operator(&self) -> bool {
+        self.all_tenants
+            && !self.credential.is_project()
+            && self.principal.is_privileged()
+            && self.principal.via.is_none()
+    }
 }
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -605,7 +620,8 @@ impl Auth {
                 }
                 None => Credential::Session,
             };
-            return Ok(Caller { principal: claims.principal, tenant, credential, session });
+            let all_tenants = claims.tenant.is_none() && claims.key.is_none();
+            return Ok(Caller { principal: claims.principal, tenant, credential, session, all_tenants });
         }
         if let Some(tok) = presented.filter(|t| t.starts_with(KEY_PREFIX)) {
             return self.key_caller(tok, h, tenant).await;
@@ -626,12 +642,13 @@ impl Auth {
             (None, Some(dev)) => (dev.clone(), true, Vec::new(), vec!["*".to_string()], Credential::Dev),
             (None, None) => return Err(AuthError::Unauthenticated("missing bearer token".into())),
         };
+        let all_tenants = tenants.iter().any(|t| t == "*");
         let tenant = token_tenant(&base.id, &tenants, tenant)?;
         // In dev mode anything goes; otherwise only the roles the token may grant.
         let limit = self.dev.is_none() || token.is_some();
         let mut principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
         principal.cause = inbound_cause(&credential, h);
-        Ok(Caller { principal, tenant, credential, session: None })
+        Ok(Caller { principal, tenant, credential, session: None, all_tenants })
     }
 
     /// A console session on the data plane: `x-onto-tenant` names a project
@@ -658,6 +675,7 @@ impl Auth {
             tenant: Some(project.r#ref),
             credential: Credential::Console { user: user.id, role, org: project.org_id },
             session: None,
+            all_tenants: false,
         })
     }
 
@@ -690,6 +708,7 @@ impl Auth {
             tenant: Some(project.r#ref.clone()),
             credential: Credential::ApiKey { id: key.id, prefix: key.prefix, project: project.r#ref },
             session: None,
+            all_tenants: false,
         })
     }
 

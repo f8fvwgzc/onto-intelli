@@ -185,7 +185,9 @@ async fn pg_a_shutdown_hands_leases_and_the_wake_scanner_to_another_instance_at_
     let released = a.shutdown(Duration::from_secs(10)).await;
     assert_eq!(released.leases, 2, "{released:?}");
     assert!(!a.wake_scanner_elected());
-    assert!(a.tenant("life").await.is_err(), "a stopping hub opens no tenant");
+    // Requests in flight are still served by the open tenant; none opens.
+    assert!(a.tenant("life").await.is_ok(), "an open tenant serves requests in flight");
+    assert!(a.tenant("life_other").await.is_err(), "a stopping hub opens no tenant");
     // B takes over at once: well within a second or two, not after 60 s.
     let handed = Instant::now();
     task(&tb, "b1").await; // wakes B's workers
@@ -215,4 +217,27 @@ async fn pg_a_shutdown_hands_leases_and_the_wake_scanner_to_another_instance_at_
     .execute(&pool)
     .await
     .unwrap();
+}
+
+/// Review finding CP-3: the shipped Docker Compose service waits longer
+/// than the default shutdown grace plus the releases before it kills the
+/// process (Docker's own default, 10 s, would kill it before any lease is
+/// given back), and the template says so.
+#[test]
+fn the_compose_stop_timeout_covers_the_shutdown_grace() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compose = std::fs::read_to_string(root.join("docker-compose.yml")).unwrap();
+    let service = compose.split("\n  onto:\n").nth(1).expect("the onto service");
+    let service = service.split("\n  db:\n").next().unwrap().split("\nvolumes:").next().unwrap();
+    let secs: u64 = service
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("stop_grace_period:"))
+        .expect("the onto service sets stop_grace_period")
+        .trim()
+        .trim_end_matches('s')
+        .parse()
+        .unwrap();
+    let grace = Config::default().grpc.shutdown_grace_secs;
+    assert!(secs >= grace + 5, "stop_grace_period {secs}s < shutdown_grace_secs {grace} + 5");
+    assert!(onto_intelli::config::EXAMPLE_CONFIG.contains("docker stop -t 30"));
 }

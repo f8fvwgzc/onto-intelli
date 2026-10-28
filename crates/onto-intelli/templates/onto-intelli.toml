@@ -112,8 +112,11 @@ proto_dirs = ["protos"]
 proto_files = ["acme/tickets/v1/tickets.proto"]
 # On SIGTERM or Ctrl-C: seconds for open connections and background workers to
 # finish before this process gives back its leases and claimed outbox rows (so a
-# replacement takes over at once) and exits. Keep it below the orchestrator's
-# termination grace period (Kubernetes: 30 s by default).
+# replacement takes over at once) and exits; connections still open then are
+# cut. Keep it at least 5 s below the orchestrator's stop timeout: Kubernetes
+# waits 30 s by default; `docker stop` and Docker Compose only 10 s (use
+# `docker stop -t 30`, or `stop_grace_period: 30s` as docker-compose.yml does,
+# or lower this). Killed before then, the process leaves its leases to expire.
 shutdown_grace_secs = 20
 
 # Map RPCs of your own protos onto engine actions (`onto actions` lists them).

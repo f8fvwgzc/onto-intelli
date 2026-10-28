@@ -640,6 +640,18 @@ impl Intelli {
                 }
                 let payload = json!({ "name": ep.name, "host": audit_host(&ep.url), "version": ep.version });
                 onto.commit_config(&ctx, kv, ConfigEvent::new(action, Some(&ep.principal_id()), payload))?;
+                // Its change cursor goes too, so the lag counters stop
+                // reporting it (an endpoint added later under this name
+                // starts at the head anyway). A fan-out round that read the
+                // endpoint before the removal may set it once more; the
+                // counters leave out the cursors of removed endpoints.
+                let store = onto.store();
+                if store.keeps_changes()
+                    && store.keeps_outbox()
+                    && let Err(e) = store.consumer_delete(&consumer_name(&ep.name), None)
+                {
+                    tracing::warn!(endpoint = %ep.name, "removing the endpoint's change cursor: {e}");
+                }
                 Ok(json!({
                     "removed": ep.name,
                     "note": "rows not yet sent to it are cancelled when the worker reaches them; an endpoint added \

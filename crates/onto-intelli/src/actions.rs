@@ -1429,7 +1429,7 @@ impl Intelli {
                 let i: crate::modeling::ApplyDraftIn = parse(action, input)?;
                 self.apply_ontology_draft(p, i).await
             }
-            "system.stats" => self.stats(),
+            "system.stats" => self.stats(p),
             "system.whoami" => {
                 let gov = &onto.options().governance;
                 Ok(json!({
@@ -1485,6 +1485,7 @@ impl Intelli {
                     )));
                 }
                 let mut page = store.trace_list(&q)?;
+                self.retain_worker_traces(p, &mut page.traces, |t| &t.principal);
                 if redact {
                     page.traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
                 }
@@ -1493,7 +1494,7 @@ impl Intelli {
             "trace.get" => {
                 let i: IdIn = parse(action, input)?;
                 let mut d = self.find_trace(&i.id)?;
-                check_trace_workspace(p, &d)?;
+                self.check_trace(p, &d)?;
                 if redact {
                     d.redact();
                 }
@@ -1517,6 +1518,7 @@ impl Intelli {
                 let i: SessionIn = parse(action, input)?;
                 let traces = store.trace_session(&i.id, i.limit.unwrap_or(onto_core::trace::DEFAULT_LIST))?;
                 let mut traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                self.retain_worker_traces(p, &mut traces, |t| &t.principal);
                 if redact {
                     traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
                 }
@@ -1532,6 +1534,32 @@ impl Intelli {
             }
             other => Err(Error::not_found(format!("action '{other}' (see system.actions)"))),
         }
+    }
+
+    /// Traces of the outbound workers (kinds `automation` and `delivery`,
+    /// principals `automation:`, `webhook:`, `writeback:`) are kept only for
+    /// callers who may see the run or the delivery itself: who dominate the
+    /// automation's `run_as` (as `automation.runs` shows runs), or who may
+    /// manage the endpoint or target (as `outbox.list` shows rows); those
+    /// of removed ones only for tenant-wide admins. Other traces stay.
+    fn retain_worker_traces<T>(&self, p: &Principal, rows: &mut Vec<T>, principal: impl Fn(&T) -> &String) {
+        if !rows.iter().any(|t| crate::intelli::OutboundScopes::is_worker(principal(t))) {
+            return;
+        }
+        let scopes = crate::intelli::OutboundScopes::load(self);
+        rows.retain(|t| scopes.worker(p, principal(t)));
+    }
+
+    /// The caller may read this trace: its workspace, and for a worker's
+    /// trace, its automation, endpoint or target
+    /// ([`retain_worker_traces`](Self::retain_worker_traces)).
+    fn check_trace(&self, p: &Principal, d: &TraceDetail) -> Result<()> {
+        check_trace_workspace(p, d)?;
+        let id = &d.trace.principal;
+        if crate::intelli::OutboundScopes::is_worker(id) && !crate::intelli::OutboundScopes::load(self).worker(p, id) {
+            return Err(Error::not_found(format!("trace {}", d.trace.id)));
+        }
+        Ok(())
     }
 
     /// A trace by id; when it is not stored yet, the queue is flushed and it
@@ -1582,7 +1610,7 @@ impl Intelli {
                 p.id
             )));
         }
-        check_trace_workspace(p, &d)?;
+        self.check_trace(p, &d)?;
         if let Some(s) = &i.span_id
             && !d.spans.iter().any(|x| &x.id == s)
         {

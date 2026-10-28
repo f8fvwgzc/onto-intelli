@@ -666,3 +666,32 @@ async fn delivery_traces_follow_traces_deliveries() {
     // The traceparent is sent all the same.
     assert!(rx.hits().iter().all(|h| h.headers.contains_key("traceparent")));
 }
+
+/// Review finding SEC-F2: a delivery trace shows only to callers who may
+/// manage its endpoint (as `outbox.list` shows its rows), whatever
+/// workspace the row was filed under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_traces_show_only_to_callers_who_may_manage_the_endpoint() {
+    let rx = Receiver::start(vec![]).await;
+    let i = open(|c| c.traces.deliveries = "all".into()).await;
+    let mut ep = endpoint("hr-ops", &rx.url("/"), secret_file("hr-ops", SECRET));
+    ep.principal = ScopePrincipal::new(vec![Role::Viewer], vec!["acme".into(), "hr".into()]);
+    put(&i, &ep);
+    let id = test_delivery(&i, "hr-ops");
+    wait_state(&i, &id, OutboxState::Delivered).await;
+    let traces = delivery_traces(&i).await;
+    assert_eq!(traces.len(), 1);
+    let trace_id = traces[0]["trace"]["id"].as_str().unwrap().to_string();
+    assert_eq!(traces[0]["trace"]["workspace"], "acme");
+
+    let sa = Principal::new("sa", vec![Role::Admin], vec!["acme".into()]);
+    let rows = i.call(&sa, "outbox.list", json!({})).await.unwrap();
+    assert_eq!(rows["hidden"], 1, "{rows}");
+    let list = i.call(&sa, "trace.list", json!({ "kind": "delivery" })).await.unwrap();
+    assert_eq!(list["traces"], json!([]), "{list}");
+    let e = i.call(&sa, "trace.get", json!({ "id": trace_id })).await.unwrap_err();
+    assert!(e.to_string().contains("not found"), "{e}");
+    let both = Principal::new("both", vec![Role::Admin], vec!["acme".into(), "hr".into()]);
+    let list = i.call(&both, "trace.list", json!({ "kind": "delivery", "workspace": "acme" })).await.unwrap();
+    assert_eq!(list["traces"].as_array().map(Vec::len), Some(1), "{list}");
+}

@@ -53,6 +53,20 @@ impl Cursor {
     pub fn new(seq: u64, n: u32) -> Self {
         Self { seq, n }
     }
+
+    /// The position just before the floor's commit (the oldest records
+    /// kept). A consumer at or after it has missed nothing retention
+    /// removed; where a consumer resumes after its gap is handled.
+    pub fn floor_edge(floor: u64) -> Self {
+        if floor == 0 { Self::default() } else { Self::new(floor - 1, u32::MAX) }
+    }
+
+    /// Retention removed records a consumer at this cursor had not read:
+    /// it is below [`floor_edge`](Self::floor_edge). The rule the fan-out,
+    /// the automation consumer and [`ConsumerLag::expired`] share.
+    pub fn expired_at(self, floor: u64) -> bool {
+        self < Self::floor_edge(floor)
+    }
 }
 
 impl fmt::Display for Cursor {
@@ -562,7 +576,9 @@ pub struct ConsumerLag {
     /// When the cursor last moved (store clock; `None` where the store does not keep it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
-    /// The cursor is below the floor: retention removed what it had not read.
+    /// The cursor is below the floor's edge ([`Cursor::expired_at`]):
+    /// retention removed what it had not read. A consumer parked at the
+    /// edge after its gap was handled is not expired.
     #[serde(default, skip_serializing_if = "is_false")]
     pub expired: bool,
 }

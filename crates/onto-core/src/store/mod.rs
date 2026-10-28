@@ -406,6 +406,12 @@ pub trait Store: Send + Sync {
     fn consumer_set(&self, _name: &str, _cursor: Cursor, _fence: Option<&Fence>) -> Result<()> {
         Err(no_leases())
     }
+    /// Forget the consumer `name` (its subscription was removed); with a
+    /// fence, only while that lease is held at its epoch. Returns whether
+    /// it existed.
+    fn consumer_delete(&self, _name: &str, _fence: Option<&Fence>) -> Result<bool> {
+        Err(no_leases())
+    }
     /// Every consumer's cursor and how far it is behind the head, by name
     /// (at most [`MAX_LAG_CONSUMERS`]). One lookup per consumer, never a
     /// scan of the feed.
@@ -1125,6 +1131,14 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn consumer_delete(&self, name: &str, fence: Option<&Fence>) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if let Some(f) = fence {
+            inner.check_fence(f)?;
+        }
+        Ok(inner.consumers.remove(name).is_some())
+    }
+
     fn consumer_lags(&self) -> Result<Vec<ConsumerLag>> {
         let inner = self.inner.lock();
         let now = now_ms();
@@ -1143,7 +1157,7 @@ impl Store for MemoryStore {
                     behind: inner.seq.saturating_sub(cursor.seq),
                     age_ms: oldest.map_or(0, |ts| now.saturating_sub(ts).max(0)),
                     updated_at: None,
-                    expired: cursor.seq < inner.floor,
+                    expired: cursor.expired_at(inner.floor),
                 }
             })
             .collect())

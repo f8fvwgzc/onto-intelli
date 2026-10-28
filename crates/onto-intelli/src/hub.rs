@@ -149,9 +149,38 @@ pub struct TenantStat {
     pub ring_bytes: u64,
     /// [`Intelli::outbound_counters`]: outbox rows per state, change lag,
     /// gaps, runs and paused counts. Only [`Hub::tenant_report`] reads
-    /// them (they cost a few index reads per tenant).
+    /// them: about eight store round trips per tenant (`{"timed_out":
+    /// true}` when they take longer than [`REPORT_TENANT_TIMEOUT`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound: Option<serde_json::Value>,
+}
+
+/// Tenants whose outbound counters [`Hub::tenant_report`] reads at once.
+pub const REPORT_CONCURRENCY: usize = 8;
+/// Longest [`Hub::tenant_report`] waits for one tenant's outbound counters.
+pub const REPORT_TENANT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `f` over `items` on blocking threads, at most `limit` at a time, each
+/// given up after `timeout` (`None`; its thread finishes on its own). In
+/// the order of `items`.
+async fn each_bounded<T, R>(
+    items: Vec<T>,
+    limit: usize,
+    timeout: Duration,
+    f: impl Fn(T) -> R + Clone + Send + 'static,
+) -> Vec<Option<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    use futures::StreamExt as _;
+    futures::stream::iter(items.into_iter().map(|t| {
+        let f = f.clone();
+        async move { tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || f(t))).await.ok()?.ok() }
+    }))
+    .buffered(limit.max(1))
+    .collect()
+    .await
 }
 
 pub struct Hub {
@@ -298,10 +327,21 @@ impl Hub {
             return Err(Error::invalid(format!("invalid tenant id '{id}' (letters, digits, '_', '-', '.')")));
         }
         self.check_reserved(id)?;
-        if self.stopping.load(Ordering::SeqCst) {
-            return Err(Error::Unavailable("the server is shutting down; retry on another replica".into()));
-        }
-        let slot = self.tenants.lock().entry(id.to_string()).or_insert_with(Slot::new).clone();
+        let slot = {
+            let mut tenants = self.tenants.lock();
+            if self.stopping.load(Ordering::SeqCst) {
+                // Draining: tenants already open keep serving the requests
+                // still in flight (until the process exits); none opens.
+                match tenants.get(id) {
+                    Some(s) if s.cell.initialized() => s.clone(),
+                    _ => {
+                        return Err(Error::Unavailable("the server is shutting down; retry on another replica".into()));
+                    }
+                }
+            } else {
+                tenants.entry(id.to_string()).or_insert_with(Slot::new).clone()
+            }
+        };
         slot.last_used.store(now_ms(), Ordering::Relaxed);
         let opened = !slot.cell.initialized();
         let intelli = slot.cell.get_or_try_init(|| self.open_tenant(id)).await.cloned();
@@ -603,18 +643,32 @@ impl Hub {
 
     /// The open tenants with their estimated memory, largest first.
     pub fn tenant_stats(&self) -> Vec<TenantStat> {
-        self.stats_of_open(false)
+        self.open_stats().into_iter().map(|(s, _)| s).collect()
     }
 
     /// [`tenant_stats`](Self::tenant_stats) with each tenant's outbound
     /// counters (docs/design/EVENTS.md section 11), for `GET
-    /// /v1/admin/tenants`. It reads the store: call it off the async
-    /// workers (`spawn_blocking`).
-    pub fn tenant_report(&self) -> Vec<TenantStat> {
-        self.stats_of_open(true)
+    /// /v1/admin/tenants`. Each tenant's counters are read on a blocking
+    /// thread, [`REPORT_CONCURRENCY`] tenants at a time; a tenant whose
+    /// counters take longer than [`REPORT_TENANT_TIMEOUT`] reports
+    /// `{"timed_out": true}`, so the report never waits on one slow store.
+    pub async fn tenant_report(&self) -> Vec<TenantStat> {
+        let open = self.open_stats();
+        let intellis: Vec<Arc<Intelli>> = open.iter().map(|(_, i)| i.clone()).collect();
+        let counters =
+            each_bounded(intellis, REPORT_CONCURRENCY, REPORT_TENANT_TIMEOUT, |i: Arc<Intelli>| i.outbound_counters())
+                .await;
+        open.into_iter()
+            .zip(counters)
+            .map(|((mut stat, _), c)| {
+                stat.outbound = Some(c.unwrap_or_else(|| serde_json::json!({ "timed_out": true })));
+                stat
+            })
+            .collect()
     }
 
-    fn stats_of_open(&self, outbound: bool) -> Vec<TenantStat> {
+    /// The open tenants' in-memory stats (no store reads), largest first.
+    fn open_stats(&self) -> Vec<(TenantStat, Arc<Intelli>)> {
         let now = now_ms();
         let open: Vec<(String, i64, Arc<Intelli>)> = self
             .tenants
@@ -622,11 +676,11 @@ impl Hub {
             .iter()
             .filter_map(|(k, s)| s.cell.get().map(|i| (k.clone(), s.last_used.load(Ordering::Relaxed), i.clone())))
             .collect();
-        let mut out: Vec<TenantStat> = open
+        let mut out: Vec<(TenantStat, Arc<Intelli>)> = open
             .into_iter()
             .map(|(tenant, used, i)| {
                 let (entities, links) = i.ontology().counts();
-                TenantStat {
+                let stat = TenantStat {
                     tenant,
                     estimated_bytes: i.estimated_bytes(),
                     entities,
@@ -634,11 +688,12 @@ impl Hub {
                     idle_ms: now - used,
                     streams: i.changes().subscribers(),
                     ring_bytes: i.changes().bytes() as u64,
-                    outbound: outbound.then(|| i.outbound_counters()),
-                }
+                    outbound: None,
+                };
+                (stat, i)
             })
             .collect();
-        out.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes).then_with(|| a.tenant.cmp(&b.tenant)));
+        out.sort_by(|(a, _), (b, _)| b.estimated_bytes.cmp(&a.estimated_bytes).then_with(|| a.tenant.cmp(&b.tenant)));
         out
     }
 
@@ -750,5 +805,34 @@ fn pg_options(cfg: &Config) -> onto_core::store::PgOptions {
         max_connections: pg.max_connections,
         connect_timeout: std::time::Duration::from_secs(pg.connect_timeout_secs),
         listen: true,
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use std::time::{Duration, Instant};
+
+    /// The tenant report reads tenants concurrently (bounded) and gives up
+    /// on a slow one instead of waiting for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenants_are_read_concurrently_and_a_slow_one_times_out() {
+        let t0 = Instant::now();
+        let out = super::each_bounded((0..16u64).collect(), 8, Duration::from_secs(5), |n| {
+            std::thread::sleep(Duration::from_millis(100));
+            n * 2
+        })
+        .await;
+        assert_eq!(out, (0..16u64).map(|n| Some(n * 2)).collect::<Vec<_>>(), "in order, all read");
+        // One after another would take 1.6 s; eight at a time take ~0.2 s.
+        assert!(t0.elapsed() < Duration::from_millis(1000), "{:?}", t0.elapsed());
+
+        let t0 = Instant::now();
+        let out = super::each_bounded(vec![0u64, 1], 2, Duration::from_millis(200), |n| {
+            std::thread::sleep(Duration::from_millis(if n == 1 { 2_000 } else { 1 }));
+            n
+        })
+        .await;
+        assert_eq!(out, vec![Some(0), None]);
+        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
     }
 }

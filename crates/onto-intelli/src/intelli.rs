@@ -572,25 +572,60 @@ impl Intelli {
         Paused { automations_enabled, automations, endpoints, endpoints_total }
     }
 
-    /// The outbound counters of docs/design/EVENTS.md section 11, for
-    /// `system.stats` and `GET /v1/admin/tenants`: outbox rows per target
+    /// The outbound counters of docs/design/EVENTS.md section 11, as an
+    /// operator sees them (`GET /v1/admin/tenants`): outbox rows per target
     /// and state (pending, inflight, retry, dead; each counted up to
-    /// [`STATS_COUNT_CAP`](onto_core::outbox::STATS_COUNT_CAP)) and open
+    /// [`OUTBOX_STATS_CAP`](onto_core::outbox::OUTBOX_STATS_CAP)) and open
     /// rows per target, how far each change consumer is behind (per
     /// consumer, and per webhook endpoint), gap records over 24 hours with
-    /// the latest, and runs per state over the last hour. Every count reads
-    /// an index range bounded by its cap, never a whole table. A store error
-    /// leaves the field `null`.
+    /// the latest, and runs per state over the last hour. Every count is
+    /// bounded by its cap, never a whole table: it reads an index range, and
+    /// on an outbox not vacuumed since its rows last changed also up to the
+    /// cap of heap rows per target and state. A store error leaves the
+    /// field `null`. Consumers of removed endpoints are left out.
+    /// `system.stats` shows [`outbound_stats_for`](Self::outbound_stats_for).
     pub fn outbound_stats(&self) -> Value {
-        use onto_core::outbox::STATS_COUNT_CAP;
+        self.outbound_view(None)
+    }
+
+    /// [`outbound_stats`](Self::outbound_stats) as `p` may see it
+    /// (`system.stats`): admins who are not agents see the endpoints and
+    /// writeback targets they may manage (whose principal they dominate),
+    /// the change consumers of those endpoints and, tenant-wide admins only,
+    /// every other consumer and what removed endpoints and targets left;
+    /// they also see the runs per state. Everyone else sees the open outbox
+    /// total and the gap counts, never a name, cursor or per-target count.
+    pub fn outbound_stats_for(&self, p: &Principal) -> Value {
+        self.outbound_view(Some(p))
+    }
+
+    fn outbound_view(&self, p: Option<&Principal>) -> Value {
+        use onto_core::outbox::{OUTBOX_STATS_CAP, STATS_COUNT_CAP};
         let store = self.onto.store();
+        let admin = p.is_none_or(|p| p.is_privileged() && !p.is_agent());
+        let scopes = OutboundScopes::load(self);
+        // Operators (no principal) see everything a tenant-wide admin does.
+        let sees_target = |name: &str| p.is_none_or(|p| scopes.outbox_target(p, name));
+        let mut hidden = 0usize;
         let clock = store.clock_ms().unwrap_or_else(|_| onto_core::time::now_ms());
-        let by_state = store.keeps_outbox().then(|| store.outbox_state_counts(STATS_COUNT_CAP).ok()).flatten();
+        let by_state = store.keeps_outbox().then(|| store.outbox_state_counts(OUTBOX_STATS_CAP).ok()).flatten();
+        let mut open_total = 0u64;
+        let mut hidden_targets = std::collections::HashSet::new();
         let (open, outbox) = match by_state {
             Some(rows) => {
                 let mut open = serde_json::Map::new();
                 let mut targets = serde_json::Map::new();
                 for (target, state, n) in rows {
+                    if state.is_open() {
+                        open_total += n;
+                    }
+                    if !admin {
+                        continue;
+                    }
+                    if !sees_target(&target) {
+                        hidden_targets.insert(target);
+                        continue;
+                    }
                     if state.is_open() {
                         let o = open.entry(target.clone()).or_insert(json!(0));
                         *o = json!(o.as_u64().unwrap_or(0) + n);
@@ -598,11 +633,12 @@ impl Intelli {
                     let t = targets.entry(target).or_insert_with(|| json!({}));
                     t[state.as_str()] = json!(n);
                 }
-                (Some(open), Some(json!({ "cap": STATS_COUNT_CAP, "targets": targets })))
+                (Some(open), Some(json!({ "cap": OUTBOX_STATS_CAP, "targets": targets })))
             }
             None => (None, None),
         };
-        let lag = store.keeps_changes().then(|| store.consumer_lags().ok()).flatten().map(|lags| {
+        hidden += hidden_targets.len();
+        let lag = (admin && store.keeps_changes()).then(|| store.consumer_lags().ok()).flatten().map(|lags| {
             let mut consumers = serde_json::Map::new();
             let mut endpoints = serde_json::Map::new();
             for l in lags {
@@ -614,7 +650,18 @@ impl Intelli {
                     "expired": l.expired,
                 });
                 if let Some(ep) = l.name.strip_prefix(crate::webhooks::CONSUMER_PREFIX) {
+                    // The cursor of a removed endpoint is no consumer at all.
+                    if !scopes.has_endpoint(ep) {
+                        continue;
+                    }
+                    if !p.is_none_or(|p| scopes.endpoint(p, ep)) {
+                        hidden += 1;
+                        continue;
+                    }
                     endpoints.insert(ep.to_string(), v.clone());
+                } else if !p.is_none_or(OutboundScopes::everywhere) {
+                    hidden += 1;
+                    continue;
                 }
                 consumers.insert(l.name, v);
             }
@@ -625,6 +672,13 @@ impl Intelli {
             .then(|| store.gap_stats(clock - GAP_WINDOW_MS, STATS_COUNT_CAP).ok())
             .flatten()
             .map(|g| json!({ "count": g.count, "capped": g.capped, "latest": g.latest }));
+        if !admin {
+            return json!({
+                "outbox_open_total": store.keeps_outbox().then_some(open_total),
+                "gaps_24h": gaps,
+                "note": "per-target outbox counts, change lag and runs are shown to admins",
+            });
+        }
         let runs =
             store.keeps_runs().then(|| store.runs_state_counts(clock - 3_600_000, RUNS_COUNT_CAP).ok()).flatten().map(
                 |rows| {
@@ -634,7 +688,13 @@ impl Intelli {
                     json!({ "states": states, "counted": counted, "capped": counted >= RUNS_COUNT_CAP as u64 })
                 },
             );
-        json!({ "outbox_open": open, "outbox": outbox, "lag": lag, "gaps_24h": gaps, "runs_1h": runs })
+        let mut v = json!({ "outbox_open": open, "outbox": outbox, "lag": lag, "gaps_24h": gaps, "runs_1h": runs });
+        if hidden > 0 {
+            // Targets and consumers of endpoints, targets and automations the
+            // caller may not manage.
+            v["hidden"] = json!(hidden);
+        }
+        v
     }
 
     /// [`outbound_stats`](Self::outbound_stats) with the paused automations
@@ -1584,7 +1644,9 @@ impl Intelli {
         }
     }
 
-    pub fn stats(&self) -> Result<Value> {
+    /// `system.stats` as `p` may see it (the outbound counters are scoped:
+    /// [`outbound_stats_for`](Self::outbound_stats_for)).
+    pub fn stats(&self, p: &Principal) -> Result<Value> {
         let llm = self.llm();
         Ok(json!({
             "version": crate::VERSION,
@@ -1604,7 +1666,7 @@ impl Intelli {
                 "available": llm.unavailable().is_none(),
                 "unavailable_reason": llm.unavailable(),
             },
-            "outbound": self.outbound_stats(),
+            "outbound": self.outbound_stats_for(p),
             "workers": self.worker_rounds(),
             "ledger": self.ledger(),
             "caches": {
@@ -1701,5 +1763,87 @@ fn open_store(cfg: &Config) -> Result<Arc<dyn Store>> {
             Ok(Arc::new(onto_core::store::PgStore::connect(&cfg.engine.resolve_database_url()?, &pg.tenant, opts)?))
         }
         other => Err(Error::Config(format!("unknown engine.storage '{other}' (postgres, memory)"))),
+    }
+}
+
+/// Who may see what of the outbound workers (docs/design/EVENTS.md 6.1): a
+/// webhook endpoint's or writeback target's counters and traces go to
+/// callers who dominate its principal (who may manage it), an automation's
+/// to callers who dominate its `run_as` (as `automation.runs` shows runs);
+/// those of removed ones to tenant-wide admins only. A list that fails to
+/// load leaves its names to tenant-wide admins.
+pub(crate) struct OutboundScopes {
+    endpoints: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    targets: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    automations: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    /// The endpoint list loaded (otherwise no consumer is taken for a
+    /// removed endpoint's).
+    endpoints_known: bool,
+}
+
+impl OutboundScopes {
+    pub(crate) fn load(i: &Intelli) -> Self {
+        let onto = i.ontology();
+        let listed = crate::webhooks::Endpoint::list(onto);
+        let endpoints_known = listed.is_ok();
+        let endpoints = listed.unwrap_or_default().into_iter().map(|e| (e.name.clone(), e.principal.clone())).collect();
+        let targets = crate::writeback::Target::list(onto)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.name.clone(), t.scope()))
+            .collect();
+        let automations = onto.schema().automations.iter().map(|(n, d)| (n.clone(), d.run_as.clone())).collect();
+        Self { endpoints, targets, automations, endpoints_known }
+    }
+
+    /// A privileged caller of every workspace who is not an agent.
+    pub(crate) fn everywhere(p: &Principal) -> bool {
+        p.is_privileged() && !p.is_agent() && p.workspaces.iter().any(|w| w == "*")
+    }
+
+    fn sees(p: &Principal, scope: Option<&onto_core::policy::ScopePrincipal>) -> bool {
+        match scope {
+            Some(sp) => onto_core::policy::dominates(p, sp),
+            None => Self::everywhere(p),
+        }
+    }
+
+    /// The endpoint exists (or the list could not be read).
+    pub(crate) fn has_endpoint(&self, name: &str) -> bool {
+        !self.endpoints_known || self.endpoints.contains_key(name)
+    }
+
+    pub(crate) fn endpoint(&self, p: &Principal, name: &str) -> bool {
+        Self::sees(p, self.endpoints.get(name))
+    }
+
+    /// An outbox target name: an endpoint's, a writeback target's, or both.
+    pub(crate) fn outbox_target(&self, p: &Principal, name: &str) -> bool {
+        match (self.endpoints.get(name), self.targets.get(name)) {
+            (None, None) => Self::everywhere(p),
+            (e, t) => e.is_none_or(|sp| Self::sees(p, Some(sp))) && t.is_none_or(|sp| Self::sees(p, Some(sp))),
+        }
+    }
+
+    /// A trace or record of the principal `id`: a worker's
+    /// (`automation:<name>`, `webhook:<name>`, `writeback:<name>`) only as
+    /// its automation, endpoint or target says; any other principal's, yes.
+    pub(crate) fn worker(&self, p: &Principal, id: &str) -> bool {
+        if let Some(n) = id.strip_prefix(onto_core::automate::PRINCIPAL_PREFIX) {
+            Self::sees(p, self.automations.get(n))
+        } else if let Some(n) = id.strip_prefix(crate::webhooks::CONSUMER_PREFIX) {
+            Self::sees(p, self.endpoints.get(n))
+        } else if let Some(n) = id.strip_prefix("writeback:") {
+            Self::sees(p, self.targets.get(n))
+        } else {
+            true
+        }
+    }
+
+    /// A worker principal id (see [`worker`](Self::worker)).
+    pub(crate) fn is_worker(id: &str) -> bool {
+        id.starts_with(onto_core::automate::PRINCIPAL_PREFIX)
+            || id.starts_with(crate::webhooks::CONSUMER_PREFIX)
+            || id.starts_with("writeback:")
     }
 }

@@ -373,3 +373,21 @@ async fn an_evicted_tenant_ends_its_streams_and_leaves_one_ontology() {
     assert_eq!(again.changes().subscribers(), 0);
     assert_eq!(hub.open_tenants(), vec!["t"]);
 }
+
+/// While a shutdown drains, a tenant that is already open keeps serving
+/// the requests still in flight; only opening a tenant is refused.
+#[tokio::test]
+async fn a_draining_hub_serves_open_tenants_and_opens_none() {
+    let mut cfg = Config::in_memory();
+    cfg.engine.tenancy = "multi".into();
+    let hub = Hub::open(cfg).await.unwrap();
+    let open = hub.resolve(None).await.unwrap();
+    hub.tenant("ws_a").await.unwrap();
+    hub.begin_shutdown();
+    let again = hub.resolve(None).await.expect("the open default tenant still serves");
+    assert!(std::sync::Arc::ptr_eq(&open, &again));
+    assert!(hub.tenant("ws_a").await.is_ok(), "an open tenant still serves");
+    let Err(refused) = hub.tenant("ws_new").await else { panic!("no tenant opens while draining") };
+    assert!(matches!(refused, onto_intelli::Error::Unavailable(_)), "{refused}");
+    assert!(!hub.open_tenants().contains(&"ws_new".to_string()), "a refused tenant leaves no slot");
+}

@@ -955,7 +955,7 @@ async fn stats_health_and_tenant_report_show_lag_gaps_and_outbox_states() {
     assert_eq!(o["gaps_24h"]["latest"]["touched"], 1, "{s}");
     assert_eq!(o["outbox"]["targets"]["ops"], json!({ "dead": 1, "pending": 1 }), "{s}");
     assert_eq!(o["outbox_open"]["ops"], 1, "{s}");
-    assert_eq!(o["outbox"]["cap"], onto_intelli::core::outbox::STATS_COUNT_CAP, "{s}");
+    assert_eq!(o["outbox"]["cap"], onto_intelli::core::outbox::OUTBOX_STATS_CAP, "{s}");
 
     let h = ok(&i, &admin(), "system.health", json!({})).await;
     let g = &h["outbound"]["changes"]["latest_gap"];
@@ -964,7 +964,7 @@ async fn stats_health_and_tenant_report_show_lag_gaps_and_outbox_states() {
 
     let hub = onto_intelli::Hub::single(i.clone());
     assert!(hub.tenant_stats()[0].outbound.is_none(), "only the report reads the store");
-    let report = tokio::task::spawn_blocking(move || hub.tenant_report()).await.unwrap();
+    let report = hub.tenant_report().await;
     let t = report[0].outbound.as_ref().expect("the tenant's counters");
     let tep = &t["lag"]["endpoints"]["ops"];
     assert_eq!((&tep["behind"], &tep["cursor"]), (&ep["behind"], &ep["cursor"]), "{t}");
@@ -1047,4 +1047,132 @@ async fn a_run_is_traced_and_continues_the_trace_of_its_trigger() {
     assert_eq!(effects, vec!["effect.action:resolve", "effect.webhook:ops"]);
     let text = d.to_string();
     assert!(!text.contains("Issue 1") && !text.contains("auto: ") && !text.contains(SECRET), "{text}");
+}
+
+/// Review finding SEC-F2: an automation's trace shows only to callers who
+/// may see its run (who dominate its `run_as`), as `automation.runs` does,
+/// even though it is filed under the trigger's workspace.
+#[tokio::test]
+async fn automation_traces_show_only_to_callers_who_dominate_the_run_principal() {
+    let i = open(|_| {}).await;
+    let mut def = resolve_blocked(false);
+    def["run_as"] = json!({ "roles": ["member"], "workspaces": ["acme", "hr"] });
+    define(&i, "xws", def).await;
+    issue(&i, "1", "triaged", "high").await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "xws" })).await;
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    i.flush_traces().await;
+    let all = ok(&i, &admin(), "trace.list", json!({ "kind": "automation" })).await;
+    let traces = all["traces"].as_array().unwrap();
+    assert_eq!(traces.len(), 1, "{all}");
+    let id = traces[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(traces[0]["workspace"], "acme");
+
+    let sa = Principal::new("sa", vec![Role::Admin], vec!["acme".into()]);
+    let runs = ok(&i, &sa, "automation.runs", json!({ "name": "xws" })).await;
+    assert_eq!((runs["items"].as_array().map(Vec::len), runs["hidden"].as_u64()), (Some(0), Some(1)), "{runs}");
+    let theirs = ok(&i, &sa, "trace.list", json!({ "kind": "automation" })).await;
+    assert_eq!(theirs["traces"], json!([]), "{theirs}");
+    let e = i.call(&sa, "trace.get", json!({ "id": id })).await.unwrap_err();
+    assert!(e.to_string().contains("not found"), "{e}");
+    let observer = Principal::new("obs", vec![Role::Custom("observer".into())], vec!["acme".into()]);
+    let seen = ok(&i, &observer, "trace.list", json!({ "kind": "automation" })).await;
+    assert_eq!(seen["traces"], json!([]), "{seen}");
+    // An admin of every workspace it runs in sees it.
+    let both = Principal::new("both", vec![Role::Admin], vec!["acme".into(), "hr".into()]);
+    let seen = ok(&i, &both, "trace.list", json!({ "kind": "automation", "workspace": "acme" })).await;
+    assert_eq!(seen["traces"].as_array().map(Vec::len), Some(1), "{seen}");
+    ok(&i, &both, "trace.get", json!({ "id": id })).await;
+}
+
+/// Review finding SEC-F3: `system.stats` shows the outbound counters by
+/// what the caller may manage: viewers and agents see totals only, a
+/// workspace admin sees the endpoints it dominates and their consumers.
+#[tokio::test]
+async fn system_stats_scopes_the_outbound_counters_to_the_caller() {
+    use onto_intelli::core::outbox::{OutboxKind, OutboxRow, SOURCE_TEST};
+    let i = open(|_| {}).await;
+    for (name, ws) in [("payroll-export", json!(["hr"])), ("sales-feed", json!(["sales"]))] {
+        ok(
+            &i,
+            &admin(),
+            "webhook.add",
+            json!({ "name": name, "url": "https://hooks.example.com/in", "secret": SECRET,
+                    "filter": { "kinds": "issue" }, "principal": { "roles": ["viewer"], "workspaces": ws } }),
+        )
+        .await;
+    }
+    let store = i.ontology().store().clone();
+    store.consumer_set("billing-sync", Default::default(), None).unwrap();
+    let row = |t: &str| OutboxRow::new(OutboxKind::Webhook, t, format!("d-{t}"), SOURCE_TEST, "acme", "x");
+    store.outbox_enqueue(&[row("payroll-export"), row("sales-feed")], None, None).unwrap();
+    issue(&i, "1", "triaged", "high").await;
+
+    // A tenant-wide admin sees everything.
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    let o = &s["outbound"];
+    assert!(o["lag"]["consumers"]["billing-sync"].is_object(), "{o}");
+    assert!(o["lag"]["endpoints"]["payroll-export"].is_object(), "{o}");
+    assert_eq!(o["outbox_open"], json!({ "payroll-export": 1, "sales-feed": 1 }), "{o}");
+    assert!(o.get("hidden").is_none(), "{o}");
+
+    // Viewers and agents: totals, never a name, cursor or per-target count.
+    for p in [Principal::viewer("vic", "sales"), Principal::new("bot", vec![Role::Agent], vec!["sales".into()])] {
+        let s = ok(&i, &p, "system.stats", json!({})).await;
+        let o = &s["outbound"];
+        let text = o.to_string();
+        for name in ["payroll-export", "sales-feed", "billing-sync", "webhook:"] {
+            assert!(!text.contains(name), "{} sees {name}: {o}", p.id);
+        }
+        assert_eq!(o["outbox_open_total"], 2, "{o}");
+        assert!(o["gaps_24h"].is_object(), "{o}");
+    }
+
+    // An admin of sales: its endpoint and consumer, nothing of hr's.
+    let sa = Principal::new("sa", vec![Role::Admin], vec!["sales".into()]);
+    let s = ok(&i, &sa, "system.stats", json!({})).await;
+    let o = &s["outbound"];
+    let text = o.to_string();
+    assert!(!text.contains("payroll-export") && !text.contains("billing-sync"), "{o}");
+    assert_eq!(o["outbox_open"], json!({ "sales-feed": 1 }), "{o}");
+    assert!(o["lag"]["endpoints"]["sales-feed"].is_object(), "{o}");
+    assert!(o["lag"]["consumers"]["webhook:sales-feed"].is_object(), "{o}");
+    assert_eq!(o["hidden"], 3, "payroll-export's target and consumer, billing-sync: {o}");
+}
+
+/// Review finding OBS-1: removing an endpoint removes its change cursor,
+/// so the lag counters stop reporting it; a cursor left behind (a fan-out
+/// round that raced the removal, or an older build) is left out too.
+#[tokio::test]
+async fn a_removed_endpoint_leaves_the_lag_counters() {
+    let i = open(|_| {}).await;
+    let add = || {
+        json!({ "name": "ops", "url": "https://hooks.example.com/in", "secret": SECRET,
+                "filter": { "kinds": "issue" }, "principal": { "roles": ["member"], "workspaces": ["acme"] } })
+    };
+    ok(&i, &admin(), "webhook.add", add()).await;
+    let store = i.ontology().store().clone();
+    assert!(store.consumer_get("webhook:ops").unwrap().is_some());
+    ok(&i, &admin(), "webhook.remove", json!({ "name": "ops" })).await;
+    assert_eq!(store.consumer_get("webhook:ops").unwrap(), None, "the cursor went with the endpoint");
+    for k in ["1", "2", "3"] {
+        issue(&i, k, "triaged", "high").await;
+    }
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    let lag = &s["outbound"]["lag"];
+    assert_eq!(lag["endpoints"], json!({}), "{s}");
+    assert!(lag["consumers"].get("webhook:ops").is_none(), "{s}");
+
+    // A cursor written back after the removal is not reported either.
+    store.consumer_set("webhook:ops", Default::default(), None).unwrap();
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    assert!(s["outbound"]["lag"]["consumers"].get("webhook:ops").is_none(), "{s}");
+    let hub = onto_intelli::Hub::single(i.clone());
+    let report = hub.tenant_report().await;
+    assert_eq!(report[0].outbound.as_ref().unwrap()["lag"]["endpoints"], json!({}));
+    // Added again under the name: it starts at the head and is reported.
+    ok(&i, &admin(), "webhook.add", add()).await;
+    let s = ok(&i, &admin(), "system.stats", json!({})).await;
+    assert_eq!(s["outbound"]["lag"]["endpoints"]["ops"]["age_ms"], 0, "{s}");
 }

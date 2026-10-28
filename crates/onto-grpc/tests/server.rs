@@ -467,6 +467,14 @@ async fn start_hub() -> (SocketAddr, oneshot::Sender<()>) {
             impersonate_roles: Vec::new(),
             tenants: vec!["ws_a".into()],
         },
+        onto_intelli::config::TokenConfig {
+            token: Some("operator-token-for-tests".into()),
+            token_env: None,
+            principal: onto_intelli::Principal::admin("operator"),
+            impersonate: true,
+            impersonate_roles: vec![onto_intelli::Role::Admin],
+            tenants: vec!["*".into()],
+        },
     ];
     let hub = onto_intelli::Hub::open(cfg).await.unwrap();
     seed::load_demo(&hub.tenant("ws_a").await.unwrap(), "acme").await.unwrap();
@@ -875,6 +883,14 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
             impersonate_roles: Vec::new(),
             tenants: vec!["ws_a".into()],
         },
+        onto_intelli::config::TokenConfig {
+            token: Some("operator-token-for-tests".into()),
+            token_env: None,
+            principal: onto_intelli::Principal::admin("operator"),
+            impersonate: true,
+            impersonate_roles: vec![onto_intelli::Role::Admin],
+            tenants: vec!["*".into()],
+        },
     ];
     let hub = onto_intelli::Hub::open(cfg).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1026,7 +1042,7 @@ async fn admin_tenants_report_outbound_counters() {
     let http = reqwest::Client::new();
     let r: Value = http
         .get(format!("http://{addr}/v1/admin/tenants"))
-        .bearer_auth("tenant-a-only-token")
+        .bearer_auth("operator-token-for-tests")
         .send()
         .await
         .unwrap()
@@ -1051,4 +1067,113 @@ async fn admin_tenants_report_outbound_counters() {
         .await
         .unwrap();
     assert_eq!(denied.status(), 403);
+}
+
+/// An admin token limited to some tenants is not an operator: the report
+/// would show other tenants' endpoint, target and consumer names and
+/// counts, which every per-tenant route refuses it. Neither is an admin
+/// acting for someone else, nor a session bound to one tenant.
+#[tokio::test]
+async fn admin_tenants_is_refused_to_credentials_limited_to_some_tenants() {
+    let (addr, _stop) = start_hub().await;
+    let http = reqwest::Client::new();
+    let status = |token: &'static str, act: Option<(&'static str, &'static str)>| {
+        let http = http.clone();
+        async move {
+            let mut rq = http.get(format!("http://{addr}/v1/admin/tenants")).bearer_auth(token);
+            if let Some((who, roles)) = act {
+                rq = rq.header("x-onto-act-as", who).header("x-onto-act-roles", roles);
+            }
+            let r = rq.send().await.unwrap();
+            let code = r.status().as_u16();
+            (code, r.text().await.unwrap())
+        }
+    };
+    let (code, body) = status("tenant-a-only-token", None).await;
+    assert_eq!(code, 403, "{body}");
+    assert!(!body.contains("ws_a"), "{body}");
+    let (code, body) = status("operator-token-for-tests", Some(("alice", "admin"))).await;
+    assert_eq!(code, 403, "acting for someone else: {body}");
+    let (code, body) = status("operator-token-for-tests", None).await;
+    assert_eq!(code, 200, "{body}");
+
+    // A session minted by the operator token is bound to one tenant.
+    let minted: Value = http
+        .post(format!("http://{addr}/v1/auth/session"))
+        .bearer_auth("operator-token-for-tests")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = minted["token"].as_str().expect("a session").to_string();
+    let r = http.get(format!("http://{addr}/v1/admin/tenants")).bearer_auth(token).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+}
+
+/// A graceful shutdown with a request whose body is still arriving: one
+/// that completes within the grace period is served by its open tenant (no
+/// 503), and one still open at the deadline is cut, so it is never served
+/// after `run_graceful` returned and released the leases.
+#[tokio::test]
+async fn graceful_shutdown_serves_requests_in_flight_and_cuts_the_rest_at_the_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve(grace: std::time::Duration) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let hub = onto_intelli::Hub::open(Config::in_memory()).await.unwrap();
+        hub.resolve(None).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = onto_grpc::ServeOptions { dev: true, ..Default::default() };
+        let server = onto_grpc::prepare(hub, opts, listener).await.unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+        let run = tokio::spawn(async move {
+            server
+                .run_graceful(
+                    async {
+                        let _ = rx.await;
+                    },
+                    grace,
+                )
+                .await
+                .unwrap();
+        });
+        (addr, tx, run)
+    }
+    const HEAD: &str = "POST /v1/call/system.health HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{";
+
+    // Completed within the grace period: served.
+    let (addr, stop, run) = serve(std::time::Duration::from_secs(5)).await;
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(HEAD.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.write_all(b"}").await.unwrap();
+    let mut out = vec![0u8; 4096];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut out)).await.unwrap().unwrap();
+    let text = String::from_utf8_lossy(&out[..n]).to_string();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    drop(c);
+    tokio::time::timeout(std::time::Duration::from_secs(10), run).await.unwrap().unwrap();
+
+    // Still open at the deadline: cut, never answered afterwards.
+    let (addr, stop, run) = serve(std::time::Duration::from_secs(1)).await;
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(HEAD.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t0 = std::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), run).await.unwrap().unwrap();
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4), "{:?}", t0.elapsed());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = c.write_all(b"}").await;
+    let mut out = vec![0u8; 4096];
+    match tokio::time::timeout(std::time::Duration::from_secs(3), c.read(&mut out)).await {
+        Ok(Ok(n)) => assert_eq!(n, 0, "answered after the cut: {}", String::from_utf8_lossy(&out[..n])),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("the connection was neither cut nor answered"),
+    }
 }

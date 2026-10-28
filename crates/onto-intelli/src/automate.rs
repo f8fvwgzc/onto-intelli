@@ -201,7 +201,7 @@ const RERUN_GRACE_MS: i64 = 10_000;
 
 /// The position just before the floor's commit (the oldest records kept).
 fn floor_edge(floor: u64) -> Cursor {
-    if floor == 0 { Cursor::default() } else { Cursor::new(floor - 1, u32::MAX) }
+    Cursor::floor_edge(floor)
 }
 
 /// One automation taking part in a round.
