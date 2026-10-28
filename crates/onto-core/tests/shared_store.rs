@@ -250,3 +250,26 @@ fn history_is_append_only() {
     let msg = res.unwrap_err().to_string();
     assert!(msg.contains("append-only"), "{msg}");
 }
+
+/// Expired KV rows of one namespace go; live ones and other namespaces stay.
+fn purge_suite(store: &dyn onto_core::store::Store) {
+    let now = onto_core::time::now_ms();
+    for (ns, key, exp) in [("auth.revoked", "old", Some(now - 1_000)), ("auth.revoked", "live", Some(now + 600_000))]
+        .into_iter()
+        .chain([("auth.revoked", "kept", None), ("other", "old", Some(now - 1_000))])
+    {
+        store.kv_put(ns, key, &json!(1), exp).unwrap();
+    }
+    assert_eq!(store.kv_purge_expired("auth.revoked").unwrap(), 1);
+    let keys: Vec<String> = store.kv_scan("auth.revoked", "").unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, ["kept", "live"]);
+    assert_eq!(store.kv_purge_expired("other").unwrap(), 1, "the other namespace was left alone");
+    assert_eq!(store.kv_purge_expired("auth.revoked").unwrap(), 0);
+}
+
+#[test]
+fn expired_kv_rows_are_purged_one_namespace_at_a_time() {
+    purge_suite(&onto_core::store::MemoryStore::default());
+    let Some(pg) = common::TestTenant::new("kv_purge") else { return };
+    purge_suite(&pg.store());
+}

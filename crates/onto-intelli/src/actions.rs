@@ -54,7 +54,10 @@ pub const RAW_WRITES: &[&str] = &[
 /// types (plan, risk, confirmation by a person), proposals instead of
 /// direct schema changes, their own memory and trace scores. Every other
 /// write action of [`ACTIONS`] is refused to agents, so a write action added
-/// later is closed to them until it is listed here.
+/// later is closed to them until it is listed here. `connector.crawl` is
+/// listed though it writes catalog entities and links without action types:
+/// it needs an admin, and it syncs what a registered source says rather
+/// than what the caller writes.
 pub const AGENT_WRITES: &[&str] = &[
     "action.apply",
     "action.undo",

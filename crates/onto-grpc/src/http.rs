@@ -36,7 +36,7 @@
 //! * `GET  /v1/packs`           industry packs; `GET /v1/packs/{id}` one pack with its lint
 //! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
 //! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose,
-//!   and never write a sample)
+//!   and write a sample only with `governance.agent_raw_writes`)
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
 //!   A session minting a session cannot outlive itself and belongs to the same login (`sid`);
@@ -44,7 +44,8 @@
 //!   `DELETE` signs out: it revokes the presented session's login, every session minted in it.
 //! * `POST /v1/auth/session/revoke`  `{jti}`: a config token revokes a session it minted, and every
 //!   session minted from that one (a `sid` works too): whatever the tenant for a token of every
-//!   tenant (`"*"`), in its own tenants for a token limited to some (the answer lists them)
+//!   tenant (`"*"`), in all of its own tenants for a token limited to some (the answer lists them;
+//!   with several, the request still names one with `x-onto-tenant`)
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
 //! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits

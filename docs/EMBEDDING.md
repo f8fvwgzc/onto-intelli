@@ -159,16 +159,26 @@ map, schema editor and proposals inbox ([UI.md](UI.md)):
   impersonating token plus `{act_as, roles, entity, tenant}`) and hands it to
   the iframe with `postMessage` (`onto:session`). The answer carries the
   session's `jti`: `POST /v1/auth/session/revoke {jti}` (the backend's
-  token, with or without `x-onto-tenant`) revokes it and every session
-  minted from it, `DELETE /v1/auth/session` (the session itself) signs out
-  its whole login, on every replica within 10 seconds. A session may mint
-  another one, which never outlives it and carries the same `sid`; that
-  one mints no further sessions (403). A token limited to some tenants
-  revokes an id for the sessions of those tenants only (the answer lists
-  them). The id carries the session's expiry, so the revocation lasts
-  exactly as long as the session would have, whatever
-  `auth.session_max_ttl_secs` is set to later; `expires_at` matters only
-  for ids without one (minted by earlier builds).
+  token) revokes it and every session minted from it, `DELETE
+  /v1/auth/session` (the session itself) signs out its whole login, on
+  every replica within 10 seconds. A session may mint another one, which
+  never outlives it and carries the same `sid`; that one mints no further
+  sessions (403). A token for every tenant (`"*"`) revokes an id with or
+  without `x-onto-tenant`. A token limited to some tenants revokes it for
+  the sessions of all of its tenants only (the answer lists them; tenant
+  ids are compared as their schema names are, ignoring case and `-`, `.`,
+  `_`); with one tenant it needs no `x-onto-tenant`, with several it must
+  name one of them (403 otherwise), as for any request. The id carries the
+  session's expiry: the revocation lasts until that expiry plus 60
+  seconds, whatever `auth.session_max_ttl_secs` is set to later (and at
+  most a year ahead, unless sessions may live longer); `expires_at`
+  matters only for ids without one (minted by earlier builds).
+- Upgrading from an earlier build: replicas still on it ignore revocations
+  limited to some tenants, so during a rolling deploy (or after rolling
+  back) such a revoke holds only on upgraded replicas; a token for every
+  tenant is not affected. Sessions minted by earlier builds from a
+  session that was itself minted from a session are not cut off by
+  revoking the middle one: revoke the login's `sid` instead.
 - Signing out from any session of a login ends the whole login (the
   session it was minted from and its other sessions too): the user signs
   out, not one copy of a token, and every session of a login is the same

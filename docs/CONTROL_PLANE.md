@@ -683,7 +683,9 @@ to the key's project, its credential is the key's (so the project-call
 guard applies), and it is refused as soon as the key is revoked, expires or
 its project is deleted (checked through the key cache, without the secret,
 since the session's HMAC already proves it). Console sessions cannot mint
-sessions (403).
+sessions (403), nor can a session minted from another session (403): only
+the first session of a login mints, so revoking any session's `jti` leaves
+no session minted from it behind (docs/EMBEDDING.md section 4).
 
 Validation when a key is created: a name of 1 to 100 printable characters,
 at least one scope, workspaces non-empty names without commas (default

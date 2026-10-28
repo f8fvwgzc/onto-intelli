@@ -1252,6 +1252,23 @@ impl Store for PgStore {
         })
     }
 
+    fn kv_purge_expired(&self, ns: &str) -> Result<u64> {
+        let pool = self.pool.clone();
+        let tk = self.t("kv");
+        let ns = ns.to_string();
+        self.block(async move {
+            let deleted = sqlx::query(sql(format!(
+                "DELETE FROM {tk} WHERE ns = $1 AND expires_at IS NOT NULL AND expires_at <= $2"
+            )))
+            .bind(&ns)
+            .bind(now_ms())
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            Ok(deleted)
+        })
+    }
+
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>> {
         let pool = self.pool.clone();
         let tk = self.t("kv");

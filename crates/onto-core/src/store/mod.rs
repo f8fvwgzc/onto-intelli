@@ -261,6 +261,13 @@ pub trait Store: Send + Sync {
     fn kv_delete(&self, ns: &str, key: &str) -> Result<()>;
     /// All live entries of a namespace whose key starts with `prefix`, key order.
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>>;
+    /// Delete the expired entries of a namespace; how many. Reads skip them
+    /// anyway: this only keeps a namespace that nothing reads back whole
+    /// from growing. Stores that keep no expired rows need not.
+    fn kv_purge_expired(&self, ns: &str) -> Result<u64> {
+        let _ = ns;
+        Ok(0)
+    }
     fn stats(&self) -> Result<StoreStats>;
     /// Version history of one entity, newest first.
     fn versions(&self, id: &str, limit: usize) -> Result<Vec<VersionRecord>>;
@@ -451,6 +458,15 @@ impl Store for MemoryStore {
             map.remove(key);
         }
         Ok(())
+    }
+
+    fn kv_purge_expired(&self, ns: &str) -> Result<u64> {
+        let now = now_ms();
+        let mut inner = self.inner.lock();
+        let Some(map) = inner.kv.get_mut(ns) else { return Ok(0) };
+        let before = map.len();
+        map.retain(|_, (_, exp)| exp.is_none_or(|e| e > now));
+        Ok((before - map.len()) as u64)
     }
 
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>> {

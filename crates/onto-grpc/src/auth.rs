@@ -74,6 +74,11 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 /// verified just before the expiry still finds it.
 pub const REVOCATION_GRACE_SECS: u64 = 60;
 
+/// The furthest ahead a revocation is kept, unless `session_max_ttl_secs`
+/// is longer: an id may claim any expiry, and a revocation that never
+/// expires would never be deleted.
+pub const REVOCATION_MAX_SECS: u64 = 366 * 24 * 3600;
+
 /// Where revoked session ids are kept, shared by every replica and by every
 /// tenant (a session id names no tenant): the default tenant's KV store,
 /// namespace [`crate::REVOKED_NS`], until `exp` (Unix seconds).
@@ -370,16 +375,20 @@ impl Auth {
     /// [`REVOCATION_GRACE_SECS`]: the same clock that expires the session
     /// drops the revocation, whatever `session_max_ttl_secs` is now. Ids
     /// minted before carry no expiry: those stay revoked until `exp_hint`,
-    /// and at least as long as a session minted now could live.
+    /// and at least as long as a session minted now could live. Never
+    /// further ahead than [`REVOCATION_MAX_SECS`] (or `session_max_ttl_secs`
+    /// when longer).
     pub async fn revoke_session(&self, id: &str, tenants: Option<&[String]>, exp_hint: u64) -> Result<()> {
         let r = self.revocations.read().clone();
         let Some(r) = r else {
             return Err(Error::Unavailable("this server keeps no session revocations".into()));
         };
+        let now = now_secs();
         let until = match id_expiry(id) {
             Some(exp) => exp.saturating_add(REVOCATION_GRACE_SECS),
-            None => exp_hint.max(now_secs() + self.session_max_ttl),
-        };
+            None => exp_hint.max(now + self.session_max_ttl),
+        }
+        .min(now + self.session_max_ttl.max(REVOCATION_MAX_SECS) + REVOCATION_GRACE_SECS);
         r.revoke(id, tenants, until).await?;
         let mut cache = self.revoked.lock();
         match tenants {
@@ -419,7 +428,9 @@ impl Auth {
         if cache.len() > 100_000 {
             cache.retain(|_, (r, at)| *r || now.duration_since(*at) < REVOCATION_TTL);
         }
-        cache.insert(key, (revoked, now));
+        // A revoke on this replica may have cached `true` while this read
+        // was in flight: a revocation is never taken back.
+        cache.entry(key).and_modify(|e| *e = (e.0 || revoked, now)).or_insert((revoked, now));
         Ok(revoked)
     }
 
@@ -815,9 +826,16 @@ fn new_jti(exp: u64) -> String {
 }
 
 /// The key of a revocation that holds for the sessions of one tenant only.
-/// Session ids never contain `@`.
+/// Session ids never contain `@`. The tenant is reduced as its schema name
+/// is (lowercase, `[a-z0-9_]`; `onto_core::store::tenant_schema`), so ids
+/// that would share a schema share revocations too.
 pub(crate) fn scoped_id(id: &str, tenant: Option<&str>) -> String {
-    format!("{id}@{}", tenant.unwrap_or_default())
+    let tenant: String = tenant
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    format!("{id}@{tenant}")
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1001,6 +1019,85 @@ mod tests {
         let bearer = format!("Bearer {token}");
         let refused = now.authenticate(&headers(&[("authorization", &bearer)])).await;
         assert!(matches!(refused, Err(AuthError::Unauthenticated(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn ids_without_an_expiry_keep_the_floor_and_no_revocation_is_kept_forever() {
+        let a = auth();
+        let recorded = Arc::new(Recorded::default());
+        a.set_revocations(recorded.clone());
+        let max_ttl = config().session_max_ttl_secs;
+        let before = now_secs();
+        a.revoke_session("an-id-minted-before", None, 1).await.unwrap();
+        let until = recorded.0.lock()[0].2;
+        assert!((before + max_ttl..=now_secs() + max_ttl).contains(&until), "as long as a session minted now: {until}");
+        // Any expiry, from the caller or in the id, is capped (no wrap past i64 either).
+        a.revoke_session("another-id", None, u64::MAX).await.unwrap();
+        a.revoke_session(&format!("x.{}", u64::MAX), None, 0).await.unwrap();
+        let cap = now_secs() + max_ttl.max(REVOCATION_MAX_SECS) + REVOCATION_GRACE_SECS;
+        for (id, _, until) in recorded.0.lock()[1..].iter() {
+            assert!(*until <= cap && *until > now_secs() + REVOCATION_MAX_SECS - 60, "{id}: {until}");
+        }
+    }
+
+    /// A store that cannot be read.
+    struct Unreadable;
+
+    impl Revocations for Unreadable {
+        fn revoke<'a>(&'a self, _: &'a str, _: Option<&'a [String]>, _: u64) -> BoxFuture<'a, ()> {
+            Box::pin(async { Err(Error::Unavailable("down".into())) })
+        }
+
+        fn is_revoked<'a>(&'a self, _: &'a str, _: Option<&'a str>) -> BoxFuture<'a, bool> {
+            Box::pin(async { Err(Error::Unavailable("down".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_is_refused_when_revocations_cannot_be_read() {
+        let a = auth();
+        a.set_revocations(Arc::new(Unreadable));
+        let (token, _) = a.issue_session(Principal::viewer("u", "acme"), Some("acme".into()), 600);
+        let bearer = format!("Bearer {token}");
+        let refused = a.authenticate(&headers(&[("authorization", &bearer)])).await;
+        assert!(matches!(refused, Err(AuthError::Unavailable(_))), "503, not accepted: {refused:?}");
+    }
+
+    /// Answers "not revoked", once let through.
+    struct Slow(tokio::sync::Semaphore, tokio::sync::Notify);
+
+    impl Revocations for Slow {
+        fn revoke<'a>(&'a self, _: &'a str, _: Option<&'a [String]>, _: u64) -> BoxFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_revoked<'a>(&'a self, _: &'a str, _: Option<&'a str>) -> BoxFuture<'a, bool> {
+            Box::pin(async move {
+                self.1.notify_one();
+                let _ = self.0.acquire().await.unwrap();
+                Ok(false)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_in_flight_never_takes_back_a_revocation_made_here() {
+        let a = Arc::new(auth());
+        let slow = Arc::new(Slow(tokio::sync::Semaphore::new(0), tokio::sync::Notify::new()));
+        a.set_revocations(slow.clone());
+        let (token, s) = a.issue_session_from(Principal::viewer("u", "acme"), Some("acme".into()), 600, None);
+        let bearer = format!("Bearer {token}");
+        // A request reads the store; meanwhile this replica revokes the session for acme.
+        let first = tokio::spawn({
+            let (a, bearer) = (a.clone(), bearer.clone());
+            async move { a.authenticate(&headers(&[("authorization", &bearer)])).await.is_ok() }
+        });
+        slow.1.notified().await;
+        a.revoke_session(s.jti.as_deref().unwrap(), Some(&["acme".to_string()]), 0).await.unwrap();
+        slow.0.add_permits(100);
+        assert!(first.await.unwrap(), "the request in flight read the store before the revoke");
+        let next = a.authenticate(&headers(&[("authorization", &bearer)])).await;
+        assert!(matches!(next, Err(AuthError::Unauthenticated(_))), "{next:?}");
     }
 
     #[tokio::test]
@@ -1210,7 +1307,16 @@ mod tests {
             }
             // Operators are not limited.
             let mut input = add(kind, private);
-            assert!(guard_project_call(&Credential::Config, "connector.add", &mut input, false).await.is_ok());
+            assert!(
+                guard_project_call(
+                    &Credential::Config { tenants: vec!["*".into()] },
+                    "connector.add",
+                    &mut input,
+                    false
+                )
+                .await
+                .is_ok()
+            );
         }
     }
 

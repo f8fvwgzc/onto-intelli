@@ -67,23 +67,44 @@ pub const REVOKED_NS: &str = "auth.revoked";
 /// the sessions' tenants, kept until the sessions would have expired: every
 /// replica sees them. A revocation for every tenant is keyed by the id; one
 /// for the sessions of some tenants (a service token limited to them) by
-/// `<id>@<tenant>`, once per tenant.
+/// `<id>@<tenant>`, once per tenant. Expired rows are deleted at most every
+/// [`PRUNE_EVERY_MS`], by the revoke that finds them due.
 ///
 /// Session authentication in every tenant therefore reads the default
 /// tenant. That is kept on purpose: every tenant lives in the same database,
 /// so the default tenant is as reachable as the session's own; a failed read
 /// refuses the session (503) rather than accepting it; and reads are cached
-/// ([`auth::REVOCATION_TTL`]), one indexed KV read per session id at most
-/// every 10 seconds.
-struct HubRevocations(std::sync::Weak<Hub>);
+/// ([`auth::REVOCATION_TTL`]): two primary-key reads (the id, the id for
+/// the session's tenant) per session id at most every 10 seconds.
+struct HubRevocations {
+    hub: std::sync::Weak<Hub>,
+    /// When expired rows were last deleted (Unix ms).
+    pruned: std::sync::atomic::AtomicI64,
+}
+
+/// How often a revoke deletes the expired revocations.
+const PRUNE_EVERY_MS: i64 = 10 * 60 * 1000;
 
 impl HubRevocations {
+    fn new(hub: &Arc<Hub>) -> Self {
+        Self { hub: Arc::downgrade(hub), pruned: std::sync::atomic::AtomicI64::new(0) }
+    }
+
     /// The default tenant's: one place for every tenant's sessions, so a
     /// revocation never depends on the tenant the caller happened to name.
     async fn store(&self) -> Result<Arc<dyn onto_intelli::core::store::Store>> {
-        let hub = self.0.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
+        let hub = self.hub.upgrade().ok_or_else(|| Error::Unavailable("the server is shutting down".into()))?;
         let intelli = hub.resolve(None).await?;
         Ok(intelli.ontology().store().clone())
+    }
+
+    /// Whether this revoke deletes the expired rows: once per [`PRUNE_EVERY_MS`].
+    fn prune_due(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let now = onto_intelli::core::time::now_ms();
+        let last = self.pruned.load(Ordering::Relaxed);
+        now - last >= PRUNE_EVERY_MS
+            && self.pruned.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 }
 
@@ -100,11 +121,16 @@ impl auth::Revocations for HubRevocations {
                 None => vec![id.to_string()],
                 Some(tenants) => tenants.iter().map(|t| auth::scoped_id(id, Some(t))).collect(),
             };
-            let until = (exp as i64).saturating_mul(1000);
+            let until = i64::try_from(exp).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
+            let prune = self.prune_due();
             tokio::task::spawn_blocking(move || {
                 keys.iter().try_for_each(|key| {
                     store.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
-                })
+                })?;
+                if prune && let Err(e) = store.kv_purge_expired(REVOKED_NS) {
+                    tracing::warn!("deleting expired session revocations: {e}");
+                }
+                Ok(())
             })
             .await
             .map_err(|e| Error::Other(format!("revoking a session: {e}")))?
@@ -119,9 +145,9 @@ impl auth::Revocations for HubRevocations {
         Box::pin(async move {
             let store = self.store().await?;
             let (id, scoped) = (id.to_string(), auth::scoped_id(id, tenant));
-            // One read for both: the id, and the id for this tenant.
+            // Two primary-key reads: the id, and the id for this tenant.
             tokio::task::spawn_blocking(move || {
-                store.kv_scan(REVOKED_NS, &id).map(|rows| rows.iter().any(|(key, _)| *key == id || *key == scoped))
+                Ok(store.kv_get(REVOKED_NS, &id)?.is_some() || store.kv_get(REVOKED_NS, &scoped)?.is_some())
             })
             .await
             .map_err(|e| Error::Other(format!("reading revocations: {e}")))?
@@ -139,7 +165,7 @@ pub async fn router_hub(hub: Arc<Hub>, opts: &ServeOptions) -> Result<(axum::Rou
     let cfg = hub.config().clone();
     let table = Arc::new(RouteTable::build(&cfg)?);
     let auth = Arc::new(auth::Auth::from_config_with(&cfg.auth, opts.dev, opts.control.clone())?);
-    auth.set_revocations(Arc::new(HubRevocations(Arc::downgrade(&hub))));
+    auth.set_revocations(Arc::new(HubRevocations::new(&hub)));
     let mut router = axum::Router::new();
     if cfg.grpc.reflection {
         let builder = || {

@@ -363,6 +363,15 @@ async fn packs_install_by_role() {
     assert_eq!(i.ontology().revision(), before, "the agent wrote nothing");
     let sampled = ok(&i, &admin(), "pack.install", json!({ "id": "manufacturing", "sample": true })).await;
     assert!(sampled["sample_entities"].as_u64().unwrap() > 0, "{sampled}");
+    // governance.agent_raw_writes opts agents back in.
+    let mut cfg = Config::in_memory();
+    cfg.engine.default_workspace = "acme".into();
+    cfg.governance.agent_raw_writes = true;
+    let open = Intelli::open(cfg).await.unwrap();
+    seed::load_demo(&open, "acme").await.unwrap();
+    ok(&open, &admin(), "pack.install", json!({ "id": "manufacturing" })).await;
+    let by_agent = ok(&open, &bot, "pack.install", json!({ "id": "manufacturing", "sample": true })).await;
+    assert!(by_agent["sample_entities"].as_u64().unwrap() > 0, "{by_agent}");
     let packs = ok(&i, &admin(), "pack.list", json!({})).await;
     let m = packs["items"].as_array().unwrap().iter().find(|p| p["id"] == "manufacturing").unwrap().clone();
     assert_eq!(m["installed"], true);
