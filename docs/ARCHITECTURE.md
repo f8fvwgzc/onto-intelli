@@ -231,7 +231,17 @@ holds the graph lock for long. Delivery concurrency limits are per process.
 A graceful shutdown (`Hub::begin_shutdown`, then `finish_shutdown`) ends
 streams with a final frame, lets workers finish their round, and releases
 the leases (fenced by epoch), claimed rows and wake scanner lock it holds,
-so the next process takes over at once instead of when the leases expire.
+so the next process takes over at once instead of when the leases expire
+(0.28 s from start to delivering a change made while it was down, in the
+docs run).
+
+**Outbound work continues the caller's trace.** A call's W3C trace id (its
+`traceparent`, else the trace that recorded it) travels on the principal
+into change records and outbox rows; runs continue their trigger's. Every
+webhook and writeback request sends it as `traceparent`, delivery attempts
+and runs become traces of kind `delivery` and `automation`, and the section
+11 counters (change lag, gaps, outbox states, runs) read capped index
+ranges into `system.stats`, `system.health` and `GET /v1/admin/tenants`.
 
 ## Performance notes
 

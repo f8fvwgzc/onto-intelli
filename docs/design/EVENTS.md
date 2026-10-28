@@ -1323,6 +1323,11 @@ commit.
 - Should `entity.hidden` also be sent for link records whose end becomes hidden (phase 1: no)?
 - `changes_meta.floor` reports a false `reset` at the exact retention edge; acceptable, or add an
   end-of-seq cursor form?
+- `automation` traces carry the time they were written and durations of 0 (seen on PostgreSQL in
+  docs run 2; see the build notes): both stores' `run_claim` set `started_at` on the stored row and
+  return only ids, so the `RunRow` the consumer executes and traces keeps `started_at = 0`, and
+  `run_trace` falls back to the process clock at trace time. Return the claim's `started_at`, or
+  build the trace from the stored row?
 
 ---
 
@@ -1711,6 +1716,7 @@ Build step 13 (docs):
   measured. In `--remote` mode the CLI prints a server error's code twice (`error: permission
   denied: permission denied: …`, `error: invalid: invalid: …`): `remote_error` wraps the
   server's message, which already starts with the code, in an `Error` whose display adds it again.
+  All four are fixed since (the items below and "Docs run 2"); docs run 2 shows each working.
 - Fixed after step 13 (delivery benchmark): `onto-bench --delivery` sends to a local HTTP receiver
   on 127.0.0.1 with 1, 10 and 50 endpoints (`--endpoints`), timing commit to receiver with one
   task per commit and during a burst of `--rows` deliveries (20,000), and the burst's rows per
@@ -1772,6 +1778,9 @@ Traces (after step 13; B.7 and section 11):
   the trigger's cursor, op and kind (no entity id: observers see attributes unredacted), and a
   child span per effect holds its index, kind, target, ok, receipt and outbox id, never its plan
   or payload. The run's reason and effect errors are error texts.
+  Not as built (docs run 2): the times are meant to be the run's store-clock start and end, but
+  the traced `RunRow` has `started_at = 0`, so the trace's time is when it was written and its
+  durations are 0 (section 18).
 - Tests: `onto-core` `runs::tests::runs_continue_the_trace_of_their_trigger_else_their_own`;
   `onto-intelli` `webhooks.rs` (`a_call_continues_its_trace_into_the_test_delivery`,
   `delivery_traces_hold_no_secret_signature_body_or_referenced_url`,
@@ -1830,3 +1839,26 @@ Counters (after step 13; section 11):
   `onto-intelli` `automate.rs` (`stats_health_and_tenant_report_show_lag_gaps_and_outbox_states`)
   and `tenants_postgres.rs` (`the_tenant_report_carries_outbound_counters`); `onto-grpc`
   `server.rs` (`admin_tenants_report_outbound_counters`).
+
+Docs run 2 (after the finishing work):
+
+- docs/AUTOMATE.md was brought up to date from a second run of a debug `onto serve` (tenant
+  `docsrun2`, `127.0.0.1:50072`, `[traces] deliveries = "all"`) with the local receiver, against
+  PostgreSQL in Docker; blocks from it are marked "(run 2)". Shown working: `traceparent` on all 11
+  requests the receiver got (change rows, the automation's webhook effect and the writeback),
+  continuing the caller's `traceparent` trace or else the trace recording the call, with
+  `cause.trace_id` in the change records and a span per attempt (a `gap` row went out under its
+  attempt's own trace id); delivery traces with their `http.post` span, a failed one's error
+  without the URL, and an automation trace with a span per effect; `system.health` with the latest
+  gap, `system.stats` (lag, outbox states, gaps, runs) as the operator and as an agent (totals
+  only), and `GET /v1/admin/tenants` (operator; 403 for the agent); SIGTERM ending an open stream
+  with `tenant_closed` and releasing both leases (the process was gone 0.03 s after the signal),
+  and a restart whose fan-out delivered a change made while it was stopped 0.28 s after the start
+  (0.09 s after "listening"; 18 to 49 s in the step 13 run); remote CLI errors printed with their
+  code once; `writeback.add` refusals naming `base_url`; the `automation.test {"id"}` refusal.
+- The step 13 statements that `traceparent` is not sent, that a restart waits for leases to expire
+  and that the CLI prints the code twice are removed from docs/AUTOMATE.md.
+- Found, not fixed: `automation` traces carry the time they were written and durations of 0 (the
+  run took 10 ms by its row); see section 18. And `trace.list {otel_trace_id}` finds a call only
+  when its caller sent `traceparent` (a call recorded without one has no `otel_trace_id`; its own
+  id is the one passed on): docs/AUTOMATE.md said it always finds the call, now corrected.

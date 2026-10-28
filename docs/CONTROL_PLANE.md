@@ -1291,7 +1291,14 @@ As built:
   automation's `run_as` (as `automation.runs`), or who may manage the
   endpoint or target (as `outbox.list`); those of removed ones only to
   tenant-wide admins. `trace.list` and `trace.session` leave the others
-  out, and `trace.get` answers `not_found`.
+  out, and `trace.get` answers `not_found`. So `trace.list
+  {otel_trace_id}` lists a call's runs and deliveries; it lists the call
+  as well only when the caller sent `traceparent` (otherwise the call's
+  own trace id is the one passed on, found with `trace.get`). Known gap
+  (docs run 2, not fixed): an `automation` trace's `ts` is when it was
+  written and its durations are 0, since the traced run row lacks the
+  claim's `started_at`; the run row has the run's times. docs/AUTOMATE.md
+  section 5 shows these traces from a real run.
 * `eval.run`: each case is a trace of kind `eval` named `eval.case`
   (`metadata.case` is the case's name, tag `eval`, the session and source
   of the caller) with an `eval.pass` score (1 or 0, `source = "eval"`,

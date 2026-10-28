@@ -250,7 +250,12 @@ process takes over at once. A process that is killed leaves them to expire
 `shutdown_grace_secs` plus 5 s (`docker stop` waits only 10 s by default;
 docker-compose.yml sets `stop_grace_period: 30s`). Either way consumers resume from their cursors in
 `consumers` and runs claimed under an older epoch are recovered, so nothing
-is skipped.
+is skipped. A released row keeps its holder and epoch; only `until` moves to
+just before the database clock's now, so the next holder takes it with the
+next epoch. In the docs run (docs/AUTOMATE.md, "A restart") both rows read
+`until` about 0.6 s in the past right after SIGTERM, and the restarted
+process held them at epoch 2 and delivered a change made while it was down
+0.28 s after it started.
 
 **Retention.** One task per open tenant, 5 minutes after it opens and then
 hourly, trims: change records by `[changes] retain_days` (7) and

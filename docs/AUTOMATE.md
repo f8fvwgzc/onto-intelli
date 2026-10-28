@@ -41,6 +41,15 @@ synchronous external effects, SQL writeback and `changes.snapshot`.
   32 random bytes). A server without `ONTO_MASTER_KEY` has no sealer, so
   plaintext and generated secrets are refused there; the operator registers
   references instead.
+- Blocks marked **(run 2)** come from a second run the same day, made after
+  the finishing work (`traceparent`, delivery and automation traces, the
+  section 11 counters, graceful shutdown, CLI error text): the same machine,
+  database and kind of debug build, `onto serve` on `127.0.0.1:50072`, tenant
+  `docsrun2`, the same receiver on `127.0.0.1:18092`, the same entities and
+  definitions, and one more setting, `[traces] deliveries = "all"`, so that
+  delivered attempts are traced too (the default, `failures`, traces only
+  attempts that end in `retry` or `dead`). Everything else is from the first
+  run; ids differ between the two.
 
 The parts of the scratch configuration that matter here:
 
@@ -69,6 +78,10 @@ cidrs = ["127.0.0.1/32"]
 
 [writeback]
 enabled = true
+
+# Run 2 only: trace every delivery attempt, not only failed ones.
+[traces]
+deliveries = "all"
 ```
 
 Without the `[[webhooks.allow]]` rule the receiver is refused, as any
@@ -144,12 +157,19 @@ A new subscription starts at the head of the feed (`"cursor": "3.0"` in
 
 ### A change and its signed CloudEvent
 
+**(run 2)** The caller sends its own W3C `traceparent`, as a service that is
+itself traced would (`onto do set_state item=issue:pay-1 state=in_progress`
+makes the same change without one):
+
 ```text
-$ onto do set_state item=issue:pay-1 state=in_progress
-applied set_state act_1a181d9add30000099dea
-  • update issue:pay-1: state triaged → in_progress
-  • record event state.changed on issue:pay-1
-  risk low · reversible
+$ curl -i -X POST -H "authorization: Bearer $ONTO_TOKEN" -H 'content-type: application/json' \
+    -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+    http://127.0.0.1:50072/v1/call/action.apply \
+    -d '{"action":"set_state","params":{"item":"issue:pay-1","state":"in_progress"}}'
+HTTP/1.1 200 OK
+x-onto-trace-id: 49d39136d70cd48df382cdbe662f7c55
+
+{"action":"set_state","actor":"operator","id":"act_1a182b04ecf00000dc679",…,"preview":["update issue:pay-1: state triaged → in_progress","record event state.changed on issue:pay-1"],…,"risk":"low",…,"status":"applied",…}
 ```
 
 What the receiver got (headers, then the body):
@@ -157,26 +177,27 @@ What the receiver got (headers, then the body):
 ```text
 POST /hooks/ops
 content-type: application/cloudevents+json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-4ef45a2c00000001-01
 user-agent: onto-intelli/0.2.0
-webhook-id: obx_1a181d9adee00000d6e50
-webhook-signature: v1,Xwaxhb2VXhODSa9ro9vlrWEYBLFRDEDPOSZyJkTGJGs=
-webhook-timestamp: 1793179889
+webhook-id: obx_1a182b04ee60000119ccc
+webhook-signature: v1,9ujp5F4n6HmCvULKRlQ4cK0bZGXFQ31eFJx/ClbBWrk=
+webhook-timestamp: 1793193955
 ```
 
 ```json
 {
   "specversion": "1.0",
-  "id": "obx_1a181d9adee00000d6e50",
-  "source": "onto-intelli://docsrun",
+  "id": "obx_1a182b04ee60000119ccc",
+  "source": "onto-intelli://docsrun2",
   "type": "onto.entity.update",
   "subject": "issue:pay-1",
-  "time": "2026-10-28T09:31:29Z",
+  "time": "2026-10-28T13:25:55Z",
   "datacontenttype": "application/json",
-  "tenant": "docsrun",
+  "tenant": "docsrun2",
   "workspace": "acme",
-  "cursor": "4.0",
+  "cursor": "5.0",
   "data": {
-    "cursor": "4.0",
+    "cursor": "5.0",
     "op": "entity.update",
     "id": "issue:pay-1",
     "kind": "issue",
@@ -186,13 +207,22 @@ webhook-timestamp: 1793179889
     "before": { "state": "triaged" },
     "state": { "from": "triaged", "to": "in_progress" },
     "cause": { "actor": "operator", "intent": "action:set_state",
-               "request_id": "req_1a181d9add300000894d0", "source": "api" },
+               "request_id": "req_1a182b04ecf00000cd4dd", "source": "api",
+               "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" },
     "entity": { "id": "issue:pay-1", "kind": "issue", "title": "Payment timeout on checkout",
                 "state": "in_progress", "props": { "priority": "high" }, "revision": 2, … },
-    "ts": 1793179889107
+    "ts": 1793193955023
   }
 }
 ```
+
+The delivery continues the caller's trace: `traceparent` carries the
+caller's trace id (`4bf92f…`) with a new span id for this attempt, and the
+change record keeps the same id as `cause.trace_id`. `x-onto-trace-id` is
+the id of the trace onto recorded for the call itself (kind `action`, whose
+`otel_trace_id` is `4bf92f…` and `parent_span` the caller's `00f067aa…`).
+Without a `traceparent`, the trace onto records for the call is the one
+continued: its id goes out in `traceparent` and `cause.trace_id`.
 
 The envelope is CloudEvents 1.0 (structured JSON); the signature is Standard
 Webhooks: `v1,` and base64 of HMAC-SHA256 over `<webhook-id>.<webhook-timestamp>.<body>`
@@ -217,13 +247,13 @@ event = verify_webhook(os.environ["DOCS_HOOK_SECRET"], headers, raw_body)
 ```
 
 ```text
-verify_webhook: ok, id obx_1a181d9adee00000d6e50
+verify_webhook: ok, id obx_1a182b04ee60000119ccc        (run 2)
 wrong secret: refused (no webhook-signature matches)
 ```
 
 With the TypeScript SDK (`verifyWebhook` in `sdk/typescript/src/webhooks.ts`,
 run with `node --experimental-strip-types` on Node 22.12) over every request
-the receiver recorded in this run. The run took longer than the 300 s
+the receiver recorded in the first run. The run took longer than the 300 s
 timestamp tolerance, so this check passed each delivery's own
 `webhook-timestamp` as `now`:
 
@@ -269,10 +299,14 @@ $ curl -H "authorization: Bearer $ONTO_TOKEN" http://127.0.0.1:50071/v1/webhooks
 The commit was at `ts` 1793179889107: fan-out enqueued the row 30 ms later
 and the receiver had it 49 ms after the commit (debug build, one
 observation; the release benchmark is under "Webhook delivery to a local
-receiver" in Benchmarks).
+receiver" in Benchmarks). In run 2 the row above was enqueued 25 ms and
+delivered 45 ms after its commit (`ts` 1793193955023, `created_at`
+…955048, `delivered_at` …955068). Delivery rows show the trace they continue as
+`otel_trace_id` (a `gap` row has none).
 
 How delivery behaves (configured in `[webhooks]`; tested in
-`crates/onto-intelli/tests/webhooks*.rs`, not exercised in this run):
+`crates/onto-intelli/tests/webhooks*.rs`; run 2 exercised retries against a
+closed port and the traces, the rest was not exercised):
 
 - 2xx is delivered. 408, 409, 425, 429, 5xx, timeouts and connection errors
   retry at `min(base * 2^(attempt-1), max)` with jitter, honouring
@@ -299,15 +333,16 @@ How delivery behaves (configured in `[webhooks]`; tested in
   continues no trace (a write made with `[traces] enabled = false` and no
   `traceparent`) is sent under the attempt's own trace id. The span id is
   new for every attempt. Change records carry the same id as
-  `cause.trace_id`. (The headers and body above were captured before
-  `traceparent` and `cause.trace_id` were added; a delivery now has both.)
+  `cause.trace_id`. Rows with no trace of their own (a `gap` delivery) are
+  sent under the attempt's own trace id.
 - Attempts become traces of kind `delivery` (`webhook.deliver:<endpoint>`,
   `writeback.deliver:<target>`) as `[traces] deliveries` says: `failures`
   (the default: attempts that end in `retry` or `dead`), `all`, or `off`.
   The trace's root span is the span the request named in `traceparent`;
   it keeps the row id, target, source, attempt number, outcome, HTTP status
   and the attempt's error, never the body, the headers (so never the
-  signature), the receiver's answer, the signing secret or the URL.
+  signature), the receiver's answer, the signing secret or the URL. Section
+  5 shows them.
 
 ## 3. Automations
 
@@ -371,8 +406,8 @@ non-breaking on schema v1 · 0 entities · 0 links in scope
 ### Propose (agent) and approve (person)
 
 ```text
-$ ONTO_TOKEN=$ONTO_TOKEN_AGENT onto schema apply escalate.toml
-error: permission denied: … ops-bot is an agent: agents may propose schema changes but not apply them
+$ ONTO_TOKEN=$ONTO_TOKEN_AGENT onto schema apply escalate.toml        # run 2; exit status 1
+error: permission denied: ops-bot is an agent: agents may propose schema changes but not apply them
 
 $ ONTO_TOKEN=$ONTO_TOKEN_AGENT onto schema propose escalate.toml --title "Escalate blocked high-priority issues"
 proposed prop_1a181daa0cb00000c774b Escalate blocked high-priority issues
@@ -388,11 +423,14 @@ escalate_blocked  inactive (not_enabled)  action create_task, webhook pager
 Installing a definition (by a change set, a proposal or a pack) never
 enables it.
 
+With `--remote`, the CLI prints a server error as `error: <code>: <message>`
+with the code once, and exits 1.
+
 ### Enable
 
 ```text
-$ ONTO_TOKEN=$ONTO_TOKEN_AGENT onto automation enable escalate_blocked
-error: permission denied: … ops-bot is an agent: automation.enable is not open to agents
+$ ONTO_TOKEN=$ONTO_TOKEN_AGENT onto automation enable escalate_blocked   # run 2
+error: permission denied: ops-bot is an agent: automation.enable is not open to agents
 
 $ onto automation enable escalate_blocked
 Enabled escalate_blocked
@@ -499,6 +537,30 @@ From the trigger's commit (`ts` 1793179962778) the run started 38 ms later,
 committed in 7 ms, and the receiver had the webhook effect 22 ms after that (one
 observation, debug build).
 
+**(run 2)** The same trigger, made with `onto do set_state item=issue:pay-2
+state=blocked` (no `traceparent`, so the trace onto recorded for that call,
+`cf313f…`, is the one continued). The run row now carries its own trace id
+and the trigger's:
+
+```text
+$ curl … /v1/automations/escalate_blocked/runs/run_1a182b101190000232a2e
+{ "run": { "id": "run_1a182b101190000232a2e", "state": "succeeded", …,
+           "started_at": 1793194000670, "finished_at": 1793194000680,
+           "trace_id": "68d137a420462842c47c46ccaf324b68",
+           "trigger": { "cursor": "9.0", "op": "entity.update", "id": "issue:pay-2", …,
+                        "trace_id": "cf313fa2fd1cf90683b088ba28859928" } } }
+```
+
+Both deliveries that change caused, the `ops` change row and the run's
+`pager` effect, went out under the trigger's trace:
+
+```text
+POST /hooks/ops    traceparent: 00-cf313fa2fd1cf90683b088ba28859928-01ef96e300000001-01   onto.entity.update 9.0
+POST /hooks/pager  traceparent: 00-cf313fa2fd1cf90683b088ba28859928-63ebcc2e00000001-01   onto.issue.escalated
+```
+
+Section 5 shows the run's `automation` trace.
+
 How a run works: the consumer (one per tenant, under the lease
 `automation:consumer`) claims the run with `INSERT … ON CONFLICT (automation,
 trigger_key) DO NOTHING`, so a duplicate trigger is settled by the claim and
@@ -539,7 +601,12 @@ never admit it, so for such an automation (`escalate_blocked` here) the
 `id` form is refused with `invalid_argument`, naming the guard and asking
 for a `cursor`; `onto watch --once --ids issue:pay-3` lists that entity's
 changes. For a trigger without either, `id` tests the entity's current
-fields.
+fields. **(run 2)**:
+
+```text
+$ curl -X POST … /v1/automations/escalate_blocked/test -d '{"id":"issue:pay-3"}'
+{"error":{"code":"invalid_argument","message":"invalid: automation.test: automation escalate_blocked's trigger has a state guard, and id tests issue:pay-3 as a synthetic update that changes no field and moves no state; pass cursor (the change to test) instead: changes.poll with ids = [\"issue:pay-3\"] (onto watch --once --ids issue:pay-3) lists its changes"}}
+```
 
 ### An expired enablement
 
@@ -658,57 +725,210 @@ proposed close_ticket act_1a181dc46fc000030a850
   risk medium · not reversible
   risk Medium, not reversible (an external write: action.undo does not undo it): pass confirm=true to apply
 
-$ onto do close_ticket issue=issue:pay-1 --confirm
-applied close_ticket act_1a181dc71fc000032f37e
+$ onto do close_ticket issue=issue:pay-1 --confirm                  # run 2
+applied close_ticket act_1a182b225bc000033ad9d
   • update issue:pay-1: state in_progress → resolved
   • writeback helpdesk.close {"issue":"issue:pay-1","title":"Payment timeout on checkout"} [async]
   ! Writeback is not reversible; action.undo does not undo the external write.
   risk medium · not reversible
 ```
 
-At the receiver, 66 ms after the commit:
+At the receiver **(run 2)**:
 
 ```text
 POST /desk/tickets/close
 content-type: application/json
-idempotency-key: act_1a181dc71fc000032f37e:1
+idempotency-key: act_1a182b225bc000033ad9d:1
+traceparent: 00-6859785e32d512f387db7590028c1b81-031adfa400000001-01
 user-agent: onto-intelli/0.2.0
-webhook-id: obx_1a181dc7201000033d442
-webhook-signature: v1,a4Kwe+58XW39IS1CPSuRHyaZxGvYZ8rPxniz32lWueM=
-webhook-timestamp: 1793180070
+webhook-id: obx_1a182b225be00003567ad
+webhook-signature: v1,Obn8ZfAAkuh0/bLrCX7qXD6+ec3Z+clMpEtuztnChRU=
+webhook-timestamp: 1793194075
 
 {"issue":"issue:pay-1","title":"Payment timeout on checkout"}
 
-verify_webhook: ok, id obx_1a181dc7201000033d442
+verify_webhook: ok, id obx_1a182b225be00003567ad
 ```
 
 The body is posted as rendered (not a CloudEvent); the Standard Webhooks
 headers are sent because the target has a secret. The key is the receipt and
 the effect's index in the action type, so a retry of the same row, or a
-replay, carries the same key.
+replay, carries the same key. `traceparent` carries the trace onto recorded
+for the `close_ticket` call (`6859785e…`, kind `action`); the `ops` delivery
+of the same commit's `entity.update` went out under it too. In the first
+run the receiver had the writeback 66 ms after the commit.
 
 The receipt lists the external write and its delivery state; undo refuses
-without `force`, and with `force` undoes the graph edits only:
+without `force`, and with `force` undoes the graph edits only **(run 2)**:
 
 ```text
-$ onto call action.receipt '{"id":"act_1a181dc71fc000032f37e"}'
+$ onto call action.receipt '{"id":"act_1a182b225bc000033ad9d"}'
 {
-  "id": "act_1a181dc71fc000032f37e", "action": "close_ticket", "actor": "operator", "status": "applied",
-  "external": [ { "effect": 1, "target": "helpdesk", "route": "close", "outbox": "obx_1a181dc7201000033d442",
-                  "idempotency_key": "act_1a181dc71fc000032f37e:1", "state": "delivered", "attempts": 1 } ],
+  "id": "act_1a182b225bc000033ad9d", "action": "close_ticket", "actor": "operator", "status": "applied",
+  "external": [ { "effect": 1, "target": "helpdesk", "route": "close", "outbox": "obx_1a182b225be00003567ad",
+                  "idempotency_key": "act_1a182b225bc000033ad9d:1", "state": "delivered", "attempts": 1 } ],
   "note": "not reversible: the external write is not undone by action.undo",
   …
 }
 
-$ onto undo act_1a181dc71fc000032f37e
-error: invalid: … action close_ticket made an external write, which is not reversible: action.undo does
-not undo it. Pass force=true to undo the graph edits only
+$ onto undo act_1a182b225bc000033ad9d                               # exit status 1
+error: invalid: action close_ticket made an external write, which is not reversible: action.undo does not undo it. Pass force=true to undo the graph edits only
 ```
 
 `unattended = ["automation"]` (or `"agent"`) on an action type waives the
 confirmation the external write added, for that caller kind only; it is
 schema, so it is approved like any change and is part of every automation
 closure that reaches it. That path was not exercised in this run.
+
+## 5. Traces and counters (run 2)
+
+### Traces
+
+A call, the runs it started and the deliveries it caused share one W3C
+trace id. Listed by that id (`onto call trace.list` output trimmed to a few
+fields per trace):
+
+```text
+$ onto call trace.list '{"otel_trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}'    # the call that sent traceparent
+fd870bf492ac3ce861cac0b08e1b8a9e  delivery  webhook.deliver:ops      webhook:ops  worker  request_id obx_1a182b04ee60000119ccc  ok  11.5 ms
+49d39136d70cd48df382cdbe662f7c55  action    action.apply:set_state   operator     http    parent_span 00f067aa0ba902b7          ok  15.5 ms
+
+$ onto call trace.list '{"otel_trace_id":"cf313fa2fd1cf90683b088ba28859928"}'    # the CLI call that triggered the run
+a405327bd42da926beb4b97d7328476b  delivery    webhook.deliver:pager            webhook:pager                obx_1a182b101250000282f8c  ok
+68d137a420462842c47c46ccaf324b68  automation  automation.run:escalate_blocked  automation:escalate_blocked  run_1a182b101190000232a2e  ok
+ae7ade8c6f1435db2dc92a1bb49e4d07  delivery    webhook.deliver:ops              webhook:ops                  obx_1a182b101150000220fd9  ok
+```
+
+The second list has no `action` trace: a call made without `traceparent`
+is recorded under the id it passes on (`GET /v1/traces/cf313fa2fd1cf90683b088ba28859928`
+is the `action.apply:set_state` trace) and has no `otel_trace_id` of its own,
+so look it up by id. The writeback call works the same way: `trace.list
+{"otel_trace_id":"6859785e32d512f387db7590028c1b81"}` gave
+`writeback.deliver:helpdesk` (11.4 ms) and `webhook.deliver:ops`.
+
+A delivery trace (`GET /v1/traces/fd870bf492ac3ce861cac0b08e1b8a9e`,
+spans): the root span is the one the request named in `traceparent`
+(`4ef45a2c00000001`), with the HTTP exchange as its child. No body, header,
+signature, secret or URL:
+
+```text
+4ef45a2c00000001  -                 webhook.deliver  ok  11.5 ms  {"attempt":1,"event_type":"onto.entity.update","http_status":200,"kind":"webhook","outbox":"obx_1a182b04ee60000119ccc","outcome":"delivered","receipt":null,"retry_in_ms":null,"run":null,"source":"change","target":"ops"}
+4ef45a2c00000002  4ef45a2c00000001  http.post        ok   2.0 ms  {"http_status":200}
+```
+
+The run's `automation` trace (`GET /v1/traces/68d137a420462842c47c46ccaf324b68`):
+its id is the run's `trace_id`, its `otel_trace_id` the trigger's
+(`cf313f…`), the root span is the run and each effect a child span:
+
+```text
+abded65700000001  -                 automation.run:escalate_blocked  ok  {"attempts":1,"automation":"escalate_blocked","depth":1,"effects":2,"mode":"live","run":"run_1a182b101190000232a2e","state":"succeeded","trigger":{"cursor":"9.0","kind":"issue","op":"entity.update"}}
+abded65700000002  abded65700000001  effect.action:create_task        ok  {"index":0,"kind":"action","ok":true,"outbox":null,"receipt":"act_1a182b101190000232a2e","target":"create_task"}
+abded65700000003  abded65700000001  effect.webhook:pager             ok  {"index":1,"kind":"webhook","ok":true,"outbox":"obx_1a182b101250000282f8c","receipt":null,"target":"pager"}
+```
+
+This trace's `ts` is when it was written (1793194000698) and its duration,
+and every span's, is 0 ms, although the run took 10 ms (`started_at`
+1793194000670, `finished_at` …680): the claim's store-clock `started_at`
+does not reach the row the trace is built from. Until that is fixed, read a
+run's times from the run row, not from its trace.
+
+A failing endpoint: `down` (`http://127.0.0.1:18093/hooks/down`, a port
+nothing listens on, filter `kind = issue`). With `[traces] deliveries` at
+`all` or the default `failures`, its attempts are `error` traces whose
+error is the attempt's, never the URL:
+
+```text
+$ onto call trace.list '{"kind":"delivery","status":"error","limit":2}'
+ffd0d85d800413d7d8f1b41cac7fe79c  webhook.deliver:down  error  retry    error sending request: client error (Connect): tcp connect error: Connection refused (os error 61)  obx_1a182b3323c000052fcf6
+8ddeaaa58abc0502e42fdb39eb38ddc8  webhook.deliver:down  error  dead     expired                                                                                       obx_1a182b2f2da000040b574
+```
+
+(The `dead: expired` row is a change whose record fell below the floor when
+capture was turned back on, below: that expires every older cursor.)
+
+### Counters
+
+A gap, made by turning capture off, writing, and turning it on again:
+
+```text
+$ onto call changes.capture '{"on":false}'
+{ "capture": false, "cursor": "16.0", "floor": 0, "head": 16 }
+$ onto do set_state item=issue:pay-3 state=triaged          # not recorded
+$ onto call changes.capture '{"on":true}'
+{ "capture": true, "cursor": "17.1", "floor": 17, "head": 17 }
+$ onto watch --once --after 17.0
+17.1 gap               capture_enabled: 0 changed without records; re-read with entity.find
+next: 17.1  (head 17, floor 17; resume with --after)
+```
+
+`system.health` reports the latest gap:
+
+```text
+$ onto call system.health      # "outbound"."changes" only
+{
+  "capture": true,
+  "latest_gap": { "cursor": "17.1", "origin": "proc_1a182af4a610000007a71",
+                  "reason": "capture_enabled", "touched": 0, "ts": 1793194142301 }
+}
+```
+
+Before the gap, the whole `outbound` object read:
+
+```text
+{
+  "automation": { "enabled": 1, "kill": false, "paused": 0, "process_enabled": true },
+  "changes": { "capture": true, "latest_gap": null },
+  "webhooks": { "endpoints": 2, "kill": false, "paused": 0, "process_enabled": true }
+}
+```
+
+`system.stats` as the operator (`GET /v1/stats`, `outbound` only; the
+`automation:consumer` and `webhook:down` consumers and the `down` endpoint
+read like `webhook:ops`):
+
+```text
+{
+  "gaps_24h": { "capped": false, "count": 1, "latest": { "cursor": "17.1", "reason": "capture_enabled", … } },
+  "lag": {
+    "consumers": { "webhook:ops": { "age_ms": 0, "behind": 0, "cursor": "17.1", "expired": false, "updated_at": 1793194144323 }, … },
+    "endpoints": { "ops": { "age_ms": 0, "behind": 0, "cursor": "17.1", "expired": false, "updated_at": 1793194144323 }, … }
+  },
+  "outbox": { "cap": 1000, "targets": { "down": { "dead": 2, "retry": 1 } } },
+  "outbox_open": { "down": 1 },
+  "runs_1h": { "capped": false, "counted": 1, "states": { "succeeded": 1 } }
+}
+```
+
+Every consumer was caught up (`behind` 0); the `down` endpoint's cursor
+moves on while its rows retry, so its backlog shows under `outbox`, not
+`lag`. Before the gap, with nothing failing, `outbox.targets` was `{}`:
+delivered rows are not counted. The agent token sees totals only:
+
+```text
+$ curl -H "authorization: Bearer $ONTO_TOKEN_AGENT" http://127.0.0.1:50072/v1/stats     # "outbound" only
+{ "gaps_24h": { "capped": false, "count": 1, "latest": { … } },
+  "note": "per-target outbox counts, change lag and runs are shown to admins",
+  "outbox_open_total": 1 }
+```
+
+`GET /v1/admin/tenants` gives the same counters per open tenant, plus paused
+counts, to operators only:
+
+```text
+$ curl -H "authorization: Bearer $ONTO_TOKEN" http://127.0.0.1:50072/v1/admin/tenants
+{
+  "estimated_bytes": 3451, "listening_stores": 1, "open": 1, "subscribers_process": 0,
+  "limits": { "max_open_tenants": 512, "tenant_idle_secs": 1800, "tenant_memory_budget_mb": 0 },
+  "tenants": [ { "tenant": "docsrun2", "entities": 5, "links": 1, "estimated_bytes": 3451, "idle_ms": 8143,
+                 "ring_bytes": 0, "streams": 0,
+                 "outbound": { "gaps_24h": { … }, "lag": { … }, "outbox": { "cap": 1000, "targets": { "down": { "dead": 2, "retry": 1 } } },
+                               "outbox_open": { "down": 1 }, "paused": { "automations": 0, "endpoints": 0 },
+                               "runs_1h": { "capped": false, "counted": 1, "states": { "succeeded": 1 } } } } ]
+}
+
+$ curl -H "authorization: Bearer $ONTO_TOKEN_AGENT" http://127.0.0.1:50072/v1/admin/tenants    # HTTP 403
+{"error":{"code":"permission_denied","message":"permission denied: ops-bot may not list the server's tenants (operators only: an admin token for every tenant)"}}
+```
 
 ## Refused
 
@@ -723,8 +943,8 @@ $ curl … /v1/webhooks -d '{"name":"meta","url":"https://169.254.169.254/latest
 $ curl … /v1/webhooks -d '{"name":"meta6","url":"https://[::ffff:169.254.169.254]/x",…}'
 {"error":{"code":"invalid_argument","message":"invalid: url: refused: [::ffff:a9fe:a9fe] resolves to ::ffff:169.254.169.254, a link-local, metadata or reserved address"}} HTTP 400
 
-$ curl … /v1/writeback/targets -d '{"name":"imds","base_url":"https://169.254.169.254/",…}'
-{"error":{"code":"invalid_argument","message":"invalid: url: refused: 169.254.169.254 resolves to 169.254.169.254, a link-local, metadata or reserved address"}} HTTP 400
+$ curl … /v1/writeback/targets -d '{"name":"imds","base_url":"https://169.254.169.254/",…}'     # run 2
+{"error":{"code":"invalid_argument","message":"invalid: base_url: refused: 169.254.169.254 resolves to 169.254.169.254, a link-local, metadata or reserved address"}} HTTP 400
 
 $ curl … /v1/webhooks -d '{"name":"meta","url":"http://169.254.169.254/latest/meta-data/",…}'
 {"error":{"code":"invalid_argument","message":"invalid: url must be an https URL"}} HTTP 400
@@ -732,6 +952,9 @@ $ curl … /v1/webhooks -d '{"name":"meta","url":"http://169.254.169.254/latest/
 $ curl … /v1/webhooks -d '{"name":"loop","url":"https://127.0.0.2:9/x",…}'
 {"error":{"code":"invalid_argument","message":"invalid: url: refused: 127.0.0.2 resolves to 127.0.0.2, not a public address (allow it with [[webhooks.allow]])"}} HTTP 400
 ```
+
+The four webhook refusals read the same in run 2. A writeback target's
+refusal names the field the caller gave (`base_url`, or its alias `url`).
 
 An operator rule cannot open the metadata range either; the server refuses
 to start:
@@ -787,12 +1010,11 @@ as.
   because each endpoint and the consumer resume from their cursors, and an
   unsettled row is sent again (delivered at least once). A second signal
   stops at once. A process that is killed (or crashes) still leaves its
-  leases to expire: changes are then enqueued up to 60 s later (18 to 49 s
-  in the run this page was written from, before graceful shutdown existed).
+  leases to expire: changes are then enqueued up to 60 s later.
   One-off `onto` commands run no fan-out, delivery or automation workers
   (`[webhooks] workers`, `[automation] workers`), so they never hold a lease.
   Change streams and delivery of rows already in the outbox are otherwise
-  not affected.
+  not affected. The restart in run 2 is below.
 - **Wake-ups.** A commit wakes fan-out while the tenant has an enabled
   subscription and the consumer while it has an enabled automation;
   otherwise they poll (`[webhooks] poll_secs`). The deployment's wake
@@ -811,10 +1033,14 @@ as.
   receipt or outbox id). It keeps no payload, plan or body; the run's
   reason and effect errors are error texts, which observers who are not
   admins see redacted. Its `otel_trace_id` is the trace the trigger was
-  written under, so `trace.list {otel_trace_id}` finds the call, the runs
-  it started and their deliveries together. A rerun is traced again under a
-  new id. Delivery attempts are traced as `[traces] deliveries` says
-  (section 2).
+  written under, so `trace.list {otel_trace_id}` finds the runs a call
+  started and their deliveries together, and the call too when its caller
+  sent `traceparent`; a call made without one is the trace whose id that
+  is (`trace.get`). The trace's time is when it was written and its
+  durations are 0 (section 5, not fixed yet); the run row has the run's
+  times. A
+  rerun is traced again under a new id. Delivery attempts are traced as
+  `[traces] deliveries` says (section 2). Section 5 shows both kinds.
 - **Counters.** `system.stats` (`GET /v1/stats`) has, under `outbound`:
   `lag`, how far each change consumer is behind (`consumers`, by name:
   `automation:consumer` and `webhook:<endpoint>`; `endpoints`, by endpoint
@@ -853,7 +1079,8 @@ as.
   store reads took 1.1 ms (20 consumers), 0.7 ms (gaps), 3.1 ms (outbox
   states, 80 counts) and 2.3 ms (runs, capped at 10,000) once warm, from a
   release build against a local PostgreSQL 16; counting the gaps without their
-  index read 269 MB of the feed in 222 ms.
+  index read 269 MB of the feed in 222 ms. Section 5 shows the counters
+  from run 2.
 - **Where the state lives.** docs/STORAGE.md lists the tables and
   migrations (0009 to 0014) and how to roll back past them;
   docs/CONTROL_PLANE.md lists the routes, the outbound address rules and the
@@ -866,6 +1093,65 @@ as.
   list|add|rm`, `onto automation list|runs|enable|disable`; the UI's
   Automate page (Automations and Webhooks tabs). This run used the CLI and
   HTTP only.
+
+### A restart (run 2)
+
+An open change stream, then SIGTERM to `onto serve` (timed by the script
+that sent it, which polled for the process to exit):
+
+```text
+$ curl -N -H "authorization: Bearer $ONTO_TOKEN" "http://127.0.0.1:50072/v1/changes/stream?after=17.1" &
+$ kill -TERM <onto serve>
+server exited 0.03 s after SIGTERM
+
+# the stream's last frame
+event: end
+data: {"code":"tenant_closed","cursor":"17.1","message":"the server is shutting down; reconnect with Last-Event-ID to resume (on another replica, or here once it restarts)"}
+
+# the server's log
+shutting down (up to 20s; signal again to stop at once)
+INFO onto_grpc: shutting down: no new connections, streams end, workers stop grace_secs=20
+INFO onto_grpc: released what this process held leases=2 claims=0 crawls=0 cut=0 failed=0
+stopped · released 2 leases, 0 claimed outbox rows
+```
+
+```text
+$ psql … -c "select name, holder, epoch, until - (extract(epoch from now())*1000)::bigint as ms_left from onto_docsrun2.leases"
+        name         |                   holder                    | epoch | ms_left
+---------------------+---------------------------------------------+-------+---------
+ webhook:fanout      | proc_1a182af4a610000007a71:02483684a75c67b1 |     1 |    -612
+ automation:consumer | proc_1a182af4a610000007a71:02483684a75c67b1 |     1 |    -609
+```
+
+A released lease keeps its holder and epoch; its `until` is set to the
+database clock, so it is free at once (read while the server ran, each
+had about 58 s left). While the server was stopped, a change made with the local CLI (no
+`--remote`: a one-off command, which takes no lease; the leases above were
+unchanged after it):
+
+```text
+$ onto do set_state item=issue:pay-3 state=in_progress
+applied set_state act_1a182b419960000033ca1
+```
+
+Then `onto serve` again, timed from the moment it was started until its log
+said "listening" and until the receiver had that change:
+
+```text
+listening 0.19 s after start; first delivery 0.28 s after start (0.09 s after listening)
+/hooks/ops onto.entity.update 18.0 issue:pay-3 obx_1a182b44436000003b8b9
+
+        name         |                   holder                    | epoch
+---------------------+---------------------------------------------+-------
+ webhook:fanout      | proc_1a182b443a1000000c67e:2732d1b505399867 |     2
+ automation:consumer | proc_1a182b443a1000000c67e:2732d1b505399867 |     2
+```
+
+The new process took both leases (epoch 2) as soon as it started, and
+fan-out resumed from the `ops` cursor (17.1), so the change made while it
+was down was delivered within 0.3 s of the start, against 18 to 49 s in the
+first run, which was made before shutdown released leases. Stopping it
+again at the end of the run logged the same release lines.
 
 ## Benchmarks
 
