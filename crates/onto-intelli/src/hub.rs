@@ -345,6 +345,11 @@ impl Hub {
         slot.last_used.store(now_ms(), Ordering::Relaxed);
         let opened = !slot.cell.initialized();
         let intelli = slot.cell.get_or_try_init(|| self.open_tenant(id)).await.cloned();
+        if opened && intelli.is_ok() {
+            // Opening (migrations included) is not idle time: the idle clock
+            // starts again when the tenant is ready.
+            slot.last_used.store(now_ms(), Ordering::Relaxed);
+        }
         if intelli.is_err() {
             // A failed open is not remembered: the next request tries again.
             let mut tenants = self.tenants.lock();

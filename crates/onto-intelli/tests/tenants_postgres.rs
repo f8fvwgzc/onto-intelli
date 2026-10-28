@@ -253,8 +253,10 @@ async fn streams_count_as_use_but_never_past_max_open_tenants() {
     let hub = Hub::open(cfg).await.unwrap();
     let admin = Principal::admin("x");
     let streamed = hub.tenant("streamed").await.unwrap();
-    hub.tenant("quiet").await.unwrap();
+    // Subscribed before the next open, which can take seconds on a loaded
+    // database: the stream's heartbeats, not the open, keep it in use.
     let sub = streamed.subscribe_changes(admin.clone(), ChangeFilter::default(), Start::Now, None).await.unwrap();
+    hub.tenant("quiet").await.unwrap();
     // Both were last requested now; after the idle time only the one with a stream stays.
     tokio::time::sleep(Duration::from_millis(3200)).await;
     // (The hub's sweeper may have closed the quiet one already.)
