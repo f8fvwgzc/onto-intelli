@@ -2433,6 +2433,21 @@ impl Store for PgStore {
         })
     }
 
+    fn outbox_open_counts(&self) -> Result<Vec<(String, u64)>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            let rows: Vec<(String, i64)> = sqlx::query_as(sql(format!(
+                "SELECT target, count(*) FROM {} WHERE state IN ('pending', 'retry', 'inflight') \
+                 GROUP BY target ORDER BY target",
+                t.outbox
+            )))
+            .fetch_all(&pool)
+            .await?;
+            Ok(rows.into_iter().map(|(t, n)| (t, n.max(0) as u64)).collect())
+        })
+    }
+
     fn outbox_vacuum(&self, before_ms: i64) -> Result<u64> {
         let pool = self.pool.clone();
         let t = Tables::of(self);

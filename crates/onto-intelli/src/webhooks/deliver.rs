@@ -24,11 +24,12 @@ use onto_core::{Error, EventInput, Mutation, Ontology, Result};
 
 use super::{
     BREAKER_PREFIX, BreakerState, CLAIM_LIMIT, Class, Endpoint, LEASE_MS, NS_CONTROL, NS_ENDPOINT, backoff_ms,
-    classify, envelope, jitter, killed, next_pause, resolve_text, retry_after_ms, signature_header, system_ctx,
+    check_endpoint_url, classify, envelope, jitter, killed, next_pause, resolve_text, retry_after_ms, signature_header,
+    system_ctx,
 };
 use crate::config::WebhooksConfig;
 use crate::intelli::Intelli;
-use crate::net::{Reach, check_target_url, guarded_client};
+use crate::net::{Reach, guarded_client};
 
 /// Requests in flight in this process, all tenants together.
 fn process_slots(n: usize) -> Arc<Semaphore> {
@@ -245,9 +246,10 @@ impl Worker {
             return release("kill switch").await;
         }
         let Some(ep) = ep else {
+            // Removed by a person: what was waiting for it is not sent.
             let a =
-                Attempt { error: Some("endpoint_missing: the endpoint no longer exists".into()), ..Default::default() };
-            return self.finish(me, &row, a, OutboxState::Dead, 0).await;
+                Attempt { error: Some("endpoint_removed: the endpoint no longer exists".into()), ..Default::default() };
+            return self.finish(me, &row, a, OutboxState::Cancelled, 0).await;
         };
         if !ep.enabled {
             return release("endpoint disabled").await;
@@ -269,17 +271,18 @@ impl Worker {
         };
         let _done = Done { w: self.clone(), name: ep.name.clone(), probe: half_open };
 
-        // Render.
-        let (data, subject) = if row.source == SOURCE_CHANGE {
-            let Some(cursor) = row.cursor else {
-                let a = Attempt { error: Some("no cursor on a change row".into()), ..Default::default() };
-                return self.finish(me, &row, a, OutboxState::Dead, 0).await;
-            };
+        // Render. A change row is rendered from its record as the endpoint's
+        // principal sees it now (its type follows: an update this principal
+        // no longer sees is `onto.entity.hidden`); a change row without a
+        // cursor is a gap notice, sent as stored.
+        let mut event_type = row.event_type.clone();
+        let (data, subject) = if let (true, Some(cursor)) = (row.source == SOURCE_CHANGE, row.cursor) {
             let (onto2, p) = (onto.clone(), ep.principal());
             let fields = ep.filter.as_ref().map(|f| f.fields).unwrap_or(FieldMode::Full);
             match blocking(move || onto2.change_at(&p, cursor, fields)).await {
                 Ok(ChangeAt::Visible(r)) => {
                     let subject = Some(r.id.clone()).filter(|s| !s.is_empty());
+                    event_type = format!("onto.{}", r.op.as_str());
                     (serde_json::to_value(&*r).unwrap_or(Value::Null), subject)
                 }
                 Ok(ChangeAt::NotVisible) => {
@@ -299,7 +302,9 @@ impl Worker {
             let subject = row.payload.get("subject").and_then(Value::as_str).map(str::to_string);
             (row.payload.clone(), subject)
         };
-        let body = match serde_json::to_vec(&envelope(&row, &self.tenant, subject.as_deref(), data)) {
+        let mut ev = envelope(&row, &self.tenant, subject.as_deref(), data);
+        ev["type"] = json!(event_type);
+        let body = match serde_json::to_vec(&ev) {
             Ok(b) => b,
             Err(e) => {
                 let a = Attempt { error: Some(format!("render: {e}")), ..Default::default() };
@@ -318,7 +323,7 @@ impl Worker {
             format!("the URL of endpoint {}", ep.name)
         };
         let reach = Reach { restricted: ep.restricted, ..self.reach.clone() };
-        let url = match resolve_text(&ep.url, &what).and_then(|u| check_target_url(&u, &what, &reach)) {
+        let url = match resolve_text(&ep.url, &what).and_then(|u| check_endpoint_url(&ep.url, &u, &reach)) {
             Ok(u) => u,
             Err(e) => {
                 let a = Attempt { error: Some(format!("refused: {e}")), ..Default::default() };
@@ -357,7 +362,13 @@ impl Worker {
         match sent {
             Err(e) => {
                 let refused = chain(&e).contains("refused:");
-                let a = Attempt { error: Some(chain(&e)), duration_ms, ..Default::default() };
+                let error = if refused && super::is_reference(&ep.url) {
+                    // The refused host and address are part of the reference's value.
+                    format!("refused: {what} resolves to an address the outbound rules refuse")
+                } else {
+                    chain(&e)
+                };
+                let a = Attempt { error: Some(error), duration_ms, ..Default::default() };
                 if refused {
                     self.finish(me, &row, a, OutboxState::Dead, 0).await
                 } else {

@@ -986,3 +986,110 @@ service ChangeService {
   rpc Head(google.protobuf.Empty) returns (google.protobuf.Struct);     // changes.head
   rpc Capture(ChangesCaptureRequest) returns (google.protobuf.Struct);  // changes.capture
 }
+
+// ── Webhooks: signed CloudEvents to registered endpoints ─────────────────
+// Endpoints receive CloudEvents 1.0 (structured JSON) signed the Standard
+// Webhooks way (webhook-id, webhook-timestamp, webhook-signature). An
+// endpoint sees what its principal may read. With a filter it subscribes to
+// the change feed: each change is enqueued once per endpoint and delivered at
+// least once; receivers dedupe on the event id. Admins only, never agents,
+// and the caller must dominate the endpoint's principal. Responses are the
+// JSON of the webhook.* and outbox.list actions. Proto3 drops false values,
+// hence disabled, clear_filter, exclude_migrations and off.
+
+message WebhookFilter {
+  repeated string kinds = 1;      // entity kinds or interfaces (links match through either end)
+  repeated string ops = 2;        // entity.create | entity.update | entity.delete | entity.hidden | link.* | schema.change | gap
+  repeated string workspaces = 3;
+  repeated string ids = 4;
+  repeated string rels = 5;
+  repeated string props = 6;
+  repeated string sources = 7;
+  string fields = 8;              // full (default) | ids
+  bool exclude_migrations = 9;
+}
+
+message WebhookPrincipal {
+  repeated string roles = 1;      // what the receiver may see: viewer, member, admin or custom roles
+  repeated string workspaces = 2; // a subset of the caller's
+}
+
+message WebhookAddRequest {
+  string name = 1;                // [a-z0-9_-], at most 40; principal id webhook:<name>
+  string url = 2;                 // https (or an operator env:/file: reference)
+  string secret = 3;              // empty: a whsec_ secret is generated, sealed and returned once
+  WebhookFilter filter = 4;       // set: subscribe to the change feed from now on
+  WebhookPrincipal principal = 5; // default: viewer in the call's workspace
+  bool disabled = 6;
+  string workspace = 7;           // workspace of the audit event
+}
+
+message WebhookUpdateRequest {
+  string name = 1;
+  string url = 2;
+  string secret = 3;
+  WebhookFilter filter = 4;
+  bool clear_filter = 5;          // drop the change subscription
+  WebhookPrincipal principal = 6;
+  bool enabled = 7;
+  bool disabled = 8;
+  string workspace = 9;
+}
+
+message WebhookNameRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message WebhookRotateRequest {
+  string name = 1;
+  string secret = 2;              // empty: generated and returned once
+  uint64 keep_secs = 3;           // the previous secret also signs this long (default a day)
+  string workspace = 4;
+}
+
+message WebhookDeliveriesRequest {
+  string name = 1;
+  string id = 2;                  // one delivery with its attempts
+  repeated string states = 3;     // pending | inflight | retry | delivered | dead | cancelled
+  int64 since = 4;                // created at or after (Unix ms)
+  uint32 limit = 5;
+}
+
+message WebhookReplayRequest {
+  string name = 1;
+  repeated string ids = 2;
+  int64 since = 3;
+  repeated string states = 4;     // default: retry, delivered, dead, cancelled
+  string workspace = 5;
+}
+
+message WebhookKillRequest {
+  bool on = 1;                    // hold every delivery in the outbox
+  bool off = 2;                   // resume deliveries
+  string workspace = 3;
+}
+
+message OutboxListRequest {
+  string target = 1;
+  repeated string states = 2;
+  string source = 3;              // change | action | automation | test
+  string receipt = 4;
+  string run = 5;
+  int64 since = 6;
+  uint32 limit = 7;
+}
+
+service WebhookService {
+  rpc Add(WebhookAddRequest) returns (google.protobuf.Struct);                // webhook.add
+  rpc Update(WebhookUpdateRequest) returns (google.protobuf.Struct);          // webhook.update
+  rpc Remove(WebhookNameRequest) returns (google.protobuf.Struct);            // webhook.remove
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // webhook.list
+  rpc Test(WebhookNameRequest) returns (google.protobuf.Struct);              // webhook.test
+  rpc RotateSecret(WebhookRotateRequest) returns (google.protobuf.Struct);    // webhook.rotate_secret
+  rpc Deliveries(WebhookDeliveriesRequest) returns (google.protobuf.Struct);  // webhook.deliveries
+  rpc Replay(WebhookReplayRequest) returns (google.protobuf.Struct);          // webhook.replay
+  rpc Resume(WebhookNameRequest) returns (google.protobuf.Struct);            // webhook.resume
+  rpc Kill(WebhookKillRequest) returns (google.protobuf.Struct);              // webhook.kill
+  rpc Outbox(OutboxListRequest) returns (google.protobuf.Struct);             // outbox.list
+}

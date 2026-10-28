@@ -45,6 +45,17 @@
 //!   (default now); `Last-Event-ID` wins over `after`. Events `change`, `heartbeat`, then one
 //!   `reset` or `end`.
 //! * `POST /v1/changes/capture` `{on}`: record changes or not (admins of every workspace)
+//! * `GET  /v1/webhooks`        webhook endpoints; `POST` registers one `{name, url, secret?, filter?,
+//!   principal?, disabled?}` (admins who dominate its principal; a generated secret is returned once)
+//! * `PATCH|DELETE /v1/webhooks/{name}`  change or remove an endpoint
+//! * `GET  /v1/webhooks/{name}/deliveries`  its deliveries (`?states=`, `since`, `limit`, `id` for one
+//!   delivery with its attempts)
+//! * `POST /v1/webhooks/{name}/{test|rotate_secret|replay|resume}`  a test delivery, a secret rotation,
+//!   a replay `{ids | since, states?}` (ids kept), or resuming a paused endpoint
+//! * `POST /v1/webhooks/kill`   `{on | off}`: the tenant's webhook kill switch
+//! * `GET  /v1/outbox`          outbound deliveries (`?target=`, `states`, `source`, `receipt`, `run`,
+//!   `since`, `limit`) for targets the caller may manage. Each change is enqueued once per endpoint
+//!   and delivered at least once; receivers dedupe on the event id.
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
 //!   A session minting a session cannot outlive itself and belongs to the same login (`sid`).
@@ -70,7 +81,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 
@@ -143,6 +154,12 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/changes/head", get(changes_head))
         .route("/v1/changes/capture", post(changes_capture))
         .route("/v1/changes/stream", get(changes_stream_get).post(changes_stream_post))
+        .route("/v1/webhooks", get(webhooks_list).post(webhook_add))
+        .route("/v1/webhooks/kill", post(webhook_kill))
+        .route("/v1/webhooks/{name}", patch(webhook_update).delete(webhook_remove))
+        .route("/v1/webhooks/{name}/deliveries", get(webhook_deliveries))
+        .route("/v1/webhooks/{name}/{verb}", post(webhook_verb))
+        .route("/v1/outbox", get(outbox_list))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -548,6 +565,7 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
             "approve": gov.can_approve(p),
             "propose": gov.can_propose(p),
             "observe": p.can_observe(),
+            "configure_outbound": p.is_privileged() && !p.is_agent(),
         },
         "governance": gov,
         "ui": { "title": cfg.ui.title },
@@ -931,6 +949,94 @@ async fn changes_stream(s: AppState, headers: HeaderMap, input: Value) -> Respon
     let events: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
         Box::pin(first.chain(frames));
     Sse::new(events).into_response()
+}
+
+/// Outbox query parameters as input: `states` and `ids` split on commas,
+/// `since`, `limit` numbers, everything else a string.
+fn outbox_query(q: HashMap<String, String>) -> Value {
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            "states" | "ids" => json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            "since" | "limit" => v.trim().parse::<i64>().map(Value::from).unwrap_or(Value::String(v)),
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    Value::Object(input)
+}
+
+/// `body` with `name` set from the path.
+fn named(body: Option<Json<Value>>, name: String) -> Value {
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("name".into(), Value::String(name));
+    }
+    input
+}
+
+async fn webhooks_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "webhook.list", json!({})).await
+}
+
+async fn webhook_add(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "webhook.add", body_or_empty(body)).await
+}
+
+async fn webhook_kill(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "webhook.kill", body_or_empty(body)).await
+}
+
+async fn webhook_update(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    run(&s, &headers, "webhook.update", named(body, name)).await
+}
+
+async fn webhook_remove(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "webhook.remove", json!({ "name": name })).await
+}
+
+async fn webhook_deliveries(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut input = outbox_query(q);
+    input["name"] = Value::String(name);
+    run(&s, &headers, "webhook.deliveries", input).await
+}
+
+async fn webhook_verb(
+    State(s): State<AppState>,
+    Path((name, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "test" => "webhook.test",
+        "rotate_secret" => "webhook.rotate_secret",
+        "replay" => "webhook.replay",
+        "resume" => "webhook.resume",
+        other => {
+            return error_response(&Error::not_found(format!(
+                "webhook action '{other}' (test, rotate_secret, replay, resume)"
+            )));
+        }
+    };
+    run(&s, &headers, action, named(body, name)).await
+}
+
+async fn outbox_list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "outbox.list", outbox_query(q)).await
 }
 
 async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {

@@ -3647,6 +3647,16 @@ impl Ontology {
                 });
                 kv.extend(followed.kv);
             }
+            // Renames reach outbound configuration in the same commit:
+            // webhook endpoints' change filters follow renamed kinds and
+            // relations (their version moves, so automations that reach them
+            // are enabled again by a person).
+            let renames = renames_of(&set.changes);
+            let rewritten = rewrite_endpoint_filters(&**o.store(), &renames)?;
+            if !rewritten.is_empty() {
+                payload["webhook_filters"] = json!(rewritten.iter().map(|(_, k, _)| k).collect::<Vec<_>>());
+            }
+            kv.extend(rewritten);
             let event = o.event(ctx, &ctx.workspace, "schema.change", None, now, payload, Vec::new());
             let mut events = origin.events.clone();
             events.push(event);
@@ -3656,7 +3666,7 @@ impl Ontology {
                 events,
                 schema: Some((Arc::new(schema), version)),
                 reindex: planned.reindex.clone(),
-                renames: renames_of(&set.changes),
+                renames,
                 ..Default::default()
             };
             Ok((planned.mutations, extra, (SchemaVersionInfo::from(&sv), planned.plan)))
@@ -3830,6 +3840,54 @@ fn renames_of(changes: &[SchemaChange]) -> Vec<crate::changes::Rename> {
             _ => None,
         })
         .collect()
+}
+
+/// The `webhook.endpoint` values whose change filter names a renamed kind
+/// (`filter.kinds`) or relation (`filter.rels`, also as `^rel`), rewritten to
+/// the new names with their `version` bumped, as KV writes for the schema
+/// commit. Endpoint values are read as JSON: onto-core does not own their
+/// type, only the filter it defines ([`crate::changes::ChangeFilter`]).
+pub(crate) fn rewrite_endpoint_filters(
+    store: &dyn crate::store::Store,
+    renames: &[crate::changes::Rename],
+) -> Result<Vec<(String, String, Value)>> {
+    use crate::changes::RenameWhat;
+    if renames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ns = crate::outbox::NS_WEBHOOK_ENDPOINT;
+    let mut out = Vec::new();
+    for (name, mut v) in store.kv_scan(ns, "")? {
+        let Some(filter) = v.get_mut("filter").and_then(Value::as_object_mut) else { continue };
+        let mut touched = false;
+        for r in renames {
+            let (key, inverse) = match r.what {
+                RenameWhat::Kind => ("kinds", false),
+                RenameWhat::Rel => ("rels", true),
+            };
+            let Some(list) = filter.get_mut(key).and_then(Value::as_array_mut) else { continue };
+            for item in list.iter_mut() {
+                let Some(text) = item.as_str() else { continue };
+                let new = if text == r.from {
+                    Some(r.to.clone())
+                } else if inverse && text.strip_prefix('^') == Some(r.from.as_str()) {
+                    Some(format!("^{}", r.to))
+                } else {
+                    None
+                };
+                if let Some(n) = new {
+                    *item = Value::String(n);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            let version = v.get("version").and_then(Value::as_u64).unwrap_or(0) + 1;
+            v["version"] = json!(version);
+            out.push((ns.to_string(), name, v));
+        }
+    }
+    Ok(out)
 }
 
 /// Migrations run with system authority across workspaces, attributed to the caller.

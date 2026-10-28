@@ -147,6 +147,17 @@ const BUILTIN_ROUTES: &[(&str, &str)] = &[
     ("onto_intelli.v1.ChangeService/Poll", "changes.poll"),
     ("onto_intelli.v1.ChangeService/Head", "changes.head"),
     ("onto_intelli.v1.ChangeService/Capture", "changes.capture"),
+    ("onto_intelli.v1.WebhookService/Add", "webhook.add"),
+    ("onto_intelli.v1.WebhookService/Update", "webhook.update"),
+    ("onto_intelli.v1.WebhookService/Remove", "webhook.remove"),
+    ("onto_intelli.v1.WebhookService/List", "webhook.list"),
+    ("onto_intelli.v1.WebhookService/Test", "webhook.test"),
+    ("onto_intelli.v1.WebhookService/RotateSecret", "webhook.rotate_secret"),
+    ("onto_intelli.v1.WebhookService/Deliveries", "webhook.deliveries"),
+    ("onto_intelli.v1.WebhookService/Replay", "webhook.replay"),
+    ("onto_intelli.v1.WebhookService/Resume", "webhook.resume"),
+    ("onto_intelli.v1.WebhookService/Kill", "webhook.kill"),
+    ("onto_intelli.v1.WebhookService/Outbox", "outbox.list"),
 ];
 
 pub struct Route {

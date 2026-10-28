@@ -280,7 +280,7 @@ export interface Whoami {
   dev_mode: boolean;
   version: string;
   schema_version: number;
-  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean };
+  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean; configure_outbound?: boolean };
   console?: { user: string; role: string; org: string } | null;
   credential?: string;
   ui: { title: string };
@@ -903,4 +903,79 @@ export interface PackInstalled {
   sample_links: number;
   sample_links_skipped: number;
   revision?: number;
+}
+
+// ── webhooks (webhook.* and outbox.list) ───────────────────────────────
+
+export interface ChangeFilter {
+  kinds?: string[];
+  ops?: string[];
+  workspaces?: string[];
+  ids?: string[];
+  rels?: string[];
+  props?: string[];
+  sources?: string[];
+  include_migrations: boolean;
+  fields: "full" | "ids";
+}
+
+export interface WebhookEndpoint {
+  name: string;
+  principal_id: string;
+  /** Full URL for endpoints the caller may manage, else its origin. */
+  url: string;
+  /** `env:VAR`, `file:/path` or `sealed (kek …)`: never the secret. */
+  secret: string;
+  previous_secret?: string;
+  previous_until?: number;
+  principal: { roles: string[]; workspaces: string[] };
+  filter: ChangeFilter | null;
+  enabled: boolean;
+  status: "active" | "paused" | "disabled";
+  paused: { reason: string; since?: number; until?: number; pending?: number; failures?: number } | null;
+  restricted: boolean;
+  version: number;
+  created_by: string;
+  created_at: number;
+  may_manage: boolean;
+  pending?: number;
+  cursor?: string;
+}
+
+export interface WebhookList {
+  items: WebhookEndpoint[];
+  kill: boolean;
+  max_endpoints: number;
+  note: string;
+}
+
+export type OutboxState = "pending" | "inflight" | "retry" | "delivered" | "dead" | "cancelled";
+
+export interface OutboxRow {
+  id: string;
+  created_at: number;
+  kind: "webhook" | "writeback";
+  target: string;
+  dedupe: string;
+  source: string;
+  workspace: string;
+  cursor?: string;
+  event_type: string;
+  state: OutboxState;
+  attempts: number;
+  next_at: number;
+  last_status?: number;
+  last_error?: string;
+  delivered_at?: number;
+}
+
+export interface DeliveryAttempt {
+  outbox_id: string;
+  attempt: number;
+  ts: number;
+  state: OutboxState;
+  status?: number;
+  error?: string;
+  duration_ms: number;
+  response?: string;
 }

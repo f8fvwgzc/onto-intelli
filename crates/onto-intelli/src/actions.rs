@@ -22,6 +22,7 @@ use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RecallOptions, RememberInput};
 use crate::trace::{self, TraceCtx, Traced};
+use crate::webhooks;
 use onto_core::trace::{MetricsQuery, ScoreRow, SessionQuery, TraceDetail, TraceQuery};
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -445,6 +446,61 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "Turn change recording on or off for the tenant (admins of every workspace, never agents); turning it on after a period off expires every older cursor, since nothing was recorded meanwhile. Input: {on | off, workspace?}.",
     ),
+    a(
+        "webhook.list",
+        false,
+        "Webhook endpoints by name: URL (its origin only for endpoints the caller may not manage), secret reference (never the secret), principal, change filter, status (active, paused, disabled), version, and pending rows and cursor for endpoints the caller manages; plus the tenant kill switch. Admins, never agents.",
+    ),
+    a(
+        "webhook.add",
+        true,
+        "Register a webhook endpoint: signed CloudEvents (Standard Webhooks) to an https URL, as the endpoint's principal sees the data. With a filter, every change it wants from now on is enqueued once and delivered at least once; dedupe on the event id. No secret: a whsec_ secret is generated, sealed and returned once. Admins who dominate the principal (default viewer in the call's workspace), never agents. Input: {name, url, secret?, filter?: {kinds?, ops?, workspaces?, ids?, rels?, props?, sources?, fields?, exclude_migrations?}, principal?: {roles, workspaces}, disabled?, workspace?}.",
+    ),
+    a(
+        "webhook.update",
+        true,
+        "Change a webhook endpoint (its version moves): url, secret (replaced, no overlap; see webhook.rotate_secret), filter or clear_filter, principal, enabled or disabled. Admins who dominate the old and new principal. Input: {name, url?, secret?, filter?, clear_filter?, principal?, enabled? | disabled?, workspace?}.",
+    ),
+    a(
+        "webhook.remove",
+        true,
+        "Remove a webhook endpoint; rows not yet sent to it are cancelled. Admins who dominate its principal. Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.test",
+        true,
+        "Enqueue a test delivery (onto.webhook.test) to an endpoint. Admins who dominate its principal. Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.rotate_secret",
+        true,
+        "Rotate an endpoint's signing secret: the new one (given, or generated and returned once) signs from now, the previous one also signs for keep_secs (default a day). Input: {name, secret?, keep_secs?, workspace?}.",
+    ),
+    a(
+        "webhook.deliveries",
+        false,
+        "An endpoint's deliveries, newest first, or one delivery with its attempts (status, error, the start of the receiver's response). Admins who dominate its principal. Input: {name, id?, states?, since?, limit?}.",
+    ),
+    a(
+        "webhook.replay",
+        true,
+        "Send an endpoint's deliveries again (by ids, or created since a time; retry, delivered, dead and cancelled by default). They keep their ids, so receivers that dedupe see repeats. Input: {name, ids? | since?, states?, workspace?}.",
+    ),
+    a(
+        "webhook.resume",
+        true,
+        "Resume a paused endpoint: clears a pause, an open breaker and a backlog pause (fan-out pauses it again while it is over its cap). Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.kill",
+        true,
+        "The tenant's webhook kill switch: on holds every delivery in the outbox (change subscriptions keep their cursors); off resumes them (admins who dominate every endpoint). Input: {on | off, workspace?}.",
+    ),
+    a(
+        "outbox.list",
+        false,
+        "Outbound deliveries waiting, sent or given up, newest first, for targets the caller may manage. Input: {target?, states?, source?, receipt?, run?, since?, limit?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -803,6 +859,9 @@ impl Intelli {
         }
         if changes::CALLS.contains(&action) {
             return blocking(|| self.changes_call(p, action, input));
+        }
+        if webhooks::CALLS.contains(&action) {
+            return blocking(|| self.webhooks_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
@@ -1293,6 +1352,7 @@ impl Intelli {
                         "apply_schema": gov.can_apply(p) && gov.live_edits,
                         "approve": gov.can_approve(p),
                         "propose": gov.can_propose(p),
+                        "configure_outbound": p.is_privileged() && !p.is_agent(),
                     },
                     "schema_version": onto.schema_version(),
                 }))

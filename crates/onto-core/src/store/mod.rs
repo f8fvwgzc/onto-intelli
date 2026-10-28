@@ -170,14 +170,18 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
-    /// Does this batch change state other processes cache (as opposed to
-    /// only appending events and versions)?
-    pub fn changes_state(&self) -> bool {
+    /// Does this batch put or delete entities or links?
+    pub fn changes_graph(&self) -> bool {
         !(self.put_entities.is_empty()
             && self.del_entities.is_empty()
             && self.put_links.is_empty()
-            && self.del_links.is_empty()
-            && self.kv.is_empty())
+            && self.del_links.is_empty())
+    }
+
+    /// Does this batch change state other processes cache (as opposed to
+    /// only appending events and versions)?
+    pub fn changes_state(&self) -> bool {
+        self.changes_graph() || !self.kv.is_empty()
     }
 
     /// The commit record of this batch (sequence and time filled in by the store).
@@ -489,6 +493,11 @@ pub trait Store: Send + Sync {
     /// When the next row is due: the earliest `next_at` of pending and retry
     /// rows, or `lease_until` of inflight ones.
     fn outbox_next_due(&self) -> Result<Option<i64>> {
+        Err(no_outbox())
+    }
+    /// Rows not yet finished (pending, inflight, retry) per target, by
+    /// target name (fan-out pauses an endpoint whose backlog passes its cap).
+    fn outbox_open_counts(&self) -> Result<Vec<(String, u64)>> {
         Err(no_outbox())
     }
     /// Delete finished rows (delivered, dead, cancelled) created before
@@ -1163,6 +1172,15 @@ impl Store for MemoryStore {
                 _ => None,
             })
             .min())
+    }
+
+    fn outbox_open_counts(&self) -> Result<Vec<(String, u64)>> {
+        let inner = self.inner.lock();
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for r in inner.outbox.values().filter(|r| r.state.is_open()) {
+            *counts.entry(r.target.clone()).or_default() += 1;
+        }
+        Ok(counts.into_iter().collect())
     }
 
     fn outbox_vacuum(&self, before_ms: i64) -> Result<u64> {

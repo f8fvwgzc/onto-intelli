@@ -3,7 +3,9 @@
 //! expired lease claimed again, a late finish with an old claim token that
 //! changes nothing, replay keeping the id, the unique `(target, dedupe)` key
 //! absorbing a repeated fan-out page, fenced enqueue with a consumer
-//! advance, and rows enqueued with their audit event in one commit. (Rows
+//! advance, rows enqueued with their audit event in one commit, backlog
+//! counts per target, and schema renames rewriting endpoint filters in the
+//! schema commit. (Rows
 //! committed with a graph change are tested in `outbox.rs`'s unit tests,
 //! where the commit's extras are reachable.)
 
@@ -44,6 +46,8 @@ fn protocol(store: &dyn Store) {
     let again: Vec<OutboxRow> = (0..6).map(|i| row("ops", &format!("test:{i}"))).collect();
     assert_eq!(store.outbox_enqueue(&again, None, None).unwrap(), 0, "a repeated page enqueues nothing");
     assert_eq!(store.outbox_enqueue(&[row("other", "test:0")], None, None).unwrap(), 1, "keys are per target");
+    // Backlogs per target (fan-out pauses an endpoint past its cap).
+    assert_eq!(store.outbox_open_counts().unwrap(), vec![("ops".to_string(), 6), ("other".to_string(), 1)]);
     let stored = store.outbox_get(&rows[0].id).unwrap().unwrap();
     assert_eq!(stored.state, OutboxState::Pending);
     assert!(stored.created_at > 0 && stored.next_at >= stored.created_at, "{stored:?}");
@@ -62,6 +66,8 @@ fn protocol(store: &dyn Store) {
         assert!(r.claim.as_deref().is_some_and(|c| c.starts_with("a:") || c.starts_with("b:")), "{r:?}");
         assert!(r.lease_until.is_some_and(|l| l > r.next_at));
     }
+    let open: u64 = store.outbox_open_counts().unwrap().iter().map(|(_, n)| n).sum();
+    assert_eq!(open, 7, "claimed rows are still undelivered");
     let rest = store.outbox_claim(10, 60_000, "c", &[]).unwrap();
     assert_eq!(rest.len(), 1, "only the other target's row is left");
     assert!(store.outbox_claim(10, 60_000, "c", &[]).unwrap().is_empty(), "nothing due");
@@ -206,11 +212,54 @@ fn through_the_engine(o: &Ontology) {
     assert_eq!(o.store().kv_get("webhook.control", "kill").unwrap(), Some(json!({ "on": true })));
 }
 
+/// A schema change that renames a kind or a relation rewrites the change
+/// filters of webhook endpoints in its own commit (their version moves);
+/// endpoints that do not name them stay as they were.
+fn renames_rewrite_endpoint_filters(o: &Ontology) {
+    let admin = ActionContext::new(Principal::admin("lead"), "acme");
+    let ep = |name: &str, filter: serde_json::Value| {
+        json!({ "name": name, "url": "https://hooks.example.com/", "secret": "env:S", "filter": filter,
+                "principal": { "roles": ["viewer"], "workspaces": ["*"] }, "enabled": true, "version": 4 })
+    };
+    let kv = vec![
+        ("webhook.endpoint".to_string(), "tasks".to_string(), ep("tasks", json!({ "kinds": ["task", "person"] }))),
+        ("webhook.endpoint".to_string(), "links".to_string(), ep("links", json!({ "rels": ["^part_of", "owns"] }))),
+        ("webhook.endpoint".to_string(), "none".to_string(), ep("none", json!({ "kinds": ["person"] }))),
+        ("webhook.endpoint".to_string(), "effects".to_string(), ep("effects", serde_json::Value::Null)),
+    ];
+    o.commit_config(&admin, kv, ConfigEvent::new("webhook.add", None, json!({}))).unwrap();
+    let set: onto_core::SchemaChangeSet = serde_json::from_value(json!({ "changes": [
+        { "op": "rename_object_type", "from": "task", "to": "chore" },
+        { "op": "rename_link_type", "from": "part_of", "to": "within" },
+    ] }))
+    .unwrap();
+    let before = o.store().head().unwrap();
+    o.schema_apply(&admin, set).unwrap();
+    let get = |name: &str| o.store().kv_get("webhook.endpoint", name).unwrap().unwrap();
+    assert_eq!(get("tasks")["filter"]["kinds"], json!(["chore", "person"]));
+    assert_eq!(get("tasks")["version"], 5);
+    assert_eq!(get("links")["filter"]["rels"], json!(["^within", "owns"]));
+    assert_eq!(get("links")["version"], 5);
+    assert_eq!((get("none")["version"].as_u64(), get("effects")["version"].as_u64()), (Some(4), Some(4)));
+    // One commit carried the schema and the rewritten filters.
+    assert_eq!(o.store().head().unwrap(), before + 1);
+    let f = EventFilter { action: Some("schema.change".into()), ..Default::default() };
+    let ev = o.events(&Principal::admin("lead"), &f).unwrap();
+    assert_eq!(ev.last().unwrap().payload["webhook_filters"], json!(["links", "tasks"]));
+}
+
 #[test]
 fn memory_outbox() {
     protocol(&MemoryStore::default());
     fenced_enqueue(&MemoryStore::default());
     through_the_engine(&Ontology::in_memory(Schema::enterprise()));
+    renames_rewrite_endpoint_filters(&Ontology::in_memory(Schema::enterprise()));
+}
+
+#[test]
+fn postgres_renames_rewrite_endpoint_filters() {
+    let Some(pg) = common::TestTenant::new("outbox_renames") else { return };
+    renames_rewrite_endpoint_filters(&pg.open(Schema::enterprise(), OntologyOptions::default()));
 }
 
 #[test]

@@ -320,6 +320,9 @@ struct Inner {
     /// Commits record change records (the tenant's `capture` setting as last
     /// read; a stale value only adds records or leaves a gap).
     capture: AtomicBool,
+    /// Commits that change entities or links wake the tenant's background
+    /// work (set while it has enabled change subscriptions; section 10).
+    wake_on_change: AtomicBool,
     opts: OntologyOptions,
     listeners: RwLock<Vec<Listener>>,
     /// The last few reasoner closures (see [`crate::reason`]).
@@ -371,6 +374,7 @@ impl Ontology {
                 revision: AtomicU64::new(1),
                 seq: AtomicU64::new(snap.seq),
                 capture: AtomicBool::new(capture),
+                wake_on_change: AtomicBool::new(false),
                 opts,
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
@@ -435,6 +439,14 @@ impl Ontology {
     /// Called synchronously after each committed write.
     pub fn on_change(&self, f: impl Fn(&ChangeSet) + Send + Sync + 'static) {
         self.inner.listeners.write().push(Arc::new(f));
+    }
+
+    /// Make commits that change entities or links bump the tenant's wake row
+    /// (stores with one), so the deployment's wake scanner opens the tenant
+    /// for its change subscriptions even when no process holds it open. Set
+    /// while the tenant has enabled webhook endpoints with a change filter.
+    pub fn set_wake_on_change(&self, on: bool) {
+        self.inner.wake_on_change.store(on, Ordering::Relaxed);
     }
 
     /// Do this process's commits record change records?
@@ -615,6 +627,7 @@ impl Ontology {
                 revision: AtomicU64::new(self.revision()),
                 seq: AtomicU64::new(0),
                 capture: AtomicBool::new(false),
+                wake_on_change: AtomicBool::new(false),
                 opts: self.inner.opts.clone(),
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
@@ -1399,6 +1412,11 @@ impl Ontology {
             staged.batch.fence = Some(fence);
         }
         staged.batch.wake = extra.wake;
+        if self.inner.wake_on_change.load(Ordering::Relaxed) && staged.batch.changes_graph() {
+            // Change subscriptions (webhook endpoints) have records to fan
+            // out: a closed tenant is woken for them.
+            staged.batch.wake = Some(staged.batch.wake.map_or(0, |w| w.min(0)));
+        }
         if !extra.outbox.is_empty() {
             if !self.inner.store.keeps_outbox() {
                 return Err(crate::outbox::no_outbox());

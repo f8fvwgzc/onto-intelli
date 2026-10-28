@@ -1443,3 +1443,42 @@ Build step 8 (outbox and delivery):
   `dead`; a secret reference that does not resolve is retried, since an operator can fix it.
 - Deferred: delivery traces (B.7 `[traces] deliveries`); only `traceparent` is sent in step 8.
 
+
+Build step 9 (endpoints and fan-out):
+
+- No migration: the outbox, consumers and leases of 0010/0011 hold everything. The Store gains
+  `outbox_open_counts` (undelivered rows per target) for the backlog cap.
+- Backlog pauses live in `webhook.control` (`backlog:<endpoint>`, `{since, pending}`), like breakers,
+  not in `Endpoint.paused`: delivery must keep draining a backlogged endpoint (the delivery worker
+  skips endpoints whose own `paused` is set), and a pause must not move the endpoint `version`.
+  Outputs show it as `status: paused` with `paused.reason = "backlogged"`. A round never enqueues
+  past `pending_cap`; the endpoint's cursor stops before the first record that did not fit.
+- Expiry uses the floor's edge: a cursor is complete at `(floor - 1, u32::MAX)` (where a gap leaves
+  it), expired below it. The gap delivery is a change-sourced row without a cursor
+  (`onto.changes.gap`, payload `{from, to, reason, message}`, dedupe `gap:<from>:<to>`), sent as
+  stored; a cursor ahead of the head (a restored store) gets the same with `reason: ahead_of_head`.
+- A new subscription starts at the head: `webhook.add` (or `webhook.update` setting a filter) sets
+  the endpoint's consumer before the configuration commit. Disabled endpoints keep their cursor and
+  resume from it (or get a gap) when enabled again.
+- A change row's CloudEvent `type` follows the record as rendered at send time
+  (`onto.entity.hidden` when the endpoint no longer sees the entity), not the type at enqueue.
+- Rows of a removed endpoint are `cancelled: endpoint_removed`, not dead (no `webhook.dead`
+  event per row).
+- While a tenant has an enabled subscription, commits that put or delete entities or links bump
+  its wake row (`Ontology::set_wake_on_change`, section 10), so the wake scanner opens a closed
+  tenant for fan-out. Fan-out runs whether or not this process sends (`[webhooks] enabled` is the
+  delivery switch); the kill switch holds deliveries, not fan-out.
+- `webhook.list` is admin-only; for endpoints the caller does not dominate it shows the URL's origin
+  only, and no cursor or pending count. `outbox.list` hides rows of endpoints the caller does not
+  dominate (and of removed targets, except to admins of every workspace) and reports how many.
+  `webhook.kill` on needs admin; off needs dominance over every endpoint (it resumes all of them).
+  Dominance refusals are audited as `authorization.denied` (`Ontology::refuse_configure`).
+- Restriction is sticky: once a project credential registers or changes an endpoint it stays
+  `restricted`; an operator removes and re-adds it to lift that.
+- URL references: write-time and delivery errors for an `env:`/`file:` URL name the reference
+  only; the refused host or address (part of the value) is not echoed. Names are judged at every
+  delivery (DNS); a write checks scheme, userinfo, fragment and IP literals.
+- HTTP: `POST /v1/webhooks/kill` is the switch, so `kill` is not a valid endpoint name.
+- UI: `pages/automate/AutomatePage.tsx` with `WebhooksTab` (the Automations tab comes with step
+  11); whoami gains `configure_outbound` (admins, never agents). CLI: `onto webhook list|add|rm`
+  (`--sees` names the principal's workspaces, since `--workspace` is a global flag).

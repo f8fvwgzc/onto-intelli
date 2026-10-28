@@ -39,6 +39,11 @@ use crate::{Error, Result};
 pub const CONFIG_NAMESPACES: &[&str] =
     &["webhook.endpoint", "webhook.control", "writeback.target", "automation.state", "automation.control"];
 
+/// KV namespace of webhook endpoints (key: the endpoint name). onto-intelli
+/// owns their type; a schema rename rewrites their change filters in the
+/// same commit.
+pub const NS_WEBHOOK_ENDPOINT: &str = "webhook.endpoint";
+
 /// Bytes of a receiver's response body kept with an attempt (diagnostics).
 pub const MAX_RESPONSE_BYTES: usize = 4096;
 /// Most rows one [`OutboxQuery`] returns.
@@ -370,6 +375,14 @@ impl Ontology {
             return Err(Error::Denied(reason));
         }
         Ok(())
+    }
+
+    /// Refuse a configuration call: the refusal is audited as
+    /// `authorization.denied` and returned as `Error::Denied(reason)`.
+    pub fn refuse_configure(&self, ctx: &ActionContext, reason: impl Into<String>) -> Error {
+        let reason = reason.into();
+        self.audit_denied(ctx, &reason, now_ms());
+        Error::Denied(reason)
     }
 
     /// Write outbound configuration or operational state (`kv`, only in

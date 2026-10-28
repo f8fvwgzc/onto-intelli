@@ -211,6 +211,8 @@ pub struct Intelli {
     /// Wakes the delivery worker: a commit enqueued outbox rows, or another
     /// process committed.
     outbox_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the fan-out of change subscriptions: something was committed.
+    fanout_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Intelli {
@@ -260,16 +262,21 @@ impl Intelli {
         let changes = ChangeHub::new(&onto, config.changes.clone());
         let outbox_wake = Arc::new(tokio::sync::Notify::new());
         let wake = outbox_wake.clone();
+        let fanout_wake = Arc::new(tokio::sync::Notify::new());
+        let fanout = fanout_wake.clone();
         onto.on_change(move |c| {
             // Rows this process enqueued, or another process's commit (which
             // may have enqueued some): look for due rows now.
             if c.outbox > 0 || c.request_id == "sync" {
                 wake.notify_one();
             }
+            // Any commit may hold records a subscription wants.
+            fanout.notify_one();
         });
         let me = Arc::new(Self {
             secrets: parking_lot::RwLock::new(None),
             outbox_wake,
+            fanout_wake,
             changes,
             closing: watch::Sender::new(false),
             stream_touch: AtomicI64::new(0),
@@ -303,6 +310,7 @@ impl Intelli {
         }
         #[cfg(feature = "outbound")]
         crate::webhooks::spawn_delivery(&me, me.outbox_wake.clone())?;
+        crate::webhooks::spawn_fanout(&me, me.fanout_wake.clone());
         Ok(me)
     }
 

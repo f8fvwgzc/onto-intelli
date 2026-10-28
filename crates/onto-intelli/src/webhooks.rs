@@ -1,4 +1,4 @@
-//! Webhook delivery from the outbox (docs/design/EVENTS.md Part B).
+//! Webhook endpoints, fan-out and delivery from the outbox (docs/design/EVENTS.md Part B).
 //!
 //! * **Envelope**: a CloudEvents 1.0 structured JSON event ([`envelope`]).
 //!   Its `id` is the outbox row id, kept when a row is replayed.
@@ -26,9 +26,20 @@
 //! configured one times the replicas that hold the tenant open.
 //!
 //! Endpoint configuration is tenant KV (`webhook.endpoint`, one value per
-//! endpoint); operational state (kill switch, breakers) is `webhook.control`.
-//! Both are written with their audit event through
-//! [`onto_core::Ontology::commit_config`].
+//! endpoint); operational state (kill switch, breakers, backlog pauses) is
+//! `webhook.control`. Both are written with their audit event through
+//! [`onto_core::Ontology::commit_config`]. The actions that manage endpoints
+//! ([`CALLS`]) need admins who dominate the endpoint's principal.
+//!
+//! * **Fan-out** ([`spawn_fanout`]): one process per tenant at a time (the
+//!   `webhook:fanout` lease, writes fenced by its epoch) turns change records
+//!   into rows for each endpoint whose filter wants them, as the endpoint's
+//!   principal sees them. Each endpoint keeps its own cursor; rows hold only
+//!   the cursor and are rendered when sent. An endpoint with `pending_cap`
+//!   undelivered rows is paused (`backlogged`) with its cursor kept, and
+//!   resumed when its backlog drains below half the cap. An endpoint whose
+//!   cursor expired gets one `onto.changes.gap` delivery and resumes at the
+//!   floor.
 
 use std::path::PathBuf;
 
@@ -52,6 +63,14 @@ pub const NS_CONTROL: &str = "webhook.control";
 pub const KILL_KEY: &str = "kill";
 /// `webhook.control` keys of breakers: `breaker:<endpoint>`.
 pub const BREAKER_PREFIX: &str = "breaker:";
+/// `webhook.control` keys of endpoints fan-out paused for their backlog:
+/// `backlog:<endpoint>` (`{since, pending}`). Kept apart from the endpoint's
+/// configuration, so a pause never moves its `version`, and deliveries
+/// continue (the backlog drains) while fan-out holds the endpoint's cursor.
+pub const BACKLOG_PREFIX: &str = "backlog:";
+/// The CloudEvent type of the delivery an endpoint gets when records it
+/// subscribed to expired before fan-out reached them (`{from, to}`).
+pub const GAP_EVENT: &str = "onto.changes.gap";
 /// The sealing purpose of endpoint signing secrets.
 pub const SECRET_PURPOSE: &str = "webhook-secret";
 /// The CloudEvent type of `webhook.test` deliveries.
@@ -219,6 +238,23 @@ pub fn resolve_text(raw: &str, what: &str) -> Result<String> {
     String::from_utf8(v.expose().to_vec()).map_err(|_| Error::invalid(format!("{what} {} is not text", r.stored())))
 }
 
+/// Check an endpoint's delivery URL (`url`, resolved from `raw`, which may be
+/// an operator reference) against the outbound rules. When it came from a
+/// reference, the error names the reference only: the refused host or
+/// address is part of the value.
+pub fn check_endpoint_url(raw: &str, url: &str, reach: &crate::net::Reach) -> Result<url::Url> {
+    if !is_reference(raw) {
+        return crate::net::check_target_url(url, "url", reach);
+    }
+    let what = format!("the URL in {}", raw.trim());
+    crate::net::check_target_url(url, &what, reach).map_err(|_| {
+        Error::invalid(format!(
+            "{what} is refused: it must be an https URL without userinfo or a fragment, to a public address or a \
+             host [[webhooks.allow]] lists"
+        ))
+    })
+}
+
 /// A new Standard Webhooks secret: `whsec_` and 32 random bytes in base64.
 pub fn generate_secret() -> Result<String> {
     let mut key = [0u8; 32];
@@ -350,6 +386,11 @@ pub struct Endpoint {
     pub created_at: i64,
 }
 
+/// The change-feed consumer (cursor) of endpoint `name`: `webhook:<name>`.
+pub fn consumer_name(name: &str) -> String {
+    format!("webhook:{name}")
+}
+
 /// `[a-z0-9_-]`, 1 to 40 characters.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -358,6 +399,26 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Endpoint {
+    /// An endpoint with only a name and a principal (dominance checks of
+    /// what a call would configure).
+    pub fn bare(name: &str, principal: ScopePrincipal) -> Self {
+        Endpoint {
+            name: name.to_string(),
+            url: String::new(),
+            secret: SecretRef::Env(String::new()),
+            previous_secret: None,
+            previous_until: None,
+            filter: None,
+            principal,
+            enabled: false,
+            paused: None,
+            restricted: false,
+            version: 0,
+            created_by: String::new(),
+            created_at: 0,
+        }
+    }
+
     /// `webhook:<name>`.
     pub fn principal_id(&self) -> String {
         format!("webhook:{}", self.name)
@@ -551,9 +612,13 @@ pub(crate) fn system_ctx(onto: &Ontology, workspace: &str) -> ActionContext {
 
 #[cfg(feature = "outbound")]
 pub use deliver::spawn_delivery;
+pub use fanout::{FANOUT_LEASE, spawn_fanout};
+pub use registry::{CALLS, url_origin};
 
 #[cfg(feature = "outbound")]
 mod deliver;
+mod fanout;
+mod registry;
 
 #[cfg(test)]
 mod tests {

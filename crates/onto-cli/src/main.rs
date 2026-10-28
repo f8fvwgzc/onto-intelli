@@ -163,6 +163,13 @@ enum Command {
     /// stream. `--once` prints one page after a cursor and the cursor to
     /// resume from (`--after`).
     Watch(WatchArgs),
+    /// Webhook endpoints: signed CloudEvents (Standard Webhooks) to your
+    /// receivers. Each change a filter subscribes to is enqueued once per
+    /// endpoint and delivered at least once; receivers dedupe on the event id.
+    Webhook {
+        #[command(subcommand)]
+        sub: WebhookCmd,
+    },
     /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
     Metric {
         name: Option<String>,
@@ -395,6 +402,44 @@ enum Command {
     Protos,
     /// Graph, memory, cache and token statistics.
     Stats,
+}
+
+#[derive(Subcommand)]
+enum WebhookCmd {
+    /// Endpoints with their status, principal and filter.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register an endpoint. Without --secret a whsec_ secret is generated
+    /// (it needs ONTO_MASTER_KEY to be sealed) and printed once; --secret
+    /// takes the secret itself or an env:VAR / file:/path reference.
+    Add {
+        name: String,
+        /// https URL (or env:VAR naming one).
+        url: String,
+        #[arg(long)]
+        secret: Option<String>,
+        /// Subscribe to changes of these kinds (repeatable).
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Subscribe to these ops (repeatable): entity.create, entity.update, link.create, ...
+        #[arg(long = "op")]
+        ops: Vec<String>,
+        /// Subscribe to every change (no kind or op narrowing).
+        #[arg(long)]
+        all: bool,
+        /// What the receiver may see: roles (repeatable, default viewer).
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        /// ... in these workspaces (repeatable, default the call's workspace).
+        #[arg(long = "sees")]
+        workspaces: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an endpoint (rows not yet sent to it are cancelled).
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1440,6 +1485,110 @@ fn print_crawl(st: &Style, c: &Value) {
     }
 }
 
+/// The input of `webhook.add` from the command line.
+#[allow(clippy::too_many_arguments)]
+fn webhook_add_input(
+    name: &str,
+    url: &str,
+    secret: Option<&str>,
+    kinds: &[String],
+    ops: &[String],
+    all: bool,
+    roles: &[String],
+    workspaces: &[String],
+) -> Value {
+    let mut input = json!({ "name": name, "url": url });
+    if let Some(s) = secret {
+        input["secret"] = json!(s);
+    }
+    if all || !kinds.is_empty() || !ops.is_empty() {
+        input["filter"] = json!({ "kinds": kinds, "ops": ops });
+    }
+    if !roles.is_empty() || !workspaces.is_empty() {
+        let roles = if roles.is_empty() { vec!["viewer".to_string()] } else { roles.to_vec() };
+        input["principal"] = json!({ "roles": roles, "workspaces": workspaces });
+    }
+    input
+}
+
+async fn webhook(cli: &Cli, sub: &WebhookCmd, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    match sub {
+        WebhookCmd::List { json: as_json } => {
+            let r = be.call("webhook.list", json!({})).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if r["kill"] == true {
+                println!("{}", st.red("deliveries are held: the tenant kill switch is on"));
+            }
+            if items.is_empty() {
+                println!(
+                    "No webhook endpoints. Add one: onto webhook add ops https://hooks.example.com/in --kind issue"
+                );
+            }
+            for e in items {
+                let p = &e["principal"];
+                let roles: Vec<&str> =
+                    p["roles"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let ws: Vec<&str> = p["workspaces"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let filter = if e["filter"].is_null() {
+                    "effects only".to_string()
+                } else {
+                    let kinds: Vec<&str> = e["filter"]["kinds"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if kinds.is_empty() {
+                        "all changes".to_string()
+                    } else {
+                        format!("changes of {}", kinds.join(", "))
+                    }
+                };
+                let status = e["status"].as_str().unwrap_or_default();
+                let status = if status == "active" { status.to_string() } else { st.red(status) };
+                println!(
+                    "{}  {}  {}  as {} in {}  {}  v{}{}",
+                    st.bold(e["name"].as_str().unwrap_or_default()),
+                    e["url"].as_str().unwrap_or_default(),
+                    status,
+                    roles.join("+"),
+                    ws.join(","),
+                    filter,
+                    e["version"],
+                    e["pending"].as_u64().filter(|n| *n > 0).map(|n| format!("  {n} pending")).unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        WebhookCmd::Add { name, url, secret, kinds, ops, all, roles, workspaces, json: as_json } => {
+            let input = webhook_add_input(name, url, secret.as_deref(), kinds, ops, *all, roles, workspaces);
+            let r = be.call("webhook.add", input).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let e = &r["endpoint"];
+            println!("Added {} ({}), secret {}", st.bold(name), e["status"].as_str().unwrap_or_default(), e["secret"]);
+            if let Some(s) = r["secret"].as_str() {
+                println!("Signing secret (shown once; store it with the receiver): {s}");
+            }
+            println!("{}", st.dim(r["note"].as_str().unwrap_or_default()));
+            Ok(())
+        }
+        WebhookCmd::Rm { name } => {
+            be.call("webhook.remove", json!({ "name": name })).await?;
+            println!("Removed {name}");
+            Ok(())
+        }
+    }
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
@@ -2178,6 +2327,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             Ok(())
         }
         Command::Watch(w) => watch(&cli, w, st).await,
+        Command::Webhook { sub } => webhook(&cli, sub, st).await,
         Command::Changes { days, within } => {
             let be = backend(&cli).await?;
             let r = be

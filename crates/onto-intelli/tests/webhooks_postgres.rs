@@ -1,7 +1,10 @@
 //! Webhook delivery on PostgreSQL (when a test database is set): two hubs
 //! (two processes' worth of delivery workers) on one tenant send each row
 //! once while nothing fails, a retry is due by the database clock, and the
-//! tenant's wake row settles once nothing is pending.
+//! tenant's wake row settles once nothing is pending. Fan-out of a change
+//! subscription with writers in both processes enqueues each change once
+//! (one fan-out holder at a time, fenced; the cursor is the dedupe key), and
+//! commits wake the tenant while it has a subscription.
 #![cfg(feature = "postgres")]
 
 mod common;
@@ -129,6 +132,65 @@ async fn two_processes_deliver_each_row_once_and_settle_the_wake_row() {
 
     drop((ta, tb, a, b));
     common::drop_tenant(&url, &prefix, "hooks");
+    let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    let sys = onto_intelli::core::store::postgres::sys_schema(&prefix);
+    onto_intelli::core::sqlx::query(onto_intelli::core::sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS \"{sys}\" CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_fan_out_each_change_once() {
+    let Some(url) = common::database_url("two_processes_fan_out_each_change_once") else { return };
+    let prefix = common::unique("ofo_");
+    let (rx, port) = receiver(vec![]).await;
+    let a = Hub::open(config(&url, &prefix)).await.unwrap();
+    let b = Hub::open(config(&url, &prefix)).await.unwrap();
+    let (ta, tb) = (a.tenant("fan").await.unwrap(), b.tenant("fan").await.unwrap());
+    let dir = std::env::temp_dir().join("onto-intelli-webhook-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("pg-fan-{}", onto_intelli::core::time::new_id("s")));
+    std::fs::write(&path, "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").unwrap();
+    let lead = Principal::admin("lead");
+    ta.call(
+        &lead,
+        "webhook.add",
+        json!({
+            "name": "tasks", "url": format!("http://127.0.0.1:{port}/in"), "secret": format!("file:{}", path.display()),
+            "filter": { "kinds": "task" }, "principal": { "roles": "viewer", "workspaces": "acme" },
+        }),
+    )
+    .await
+    .unwrap();
+    let store = tb.ontology().store().clone();
+    // Writers in both processes; the subscription wakes the tenant on commits.
+    let bumped = store.wake_get().unwrap().map_or(0, |w| w.bumped);
+    for n in 0..10 {
+        let (t, who) = if n % 2 == 0 { (&ta, "a") } else { (&tb, "b") };
+        t.call(&lead, "entity.upsert", json!({ "id": format!("task:{who}{n}"), "title": "T", "workspace": "acme" }))
+            .await
+            .unwrap();
+    }
+    assert!(store.wake_get().unwrap().is_some_and(|w| w.bumped > bumped), "commits wake a subscribed tenant");
+    let delivered = || {
+        let rows = store.outbox_list(&OutboxQuery { target: Some("tasks".into()), ..Default::default() }).unwrap();
+        rows.len() == 10 && rows.iter().all(|r| r.state == OutboxState::Delivered)
+    };
+    assert!(eventually(20, delivered).await, "{:?}", rx.ids.lock());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = store.outbox_list(&OutboxQuery { target: Some("tasks".into()), ..Default::default() }).unwrap();
+    let keys: HashSet<&str> = rows.iter().map(|r| r.dedupe.as_str()).collect();
+    assert_eq!((rows.len(), keys.len()), (10, 10), "each change enqueued once");
+    let got = rx.ids.lock().clone();
+    assert_eq!(got.iter().collect::<HashSet<_>>().len(), 10, "{got:?}");
+    let lease = store.lease_get(webhooks::FANOUT_LEASE).unwrap().expect("the fan-out lease was taken");
+    assert!(lease.epoch >= 1);
+
+    drop((ta, tb, a, b));
+    common::drop_tenant(&url, &prefix, "fan");
     let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     let sys = onto_intelli::core::store::postgres::sys_schema(&prefix);
     onto_intelli::core::sqlx::query(onto_intelli::core::sqlx::AssertSqlSafe(format!(
