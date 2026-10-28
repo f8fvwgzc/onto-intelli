@@ -36,7 +36,8 @@ const fn a(name: &'static str, write: bool, description: &'static str) -> Action
 
 /// Actions that change entities and links directly, without an action
 /// type's checks: refused to agents unless `governance.agent_raw_writes`
-/// (`ingest.sheet` with `dry_run` writes nothing and stays allowed).
+/// (`ingest.sheet` with `dry_run` writes nothing and stays allowed). So is
+/// `pack.install` with `sample`, which writes the pack's sample data.
 pub const RAW_WRITES: &[&str] = &[
     "entity.upsert",
     "entity.patch",
@@ -53,7 +54,10 @@ pub const RAW_WRITES: &[&str] = &[
 /// types (plan, risk, confirmation by a person), proposals instead of
 /// direct schema changes, their own memory and trace scores. Every other
 /// write action of [`ACTIONS`] is refused to agents, so a write action added
-/// later is closed to them until it is listed here.
+/// later is closed to them until it is listed here. `connector.crawl` is
+/// listed though it writes catalog entities and links without action types:
+/// it needs an admin, and it syncs what a registered source says rather
+/// than what the caller writes.
 pub const AGENT_WRITES: &[&str] = &[
     "action.apply",
     "action.undo",
@@ -82,16 +86,20 @@ pub const AGENT_WRITES: &[&str] = &[
 /// May agent `p` run write action `action` with `input`?
 fn agent_may_write(p: &Principal, action: &str, input: &Value, raw_writes: bool) -> Result<()> {
     let write = ACTIONS.iter().any(|a| a.name == action && a.write);
-    if !p.is_agent() || !write || AGENT_WRITES.contains(&action) {
+    if !p.is_agent() || !write {
         return Ok(());
     }
-    if action == "ingest.sheet" && input.get("dry_run").and_then(Value::as_bool) == Some(true) {
+    let flag = |name: &str| input.get(name).and_then(Value::as_bool) == Some(true);
+    if action == "ingest.sheet" && flag("dry_run") {
         return Ok(());
     }
-    if raw_writes && RAW_WRITES.contains(&action) {
+    // A pack's sample writes its entities and links directly: a raw write,
+    // though the pack's schema, from an agent, is only proposed.
+    let raw = RAW_WRITES.contains(&action) || (action == "pack.install" && flag("sample"));
+    if (AGENT_WRITES.contains(&action) && !raw) || (raw && raw_writes) {
         return Ok(());
     }
-    let why = if RAW_WRITES.contains(&action) {
+    let why = if raw {
         "writes the graph directly, which agents may not (use an action type, action.apply; or set governance.agent_raw_writes)"
     } else {
         "is not open to agents"
