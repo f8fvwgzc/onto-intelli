@@ -220,6 +220,33 @@ pub fn diff_fields(old: &Entity, new: &Entity) -> Vec<String> {
     changed
 }
 
+/// Per-item overheads of [`Ontology::estimated_bytes`]: rough figures for the
+/// maps, indexes and allocations around the contents.
+const ENTITY_OVERHEAD: u64 = 320;
+const LINK_OVERHEAD: u64 = 160;
+const TEXT_DOC_OVERHEAD: u64 = 256;
+const VECTOR_BYTES: u64 = 512 + 64;
+
+fn json_bytes(m: &serde_json::Map<String, Value>) -> u64 {
+    fn value(v: &Value) -> u64 {
+        16 + match v {
+            Value::String(s) => s.len() as u64,
+            Value::Array(a) => a.iter().map(value).sum(),
+            Value::Object(o) => o.iter().map(|(k, v)| k.len() as u64 + value(v)).sum(),
+            _ => 0,
+        }
+    }
+    m.iter().map(|(k, v)| k.len() as u64 + value(v)).sum()
+}
+
+fn entity_bytes(e: &Entity) -> u64 {
+    ENTITY_OVERHEAD
+        + (e.id.len() + e.kind.len() + e.workspace.len() + e.title.len()) as u64
+        + e.state.as_ref().map_or(0, |s| s.len() as u64)
+        + e.aliases.iter().map(|a| a.len() as u64 + 24).sum::<u64>()
+        + json_bytes(&e.props)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct OntoStats {
     pub schema: String,
@@ -263,6 +290,8 @@ struct Inner {
     listeners: RwLock<Vec<Listener>>,
     /// The last few reasoner closures (see [`crate::reason`]).
     reason_cache: crate::reason::ClosureCache,
+    /// `(revision, bytes)` of the last [`Ontology::estimated_bytes`].
+    size: parking_lot::Mutex<(u64, u64)>,
 }
 
 /// Cheap to clone; all clones share the same graph.
@@ -309,6 +338,7 @@ impl Ontology {
                 opts,
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
+                size: parking_lot::Mutex::new((0, 0)),
             }),
         };
         onto.bootstrap_schema(config_schema)?;
@@ -506,6 +536,7 @@ impl Ontology {
                 opts: self.inner.opts.clone(),
                 listeners: RwLock::new(Vec::new()),
                 reason_cache: Default::default(),
+                size: parking_lot::Mutex::new((0, 0)),
             }),
         }
     }
@@ -958,6 +989,37 @@ impl Ontology {
             return Err(Error::Denied(format!("{} has no access to workspace {w}", p.id)));
         }
         Ok(self.inner.store.events(filter)?.into_iter().filter(|e| p.in_workspace(&e.workspace)).collect())
+    }
+
+    /// A rough size, in bytes, of what this ontology keeps in memory: the
+    /// entities and links (from their contents) and their text index and
+    /// in-memory vectors (per document). An estimate for eviction budgets and
+    /// metrics, not a measurement. Recomputed after a write, cached otherwise.
+    pub fn estimated_bytes(&self) -> u64 {
+        let rev = self.revision();
+        let mut cached = self.inner.size.lock();
+        if cached.0 == rev && rev != 0 {
+            return cached.1;
+        }
+        let g = self.inner.graph.read();
+        let mut bytes = 0u64;
+        for e in g.entities() {
+            bytes += entity_bytes(e);
+        }
+        for l in g.links() {
+            bytes += LINK_OVERHEAD + (l.from.len() + l.rel.len() + l.to.len()) as u64 + json_bytes(&l.props);
+        }
+        drop(g);
+        bytes += self.inner.text.read().len() as u64 * TEXT_DOC_OVERHEAD;
+        bytes += self.inner.vectors.read().len() as u64 * VECTOR_BYTES;
+        *cached = (rev, bytes);
+        bytes
+    }
+
+    /// Entities and links in memory.
+    pub fn counts(&self) -> (usize, usize) {
+        let g = self.inner.graph.read();
+        (g.len(), g.link_count())
     }
 
     pub fn stats(&self) -> Result<OntoStats> {
@@ -1553,6 +1615,7 @@ impl Ontology {
             Mutation::Link(input) => self.stage_link(schema, ctx, st, input, now),
             Mutation::Unlink(input) => {
                 let (base, dir) = schema.resolve_rel_lenient(&input.rel);
+                policy::check_acl_link(&ctx.principal, &base)?;
                 let (mut from, mut to) = if dir == Dir::In { (input.to, input.from) } else { (input.from, input.to) };
                 if schema.link_type(&base).is_some_and(|lt| lt.symmetric) && from > to {
                     std::mem::swap(&mut from, &mut to);
@@ -1625,6 +1688,7 @@ impl Ontology {
         if base.is_empty() {
             return Err(Error::invalid("relation name is required"));
         }
+        policy::check_acl_link(&ctx.principal, &base)?;
         let (mut from, mut to) = if dir == Dir::In { (input.to, input.from) } else { (input.from, input.to) };
         if st.entity(&from).is_none() {
             from = self.resolve_in(st.g, &from);
@@ -2015,6 +2079,34 @@ mod tests {
         assert!(o.get(&kenji, "knowledge:salaries").is_ok());
         assert!(o.get(&eve, "knowledge:salaries").is_err());
         assert!(o.search(&eve, "salary", &[], None, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_admins_change_the_links_acls_follow() {
+        let (o, admin) = onto();
+        o.upsert(
+            &admin,
+            EntityInput::new("knowledge", "salaries", "Salary bands")
+                .prop("visibility", "restricted")
+                .prop("acl", serde_json::json!(["team:payments"])),
+        )
+        .unwrap();
+        o.upsert(&admin, EntityInput::new("person", "eve", "Eve")).unwrap();
+        let eve = Principal::member("eve", "acme").with_entity("person:eve");
+        let as_eve = ActionContext::new(eve.clone(), "acme");
+        // Joining the team named in the acl would make the entity visible.
+        let err = o.link(&as_eve, "person:eve", "member_of", "team:payments").unwrap_err();
+        assert!(matches!(err, Error::Denied(ref m) if m.contains("member_of")), "{err}");
+        let batch = vec![Mutation::Link(LinkInput::new("person:eve", "member_of", "team:payments"))];
+        assert!(matches!(o.apply(&as_eve, batch), Err(Error::Denied(_))), "in a batch too");
+        assert!(o.get(&eve, "knowledge:salaries").is_err());
+        // Leaving a team changes access too.
+        let kenji = ActionContext::new(Principal::member("kenji", "acme").with_entity("person:kenji"), "acme");
+        assert!(matches!(o.unlink(&kenji, "person:kenji", "member_of", "team:payments"), Err(Error::Denied(_))));
+        // Other links stay open to members, and admins may change memberships.
+        o.link(&as_eve, "person:eve", "manages", "team:payments").unwrap();
+        o.link(&admin, "person:eve", "member_of", "team:payments").unwrap();
+        assert!(o.get(&eve, "knowledge:salaries").is_ok());
     }
 
     #[test]

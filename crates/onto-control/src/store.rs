@@ -94,6 +94,9 @@ pub trait ControlStore: Send + Sync {
     async fn expire_key(&self, id: &str, at: i64) -> Result<()>;
     /// Batched `last_used_at` writes (never moves backwards).
     async fn touch_keys(&self, used: &[(String, i64)]) -> Result<()>;
+    /// Replace a key's hash when it is still `old` (a hash made under a
+    /// previous pepper, rewritten under the current one). Whether it changed.
+    async fn set_key_hash(&self, id: &str, old: &str, new: &str) -> Result<bool>;
 
     // ── OIDC state ────────────────────────────────────────────────────────
     async fn put_login(&self, l: PendingLogin) -> Result<()>;
@@ -660,6 +663,17 @@ impl ControlStore for MemoryControl {
         let k = s.keys.get_mut(id).ok_or_else(|| Error::not_found(format!("key {id}")))?;
         k.expires_at = Some(k.expires_at.map_or(at, |e| e.min(at)));
         Ok(())
+    }
+
+    async fn set_key_hash(&self, id: &str, old: &str, new: &str) -> Result<bool> {
+        let mut s = self.s.lock();
+        match s.keys.get_mut(id) {
+            Some(k) if k.hash == old => {
+                k.hash = new.to_string();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn touch_keys(&self, used: &[(String, i64)]) -> Result<()> {

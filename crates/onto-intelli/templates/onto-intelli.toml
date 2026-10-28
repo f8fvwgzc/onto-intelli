@@ -11,6 +11,10 @@ default_workspace = "acme"
 ingest_queue = 1024           # async ingestion backpressure
 # read_consistency = "eventual" # eventual | strong (check the database's commit head before each read)
 # follow_interval_ms = 1000     # poll fallback when a LISTEN/NOTIFY notice is missed
+# PostgreSQL tenants open on first use and close again (they reopen on the next request):
+# max_open_tenants = 512        # least recently used close past this (0: no limit)
+# tenant_idle_secs = 1800       # unused this long (0: never)
+# tenant_memory_budget_mb = 0   # least recently used close while the open ones' estimate is above it (0: none)
 
 # [engine.postgres]
 # tenant = "acme"               # one PostgreSQL schema per tenant: {schema_prefix}{tenant}
@@ -30,6 +34,7 @@ apply_roles = ["admin"]       # apply change sets directly
 approve_roles = ["admin"]     # approve/reject proposals (agents never can)
 required_approvals = 1
 allow_self_approval = false
+agent_raw_writes = false      # true: agents may also write the graph directly (entity.upsert, graph.apply, ...)
 
 # Connectors crawl data sources' metadata (never rows) into the catalog:
 #   onto connect postgres env:WAREHOUSE_URL --name warehouse --every 15m
@@ -39,12 +44,16 @@ background = true             # crawl due connectors while onto runs
 tick_secs = 30
 
 [llm]
+# Keys set here win over the platform's LLM_* variables (LLM connection contract v1,
+# docs/EMBEDDING.md); keys left unset take them, else the defaults shown.
 # mock: offline and deterministic (default, no key needed)
 # openai | ollama | openai-compatible (vLLM, LM Studio, OpenRouter) | anthropic | none
-provider = "mock"
-model = ""                    # empty = provider default
+# provider = "mock"
+# model = ""                  # empty = provider default
 # api_key_env = "OPENAI_API_KEY"      # keys are read from the environment only
+# api_key_file = "/var/run/secrets/llm/api-key"  # or a file, read on every request
 # base_url = "http://localhost:11434/v1"
+# max_retries = 0             # retries after a transport error, 408, 429 or 5xx (0..=10)
 max_output_tokens = 4096
 # effort = "medium"           # anthropic: low | medium | high | xhigh | max
 # fallbacks = true            # anthropic: server-side refusal fallback

@@ -69,6 +69,7 @@ fn fixture() -> (Vec<TraceRecord>, Vec<ScoreRow>) {
             tags: vec![format!("t{}", i % 2)],
             version: "0.2.0".into(),
             preview: None,
+            redacted: false,
         };
         let mut spans = vec![SpanRow {
             trace_id: id.clone(),

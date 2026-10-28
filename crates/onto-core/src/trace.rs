@@ -130,6 +130,9 @@ pub struct TraceRow {
     /// Lists only: the first 120 characters of the stored question.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Read by a non-admin observer: bodies, preview and error text removed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 impl TraceRow {
@@ -142,7 +145,23 @@ impl TraceRow {
     pub fn listed(&self) -> TraceRow {
         TraceRow { preview: preview(self.question()), input: None, output: None, ..self.clone() }
     }
+
+    /// The row as an observer who is not an admin sees it: timings, names,
+    /// tokens and costs, but no question, answer or error text, which may
+    /// quote restricted entities the observer cannot read.
+    pub fn redact(&mut self) {
+        self.input = None;
+        self.output = None;
+        self.preview = None;
+        if self.error_message.is_some() {
+            self.error_message = Some(REDACTED.into());
+        }
+        self.redacted = true;
+    }
 }
+
+/// What replaces a redacted error text.
+pub const REDACTED: &str = "[redacted: admins only]";
 
 /// One observation inside a trace (a row of `spans`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -168,6 +187,28 @@ pub struct SpanRow {
     pub attrs: Value,
     pub input: Option<Value>,
     pub output: Option<Value>,
+}
+
+impl SpanRow {
+    /// See [`TraceRow::redact`].
+    pub fn redact(&mut self) {
+        self.input = None;
+        self.output = None;
+        if self.error.is_some() {
+            self.error = Some(REDACTED.into());
+        }
+    }
+}
+
+impl TraceDetail {
+    /// See [`TraceRow::redact`].
+    pub fn redact(&mut self) {
+        self.trace.redact();
+        self.spans.iter_mut().for_each(SpanRow::redact);
+        for s in &mut self.scores {
+            s.comment = None;
+        }
+    }
 }
 
 /// An evaluation or feedback on a trace (a row of `scores`).

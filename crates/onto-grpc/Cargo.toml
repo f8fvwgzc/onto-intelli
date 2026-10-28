@@ -34,6 +34,7 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+parking_lot.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
@@ -43,5 +44,4 @@ prost.workspace = true
 [dev-dependencies]
 reqwest = { workspace = true }
 aws-lc-rs.workspace = true
-parking_lot.workspace = true
 url.workspace = true

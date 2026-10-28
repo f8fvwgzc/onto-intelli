@@ -24,8 +24,10 @@ fn template(var: &str) -> Option<String> {
     v
 }
 
+/// A database name no other test in this run shares: the whole id, since
+/// its first digits are a millisecond clock that tests started together share.
 fn unique() -> String {
-    format!("ct_{}", &onto_intelli::core::time::new_id("x")[2..10])
+    format!("ct_{}", &onto_intelli::core::time::new_id("x")[2..])
 }
 
 /// Crawl `url` as connector `shop` and check what every engine must give.

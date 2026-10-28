@@ -75,6 +75,10 @@ pub struct Governance {
     pub required_approvals: usize,
     /// May the proposer approve their own proposal?
     pub allow_self_approval: bool,
+    /// May agents write the graph directly (`entity.upsert`, `link.create`,
+    /// `graph.apply`, `ingest.batch`, …)? Off: they change it through action
+    /// types, whose checks, risk and audit apply.
+    pub agent_raw_writes: bool,
 }
 
 impl Default for Governance {
@@ -86,6 +90,7 @@ impl Default for Governance {
             propose_roles: Vec::new(),
             required_approvals: 1,
             allow_self_approval: false,
+            agent_raw_writes: false,
         }
     }
 }

@@ -396,7 +396,10 @@ async fn postgres_control_migrations() {
     let pg = PgControl::connect(&url, &schema).await.unwrap();
     // Applied once and recorded; connecting again applies nothing.
     let first = pg.migrations().await.unwrap();
-    assert_eq!(first.iter().map(|m| (m.0, m.1.as_str())).collect::<Vec<_>>(), vec![(1, "control"), (2, "llm_usage")]);
+    assert_eq!(
+        first.iter().map(|m| (m.0, m.1.as_str())).collect::<Vec<_>>(),
+        vec![(1, "control"), (2, "llm_usage"), (3, "audit_no_delete")]
+    );
     let again = PgControl::connect(&url, &schema).await.unwrap();
     assert_eq!(again.migrations().await.unwrap(), first);
     // The audit log is append-only.
@@ -406,6 +409,12 @@ async fn postgres_control_migrations() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("append-only"), "{err}");
+    // DELETE and TRUNCATE are refused too: nobody erases what they did.
+    for stmt in ["DELETE FROM \"{s}\".audit_log", "TRUNCATE \"{s}\".audit_log"] {
+        let err = sqlx::query(sqlx::AssertSqlSafe(stmt.replace("{s}", &schema))).execute(pg.pool()).await.unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{stmt}: {err}");
+    }
+    assert_eq!(pg.audit_log("org_1", None, 10).await.unwrap().len(), 1);
     // A schema newer than this build is refused.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".schema_migrations (version, name, applied_at) VALUES (999, 'future', 0)"

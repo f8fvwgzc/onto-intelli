@@ -479,7 +479,9 @@ async fn full_flow(store: Store) {
     assert_eq!(me["projects"].as_array().unwrap().len(), 1);
     assert_eq!(me["projects"][0]["name"], "My first project");
     let project_ref = me["projects"][0]["ref"].as_str().unwrap().to_string();
-    assert!(srv.hub.known_tenants().unwrap().contains(&project_ref), "the project's tenant is open");
+    // The project's storage exists, but a sign-up keeps nothing open: it opens on first use.
+    assert!(!srv.hub.open_tenants().contains(&project_ref), "a sign-up does not open the tenant");
+    srv.hub.tenant(&project_ref).await.expect("the project's tenant opens on first use");
     let org = me["orgs"][0]["id"].as_str().unwrap().to_string();
     let (_, audit) = srv.call(Method::GET, &format!("/v1/console/orgs/{org}/audit"), Some(&token), None).await;
     let actions: Vec<&str> =

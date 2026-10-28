@@ -213,6 +213,23 @@ pub fn check(p: &Principal, access: Access, ws: &str, entity: Option<&Entity>, g
     Ok(())
 }
 
+/// Link types [`visible`] follows to grant access to restricted entities: a
+/// `member_of` link to a team named in an entity's `acl` makes it visible.
+pub const ACL_LINK_TYPES: &[&str] = &["member_of"];
+
+/// Only admins (and the system) create or delete links that grant access:
+/// otherwise any member could join a team named in a restricted entity's
+/// `acl` and read it.
+pub fn check_acl_link(p: &Principal, rel: &str) -> Result<()> {
+    if ACL_LINK_TYPES.contains(&rel) && !p.is_privileged() {
+        return Err(Error::Denied(format!(
+            "{} may not change {rel} links: they grant access to restricted entities (admins only)",
+            p.id
+        )));
+    }
+    Ok(())
+}
+
 /// Entities with `visibility = "restricted"` are only visible to principals
 /// (or their teams) listed in the `acl` property, and to admins.
 pub fn visible(p: &Principal, e: &Entity, graph: &Graph) -> bool {
@@ -234,7 +251,7 @@ pub fn visible(p: &Principal, e: &Entity, graph: &Graph) -> bool {
             if acl.contains(&me) || acl.contains(&p.id.as_str()) {
                 return true;
             }
-            graph.neighbors(me, "member_of", Dir::Out).iter().any(|team| acl.contains(team))
+            ACL_LINK_TYPES.iter().any(|rel| graph.neighbors(me, rel, Dir::Out).iter().any(|team| acl.contains(team)))
         }
         _ => true,
     }
