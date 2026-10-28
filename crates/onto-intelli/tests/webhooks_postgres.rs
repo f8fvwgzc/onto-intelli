@@ -102,6 +102,7 @@ async fn two_processes_deliver_each_row_once_and_settle_the_wake_row() {
         version: 1,
         created_by: "lead".into(),
         created_at: 0,
+        incarnation: String::new(),
     };
     let admin = ActionContext::new(Principal::admin("lead"), "acme");
     let kv = vec![(NS_ENDPOINT.to_string(), "ops".to_string(), serde_json::to_value(&ep).unwrap())];

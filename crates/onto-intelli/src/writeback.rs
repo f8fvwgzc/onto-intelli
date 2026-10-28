@@ -80,14 +80,19 @@ pub struct Target {
     /// Registered by a project credential: no operator allow rules apply.
     #[serde(default)]
     pub restricted: bool,
-    /// Part of automation closure hashes. It starts at the registration time
-    /// (ms), so a target removed and added again never hashes like before.
+    /// Part of automation closure hashes; it starts at the registration
+    /// time (ms).
     #[serde(default)]
     pub version: u64,
     #[serde(default)]
     pub created_by: String,
     #[serde(default)]
     pub created_at: i64,
+    /// A random id drawn at registration: with `created_at`, part of
+    /// automation closure hashes, so a target removed and added again never
+    /// hashes like the one before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incarnation: String,
 }
 
 impl Target {
@@ -283,6 +288,7 @@ impl Intelli {
             version: 0,
             created_by: String::new(),
             created_at: 0,
+            incarnation: String::new(),
         };
         let reach = self.reach(restricted)?;
         if routes.is_empty() {
@@ -419,6 +425,7 @@ impl Intelli {
                     version: now.max(1) as u64,
                     created_by: p.id.clone(),
                     created_at: now,
+                    incarnation: crate::webhooks::new_incarnation()?,
                 };
                 let payload = json!({
                     "name": t.name,
@@ -549,6 +556,7 @@ mod tests {
             version: 1,
             created_by: "lead".into(),
             created_at: 0,
+            incarnation: String::new(),
         }
     }
 

@@ -286,6 +286,7 @@ async fn a_restricted_target_ignores_the_allow_list() {
         version: 1,
         created_by: "lead".into(),
         created_at: 0,
+        incarnation: String::new(),
     };
     let ctx = ActionContext::new(lead(), "acme");
     let kv = vec![(NS_TARGET.to_string(), t.name.clone(), serde_json::to_value(&t).unwrap())];
@@ -427,4 +428,47 @@ async fn targets_are_managed_by_admins_of_every_workspace_they_serve() {
     }
     let added = &events(&i, "writeback.add")[0];
     assert!(!added.payload.to_string().contains("abc"), "audit events name the host only: {:?}", added.payload);
+}
+
+/// SEC3-R: a writeback target removed and added again with the same version
+/// and principal (registered within the same millisecond, say) is a new
+/// incarnation: an automation that reaches it is stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_target_added_again_at_the_enabled_version_still_stops_the_automation() {
+    let i = open(true).await;
+    let store = i.ontology().store().clone();
+    let add =
+        json!({ "name": "helpdesk", "base_url": "https://desk.example.com/", "routes": { "close": "tickets/close" } });
+    ok(&i, &lead(), "writeback.add", add).await;
+    let record = || store.kv_get(NS_TARGET, "helpdesk").unwrap().unwrap();
+    let enabled = record();
+    let def = json!({
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"] },
+        "effects": [{ "action": { "type": "close_ticket", "params": { "issue": "{trigger.id}" } } }]
+    });
+    ok(&i, &lead(), "schema.apply", json!({ "changes": [{ "op": "put_automation", "name": "close", "def": def }] }))
+        .await;
+    ok(&i, &lead(), "automation.enable", json!({ "name": "close" })).await;
+    let got = ok(&i, &lead(), "automation.get", json!({ "name": "close" })).await;
+    assert_eq!(got["status"], "active", "{got}");
+    ok(&i, &lead(), "writeback.remove", json!({ "name": "helpdesk" })).await;
+    let again = json!({ "name": "helpdesk", "base_url": "https://elsewhere.example.net/", "routes": { "close": "tickets/close" } });
+    ok(&i, &lead(), "writeback.add", again).await;
+    // The new target's record at exactly the enabled version and
+    // registration time, with the same principal.
+    let mut rec = record();
+    assert_ne!(rec["incarnation"], enabled["incarnation"], "{rec}");
+    rec["version"] = enabled["version"].clone();
+    rec["created_at"] = enabled["created_at"].clone();
+    let ctx = ActionContext::new(lead(), "acme");
+    let event = ConfigEvent::new("writeback.add", Some("writeback:helpdesk"), json!({}));
+    i.ontology().commit_config(&ctx, vec![(NS_TARGET.to_string(), "helpdesk".to_string(), rec)], event).unwrap();
+    let got = ok(&i, &lead(), "automation.get", json!({ "name": "close" })).await;
+    assert_eq!(
+        (got["status"].as_str(), got["reason"].as_str()),
+        (Some("inactive"), Some("stale_definition: target:helpdesk")),
+        "{got}"
+    );
+    assert_eq!(got["closure"]["changed_since_enabled"], json!(["target:helpdesk"]));
 }

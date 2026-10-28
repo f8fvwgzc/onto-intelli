@@ -132,6 +132,7 @@ fn endpoint(name: &str, url: &str, secret: SecretRef) -> Endpoint {
         version: 1,
         created_by: "lead".into(),
         created_at: 0,
+        incarnation: String::new(),
     }
 }
 

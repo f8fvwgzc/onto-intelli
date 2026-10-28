@@ -1672,6 +1672,11 @@ Review round 1 (phase 1 steps 8-12):
   `webhook.deliveries`, not replayed, shown by `outbox.list` only to tenant-wide admins, and
   cancelled rather than sent. Registration waits until the store clock is past the newest row
   of the name. An endpoint's `version` starts at its registration time in ms, as a target's does.
+- Closure items of endpoints and targets hash `{version, principal, created_at, incarnation}`
+  (`incarnation`: 128 random bits drawn at registration). A version can run ahead of the clock
+  under rapid updates, so an endpoint removed and added again could otherwise get the very version
+  an automation was enabled with; the incarnation tells it from the one before, also when both
+  were registered in the same millisecond.
 - Call traces of `webhook.*`, `outbox.list`, `writeback.*` and `connector.*` keep no input or
   output (signing secrets, receiver URLs, credentials).
 - Supplied signing secrets give a key of 24 to 64 bytes (`whsec_` base64, or other text as its

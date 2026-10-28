@@ -422,6 +422,11 @@ pub struct Endpoint {
     pub created_by: String,
     #[serde(default)]
     pub created_at: i64,
+    /// A random id drawn at registration: with `created_at`, part of
+    /// automation closure hashes, so an endpoint removed and added again
+    /// never hashes like the one before (whatever its version).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incarnation: String,
 }
 
 /// The change-feed consumer (cursor) of endpoint `name`: `webhook:<name>`.
@@ -464,6 +469,7 @@ impl Endpoint {
             version: 0,
             created_by: String::new(),
             created_at: 0,
+            incarnation: String::new(),
         }
     }
 
@@ -535,6 +541,14 @@ pub(crate) fn incarnation_start(onto: &Ontology, name: &str) -> Result<i64> {
         now = store.clock_ms()?;
     }
     Err(Error::Unavailable(format!("{name}: the store clock is behind rows made for an earlier {name}")))
+}
+
+/// A new random incarnation id (128 bits, hex) for an endpoint or writeback
+/// target being registered.
+pub(crate) fn new_incarnation() -> Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| Error::Unavailable(format!("random incarnation id: {e}")))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
 /// Is the tenant's kill switch on?

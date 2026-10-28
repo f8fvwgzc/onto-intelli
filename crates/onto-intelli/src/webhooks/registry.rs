@@ -503,8 +503,9 @@ impl Intelli {
                 let (secret, generated) = self.secret_input(&name, i.secret.as_deref())?;
                 // The store's clock: rows created for this endpoint are never
                 // older (an earlier endpoint of this name keeps its rows), and
-                // the version starts there, so an endpoint removed and added
-                // again never hashes like the old one in an automation closure.
+                // with a random incarnation id it tells this endpoint from an
+                // earlier one of the name in automation closures (a version
+                // can run ahead of the clock, so it alone does not).
                 let created_at = super::incarnation_start(onto, &name)?;
                 let ep = Endpoint {
                     name: name.clone(),
@@ -520,6 +521,7 @@ impl Intelli {
                     version: created_at.max(1) as u64,
                     created_by: p.id.clone(),
                     created_at,
+                    incarnation: super::new_incarnation()?,
                 };
                 if ep.filter.is_some() {
                     self.start_cursor(&name)?;

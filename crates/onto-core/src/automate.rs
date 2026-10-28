@@ -14,8 +14,8 @@
 //!   changes and dominates its `run_as`. Installing a pack or applying a
 //!   schema never enables one.
 //! * **The closure binds an enablement.** [`closure`] hashes the automation,
-//!   every action type its effects name and the version and principal of
-//!   every endpoint and writeback target those reach. A change to any of
+//!   every action type its effects name and the version, principal and
+//!   incarnation of every endpoint and writeback target those reach. A change to any of
 //!   them makes an enabled automation inactive (`stale_definition`) until a
 //!   person enables it again; lint shows which enabled automations a schema
 //!   change would stop (`automation_closure_changed`).
@@ -586,12 +586,22 @@ impl Automation {
 // ── closure ──────────────────────────────────────────────────────────────
 
 /// A webhook endpoint or writeback target as a closure sees it: its name,
-/// configuration version and principal (the records live in onto-intelli KV).
+/// configuration version, principal and incarnation (the records live in
+/// onto-intelli KV).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundRef {
     pub name: String,
     pub version: u64,
     pub principal: ScopePrincipal,
+    /// When this incarnation of the name was registered (store clock, ms).
+    #[serde(default)]
+    pub created_at: i64,
+    /// A random id drawn when this incarnation was registered. With
+    /// `created_at` it tells an endpoint or target removed and added again
+    /// from the one before, whatever their versions (a version can run
+    /// ahead of the clock, so it alone does not).
+    #[serde(default)]
+    pub incarnation: String,
 }
 
 /// The hash an enablement binds to, with the hash of each item it covers:
@@ -670,8 +680,9 @@ fn targets_in(v: &Value) -> Vec<String> {
 /// the registered endpoints and writeback targets (only those it reaches
 /// count): SHA-256 over the canonical JSON of the automation, every action
 /// type its effects name (effects, roles, risk, preconditions, everything
-/// the action type declares), and the `version` and principal of every
-/// endpoint and target those reach.
+/// the action type declares), and the `version`, principal and incarnation
+/// (`created_at` and its random id) of every endpoint and target those
+/// reach: one removed and added again never hashes like the one before.
 pub fn closure(
     schema: &Schema,
     name: &str,
@@ -684,7 +695,14 @@ pub fn closure(
     let outbound = |list: &[OutboundRef], n: &str| -> String {
         list.iter().find(|r| r.name == n).map_or_else(
             || MISSING.to_string(),
-            |r| hash_of(&json!({ "version": r.version, "principal": r.principal })),
+            |r| {
+                hash_of(&json!({
+                    "version": r.version,
+                    "principal": r.principal,
+                    "created_at": r.created_at,
+                    "incarnation": r.incarnation,
+                }))
+            },
         )
     };
     let mut reached_targets_all = BTreeSet::new();
@@ -868,7 +886,8 @@ pub struct Enablements {
     pub targets: Vec<OutboundRef>,
 }
 
-/// `(name, version, principal)` of the records in KV namespace `ns`
+/// `(name, version, principal, created_at, incarnation)` of the records in
+/// KV namespace `ns`
 /// (webhook endpoints, writeback targets). A writeback target has no
 /// principal of its own: it acts as `{admin, workspaces}` (who may add or
 /// remove it). Records with neither are skipped.
@@ -884,7 +903,13 @@ pub fn outbound_refs(store: &dyn Store, ns: &str) -> Result<Vec<OutboundRef>> {
                     ScopePrincipal::new(vec![crate::policy::Role::Admin], ws)
                 }
             };
-            Some(OutboundRef { name, version: v.get("version").and_then(Value::as_u64).unwrap_or(0), principal })
+            Some(OutboundRef {
+                name,
+                version: v.get("version").and_then(Value::as_u64).unwrap_or(0),
+                principal,
+                created_at: v.get("created_at").and_then(Value::as_i64).unwrap_or(0),
+                incarnation: v.get("incarnation").and_then(Value::as_str).unwrap_or_default().to_string(),
+            })
         })
         .collect())
 }
@@ -1187,6 +1212,8 @@ patch = { props = { escalated = true }, id = "{issue}" }
                 roles.iter().map(|r| Role::parse(r).unwrap()).collect(),
                 ws.iter().map(|w| w.to_string()).collect(),
             ),
+            created_at: 1_000,
+            incarnation: "a1".into(),
         };
         let eps = [ep(1, &["viewer"], &["acme"])];
         let c = closure(&s, name, &a, &eps, &[]);
@@ -1227,6 +1254,16 @@ param = "issue""#,
         assert_eq!(changed(&s, &a, &[ep(2, &["viewer"], &["acme"])]), ["endpoint:ops_pager"]);
         assert_eq!(changed(&s, &a, &[ep(1, &["admin"], &["acme"])]), ["endpoint:ops_pager"]);
         assert_eq!(changed(&s, &a, &[ep(1, &["viewer"], &["*"])]), ["endpoint:ops_pager"]);
+        // SEC3-R: another incarnation with the same version and principal
+        // (removed and added again; versions can run ahead of the clock).
+        let again = |created_at: i64, incarnation: &str| OutboundRef {
+            created_at,
+            incarnation: incarnation.into(),
+            ..ep(1, &["viewer"], &["acme"])
+        };
+        assert_eq!(changed(&s, &a, &[again(2_000, "a1")]), ["endpoint:ops_pager"]);
+        assert_eq!(changed(&s, &a, &[again(1_000, "b2")]), ["endpoint:ops_pager"]);
+        assert!(changed(&s, &a, &[again(1_000, "a1")]).is_empty());
         // An endpoint that is gone (or not yet registered) is `missing`.
         let gone = closure(&s, name, &a, &[], &[]);
         assert_eq!(gone.items["endpoint:ops_pager"], MISSING);
@@ -1367,6 +1404,7 @@ param = "issue""#,
             name: "ops_pager".into(),
             version: 1,
             principal: ScopePrincipal::new(vec![Role::Viewer], vec!["acme".into()]),
+            ..Default::default()
         }];
         let c = closure(&s, name, &s.automations[name], &eps, &[]);
         let mut en = Enablements { endpoints: eps, ..Default::default() };

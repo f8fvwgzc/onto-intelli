@@ -718,3 +718,59 @@ async fn weak_signing_secrets_are_refused() {
     assert_eq!(e.code(), "invalid_argument", "{e}");
     assert!(e.to_string().contains("env:ONTO_TEST_WEAK_HOOK_SECRET") && !e.to_string().contains("too-short"), "{e}");
 }
+
+/// SEC3-R: an endpoint's version runs ahead of the clock under rapid
+/// updates, so an endpoint removed and added again can get the very version
+/// an automation was enabled with. Its incarnation (registration time and
+/// random id) still makes the automation stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_endpoint_added_again_at_the_enabled_version_still_stops_the_automation() {
+    let i = open(|cfg| cfg.automation.workers = false).await;
+    let store = i.ontology().store().clone();
+    let ns = onto_intelli::core::outbox::NS_WEBHOOK_ENDPOINT;
+    let p = json!({ "roles": "member", "workspaces": "acme" });
+    let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    let add = json!({ "name": "ops", "url": "https://first.example.com/in", "secret": secret, "principal": p });
+    ok(&i, &lead(), "webhook.add", add).await;
+    for n in 0..200 {
+        let url = format!("https://first.example.com/in/{n}");
+        ok(&i, &lead(), "webhook.update", json!({ "name": "ops", "url": url })).await;
+    }
+    let version = || store.kv_get(ns, "ops").unwrap().unwrap()["version"].as_u64().unwrap();
+    let enabled_version = version();
+    let def = json!({
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"] },
+        "effects": [{ "webhook": { "endpoint": "ops", "event": "issue.changed", "payload": { "id": "{trigger.id}" } } }]
+    });
+    ok(&i, &lead(), "schema.apply", json!({ "changes": [{ "op": "put_automation", "name": "tell", "def": def }] }))
+        .await;
+    ok(&i, &lead(), "automation.enable", json!({ "name": "tell" })).await;
+    let stale = |got: &Value| {
+        (got["status"].as_str(), got["reason"].as_str()) == (Some("inactive"), Some("stale_definition: endpoint:ops"))
+    };
+    let readd = json!({ "name": "ops", "url": "https://elsewhere.example.net/in", "secret": secret, "principal": p });
+    // Added again while the clock catches up with the enabled version: the
+    // automation is stale every time, including at that very version.
+    let start = Instant::now();
+    loop {
+        ok(&i, &lead(), "webhook.remove", json!({ "name": "ops" })).await;
+        ok(&i, &lead(), "webhook.add", readd.clone()).await;
+        let got = ok(&i, &lead(), "automation.get", json!({ "name": "tell" })).await;
+        assert!(stale(&got), "version {} (enabled at {enabled_version}): {got}", version());
+        if version() >= enabled_version || start.elapsed() > Duration::from_secs(5) {
+            break;
+        }
+    }
+    // The collision made certain: the new endpoint's record at exactly the
+    // enabled version, with the same principal.
+    let mut rec = store.kv_get(ns, "ops").unwrap().unwrap();
+    rec["version"] = json!(enabled_version);
+    let ctx = onto_intelli::ActionContext::new(lead(), "acme");
+    let event = onto_intelli::core::outbox::ConfigEvent::new("webhook.update", Some("webhook:ops"), json!({}));
+    i.ontology().commit_config(&ctx, vec![(ns.to_string(), "ops".to_string(), rec)], event).unwrap();
+    assert_eq!(version(), enabled_version);
+    let got = ok(&i, &lead(), "automation.get", json!({ "name": "tell" })).await;
+    assert!(stale(&got), "{got}");
+    assert_eq!(got["closure"]["changed_since_enabled"], json!(["endpoint:ops"]));
+}
