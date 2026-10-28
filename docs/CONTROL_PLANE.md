@@ -704,7 +704,9 @@ to the key's project, its credential is the key's (so the project-call
 guard applies), and it is refused as soon as the key is revoked, expires or
 its project is deleted (checked through the key cache, without the secret,
 since the session's HMAC already proves it). Console sessions cannot mint
-sessions (403).
+sessions (403), nor can a session minted from another session (403): only
+the first session of a login mints, so revoking any session's `jti` leaves
+no session minted from it behind (docs/EMBEDDING.md section 4).
 
 Validation when a key is created: a name of 1 to 100 printable characters,
 at least one scope, workspaces non-empty names without commas (default
@@ -1841,7 +1843,7 @@ role is needed (`/v1/console/me` returns the role per project).
 | `#/invite?code=` | Invitation details, "Sign in to accept" | `GET /v1/console/invitations/{code}` |
 | `#/projects` | Projects of the organization (cards: name, ref, created, 7-day requests), **New project** dialog (name, seed demo) | `GET/POST /v1/console/orgs/{org}/projects`, `GET /v1/metrics` per card |
 | `#/overview` | Metric cards (requests, error rate, p50/p95, tokens, cost, deterministic share, cache hit rate) with deltas against the previous period; charts: requests and errors per day, latency p50/p95, cost by model; recent errors; a "Get connected" checklist while the project has no traces | `GET /v1/metrics?since=&bucket=`, `GET /v1/traces?status=error&limit=5`, `GET /v1/traces?limit=1`, `GET …/keys`, `GET …/llm` |
-| `#/traces` | Filter bar (time range, name, status, user, session, model, mode, tag, text), table (time, name, preview, mode, latency, tokens, cost, user), keyset paging, live refresh toggle (10 s) | `GET /v1/traces` |
+| `#/traces` | Filter bar (time range, name, status, user, session, model, mode, tag, text: admins only), table (time, name, preview, mode, latency, tokens, cost, user), keyset paging, live refresh toggle (10 s) | `GET /v1/traces` |
 | `#/traces/{id}` | Header (status, latency, tokens, cost, user, session, API key prefix), **waterfall** of spans (bars positioned by offset and duration, indented by parent, coloured by kind), span panel (attributes, input/output, tokens), scores with **Add score** (thumbs up/down, value, comment) | `GET /v1/traces/{id}`, `POST /v1/traces/{id}/scores` |
 | `#/sessions`, `#/sessions/{id}` | Sessions table; session replay: each turn's question and answer with its latency, mode and a link to the trace | `GET /v1/sessions`, `GET /v1/sessions/{id}` |
 | `#/usage` | Month selector; month-to-date cost and tokens against the budget (progress bar, warning at 80 %), daily stacked bars by model, table by model; asks, LLM calls, deterministic answers | `GET …/usage` (the budget comes with it) |

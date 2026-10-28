@@ -6,10 +6,12 @@ import { Histogram } from "../../components/charts";
 import { Page, Status, td, th } from "../../components/consoleUi";
 import { PageHeader, isTyping } from "../../components/Shell";
 import { Button, EmptyState, ErrorState, Input, Kbd, Select, Skeleton, cx } from "../../components/ui";
+import { useConsoleScope } from "../../lib/console";
 import { ms, num, usd, when } from "../../lib/format";
 import { useScope } from "../../lib/queries";
 import { RANGES, observe, rangeMs, type TraceFilter, type TraceRow } from "../../lib/observe";
 import { href, navigate, setQuery, useRoute } from "../../lib/router";
+import { pickFilters, searchesQuestions } from "../../lib/traceSearch";
 import { minuteNow } from "./ProjectsPage";
 
 const TEXT_FILTERS = [
@@ -19,6 +21,8 @@ const TEXT_FILTERS = [
   { key: "model", label: "Model", placeholder: "claude-…" },
   { key: "tag", label: "Tag", placeholder: "tag" },
 ] as const;
+
+const FILTER_KEYS = ["status", "mode", "q", ...TEXT_FILTERS.map((t) => t.key)];
 
 const MODES = ["deterministic", "llm", "llm_cache", "answer_cache", "fallback", "clarify", "proposal", "action"];
 
@@ -46,6 +50,9 @@ function FilterInput({ name, label, placeholder, value }: { name: string; label:
 export default function TracesPage() {
   const route = useRoute();
   const scope = useScope();
+  // Only admins search questions (the server refuses `q` to others).
+  const { role } = useConsoleScope();
+  const canSearch = searchesQuestions(role);
   const q = route.query;
   const range = q.get("range") ?? "24h";
   const live = q.get("live") === "1";
@@ -62,15 +69,11 @@ export default function TracesPage() {
   }, [text, q]);
 
   const filter: TraceFilter = useMemo(() => {
-    const f: TraceFilter = { limit: 50 };
+    const f: TraceFilter = { limit: 50, ...pickFilters(q, FILTER_KEYS, role) };
     if (range !== "all") f.since = minuteNow() - rangeMs(range, "24h");
-    for (const k of ["status", "mode", "q", ...TEXT_FILTERS.map((t) => t.key)] as const) {
-      const v = q.get(k);
-      if (v) f[k] = v;
-    }
     return f;
-    // A new minute moves the window; the query string is the rest.
-  }, [q.toString(), range]);
+    // A new minute moves the window; the query string and the role are the rest.
+  }, [q.toString(), range, role]);
 
   const traces = useInfiniteQuery({
     queryKey: ["traces", ...scope, filter],
@@ -86,7 +89,7 @@ export default function TracesPage() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "/" && !isTyping(e.target)) {
+      if (e.key === "/" && canSearch && !isTyping(e.target)) {
         e.preventDefault();
         search.current?.focus();
         return;
@@ -102,9 +105,9 @@ export default function TracesPage() {
     // Capture phase: this page's "/" wins over the shell's (which opens the palette).
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [list, sel]);
+  }, [list, sel, canSearch]);
 
-  const active = ["status", "mode", "q", ...TEXT_FILTERS.map((t) => t.key)].some((k) => q.get(k));
+  const active = Object.keys(pickFilters(q, FILTER_KEYS, role)).length > 0;
 
   return (
     <>
@@ -122,21 +125,23 @@ export default function TracesPage() {
       </PageHeader>
       <div className="flex flex-col gap-2 border-b border-hairline px-4 py-2.5 md:px-5">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-0 flex-1 basis-56">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-ink-3" aria-hidden />
-            <Input
-              ref={search}
-              aria-label="Search questions"
-              placeholder="Search questions"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              className="h-8 pr-8 pl-8 text-[13px]"
-              onKeyDown={(e) => e.key === "Escape" && (e.currentTarget.blur(), e.preventDefault())}
-            />
-            <span className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 sm:block">
-              <Kbd>/</Kbd>
-            </span>
-          </div>
+          {canSearch ? (
+            <div className="relative min-w-0 flex-1 basis-56">
+              <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-ink-3" aria-hidden />
+              <Input
+                ref={search}
+                aria-label="Search questions"
+                placeholder="Search questions"
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                className="h-8 pr-8 pl-8 text-[13px]"
+                onKeyDown={(e) => e.key === "Escape" && (e.currentTarget.blur(), e.preventDefault())}
+              />
+              <span className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 sm:block">
+                <Kbd>/</Kbd>
+              </span>
+            </div>
+          ) : null}
           <Select
             aria-label="Time range"
             value={range}
@@ -173,7 +178,7 @@ export default function TracesPage() {
               icon={<X className="size-4" aria-hidden />}
               onClick={() => {
                 setText("");
-                setQuery(Object.fromEntries(["status", "mode", "q", ...TEXT_FILTERS.map((t) => t.key)].map((k) => [k, undefined])));
+                setQuery(Object.fromEntries(FILTER_KEYS.map((k) => [k, undefined])));
               }}
             >
               Reset

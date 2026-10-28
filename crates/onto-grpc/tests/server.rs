@@ -970,9 +970,53 @@ async fn sessions_cannot_renew_themselves_and_can_be_revoked() {
         .unwrap();
     assert_eq!(r.status(), 403);
 
+    let revoke = |bearer: &'static str, jti: Value| {
+        let (http, base) = (http.clone(), base.clone());
+        async move {
+            let r = http
+                .post(format!("{base}/v1/auth/session/revoke"))
+                .bearer_auth(bearer)
+                .json(&json!({ "jti": jti }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            r.json::<Value>().await.unwrap()
+        }
+    };
+    // Only the first session of a login mints, so revoking any session's id
+    // leaves no session minted from it behind.
+    let root =
+        mint("service-token-for-tests".into(), json!({ "act_as": "user:5", "roles": ["member"], "tenant": "ws_1" }))
+            .await;
+    let derived = mint(root["token"].as_str().unwrap().to_string(), json!({})).await;
+    let r = http
+        .post(format!("{base}/v1/auth/session"))
+        .bearer_auth(derived["token"].as_str().unwrap())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a session minted from a session mints none");
+    revoke("service-token-for-tests", derived["jti"].clone()).await;
+    assert_eq!(whoami(derived["token"].as_str().unwrap().to_string()).await, 401);
+    assert_eq!(whoami(root["token"].as_str().unwrap().to_string()).await, 200, "the session it came from stays");
+
     // A token limited to one tenant mints sessions for that tenant, never the default one.
     let dash = mint("tenant-a-only-token".into(), json!({})).await;
     assert_eq!(dash["tenant"], "ws_a");
+    // It revokes by id for its own tenants only: another tenant's session survives.
+    let other =
+        mint("service-token-for-tests".into(), json!({ "act_as": "user:6", "roles": ["member"], "tenant": "ws_1" }))
+            .await;
+    let r = revoke("tenant-a-only-token", other["jti"].clone()).await;
+    assert_eq!(whoami(other["token"].as_str().unwrap().to_string()).await, 200, "a ws_1 session");
+    assert_eq!(r["tenants"], json!(["ws_a"]), "{r}");
+    revoke("tenant-a-only-token", dash["jti"].clone()).await;
+    assert_eq!(whoami(dash["token"].as_str().unwrap().to_string()).await, 401, "a ws_a session");
+    // A token for every tenant still revokes it, without naming the tenant.
+    revoke("service-token-for-tests", other["jti"].clone()).await;
+    assert_eq!(whoami(other["token"].as_str().unwrap().to_string()).await, 401);
 }
 
 #[tokio::test]
@@ -984,14 +1028,19 @@ async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revok
     let mut cfg = Config::in_memory();
     cfg.engine.tenancy = "multi".into();
     cfg.auth.session_secret_env = Some(SECRET.into());
-    cfg.auth.tokens = vec![onto_intelli::config::TokenConfig {
-        token: Some("service-token-for-tests".into()),
+    let token = |secret: &str, tenants: &[&str]| onto_intelli::config::TokenConfig {
+        token: Some(secret.into()),
         token_env: None,
         principal: onto_intelli::Principal::new("svc", vec![onto_intelli::Role::Member], vec!["*".into()]),
         impersonate: true,
         impersonate_roles: vec![onto_intelli::Role::Member],
-        tenants: vec!["*".into()],
-    }];
+        tenants: tenants.iter().map(|t| t.to_string()).collect(),
+    };
+    cfg.auth.tokens = vec![
+        token("service-token-for-tests", &["*"]),
+        token("ws1-only-token-for-tests", &["ws_1"]),
+        token("ws1-and-ws2-token-for-tests", &["ws_1", "ws_2"]),
+    ];
     let hub = onto_intelli::Hub::open(cfg).await.unwrap();
     let mut bases = Vec::new();
     for _ in 0..2 {
@@ -1032,6 +1081,68 @@ async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revok
         assert_eq!(status(&bases[0], token).await, 401, "{header:?}: this replica");
         assert_eq!(status(&bases[1], token).await, 401, "{header:?}: the other replica");
     }
+
+    let mint = |bearer: String, body: Value| {
+        let r = http.post(format!("{}/v1/auth/session", bases[0])).bearer_auth(bearer).json(&body);
+        async move {
+            let r = r.send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            r.json::<Value>().await.unwrap()
+        }
+    };
+    let revoke = |bearer: &str, tenant: Option<&str>, jti: &Value| {
+        let mut r =
+            http.post(format!("{}/v1/auth/session/revoke", bases[0])).bearer_auth(bearer).json(&json!({ "jti": jti }));
+        if let Some(t) = tenant {
+            r = r.header("x-onto-tenant", t);
+        }
+        async move {
+            let r = r.send().await.unwrap();
+            (r.status(), r.json::<Value>().await.unwrap_or_default())
+        }
+    };
+    let user = |n: u32, tenant: &str| json!({ "act_as": format!("user:{n}"), "roles": ["member"], "tenant": tenant });
+    let svc = || "service-token-for-tests".to_string();
+    // A token limited to ws_1 revokes for ws_1 only (not for the look-alike
+    // WS-1). The other replica has never seen these ids, so it reads the store.
+    let root = mint(svc(), user(3, "ws_1")).await;
+    let derived = mint(root["token"].as_str().unwrap().to_string(), json!({})).await;
+    let alias = mint(svc(), user(4, "WS-1")).await;
+    // The same id in another tenant (signed as the server signs).
+    let (jti, exp) = (root["jti"].as_str().unwrap(), root["expires_at"].as_u64().unwrap());
+    let elsewhere = signed_session("a-session-secret-of-at-least-32-characters", "ws_2", jti, exp);
+    for id in [&root["jti"], &alias["jti"]] {
+        let (st, body) = revoke("ws1-only-token-for-tests", None, id).await;
+        assert_eq!((st.as_u16(), &body["tenants"]), (200, &json!(["ws_1"])), "{body}");
+    }
+    let on_other = |minted: &Value| status(&bases[1], minted["token"].as_str().unwrap());
+    assert_eq!(on_other(&root).await, 401, "the session");
+    assert_eq!(on_other(&derived).await, 401, "a session minted from it: its login, for ws_1");
+    assert_eq!(on_other(&alias).await, 200, "WS-1 is another tenant than ws_1");
+    assert_eq!(status(&bases[1], &elsewhere).await, 200, "the same id in ws_2");
+    // A token limited to two tenants names one of them, and revokes in both.
+    let other = mint(svc(), user(5, "ws_2")).await;
+    let (st, _) = revoke("ws1-and-ws2-token-for-tests", None, &other["jti"]).await;
+    assert_eq!(st.as_u16(), 403, "two tenants: the request names one");
+    let (st, body) = revoke("ws1-and-ws2-token-for-tests", Some("ws_1"), &other["jti"]).await;
+    assert_eq!((st.as_u16(), &body["tenants"]), (200, &json!(["ws_1", "ws_2"])), "{body}");
+    assert_eq!(on_other(&other).await, 401, "a ws_2 session, revoked by a request that named ws_1");
+}
+
+/// A session token for `tenant` with the id `jti` (also its login), signed
+/// with `secret` the way the server signs them.
+fn signed_session(secret: &str, tenant: &str, jti: &str, exp: u64) -> String {
+    use base64::Engine;
+    use hmac::{KeyInit, Mac};
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let claims = json!({
+        "principal": { "id": "user:x", "roles": ["member"], "workspaces": ["*"] },
+        "tenant": tenant, "exp": exp, "jti": jti, "sid": jti,
+    });
+    let payload = format!("onto1.{}", b64.encode(serde_json::to_vec(&claims).unwrap()));
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(payload.as_bytes());
+    format!("{payload}.{}", b64.encode(mac.finalize().into_bytes()))
 }
 
 /// `GET /v1/admin/tenants` carries each open tenant's outbound counters
