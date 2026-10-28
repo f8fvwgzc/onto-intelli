@@ -1,11 +1,35 @@
-//! Automation definitions through the action surface (docs/design/EVENTS.md
-//! Part C, build step 10): `put_automation` / `delete_automation` in
+//! Automate through the action surface (docs/design/EVENTS.md Part C).
+//!
+//! Build step 10: `put_automation` / `delete_automation` in
 //! `schema.plan|apply|propose`, `[automation] max_automations` enforced at
 //! apply and propose, and the automation lint checks in `schema.lint`.
+//!
+//! Build step 11: the runtime. A change runs an enabled automation, and its
+//! webhook effect reaches a local receiver signed (Standard Webhooks) with
+//! the cause in the CloudEvent; who may enable (the matrix, with audited
+//! refusals); an agent proposes, an approver applies and enables; the kill
+//! switch, the breaker, rate limits writing skipped rows that a rerun runs,
+//! the depth limit stopping an A→B→A cascade, a changed closure
+//! (`stale_definition`), an expired enablement, refused plans, dry runs and
+//! `{}` inputs.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use base64::Engine as _;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use onto_intelli::{Config, Intelli, Principal, Role};
+use onto_intelli::config::AllowConfig;
+use onto_intelli::core::EventFilter;
+use onto_intelli::core::automate::{AutomationState, NS_AUTOMATION_STATE};
+use onto_intelli::core::outbox::ConfigEvent;
+use onto_intelli::hub::{Secret, SecretBox};
+use onto_intelli::webhooks;
+use onto_intelli::{ActionContext, Config, Intelli, Principal, Role};
 
 fn put(name: &str) -> Value {
     json!({
@@ -78,4 +102,606 @@ async fn definitions_go_through_schema_actions_with_the_configured_limit() {
         lint["findings"].as_array().unwrap().iter().filter(|f| f["check"] == "automation_gap_blind").collect();
     assert_eq!(gap.len(), 1);
     assert_eq!(gap[0]["target"], "automation:first");
+}
+
+// ── build step 11: the runtime ───────────────────────────────────────────
+
+/// Resolve a high-priority issue when it becomes blocked, and tell `ops`.
+fn resolve_blocked(webhook: bool) -> Value {
+    let mut effects = vec![
+        json!({ "action": { "type": "resolve", "params": { "issue": "{trigger.id}", "note": "auto: {subject.title}" } } }),
+    ];
+    if webhook {
+        effects.push(json!({ "webhook": { "endpoint": "ops", "event": "issue.resolved", "payload": {
+            "id": "{trigger.id}", "title": "{subject.title}", "from": "{trigger.state.from}"
+        } } }));
+    }
+    json!({
+        "description": "Resolve a high-priority issue when it becomes blocked.",
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"], "state": { "to": ["blocked"] } },
+        "conditions": [{ "check": "prop_eq", "param": "subject", "prop": "priority", "value": "high" }],
+        "effects": effects,
+    })
+}
+
+fn admin() -> Principal {
+    Principal::admin("lead")
+}
+
+async fn open(tweak: impl FnOnce(&mut Config)) -> Arc<Intelli> {
+    let mut cfg = Config::in_memory();
+    cfg.engine.default_workspace = "acme".into();
+    cfg.automation.workers = false;
+    cfg.webhooks.enabled = false;
+    tweak(&mut cfg);
+    let i = Intelli::open(cfg).await.unwrap();
+    i.set_secrets(Some(Arc::new(TestBox)));
+    i
+}
+
+async fn ok(i: &Intelli, p: &Principal, action: &str, input: Value) -> Value {
+    i.call(p, action, input.clone()).await.unwrap_or_else(|e| panic!("{action} {input}: {e}"))
+}
+
+async fn define(i: &Intelli, name: &str, def: Value) {
+    ok(i, &admin(), "schema.apply", json!({ "changes": [{ "op": "put_automation", "name": name, "def": def }] })).await;
+}
+
+/// The endpoints' signing secret (the Standard Webhooks reference secret).
+const SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+
+/// Seals by encoding (tests only).
+struct TestBox;
+
+impl SecretBox for TestBox {
+    fn seal(&self, purpose: &str, name: &str, plain: &[u8]) -> onto_intelli::Result<String> {
+        let mut blob = format!("{purpose}/{name}/").into_bytes();
+        blob.extend_from_slice(plain);
+        Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+    }
+
+    fn open(&self, purpose: &str, name: &str, sealed: &str) -> onto_intelli::Result<Secret> {
+        let blob = base64::engine::general_purpose::STANDARD.decode(sealed).unwrap();
+        let prefix = format!("{purpose}/{name}/");
+        Ok(Secret::new(blob[prefix.len()..].to_vec()))
+    }
+}
+
+async fn endpoint(i: &Intelli, url: &str, principal: Value) {
+    ok(i, &admin(), "webhook.add", json!({ "name": "ops", "url": url, "secret": SECRET, "principal": principal }))
+        .await;
+}
+
+async fn issue(i: &Intelli, key: &str, state: &str, priority: &str) {
+    let mut input =
+        json!({ "id": format!("issue:{key}"), "title": format!("Issue {key}"), "props": { "priority": priority } });
+    if !state.is_empty() {
+        input["state"] = json!(state);
+    }
+    ok(i, &admin(), "entity.upsert", input).await;
+}
+
+async fn set_state(i: &Intelli, key: &str, state: &str) {
+    ok(i, &admin(), "entity.upsert", json!({ "id": format!("issue:{key}"), "state": state })).await;
+}
+
+/// Run consumer rounds until one finds nothing more to do.
+fn drain(i: &Intelli) -> Vec<onto_intelli::automate::RoundReport> {
+    let mut out = Vec::new();
+    for _ in 0..20 {
+        let r = i.automation_round().unwrap();
+        let quiet = !r.more && r.executed == 0 && r.settled == 0 && r.retried == 0 && r.recovered == 0;
+        out.push(r);
+        if quiet {
+            break;
+        }
+    }
+    out
+}
+
+async fn runs(i: &Intelli, name: &str) -> Vec<Value> {
+    ok(i, &admin(), "automation.runs", json!({ "name": name })).await["items"].as_array().unwrap().clone()
+}
+
+fn events(i: &Intelli, action: &str) -> Vec<onto_intelli::Event> {
+    let f = EventFilter { action: Some(action.into()), ..Default::default() };
+    i.ontology().events(&admin(), &f).unwrap()
+}
+
+fn state_of(i: &Intelli, id: &str) -> Option<String> {
+    i.ontology().get(&admin(), id).unwrap().state
+}
+
+/// One request the receiver got: its headers and body.
+type Hit = (HeaderMap, Vec<u8>);
+
+#[derive(Clone, Default)]
+struct Receiver {
+    hits: Arc<Mutex<Vec<Hit>>>,
+    port: u16,
+}
+
+async fn handle(State(r): State<Receiver>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    r.hits.lock().push((headers, body.to_vec()));
+    StatusCode::OK
+}
+
+impl Receiver {
+    async fn start() -> Receiver {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let r = Receiver { hits: Default::default(), port };
+        let app = axum::Router::new().fallback(handle).with_state(r.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        r
+    }
+}
+
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < Duration::from_secs(15), "waited for {what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_runs_an_enabled_automation_and_its_webhook_arrives_signed() {
+    let rx = Receiver::start().await;
+    let i = open(|cfg| {
+        cfg.automation.workers = true;
+        cfg.webhooks.enabled = true;
+        cfg.webhooks.poll_secs = 1;
+        cfg.webhooks.allow = vec![AllowConfig { host: "127.0.0.1".into(), cidrs: vec!["127.0.0.1/32".into()] }];
+    })
+    .await;
+    endpoint(
+        &i,
+        &format!("http://127.0.0.1:{}/hooks", rx.port),
+        json!({ "roles": ["member"], "workspaces": ["acme"] }),
+    )
+    .await;
+    define(&i, "resolve_blocked", resolve_blocked(true)).await;
+    issue(&i, "1", "triaged", "high").await;
+    // Defined but not enabled: nothing runs.
+    set_state(&i, "1", "in_progress").await;
+    let enabled = ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    assert_eq!(enabled["enabled"], true, "{enabled}");
+    assert!(enabled["note"].as_str().unwrap().contains("not reversible"), "{enabled}");
+    set_state(&i, "1", "blocked").await;
+
+    until("the run", || state_of(&i, "issue:1").as_deref() == Some("resolved")).await;
+    until("the delivery", || !rx.hits.lock().is_empty()).await;
+    let all = runs(&i, "resolve_blocked").await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    let run = &all[0];
+    assert_eq!(run["state"], "succeeded", "{run}");
+    assert_eq!(run["depth"], 1);
+    assert_eq!(run["principal"], "automation:resolve_blocked");
+    assert_eq!(run["trigger"]["state"]["from"], "in_progress");
+    let receipt_id = run["effects"][0]["receipt"].as_str().unwrap();
+    let receipt = ok(&i, &admin(), "action.receipt", json!({ "id": receipt_id })).await;
+    assert_eq!(receipt["actor"], "automation:resolve_blocked", "{receipt}");
+    assert_eq!(receipt["plan"]["params"]["note"], "auto: Issue 1");
+
+    // The delivery: a CloudEvent carrying the cause, signed with the endpoint's secret.
+    let (headers, body) = rx.hits.lock()[0].clone();
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let ev = webhooks::verify(
+        &[SECRET],
+        &h("webhook-id"),
+        &h("webhook-timestamp"),
+        &h("webhook-signature"),
+        &body,
+        onto_intelli::core::time::now_ms() / 1000,
+        webhooks::TOLERANCE_SECS,
+    )
+    .unwrap();
+    assert_eq!(ev["type"], "onto.issue.resolved");
+    assert_eq!(ev["data"], json!({ "id": "issue:1", "title": "Issue 1", "from": "in_progress" }));
+    assert_eq!((ev["causeautomation"].as_str(), ev["causedepth"].as_u64()), (Some("resolve_blocked"), Some(1)));
+    assert_eq!(ev["causerun"], run["id"]);
+    assert_eq!(ev["id"], run["effects"][1]["outbox"]);
+    // Audited: the enablement and the run.
+    assert_eq!(events(&i, "automation.enable").len(), 1);
+    let run_events = events(&i, "automation.run");
+    assert_eq!(run_events.len(), 1);
+    assert_eq!(run_events[0].actor, "automation:resolve_blocked");
+    // Its own change does not trigger it again (allow_self is off), and the
+    // in_progress change before the enablement started nothing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(runs(&i, "resolve_blocked").await.len(), 1);
+}
+
+#[tokio::test]
+async fn who_may_enable_and_refusals_are_audited() {
+    let i = open(|_| {}).await;
+    let mut wide = resolve_blocked(false);
+    wide["run_as"] = json!({ "roles": ["member"], "workspaces": ["*"] });
+    define(&i, "wide", wide).await;
+    define(&i, "narrow", resolve_blocked(false)).await;
+    let scoped_admin = Principal::named("user:ws1", &["admin"], &["acme"]).unwrap();
+    let viewer = Principal::named("user:v", &["viewer"], &["*"]).unwrap();
+    let member = Principal::named("user:m", &["member"], &["*"]).unwrap();
+    let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
+    // A scoped admin covers the acme run_as, not the `*` one.
+    ok(&i, &scoped_admin, "automation.enable", json!({ "name": "narrow" })).await;
+    let denied_before = events(&i, "authorization.denied").len();
+    for (p, name) in [(&scoped_admin, "wide"), (&viewer, "narrow"), (&member, "narrow"), (&agent, "narrow")] {
+        let e = i.call(p, "automation.enable", json!({ "name": name })).await.unwrap_err();
+        assert_eq!(e.code(), "permission_denied", "{} {name}: {e}", p.id);
+    }
+    assert!(
+        events(&i, "authorization.denied").len() >= denied_before + 3,
+        "refusals are audited as authorization.denied"
+    );
+    // An admin over every workspace enables the wide one.
+    ok(&i, &admin(), "automation.enable", json!({ "name": "wide" })).await;
+    let list = ok(&i, &member, "automation.list", json!({})).await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|a| a["status"] == "active" && a["may_enable"] == false), "{list}");
+    assert!(list["note"].as_str().unwrap().contains("visible to everyone who can read the schema"));
+    // Stopping: whoever may enable it, or any admin; never a member.
+    let e = i.call(&member, "automation.disable", json!({ "name": "narrow" })).await.unwrap_err();
+    assert_eq!(e.code(), "permission_denied");
+    ok(&i, &scoped_admin, "automation.disable", json!({ "name": "wide" })).await;
+    let got = ok(&i, &admin(), "automation.get", json!({ "name": "wide" })).await;
+    assert_eq!((got["enabled"].as_bool(), got["reason"].as_str()), (Some(false), Some("not_enabled")), "{got}");
+    assert!(got["means"].as_str().unwrap().contains("evaluated against the graph at the run's commit"));
+    // An endpoint that would see less than the run renders cannot be reached.
+    endpoint(&i, "https://hooks.example.com/in", json!({ "roles": ["viewer"], "workspaces": ["acme"] })).await;
+    define(&i, "tell", resolve_blocked(true)).await;
+    let e = i.call(&admin(), "automation.enable", json!({ "name": "tell" })).await.unwrap_err();
+    assert_eq!(e.code(), "permission_denied", "{e}");
+    assert!(e.to_string().contains("webhook endpoint ops may see less"), "{e}");
+}
+
+#[tokio::test]
+async fn an_agent_proposes_an_approver_applies_and_enables() {
+    let i = open(|_| {}).await;
+    let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
+    let filed = ok(
+        &i,
+        &agent,
+        "schema.propose",
+        json!({ "title": "Resolve blocked", "changes": [{ "op": "put_automation", "name": "resolve_blocked", "def": resolve_blocked(false) }] }),
+    )
+    .await;
+    let id = filed["id"].as_str().or(filed["proposal"]["id"].as_str()).unwrap_or_else(|| panic!("{filed}")).to_string();
+    let e = i.call(&agent, "schema.approve", json!({ "id": id })).await.unwrap_err();
+    assert_eq!(e.code(), "permission_denied");
+    ok(&i, &admin(), "schema.approve", json!({ "id": id })).await;
+    // Defining never enables: the agent cannot, an approver can.
+    let got = ok(&i, &agent, "automation.get", json!({ "name": "resolve_blocked" })).await;
+    assert_eq!(got["reason"], "not_enabled");
+    assert_eq!(
+        i.call(&agent, "automation.enable", json!({ "name": "resolve_blocked" })).await.unwrap_err().code(),
+        "permission_denied"
+    );
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("resolved"));
+    // A low-priority issue does not meet the condition: no run at all.
+    issue(&i, "2", "triaged", "low").await;
+    set_state(&i, "2", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:2").as_deref(), Some("blocked"));
+    assert_eq!(runs(&i, "resolve_blocked").await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_kill_switch_stops_runs_and_the_process_switch_runs_none() {
+    let i = open(|_| {}).await;
+    define(&i, "resolve_blocked", resolve_blocked(false)).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    let member = Principal::named("user:m", &["member"], &["*"]).unwrap();
+    assert_eq!(
+        i.call(&member, "automation.kill", json!({ "on": true })).await.unwrap_err().code(),
+        "permission_denied"
+    );
+    let k = ok(&i, &admin(), "automation.kill", json!({ "on": true })).await;
+    assert_eq!(k["kill"], true);
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("blocked"), "killed: nothing runs");
+    let got = ok(&i, &admin(), "automation.get", json!({ "name": "resolve_blocked" })).await;
+    assert_eq!(got["reason"], "killed");
+    ok(&i, &admin(), "automation.kill", json!({ "off": true })).await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("blocked"), "changes made while killed never start runs");
+    set_state(&i, "1", "in_progress").await;
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("resolved"));
+    for input in [json!({}), json!({ "on": true, "off": true })] {
+        assert_eq!(i.call(&admin(), "automation.kill", input).await.unwrap_err().code(), "invalid_argument");
+    }
+
+    // [automation] enabled = false: this process runs none.
+    let off = open(|cfg| cfg.automation.enabled = false).await;
+    define(&off, "resolve_blocked", resolve_blocked(false)).await;
+    ok(&off, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&off, "1", "triaged", "high").await;
+    set_state(&off, "1", "blocked").await;
+    assert!(off.automation_round().unwrap().idle);
+    assert_eq!(state_of(&off, "issue:1").as_deref(), Some("blocked"));
+    let list = ok(&off, &admin(), "automation.list", json!({})).await;
+    assert_eq!(list["process_enabled"], false);
+}
+
+/// An automation whose every run fails: its payload names a property the
+/// subject does not have, and templates render strictly.
+fn failing_def() -> Value {
+    let mut d = resolve_blocked(false);
+    d["conditions"] = json!([]);
+    d["trigger"] = json!({ "on": "change", "kinds": ["issue"], "ops": ["entity.update"], "props": ["description"] });
+    d["effects"] = json!([{ "webhook": { "endpoint": "ops", "event": "x", "payload": { "d": "{subject.nope}" } } }]);
+    d
+}
+
+#[tokio::test]
+async fn the_breaker_pauses_after_consecutive_failures() {
+    let i = open(|cfg| cfg.automation.pause_after_failures = 2).await;
+    endpoint(&i, "https://hooks.example.com/in", json!({ "roles": ["member"], "workspaces": ["acme"] })).await;
+    define(&i, "echo", failing_def()).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "echo" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    for n in 0..3 {
+        ok(&i, &admin(), "entity.upsert", json!({ "id": "issue:1", "props": { "description": format!("v{n}") } }))
+            .await;
+        drain(&i);
+    }
+    let all = runs(&i, "echo").await;
+    assert_eq!(all.len(), 2, "the third change found it paused: {all:?}");
+    assert!(all.iter().all(|r| r["state"] == "failed"), "{all:?}");
+    assert!(all[0]["reason"].as_str().unwrap().contains("invalid_template"), "{all:?}");
+    let got = ok(&i, &admin(), "automation.get", json!({ "name": "echo" })).await;
+    assert!(got["reason"].as_str().unwrap().starts_with("paused: failing: 2 consecutive failed runs"), "{got}");
+    assert_eq!(events(&i, "automation.paused").len(), 1);
+}
+
+#[tokio::test]
+async fn rate_limits_write_skipped_rows_that_a_rerun_runs() {
+    let i = open(|_| {}).await;
+    let mut def = resolve_blocked(false);
+    def["rate"] = json!({ "per_minute": 1 });
+    define(&i, "resolve_blocked", def).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    issue(&i, "2", "triaged", "high").await;
+    set_state(&i, "1", "blocked").await;
+    set_state(&i, "2", "blocked").await;
+    drain(&i);
+    let rows = runs(&i, "resolve_blocked").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let skipped: Vec<&Value> = rows.iter().filter(|r| r["state"] == "skipped").collect();
+    assert_eq!(skipped.len(), 1, "{rows:?}");
+    assert!(skipped[0]["reason"].as_str().unwrap().starts_with("rate_limited"), "{rows:?}");
+    assert_eq!(state_of(&i, "issue:2").as_deref(), Some("blocked"));
+    // A member may not rerun; an approver who dominates run_as may.
+    let id = skipped[0]["id"].as_str().unwrap().to_string();
+    let member = Principal::named("user:m", &["member"], &["*"]).unwrap();
+    assert_eq!(i.call(&member, "automation.rerun", json!({ "id": id })).await.unwrap_err().code(), "permission_denied");
+    let r = ok(&i, &admin(), "automation.rerun", json!({ "id": id })).await;
+    assert_eq!(r["state"], "retry");
+    drain(&i);
+    let again = ok(&i, &admin(), "automation.runs", json!({ "id": id })).await;
+    assert_eq!(again["run"]["state"], "succeeded", "{again}");
+    assert_eq!(state_of(&i, "issue:2").as_deref(), Some("resolved"));
+    // A succeeded run is not rerun.
+    let e = i.call(&admin(), "automation.rerun", json!({ "id": id })).await.unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
+    assert_eq!(events(&i, "automation.rerun").len(), 1);
+}
+
+/// Set `description` of an issue to `value` (low risk, reversible).
+const SET_DESCRIPTION: &str = r#"{
+    "description": "Set an issue's description.", "risk": "low",
+    "parameters": { "issue": { "type": "entity", "kinds": ["issue"], "required": true }, "value": { "type": "string", "required": true } },
+    "effects": [{ "patch": { "id": "{issue}", "props": { "description": "{value}" } } }]
+}"#;
+
+fn ping(when: &str, then: &str) -> Value {
+    json!({
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "max_depth": 2,
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"], "props": ["description"] },
+        "conditions": [{ "check": "prop_eq", "param": "subject", "prop": "description", "value": when }],
+        "effects": [{ "action": { "type": "set_description", "params": { "issue": "{trigger.id}", "value": then } } }],
+    })
+}
+
+/// Move an issue to `then` when it moved to `when` (matched on the change
+/// as committed, so the cascade does not depend on evaluation order).
+fn bounce(when: &str, then: &str) -> Value {
+    json!({
+        "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+        "max_depth": 2,
+        "trigger": { "on": "change", "kinds": ["issue"], "ops": ["entity.update"], "state": { "to": [when] } },
+        "effects": [{ "action": { "type": "set_state", "params": { "issue": "{trigger.id}", "value": then } } }],
+    })
+}
+
+#[tokio::test]
+async fn the_depth_limit_stops_an_a_b_a_cascade() {
+    let i = open(|_| {}).await;
+    let at = json!({
+        "description": "Move an issue to a state.", "risk": "low",
+        "parameters": { "issue": { "type": "entity", "kinds": ["issue"], "required": true }, "value": { "type": "string", "required": true } },
+        "effects": [{ "patch": { "id": "{issue}", "state": "{value}" } }]
+    });
+    ok(
+        &i,
+        &admin(),
+        "schema.apply",
+        json!({ "changes": [
+            { "op": "put_action_type", "name": "set_state", "def": at },
+            { "op": "put_automation", "name": "a", "def": bounce("blocked", "in_progress") },
+            { "op": "put_automation", "name": "b", "def": bounce("in_progress", "blocked") },
+        ] }),
+    )
+    .await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "a" })).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "b" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    // A person blocks it (depth 0): a runs at depth 1, b at depth 2, then a
+    // would run at depth 3, over max_depth 2.
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    let a = runs(&i, "a").await;
+    let b = runs(&i, "b").await;
+    assert_eq!(b.len(), 1, "{b:?}");
+    assert_eq!((b[0]["state"].as_str(), b[0]["depth"].as_u64()), (Some("succeeded"), Some(2)));
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert_eq!((a[1]["state"].as_str(), a[1]["depth"].as_u64()), (Some("succeeded"), Some(1)));
+    assert_eq!((a[0]["state"].as_str(), a[0]["depth"].as_u64()), (Some("refused"), Some(3)));
+    assert!(a[0]["reason"].as_str().unwrap().starts_with("depth"), "{a:?}");
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("blocked"), "the cascade stopped after b");
+}
+
+#[tokio::test]
+async fn a_changed_closure_or_an_expired_enablement_stops_it() {
+    let i = open(|_| {}).await;
+    define(&i, "resolve_blocked", resolve_blocked(false)).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    issue(&i, "1", "triaged", "high").await;
+    // Raising the action type's risk changes the closure.
+    let mut resolve = serde_json::to_value(&i.ontology().schema().action_types["resolve"]).unwrap();
+    resolve["description"] = json!("Resolve an issue (reworded).");
+    ok(
+        &i,
+        &admin(),
+        "schema.apply",
+        json!({ "changes": [{ "op": "put_action_type", "name": "resolve", "def": resolve }] }),
+    )
+    .await;
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("blocked"));
+    let got = ok(&i, &admin(), "automation.get", json!({ "name": "resolve_blocked" })).await;
+    assert_eq!(got["reason"], "paused: stale_definition: action_type:resolve", "{got}");
+    assert_eq!(got["closure"]["changed_since_enabled"], json!(["action_type:resolve"]));
+    assert_eq!(events(&i, "automation.stale").len(), 1);
+    drain(&i);
+    assert_eq!(events(&i, "automation.stale").len(), 1, "one event, not one per round");
+    // A person enables it again: it runs on changes from then on.
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    set_state(&i, "1", "in_progress").await;
+    set_state(&i, "1", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:1").as_deref(), Some("resolved"));
+
+    // The enablement expires (here: written as expired).
+    let st: AutomationState =
+        serde_json::from_value(i.ontology().store().kv_get(NS_AUTOMATION_STATE, "resolve_blocked").unwrap().unwrap())
+            .unwrap();
+    assert!(st.expires_at - st.enabled_at == 30 * 86_400_000, "30 days by default");
+    let expired = AutomationState { expires_at: 1, ..st };
+    i.ontology()
+        .commit_automation(
+            &ActionContext::new(admin(), "acme"),
+            vec![(NS_AUTOMATION_STATE.into(), "resolve_blocked".into(), serde_json::to_value(&expired).unwrap())],
+            ConfigEvent::new("test.expire", None, json!({})),
+        )
+        .unwrap();
+    issue(&i, "2", "triaged", "high").await;
+    set_state(&i, "2", "blocked").await;
+    drain(&i);
+    assert_eq!(state_of(&i, "issue:2").as_deref(), Some("blocked"));
+    let got = ok(&i, &admin(), "automation.get", json!({ "name": "resolve_blocked" })).await;
+    assert_eq!(got["reason"], "paused: enablement_expired");
+    assert_eq!(events(&i, "automation.expired").len(), 1);
+}
+
+#[tokio::test]
+async fn medium_risk_and_not_reversible_plans_are_refused() {
+    let i = open(|_| {}).await;
+    let mut risky: Value = serde_json::from_str(SET_DESCRIPTION).unwrap();
+    risky["risk"] = json!("medium");
+    let start = json!({
+        "description": "Start an issue.", "risk": "low",
+        "parameters": { "issue": { "type": "entity", "kinds": ["issue"], "required": true } },
+        "effects": [{ "patch": { "id": "{issue}", "state": "in_progress" } }]
+    });
+    let def = |action: &str| {
+        let mut d = ping("go", "x");
+        d["conditions"] = json!([]);
+        d["effects"] = json!([{ "action": { "type": action, "params": { "issue": "{trigger.id}", "value": "x" } } }]);
+        d
+    };
+    ok(
+        &i,
+        &admin(),
+        "schema.apply",
+        json!({ "changes": [
+            { "op": "put_action_type", "name": "risky", "def": risky },
+            { "op": "put_action_type", "name": "start", "def": start },
+            { "op": "put_automation", "name": "medium", "def": def("risky") },
+            { "op": "put_automation", "name": "irreversible", "def": def("start") },
+        ] }),
+    )
+    .await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "medium" })).await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "irreversible" })).await;
+    // No state yet: setting one cannot be undone, so the plan is not reversible.
+    issue(&i, "1", "", "high").await;
+    ok(&i, &admin(), "entity.upsert", json!({ "id": "issue:1", "props": { "description": "go" } })).await;
+    drain(&i);
+    for name in ["medium", "irreversible"] {
+        let r = runs(&i, name).await;
+        assert_eq!(r.len(), 1, "{name}: {r:?}");
+        assert_eq!(r[0]["state"], "refused", "{name}: {r:?}");
+        assert!(r[0]["reason"].as_str().unwrap().starts_with("needs_confirmation"), "{name}: {r:?}");
+    }
+    assert!(runs(&i, "irreversible").await[0]["reason"].as_str().unwrap().contains("not reversible"));
+    assert_eq!(state_of(&i, "issue:1"), None);
+}
+
+#[tokio::test]
+async fn dry_runs_render_as_the_run_and_the_caller_and_write_nothing() {
+    let i = open(|_| {}).await;
+    define(&i, "resolve_blocked", resolve_blocked(false)).await;
+    issue(&i, "1", "blocked", "high").await;
+    let seq = i.ontology().store().head().unwrap();
+    let t = ok(&i, &admin(), "automation.test", json!({ "name": "resolve_blocked", "id": "issue:1" })).await;
+    assert_eq!(t["verdict"], "would_run", "{t}");
+    assert_eq!(t["matched"], false, "an entity is not a state move: {t}");
+    assert_eq!(t["effects"][0]["plan"]["preview"][0], "update issue:1: state blocked → resolved");
+    assert_eq!(i.ontology().store().head().unwrap(), seq, "nothing was written");
+    // A caller who cannot see the subject renders nothing of it.
+    let outsider = Principal::named("user:o", &["viewer"], &["elsewhere"]).unwrap();
+    let e = i.call(&outsider, "automation.test", json!({ "name": "resolve_blocked", "id": "issue:1" })).await;
+    assert!(e.is_err(), "the caller does not see issue:1");
+    // By cursor: the change itself.
+    set_state(&i, "1", "triaged").await;
+    set_state(&i, "1", "blocked").await;
+    let head = ok(&i, &admin(), "changes.head", json!({})).await;
+    let t = ok(&i, &admin(), "automation.test", json!({ "name": "resolve_blocked", "cursor": head["cursor"] })).await;
+    assert_eq!(t["matched"], true, "{t}");
+    assert_eq!(t["trigger"]["state"]["from"], "triaged");
+}
+
+#[tokio::test]
+async fn empty_inputs_fail_cleanly() {
+    let i = open(|_| {}).await;
+    for action in onto_intelli::automate::CALLS {
+        match i.call(&admin(), action, json!({})).await {
+            Ok(v) => assert!(v.is_object(), "{action}: {v}"),
+            Err(e) => assert_eq!(e.code(), "invalid_argument", "{action}: {e}"),
+        }
+    }
+    assert_eq!(i.call(&admin(), "automation.get", json!({ "name": "nope" })).await.unwrap_err().code(), "not_found");
+    assert_eq!(
+        i.call(&admin(), "automation.runs", json!({ "state": "done" })).await.unwrap_err().code(),
+        "invalid_argument"
+    );
+    let who = ok(&i, &admin(), "system.whoami", json!({})).await;
+    assert_eq!(who["capabilities"]["automate"], true);
+    let agent = Principal::new("assistant", vec![Role::Agent], vec!["*".into()]);
+    assert_eq!(ok(&i, &agent, "system.whoami", json!({})).await["capabilities"]["automate"], false);
 }

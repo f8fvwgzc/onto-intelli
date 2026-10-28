@@ -1524,3 +1524,59 @@ Build step 10 (automation definitions):
   as pure functions over committed records: migrations are skipped unless `include_migrations`,
   gaps never match, and a run's own changes are skipped unless `allow_self`. Rate limits, the
   subject budget and the runtime that uses these come with step 11.
+
+Build step 11 (automation runtime):
+
+- No migration: `automation_runs` (0012), `leases`, `consumers` and `timers` (0010) hold everything.
+  Store methods: `run_claim(rows, fence)` (one `INSERT … ON CONFLICT DO NOTHING RETURNING id`; the
+  id and `(automation, trigger_key)` are both unique, so it also takes the batched final rows),
+  `run_update(row, from_states, fence)`, `run_get`, `runs_list`, `runs_running(epoch)`. Commits
+  carry `WriteBatch.runs` (`Extra.runs`): each row must exist and still be `running`, otherwise the
+  whole commit is refused (`Conflict`, `run_settled`). With the fence this makes a run complete at
+  most once even if two executions race; recovery completes a crashed run exactly once (tested
+  with a store that fails the commit, on memory and PostgreSQL).
+- `RunRow.trigger` names its kind `on` (`"change"`), not `kind` as C.8 wrote: templates read
+  `{trigger.kind}` as the entity kind (the change record's field), so the trigger kind needed
+  another name. The trigger also keeps `subject` (the entity, or a link's `from` end), `actor`,
+  `source` and the change's depth, so a recovered or rerun run is evaluated from its row alone.
+- Templates walk structured values (`{trigger.state.from}`); a string still names an entity, read
+  as the acting principal. The receipt id of a run is `act_<run id suffix>` and the plan seed is
+  the run's `started_at`, so a re-executed run renders the same ids.
+- The consumer evaluates each admitted trigger on the graph before claiming: conditions that do
+  not hold start no run (no row: a trigger that does not apply is not a skipped run, and such rows
+  would trip the breaker); a plan that is not valid is `refused: plan_invalid`, one that needs
+  confirmation `refused: needs_confirmation`; an invalid template `failed`. The commit evaluates
+  again, where conditions or preconditions that stopped holding make the run
+  `failed: precondition_changed` (C.7) and a plan that now needs confirmation `refused`.
+- Triggers are matched on the record as the run principal sees it (`changes::view`), so an
+  automation never runs on a change its `run_as` cannot read. Within one page, later runs see the
+  graph as earlier runs left it (C.3's "evaluated against the graph at the run's commit").
+- `AutomationState.from` (new): the head of the feed when it was enabled. Runs start with changes
+  after it; changes made while an automation is not enabled, or while the tenant kill switch is
+  on, never start runs (the consumer moves its cursor to the head). Enabling again restarts there.
+- Enablement is written by `Ontology::commit_automation` (KV `automation.state` and
+  `automation.control` only, with the audit event): approvers (`can_approve`) or admins, never
+  agents, who dominate `run_as`; every endpoint named must exist and dominate `run_as`. A stale
+  closure or an expired enablement is marked once (`paused`, events `automation.stale` /
+  `automation.expired`); `automation.enable` clears it. The breaker writes `paused: failing` with
+  `automation.paused` after `pause_after_failures` consecutive failed runs among runs that
+  executed (skipped and refused rows neither count nor reset it).
+- Retries: `retry:<run>` timers, `min(base * 2^(attempt - 1), max)`, `attempts` counts executions;
+  `automation.rerun` (skipped or failed runs, as enable) moves the row to `retry` with a timer due
+  now, so the lease holder runs it, fenced. `automation.disable` cancels the automation's pending
+  retries, a tenant kill all of them. A lost lease leaves the row `running` for recovery.
+- `automation.runs` shows runs to callers who dominate the automation's `run_as` (they could see
+  what it saw); others are counted in `hidden`. `automation.test` renders and plans as the run
+  principal and the caller together and writes nothing.
+- Webhook effects are `onto.<event>` CloudEvents (`event = "issue.escalated"` sends
+  `onto.issue.escalated`) with `causeautomation`, `causerun`, `causedepth`.
+- HTTP: `GET /v1/automations`, `GET /v1/automations/{name}`, `GET /v1/automations/{name}/runs`
+  (`/runs/{id}` one run, `POST /runs/{id}/rerun`), `POST /v1/automations/{name}/{test|enable|
+  disable}`, `POST /v1/automations/kill` (a `GET` there reads an automation named `kill`). Runs of
+  every automation are listed through `automation.runs` (gRPC `AutomateService/Runs`,
+  `/v1/call`). whoami gains `automate`. onto-cli's local commands run no consumer
+  (`[automation] workers = false` outside `serve`).
+- Deferred: automation traces (kind `automation`, section 11) and the run counters in
+  `system.stats`/`system.health`; the inbound `x-onto-cause-depth`/`x-onto-cause-run` headers
+  from config tokens (C.6), which need a cause on the request context in onto-grpc. Until then a
+  loop that leaves onto and comes back is bounded by the per-subject budget only.

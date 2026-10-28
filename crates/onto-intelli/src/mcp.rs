@@ -243,6 +243,43 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             false,
         ),
         (
+            "list_automations",
+            "automation.list",
+            "Automations defined in the schema: what each one reacts to (its change trigger), what it does (an action type and webhooks), who it runs as, and whether it is active (or why not). Definitions are visible to everyone who can read the schema; agents change them only through propose_schema_change (put_automation) and never enable them.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        (
+            "automation_runs",
+            "automation.runs",
+            "An automation's runs, newest first: state (succeeded, failed, retry, skipped, refused, would_run, cancelled), the reason, the change that triggered it, and its effects (receipts, outbox ids). Runs of automations you do not cover are counted as hidden.",
+            obj(
+                json!({
+                    "name": s("Automation name (all when omitted)"),
+                    "state": arr("States to list"),
+                    "since": { "type": "integer", "description": "Started at or after (Unix ms)" },
+                    "limit": { "type": "integer", "description": "At most this many (default 50)" },
+                    "id": s("One run")
+                }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "test_automation",
+            "automation.test",
+            "Dry-run an automation against a change (cursor) or an entity as if it was just updated (id): whether its trigger admits it, its conditions, the action plan and the webhook payloads, rendered as the run principal and you together. Writes nothing.",
+            obj(
+                json!({
+                    "name": s("Automation name"),
+                    "cursor": s("A change cursor (like 42.0)"),
+                    "id": s("An entity id")
+                }),
+                &["name"],
+            ),
+            false,
+        ),
+        (
             "experts",
             "people.experts",
             "Who knows about a topic, with reasons.",
@@ -620,6 +657,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "propose_schema_change",
             "list_proposals",
             "get_proposal",
+            "test_automation",
             "list_packs",
             "show_pack",
             "plan_pack",
@@ -670,6 +708,9 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "history",
             "changes",
             "poll_changes",
+            "list_automations",
+            "automation_runs",
+            "test_automation",
         ],
     ),
     (

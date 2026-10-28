@@ -17,6 +17,7 @@ use onto_core::{
 use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, SchemaChangeSet, SearchMode};
 
 use crate::assurance;
+use crate::automate;
 use crate::changes;
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
@@ -501,6 +502,46 @@ pub const ACTIONS: &[ActionInfo] = &[
         false,
         "Outbound deliveries waiting, sent or given up, newest first, for targets the caller may manage. Input: {target?, states?, source?, receipt?, run?, since?, limit?}.",
     ),
+    a(
+        "automation.list",
+        false,
+        "Automations by name: description, mode, run_as, trigger, effects, status (active, or inactive with the reason: not_enabled, paused, stale_definition, enablement_expired, killed), who enabled it and when it expires, and whether the caller may enable it; plus the tenant kill switch. Definitions are visible to everyone who can read the schema.",
+    ),
+    a(
+        "automation.get",
+        false,
+        "One automation: its definition, status, enablement and closure (the items its enablement binds to, and those that changed since). Input: {name}.",
+    ),
+    a(
+        "automation.runs",
+        false,
+        "Automation runs, newest first (ties by id): state (running, succeeded, failed, retry, skipped, refused, would_run, cancelled), reason, trigger, effects with receipts and outbox ids; runs of automations the caller does not dominate are counted as hidden. Input: {name?, state?, since?, limit?} or {id}.",
+    ),
+    a(
+        "automation.test",
+        false,
+        "A dry run of an automation against a change (cursor) or an entity as if it was just updated (id), rendered and planned as the run principal and the caller together: whether the trigger admits it, the conditions, the plan and the webhook payloads. Writes nothing. Input: {name, cursor? | id?}.",
+    ),
+    a(
+        "automation.enable",
+        true,
+        "Enable an automation (approvers and admins who dominate its run_as, never agents; every endpoint it reaches must dominate run_as too). It runs on changes from now on, binds to its closure hash (any change to what it reaches stops it) and expires after [automation] enable_ttl_days. Webhook effects are enqueued once and delivered at least once. Input: {name, workspace?}.",
+    ),
+    a(
+        "automation.disable",
+        true,
+        "Stop an automation (admins, or whoever may enable it); its pending retries are cancelled. Input: {name, workspace?}.",
+    ),
+    a(
+        "automation.rerun",
+        true,
+        "Run a skipped or failed run again (as enable); it is evaluated and planned on the graph at its commit. Input: {id, workspace?}.",
+    ),
+    a(
+        "automation.kill",
+        true,
+        "The tenant's automation kill switch: on stops every automation (changes made meanwhile never start runs; pending retries are cancelled); off resumes them (admins who may enable every enabled automation). Input: {on | off, workspace?}.",
+    ),
     a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
     a("system.health", false, "Liveness and version."),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
@@ -862,6 +903,9 @@ impl Intelli {
         }
         if webhooks::CALLS.contains(&action) {
             return blocking(|| self.webhooks_call(p, action, input));
+        }
+        if automate::CALLS.contains(&action) {
+            return blocking(|| self.automate_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
@@ -1353,6 +1397,7 @@ impl Intelli {
                         "approve": gov.can_approve(p),
                         "propose": gov.can_propose(p),
                         "configure_outbound": p.is_privileged() && !p.is_agent(),
+                        "automate": !p.is_agent() && (gov.can_approve(p) || p.is_privileged()),
                     },
                     "schema_version": onto.schema_version(),
                 }))

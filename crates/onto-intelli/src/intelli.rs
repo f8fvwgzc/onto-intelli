@@ -213,6 +213,11 @@ pub struct Intelli {
     outbox_wake: Arc<tokio::sync::Notify>,
     /// Wakes the fan-out of change subscriptions: something was committed.
     fanout_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the automation consumer: something was committed, or an
+    /// automation was enabled, rerun or switched.
+    automation_wake: Arc<tokio::sync::Notify>,
+    /// The automation consumer's state in this process.
+    automation: parking_lot::Mutex<crate::automate::Runtime>,
 }
 
 impl Intelli {
@@ -266,19 +271,24 @@ impl Intelli {
         let wake = outbox_wake.clone();
         let fanout_wake = Arc::new(tokio::sync::Notify::new());
         let fanout = fanout_wake.clone();
+        let automation_wake = Arc::new(tokio::sync::Notify::new());
+        let automation = automation_wake.clone();
         onto.on_change(move |c| {
             // Rows this process enqueued, or another process's commit (which
             // may have enqueued some): look for due rows now.
             if c.outbox > 0 || c.request_id == "sync" {
                 wake.notify_one();
             }
-            // Any commit may hold records a subscription wants.
+            // Any commit may hold records a subscription or an automation wants.
             fanout.notify_one();
+            automation.notify_one();
         });
         let me = Arc::new(Self {
             secrets: parking_lot::RwLock::new(None),
             outbox_wake,
             fanout_wake,
+            automation_wake,
+            automation: parking_lot::Mutex::new(crate::automate::Runtime::new()),
             changes,
             closing: watch::Sender::new(false),
             stream_touch: AtomicI64::new(0),
@@ -313,6 +323,7 @@ impl Intelli {
         #[cfg(feature = "outbound")]
         crate::webhooks::spawn_delivery(&me, me.outbox_wake.clone())?;
         crate::webhooks::spawn_fanout(&me, me.fanout_wake.clone());
+        crate::automate::spawn_automation_workers(&me, me.automation_wake.clone());
         Ok(me)
     }
 
@@ -408,6 +419,15 @@ impl Intelli {
     /// Wake the delivery worker (rows were enqueued or replayed).
     pub fn wake_outbox(&self) {
         self.outbox_wake.notify_one();
+    }
+
+    /// Wakes the automation consumer.
+    pub(crate) fn automation_wake(&self) -> &Arc<tokio::sync::Notify> {
+        &self.automation_wake
+    }
+
+    pub(crate) fn automation_runtime(&self) -> &parking_lot::Mutex<crate::automate::Runtime> {
+        &self.automation
     }
 
     pub fn is_closing(&self) -> bool {

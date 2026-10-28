@@ -24,7 +24,8 @@ use crate::schema::{Dir, Schema};
 use crate::time::{new_id, now_ms};
 use crate::{Error, Ontology, Result};
 
-const RECEIPTS: &str = "action_receipt";
+/// KV namespace of action receipts (key: the receipt id).
+pub(crate) const RECEIPTS: &str = "action_receipt";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -392,7 +393,7 @@ impl PlanSeed {
     }
 
     /// The seed of a receipt: its timestamp, and its id without the `act_` prefix.
-    fn of(id: &str, ts: i64) -> Self {
+    pub(crate) fn of(id: &str, ts: i64) -> Self {
         Self { now: ts, new_id: id.split_once('_').map_or(id, |(_, rest)| rest).to_string() }
     }
 }
@@ -455,6 +456,15 @@ impl<'a> Templates<'a> {
         if field.is_empty() {
             return (!base.is_null()).then_some(base);
         }
+        // A structured value (an automation's `{trigger.state.from}`) is
+        // walked by field; a string names an entity, read as the principal.
+        if base.is_object() {
+            let mut cur = &base;
+            for f in &field {
+                cur = cur.get(*f)?;
+            }
+            return (!cur.is_null()).then(|| cur.clone());
+        }
         let e = self.entity(base.as_str()?)?;
         let v = match field[0] {
             "id" => json!(e.id),
@@ -487,7 +497,6 @@ impl<'a> Templates<'a> {
     /// Render JSON strictly: any placeholder without a value, at any depth,
     /// refuses the render with `invalid_template`, naming the placeholders
     /// (never a value).
-    #[cfg_attr(not(test), expect(dead_code, reason = "automation, webhook and writeback payloads render strictly"))]
     pub(crate) fn render_strict(&self, v: &Value) -> Result<Value> {
         let mut missing = Vec::new();
         match self.value(v, true, &mut missing) {
@@ -667,6 +676,19 @@ fn eval_check(schema: &Schema, g: &Graph, c: &Check, env: &Templates<'_>, p: &Pr
     (ok, c.message.clone().unwrap_or(default_msg))
 }
 
+/// Evaluate `checks` (an automation's conditions) with the templates `env`
+/// as `p`: the failed checks' messages, empty when all pass. Every entity a
+/// check reads goes through `env`'s visibility.
+pub(crate) fn eval_checks(
+    schema: &Schema,
+    g: &Graph,
+    checks: &[Check],
+    env: &Templates<'_>,
+    p: &Principal,
+) -> Vec<String> {
+    checks.iter().map(|c| eval_check(schema, g, c, env, p)).filter(|(ok, _)| !ok).map(|(_, message)| message).collect()
+}
+
 fn as_input(e: &Entity) -> EntityInput {
     EntityInput {
         id: Some(e.id.clone()),
@@ -686,7 +708,7 @@ fn as_input(e: &Entity) -> EntityInput {
 pub(crate) const PRECONDITION_CHANGED: &str = "precondition_changed";
 
 /// The entity an action's audit event names: its first id-like parameter.
-fn audit_target(params: &Map<String, Value>) -> Option<String> {
+pub(crate) fn audit_target(params: &Map<String, Value>) -> Option<String> {
     params.values().find_map(|v| v.as_str().filter(|s| s.contains(':')).map(str::to_string))
 }
 
@@ -730,9 +752,26 @@ impl Ontology {
         params: &Map<String, Value>,
         seed: &PlanSeed,
     ) -> Result<ActionPlan> {
+        self.plan_on_as(g, schema, ctx, name, params, seed, None)
+    }
+
+    /// [`plan_on`](Self::plan_on) where an entity is visible only when
+    /// `also` may see it too (an automation's dry run, made with the run
+    /// principal and the caller together).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_on_as(
+        &self,
+        g: &Graph,
+        schema: &Schema,
+        ctx: &ActionContext,
+        name: &str,
+        params: &Map<String, Value>,
+        seed: &PlanSeed,
+        also: Option<&Principal>,
+    ) -> Result<ActionPlan> {
         let at = schema.action_types.get(name).ok_or_else(|| Error::not_found(format!("action type {name}")))?;
         let p = &ctx.principal;
-        let see = |e: &Entity| policy::visible(p, e, g);
+        let see = |e: &Entity| policy::visible(p, e, g) && also.is_none_or(|a| policy::visible(a, e, g));
         let mut checks = Vec::new();
         let mut warnings = Vec::new();
         let mut norm: Map<String, Value> = Map::new();

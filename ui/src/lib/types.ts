@@ -280,7 +280,7 @@ export interface Whoami {
   dev_mode: boolean;
   version: string;
   schema_version: number;
-  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean; configure_outbound?: boolean };
+  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean; configure_outbound?: boolean; automate?: boolean };
   console?: { user: string; role: string; org: string } | null;
   credential?: string;
   ui: { title: string };
@@ -978,4 +978,72 @@ export interface DeliveryAttempt {
   error?: string;
   duration_ms: number;
   response?: string;
+}
+
+// ── automate (crates/onto-intelli/src/automate.rs) ───────────────────────
+
+export interface AutomationEffectSummary {
+  kind: "action" | "webhook";
+  target: string;
+  event?: string;
+}
+
+export interface AutomationItem {
+  name: string;
+  principal_id: string;
+  description: string;
+  mode: "live" | "shadow";
+  run_as: { roles: string[]; workspaces: string[] };
+  trigger: { on: string; kinds?: string[]; ops?: string[]; workspaces?: string[]; rels?: string[]; props?: string[]; state?: { from?: string[]; to?: string[] }; sources?: string[] };
+  effects: AutomationEffectSummary[];
+  status: "active" | "inactive";
+  reason: string | null;
+  enabled: boolean;
+  enabled_by: string | null;
+  enabled_at: number | null;
+  expires_at: number | null;
+  paused: { reason: string; since: number } | null;
+  may_enable: boolean;
+}
+
+export interface AutomationList {
+  items: AutomationItem[];
+  kill: boolean;
+  process_enabled: boolean;
+  note: string;
+}
+
+export type RunState = "running" | "succeeded" | "failed" | "retry" | "skipped" | "refused" | "would_run" | "cancelled";
+
+export interface AutomationRunEffect {
+  index: number;
+  kind: "action" | "webhook";
+  target: string;
+  ok: boolean;
+  receipt?: string;
+  outbox?: string;
+  error?: string;
+  plan?: Record<string, unknown>;
+}
+
+export interface AutomationRun {
+  id: string;
+  automation: string;
+  trigger_key: string;
+  mode: "live" | "shadow";
+  depth: number;
+  state: RunState;
+  reason?: string;
+  trigger: { on: string; cursor: string; op: string; id: string; kind: string; workspace: string; subject: string; actor: string; state?: { from?: string; to?: string } };
+  principal: string;
+  effects: AutomationRunEffect[];
+  attempts: number;
+  started_at: number;
+  finished_at?: number;
+}
+
+export interface AutomationRuns {
+  items: AutomationRun[];
+  hidden: number;
+  note: string;
 }

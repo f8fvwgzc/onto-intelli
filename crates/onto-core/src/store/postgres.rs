@@ -50,6 +50,7 @@ use crate::graph::LinkKey;
 use crate::leases::{Fence, Lease, Timer, Wake, lease_lost};
 use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::outbox::{Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, replay_states};
+use crate::runs::{RunQuery, RunRow, RunState, settled};
 use crate::time::{new_id, now_ms};
 use crate::{Error, Result};
 
@@ -1240,6 +1241,8 @@ impl Store for PgStore {
         let del_l = b.del_links.clone();
         let fence = b.fence.clone();
         let outbox = (!b.outbox.is_empty()).then(|| outbox_json(&b.outbox)).transpose()?;
+        let runs = (!b.runs.is_empty()).then(|| runs_json(&b.runs)).transpose()?;
+        let run_ids: Vec<String> = b.runs.iter().map(|r| r.id.clone()).collect();
         let wake = match b.wake {
             Some(delay) => {
                 self.ensure_sys()?;
@@ -1252,6 +1255,14 @@ impl Store for PgStore {
             // First, so a lost lease writes nothing and a takeover waits for this commit.
             if let Some(f) = &fence {
                 check_fence(&mut tx, &tables, f).await?;
+            }
+            // Runs settle only while they are still running: a run is
+            // completed at most once.
+            if let Some(doc) = &runs {
+                let n = settle_runs(&mut tx, &tables, doc).await?;
+                if n != run_ids.len() {
+                    return Err(settled(&run_ids.join(", ")));
+                }
             }
             let mut seq: i64 = 0;
             if bumps {
@@ -1511,6 +1522,128 @@ impl Store for PgStore {
             }
             tx.commit().await?;
             Ok(seq as u64)
+        })
+    }
+
+    fn keeps_runs(&self) -> bool {
+        true
+    }
+
+    /// One statement: `ON CONFLICT DO NOTHING` covers the id and the unique
+    /// `(automation, trigger_key)`, so a duplicate trigger inserts nothing.
+    fn run_claim(&self, rows: &[RunRow], fence: Option<&Fence>) -> Result<Vec<String>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let doc = runs_json(rows)?;
+        let fence = fence.cloned();
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &t, f).await?;
+            }
+            let ids: Vec<String> = sqlx::query_scalar(sql(format!(
+                "WITH c AS (SELECT {now} AS t) \
+                 INSERT INTO {r} (id, automation, trigger_key, closure_hash, state, depth, epoch, started_at, \
+                 finished_at, doc) \
+                 SELECT x.id, x.automation, x.trigger_key, x.closure_hash, x.state, x.depth, x.epoch, c.t, \
+                 CASE WHEN x.final THEN c.t END, x.doc FROM c, jsonb_to_recordset($1::jsonb) AS x(id text, \
+                 automation text, trigger_key text, closure_hash text, state text, depth int, epoch bigint, \
+                 final boolean, doc jsonb) ON CONFLICT DO NOTHING RETURNING id",
+                r = t.runs,
+                now = t.now
+            )))
+            .bind(&doc)
+            .fetch_all(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(ids)
+        })
+    }
+
+    fn run_update(&self, row: &RunRow, from: &[RunState], fence: Option<&Fence>) -> Result<bool> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let doc = serde_json::to_string(row)?;
+        let (id, state, epoch, fin) =
+            (row.id.clone(), row.state.as_str().to_string(), row.epoch as i64, row.state.is_final());
+        let from: Vec<String> = from.iter().map(|s| s.as_str().to_string()).collect();
+        let fence = fence.cloned();
+        self.block(async move {
+            let mut tx = pool.begin().await?;
+            if let Some(f) = &fence {
+                check_fence(&mut tx, &t, f).await?;
+            }
+            let n = sqlx::query(sql(format!(
+                "UPDATE {r} SET state = $2, epoch = $3, finished_at = CASE WHEN $4 THEN {now} END, doc = $5::jsonb \
+                 WHERE id = $1 AND (cardinality($6::text[]) = 0 OR state = ANY($6))",
+                r = t.runs,
+                now = t.now
+            )))
+            .bind(&id)
+            .bind(&state)
+            .bind(epoch)
+            .bind(fin)
+            .bind(&doc)
+            .bind(&from)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            Ok(n > 0)
+        })
+    }
+
+    fn run_get(&self, id: &str) -> Result<Option<RunRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let id = id.to_string();
+        self.block(async move {
+            let row = sqlx::query(sql(format!("SELECT {RUN_COLS} FROM {} WHERE id = $1", t.runs)))
+                .bind(&id)
+                .fetch_optional(&pool)
+                .await?;
+            row.as_ref().map(run_row).transpose()
+        })
+    }
+
+    fn runs_list(&self, q: &RunQuery) -> Result<Vec<RunRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        let q = q.clone();
+        let states: Vec<String> = q.states.iter().map(|s| s.as_str().to_string()).collect();
+        self.block(async move {
+            let rows = sqlx::query(sql(format!(
+                "SELECT {RUN_COLS} FROM {} WHERE ($1::text IS NULL OR automation = $1) \
+                 AND (cardinality($2::text[]) = 0 OR state = ANY($2)) AND ($3::bigint IS NULL OR started_at >= $3) \
+                 ORDER BY started_at DESC, id DESC LIMIT $4",
+                t.runs
+            )))
+            .bind(&q.automation)
+            .bind(&states)
+            .bind(q.since)
+            .bind(q.limit() as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.iter().map(run_row).collect()
+        })
+    }
+
+    fn runs_running(&self, epoch: u64, limit: usize) -> Result<Vec<RunRow>> {
+        let pool = self.pool.clone();
+        let t = Tables::of(self);
+        self.block(async move {
+            let rows = sqlx::query(sql(format!(
+                "SELECT {RUN_COLS} FROM {} WHERE state = 'running' AND epoch < $1 ORDER BY started_at, id LIMIT $2",
+                t.runs
+            )))
+            .bind(epoch.min(i64::MAX as u64) as i64)
+            .bind(limit.clamp(1, 1000) as i64)
+            .fetch_all(&pool)
+            .await?;
+            rows.iter().map(run_row).collect()
         })
     }
 
@@ -2746,6 +2879,7 @@ struct Tables {
     timers: String,
     outbox: String,
     attempts: String,
+    runs: String,
     /// The tenant schema's `now_ms()` (the database clock).
     now: String,
 }
@@ -2782,6 +2916,7 @@ impl Tables {
             timers: s.t("timers"),
             outbox: s.t("outbox"),
             attempts: s.t("delivery_attempts"),
+            runs: s.t("automation_runs"),
             now: s.t("now_ms()"),
         }
     }
@@ -2860,6 +2995,65 @@ async fn insert_outbox(
          cause jsonb, otel_trace_id text){}",
         if skip_existing { " ON CONFLICT DO NOTHING" } else { "" },
         o = t.outbox,
+        now = t.now
+    )))
+    .bind(doc)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(n as usize)
+}
+
+/// The columns of a run row, in [`run_row`]'s order.
+const RUN_COLS: &str = "state, epoch, started_at, finished_at, doc::text";
+
+/// A run row: its document, with the columns the store keeps authoritative.
+fn run_row(r: &sqlx::postgres::PgRow) -> Result<RunRow> {
+    let state: String = r.try_get(0)?;
+    let doc: String = r.try_get(4)?;
+    let mut row: RunRow =
+        serde_json::from_str(&doc).map_err(|e| Error::Storage(format!("corrupt automation run: {e}")))?;
+    row.state = state.parse().map_err(|_| Error::Storage(format!("unknown run state '{state}'")))?;
+    row.epoch = r.try_get::<i64, _>(1)?.max(0) as u64;
+    row.started_at = r.try_get(2)?;
+    row.finished_at = r.try_get(3)?;
+    Ok(row)
+}
+
+/// Run rows as one JSON array for `jsonb_to_recordset`.
+fn runs_json(rows: &[RunRow]) -> Result<String> {
+    let v: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            Ok(json!({
+                "id": r.id,
+                "automation": r.automation,
+                "trigger_key": r.trigger_key,
+                "closure_hash": r.closure_hash,
+                "state": r.state.as_str(),
+                "depth": r.depth,
+                "epoch": r.epoch.min(i64::MAX as u64),
+                "final": r.state.is_final(),
+                "doc": serde_json::to_value(r)?,
+            }))
+        })
+        .collect::<Result<_>>()?;
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// Settle runs inside a commit: each row is replaced only while it is still
+/// `running`. Returns how many were.
+async fn settle_runs(
+    tx: &mut sqlx::transaction::Transaction<'_, sqlx::Postgres>,
+    t: &Tables,
+    doc: &str,
+) -> Result<usize> {
+    let n = sqlx::query(sql(format!(
+        "UPDATE {r} SET state = x.state, epoch = x.epoch, closure_hash = x.closure_hash, \
+         finished_at = CASE WHEN x.final THEN {now} END, doc = x.doc \
+         FROM jsonb_to_recordset($1::jsonb) AS x(id text, state text, epoch bigint, closure_hash text, \
+         final boolean, doc jsonb) WHERE {r}.id = x.id AND {r}.state = 'running'",
+        r = t.runs,
         now = t.now
     )))
     .bind(doc)

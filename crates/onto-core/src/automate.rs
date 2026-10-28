@@ -709,6 +709,112 @@ pub fn closure(
     Closure { hash: hash_of(&items), items }
 }
 
+// ── run budgets ──────────────────────────────────────────────────────────
+
+/// Which budget a trigger was over (C.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    /// The tenant's runs per minute (`[automation] max_runs_per_minute`).
+    Tenant,
+    /// The automation's runs per minute (`rate.per_minute`).
+    Automation,
+    /// Runs per `(automation, subject)` per hour (`rate.per_subject_per_hour`).
+    Subject,
+}
+
+impl Over {
+    /// The reason a `skipped` run row records.
+    pub fn reason(self, limit: u32) -> String {
+        match self {
+            Over::Tenant => {
+                format!("rate_limited: the tenant's {limit} runs per minute ([automation] max_runs_per_minute)")
+            }
+            Over::Automation => format!("rate_limited: the automation's {limit} runs per minute (rate.per_minute)"),
+            Over::Subject => {
+                format!("subject_budget: {limit} runs per subject per hour (rate.per_subject_per_hour)")
+            }
+        }
+    }
+}
+
+/// The limits one trigger is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub tenant_per_minute: u32,
+    pub per_minute: u32,
+    pub per_subject_per_hour: u32,
+}
+
+impl Rate {
+    /// This automation's limits, with the process defaults for unset values.
+    pub fn limits(&self, tenant_per_minute: u32, default_per_minute: u32, default_per_subject_per_hour: u32) -> Limits {
+        Limits {
+            tenant_per_minute,
+            per_minute: self.per_minute.unwrap_or(default_per_minute),
+            per_subject_per_hour: self.per_subject_per_hour.unwrap_or(default_per_subject_per_hour),
+        }
+    }
+}
+
+/// Sliding-window run budgets of the automation consumer: runs per tenant
+/// per minute, per automation per minute, and per `(automation, subject)`
+/// per hour (the backstop against loops that leave onto and come back). Kept
+/// in the consumer's memory, so they are approximate across lease handoffs:
+/// a new holder starts with empty windows.
+#[derive(Debug, Default)]
+pub struct Budget {
+    windows: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+}
+
+const MINUTE_MS: i64 = 60_000;
+const HOUR_MS: i64 = 3_600_000;
+
+impl Budget {
+    fn used(&mut self, key: &str, now: i64, window: i64) -> usize {
+        match self.windows.get_mut(key) {
+            Some(q) => {
+                while q.front().is_some_and(|t| *t <= now - window) {
+                    q.pop_front();
+                }
+                q.len()
+            }
+            None => 0,
+        }
+    }
+
+    /// Admit one run of automation `name` about `subject` at `now` (ms), or
+    /// say which budget it is over. An admitted run counts against all three.
+    pub fn admit(&mut self, now: i64, name: &str, subject: &str, l: &Limits) -> std::result::Result<(), (Over, u32)> {
+        let tenant = "tenant".to_string();
+        let auto = format!("automation:{name}");
+        let subj = format!("subject:{name}:{subject}");
+        if self.used(&tenant, now, MINUTE_MS) >= l.tenant_per_minute as usize {
+            return Err((Over::Tenant, l.tenant_per_minute));
+        }
+        if self.used(&auto, now, MINUTE_MS) >= l.per_minute as usize {
+            return Err((Over::Automation, l.per_minute));
+        }
+        if self.used(&subj, now, HOUR_MS) >= l.per_subject_per_hour as usize {
+            return Err((Over::Subject, l.per_subject_per_hour));
+        }
+        for k in [tenant, auto, subj] {
+            self.windows.entry(k).or_default().push_back(now);
+        }
+        Ok(())
+    }
+
+    /// Forget windows with nothing in them (called now and then).
+    pub fn trim(&mut self, now: i64) {
+        self.windows.retain(|k, q| {
+            let window = if k.starts_with("subject:") { HOUR_MS } else { MINUTE_MS };
+            while q.front().is_some_and(|t| *t <= now - window) {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+}
+
 // ── enablement state ─────────────────────────────────────────────────────
 
 /// Why an enabled automation does not run now.
@@ -740,6 +846,10 @@ pub struct AutomationState {
     pub expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<Paused>,
+    /// The head of the change feed when it was enabled: runs start with the
+    /// changes after it, never with what happened before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<changes::Cursor>,
 }
 
 impl AutomationState {
@@ -1195,6 +1305,39 @@ param = "issue""#,
         assert_eq!(a.depth_limit(3), 2);
         a.max_depth = Some(9);
         assert_eq!(a.depth_limit(3), 3);
+    }
+
+    #[test]
+    fn budgets_limit_runs_per_tenant_automation_and_subject() {
+        let mut b = Budget::default();
+        let l = Limits { tenant_per_minute: 5, per_minute: 2, per_subject_per_hour: 3 };
+        let t0 = 1_000_000;
+        assert!(b.admit(t0, "a", "issue:1", &l).is_ok());
+        assert!(b.admit(t0 + 1, "a", "issue:2", &l).is_ok());
+        // The automation's minute is used up; another automation still runs.
+        assert_eq!(b.admit(t0 + 2, "a", "issue:3", &l), Err((Over::Automation, 2)));
+        assert!(b.admit(t0 + 2, "b", "issue:3", &l).is_ok());
+        // A minute later the window has moved on.
+        assert!(b.admit(t0 + MINUTE_MS + 1, "a", "issue:1", &l).is_ok());
+        assert!(b.admit(t0 + 2 * MINUTE_MS + 2, "a", "issue:1", &l).is_ok());
+        // Three runs about issue:1 within the hour: the subject budget stops a loop.
+        assert_eq!(b.admit(t0 + 3 * MINUTE_MS + 3, "a", "issue:1", &l), Err((Over::Subject, 3)));
+        assert!(b.admit(t0 + HOUR_MS + 1, "a", "issue:1", &l).is_ok(), "the hour moved on");
+        // The tenant's budget covers every automation.
+        let tight = Limits { tenant_per_minute: 1, per_minute: 10, per_subject_per_hour: 10 };
+        let mut b = Budget::default();
+        assert!(b.admit(t0, "a", "x", &tight).is_ok());
+        assert_eq!(b.admit(t0, "b", "y", &tight), Err((Over::Tenant, 1)));
+        assert!(Over::Tenant.reason(1).contains("max_runs_per_minute"));
+        assert!(Over::Subject.reason(3).starts_with("subject_budget"));
+        // Minute windows empty after a minute; the subject's lasts the hour.
+        b.trim(t0 + 2 * MINUTE_MS);
+        assert_eq!(b.windows.keys().collect::<Vec<_>>(), ["subject:a:x"]);
+        b.trim(t0 + HOUR_MS + 1);
+        assert!(b.windows.is_empty());
+        // Unset rates take the process defaults.
+        let r = Rate { per_minute: Some(30), per_subject_per_hour: None };
+        assert_eq!(r.limits(600, 60, 10), Limits { tenant_per_minute: 600, per_minute: 30, per_subject_per_hour: 10 });
     }
 
     #[test]

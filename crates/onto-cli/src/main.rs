@@ -170,6 +170,15 @@ enum Command {
         #[command(subcommand)]
         sub: WebhookCmd,
     },
+    /// Automations: change-triggered runs of governed action types and
+    /// webhooks, defined in the schema ([automations.<name>]) and enabled by
+    /// a person. A run commits its action, receipt, outbox rows and run row
+    /// together; webhook effects are delivered at least once and external
+    /// effects are not reversible.
+    Automation {
+        #[command(subcommand)]
+        sub: AutomationCmd,
+    },
     /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
     Metric {
         name: Option<String>,
@@ -440,6 +449,32 @@ enum WebhookCmd {
     },
     /// Remove an endpoint (rows not yet sent to it are cancelled).
     Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum AutomationCmd {
+    /// Automations with their status (active, or why not).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Runs, newest first.
+    Runs {
+        /// One automation's runs (all when omitted).
+        name: Option<String>,
+        /// Only runs in this state (repeatable): succeeded, failed, retry, skipped, refused, ...
+        #[arg(long = "state")]
+        states: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable an automation: it runs on changes from now on, binds to what it
+    /// reaches (any change stops it) and expires after enable_ttl_days.
+    Enable { name: String },
+    /// Stop an automation (its pending retries are cancelled).
+    Disable { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1589,6 +1624,99 @@ async fn webhook(cli: &Cli, sub: &WebhookCmd, st: &Style) -> Result<()> {
     }
 }
 
+async fn automation(cli: &Cli, sub: &AutomationCmd, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    match sub {
+        AutomationCmd::List { json: as_json } => {
+            let r = be.call("automation.list", json!({})).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            if r["kill"] == true {
+                println!("{}", st.red("automations are stopped: the tenant kill switch is on"));
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!(
+                    "No automations. Define one in the schema ([automations.<name>]), then: onto automation enable <name>"
+                );
+            }
+            for a in items {
+                let status = match a["reason"].as_str() {
+                    None => "active".to_string(),
+                    Some(r) => st.red(&format!("inactive ({r})")),
+                };
+                let effects: Vec<String> = a["effects"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .map(|x| {
+                                format!(
+                                    "{} {}",
+                                    x["kind"].as_str().unwrap_or_default(),
+                                    x["target"].as_str().unwrap_or_default()
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "{}  {}  {}{}",
+                    st.bold(a["name"].as_str().unwrap_or_default()),
+                    status,
+                    effects.join(", "),
+                    a["expires_at"]
+                        .as_i64()
+                        .map(|t| format!("  expires {}", onto_intelli::core::time::fmt_ts(t)))
+                        .unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        AutomationCmd::Runs { name, states, limit, json: as_json } => {
+            let r = be.call("automation.runs", json!({ "name": name, "state": states, "limit": limit })).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!("No runs.");
+            }
+            for run in items {
+                let state = run["state"].as_str().unwrap_or_default();
+                let state = if matches!(state, "succeeded" | "would_run") { state.to_string() } else { st.red(state) };
+                println!(
+                    "{}  {}  {}  {} {}  depth {}{}",
+                    run["id"].as_str().unwrap_or_default(),
+                    run["automation"].as_str().unwrap_or_default(),
+                    state,
+                    run["trigger"]["op"].as_str().unwrap_or_default(),
+                    run["trigger"]["id"].as_str().unwrap_or_default(),
+                    run["depth"],
+                    run["reason"].as_str().map(|r| format!("  {}", st.dim(r))).unwrap_or_default(),
+                );
+            }
+            if r["hidden"].as_u64().unwrap_or(0) > 0 {
+                println!("{}", st.dim(&format!("{} runs of automations you do not cover are hidden", r["hidden"])));
+            }
+            Ok(())
+        }
+        AutomationCmd::Enable { name } => {
+            let r = be.call("automation.enable", json!({ "name": name })).await?;
+            println!("Enabled {}", st.bold(name));
+            println!("{}", st.dim(r["note"].as_str().unwrap_or_default()));
+            Ok(())
+        }
+        AutomationCmd::Disable { name } => {
+            let r = be.call("automation.disable", json!({ "name": name })).await?;
+            println!("Disabled {name} ({} pending retries cancelled)", r["cancelled_retries"]);
+            Ok(())
+        }
+    }
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
@@ -1742,7 +1870,9 @@ fn local_config(cli: &Cli) -> Result<Config> {
 
 /// The local store (the `--tenant`'s, when given).
 async fn open_local(cli: &Cli) -> Result<(Arc<Intelli>, Config)> {
-    let cfg = local_config(cli)?;
+    let mut cfg = local_config(cli)?;
+    // One-off commands run no automation consumer (`onto serve` does).
+    cfg.automation.workers = false;
     let intelli = match &cli.tenant {
         Some(t) => onto_intelli::Hub::open(cfg.clone()).await?.tenant(t).await?,
         None => Intelli::open(cfg.clone()).await?,
@@ -2328,6 +2458,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
         }
         Command::Watch(w) => watch(&cli, w, st).await,
         Command::Webhook { sub } => webhook(&cli, sub, st).await,
+        Command::Automation { sub } => automation(&cli, sub, st).await,
         Command::Changes { days, within } => {
             let be = backend(&cli).await?;
             let r = be

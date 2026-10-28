@@ -24,6 +24,7 @@
 pub mod actions;
 pub mod answer;
 pub mod assurance;
+pub mod automate;
 pub mod blocking;
 pub mod cache;
 pub mod changes;

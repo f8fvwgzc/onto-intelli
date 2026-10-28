@@ -33,6 +33,7 @@ use crate::model::{Entity, Event, EventFilter, Id, Link};
 use crate::outbox::{
     Attempt, AttemptRecord, OutboxQuery, OutboxRow, OutboxSelect, OutboxState, no_outbox, replay_states,
 };
+use crate::runs::{RunQuery, RunRow, RunState, no_runs, settled};
 use crate::time::now_ms;
 use crate::trace::{
     self, MetricsQuery, ScoreRow, SessionPage, SessionQuery, TraceDetail, TraceMetrics, TracePage, TraceQuery,
@@ -167,6 +168,11 @@ pub struct WriteBatch {
     /// are unique by construction: a duplicate `(target, dedupe)` fails the
     /// whole write with `Error::Conflict`.
     pub outbox: Vec<OutboxRow>,
+    /// Automation run rows settled in the same transaction ([`crate::runs`]):
+    /// each must exist and still be `running`, otherwise the whole write is
+    /// refused (`Conflict`, `run_settled`), so a run is completed at most
+    /// once. The store stamps `finished_at` of final rows by its clock.
+    pub runs: Vec<RunRow>,
 }
 
 impl WriteBatch {
@@ -237,6 +243,7 @@ impl WriteBatch {
             && self.kv.is_empty()
             && self.reembed.is_empty()
             && self.outbox.is_empty()
+            && self.runs.is_empty()
     }
 }
 
@@ -506,6 +513,42 @@ pub trait Store: Send + Sync {
         Err(no_outbox())
     }
 
+    // ── automation runs (docs/design/EVENTS.md C.7, C.8); stores without them refuse ──
+    // Times are the store's clock; none of these goes through the commit log.
+
+    /// Does this store keep automation runs?
+    fn keeps_runs(&self) -> bool {
+        false
+    }
+    /// Claim runs: insert each row unless its id or its `(automation,
+    /// trigger_key)` exists (a duplicate trigger, settled here and never
+    /// retried), with `started_at` (and `finished_at` for final rows) by the
+    /// store's clock; with a fence, only while that lease is held at its
+    /// epoch. One statement. Returns the ids inserted.
+    fn run_claim(&self, _rows: &[RunRow], _fence: Option<&Fence>) -> Result<Vec<String>> {
+        Err(no_runs())
+    }
+    /// Replace a run row (state, epoch, attempts, document; `finished_at`
+    /// stamped when it is final, cleared otherwise) only while its state is
+    /// one of `from` (any, when empty); with a fence, only while that lease
+    /// is held. Returns whether it changed.
+    fn run_update(&self, _row: &RunRow, _from: &[RunState], _fence: Option<&Fence>) -> Result<bool> {
+        Err(no_runs())
+    }
+    /// One run.
+    fn run_get(&self, _id: &str) -> Result<Option<RunRow>> {
+        Err(no_runs())
+    }
+    /// Runs matching `q`, newest first (ties by id, descending).
+    fn runs_list(&self, _q: &RunQuery) -> Result<Vec<RunRow>> {
+        Err(no_runs())
+    }
+    /// `running` rows claimed under an epoch below `epoch` (what a new
+    /// holder of the consumer lease recovers), oldest first, at most `limit`.
+    fn runs_running(&self, _epoch: u64, _limit: usize) -> Result<Vec<RunRow>> {
+        Err(no_runs())
+    }
+
     /// Newest first.
     fn events(&self, filter: &EventFilter) -> Result<Vec<Event>>;
     fn kv_put(&self, ns: &str, key: &str, value: &Value, expires_at: Option<i64>) -> Result<()>;
@@ -645,6 +688,10 @@ struct MemInner {
     /// (target, dedupe) of every row in `outbox`
     outbox_keys: HashSet<(String, String)>,
     attempts: Vec<AttemptRecord>,
+    /// id -> run
+    runs: HashMap<String, RunRow>,
+    /// (automation, trigger_key) of every run in `runs`
+    run_keys: HashSet<(String, String)>,
 }
 
 struct MemLease {
@@ -691,6 +738,24 @@ impl MemInner {
         Ok(n)
     }
 
+    /// Settle runs in a commit: every row must exist and be `running`.
+    fn runs_settle(&mut self, rows: &[RunRow]) -> Result<()> {
+        for r in rows {
+            if self.runs.get(&r.id).is_none_or(|cur| cur.state != RunState::Running) {
+                return Err(settled(&r.id));
+            }
+        }
+        let now = now_ms();
+        for r in rows {
+            let started = self.runs.get(&r.id).map(|c| c.started_at).unwrap_or(now);
+            let mut r = r.clone();
+            r.started_at = started;
+            r.finished_at = r.state.is_final().then_some(now);
+            self.runs.insert(r.id.clone(), r);
+        }
+        Ok(())
+    }
+
     /// The fence's lease is held by its holder at its epoch right now.
     fn check_fence(&self, f: &Fence) -> Result<()> {
         match self.leases.get(&f.name) {
@@ -730,8 +795,14 @@ impl MemoryStore {
         if let Some(f) = &batch.fence {
             inner.check_fence(f)?;
         }
-        // Before anything else is written: a duplicate key fails the write.
+        // Before anything else is written: a duplicate key, or a run that is
+        // no longer running, fails the write.
+        if let Some(r) = batch.runs.iter().find(|r| inner.runs.get(&r.id).is_none_or(|c| c.state != RunState::Running))
+        {
+            return Err(settled(&r.id));
+        }
         inner.outbox_insert(&batch.outbox, true)?;
+        inner.runs_settle(&batch.runs)?;
         for e in &batch.events {
             if inner.events.len() >= self.max_events {
                 inner.events.pop_front();
@@ -1010,6 +1081,71 @@ impl Store for MemoryStore {
             }
             _ => Ok(false),
         }
+    }
+
+    fn keeps_runs(&self) -> bool {
+        true
+    }
+
+    fn run_claim(&self, rows: &[RunRow], fence: Option<&Fence>) -> Result<Vec<String>> {
+        let mut inner = self.inner.lock();
+        if let Some(f) = fence {
+            inner.check_fence(f)?;
+        }
+        let now = now_ms();
+        let mut out = Vec::new();
+        for r in rows {
+            let key = (r.automation.clone(), r.trigger_key.clone());
+            if inner.runs.contains_key(&r.id) || inner.run_keys.contains(&key) {
+                continue;
+            }
+            let mut r = r.clone();
+            r.started_at = now;
+            r.finished_at = r.state.is_final().then_some(now);
+            inner.run_keys.insert(key);
+            out.push(r.id.clone());
+            inner.runs.insert(r.id.clone(), r);
+        }
+        Ok(out)
+    }
+
+    fn run_update(&self, row: &RunRow, from: &[RunState], fence: Option<&Fence>) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if let Some(f) = fence {
+            inner.check_fence(f)?;
+        }
+        let Some(cur) = inner.runs.get(&row.id) else { return Ok(false) };
+        if !from.is_empty() && !from.contains(&cur.state) {
+            return Ok(false);
+        }
+        let mut r = row.clone();
+        r.started_at = cur.started_at;
+        r.automation = cur.automation.clone();
+        r.trigger_key = cur.trigger_key.clone();
+        r.finished_at = r.state.is_final().then(now_ms);
+        inner.runs.insert(r.id.clone(), r);
+        Ok(true)
+    }
+
+    fn run_get(&self, id: &str) -> Result<Option<RunRow>> {
+        Ok(self.inner.lock().runs.get(id).cloned())
+    }
+
+    fn runs_list(&self, q: &RunQuery) -> Result<Vec<RunRow>> {
+        let inner = self.inner.lock();
+        let mut out: Vec<RunRow> = inner.runs.values().filter(|r| q.matches(r)).cloned().collect();
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at).then_with(|| b.id.cmp(&a.id)));
+        out.truncate(q.limit());
+        Ok(out)
+    }
+
+    fn runs_running(&self, epoch: u64, limit: usize) -> Result<Vec<RunRow>> {
+        let inner = self.inner.lock();
+        let mut out: Vec<RunRow> =
+            inner.runs.values().filter(|r| r.state == RunState::Running && r.epoch < epoch).cloned().collect();
+        out.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
+        out.truncate(limit);
+        Ok(out)
     }
 
     fn keeps_outbox(&self) -> bool {

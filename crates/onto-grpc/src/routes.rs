@@ -158,6 +158,14 @@ const BUILTIN_ROUTES: &[(&str, &str)] = &[
     ("onto_intelli.v1.WebhookService/Resume", "webhook.resume"),
     ("onto_intelli.v1.WebhookService/Kill", "webhook.kill"),
     ("onto_intelli.v1.WebhookService/Outbox", "outbox.list"),
+    ("onto_intelli.v1.AutomateService/List", "automation.list"),
+    ("onto_intelli.v1.AutomateService/Get", "automation.get"),
+    ("onto_intelli.v1.AutomateService/Runs", "automation.runs"),
+    ("onto_intelli.v1.AutomateService/Test", "automation.test"),
+    ("onto_intelli.v1.AutomateService/Enable", "automation.enable"),
+    ("onto_intelli.v1.AutomateService/Disable", "automation.disable"),
+    ("onto_intelli.v1.AutomateService/Rerun", "automation.rerun"),
+    ("onto_intelli.v1.AutomateService/Kill", "automation.kill"),
 ];
 
 pub struct Route {

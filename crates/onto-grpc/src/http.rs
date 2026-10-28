@@ -53,6 +53,15 @@
 //! * `POST /v1/webhooks/{name}/{test|rotate_secret|replay|resume}`  a test delivery, a secret rotation,
 //!   a replay `{ids | since, states?}` (ids kept), or resuming a paused endpoint
 //! * `POST /v1/webhooks/kill`   `{on | off}`: the tenant's webhook kill switch
+//! * `GET  /v1/automations`     automations with their status (readers); `POST /v1/automations/kill`
+//!   `{on | off}` is the tenant's automation kill switch
+//! * `GET  /v1/automations/{name}`  one automation: definition, status, enablement, closure
+//! * `GET  /v1/automations/{name}/runs`  its runs (`?state=`, `since`, `limit`), newest first;
+//!   `GET .../runs/{id}` one run; `POST .../runs/{id}/rerun` runs a skipped or failed one again
+//! * `POST /v1/automations/{name}/{test|enable|disable}`  a dry run `{cursor | id}` (writes nothing),
+//!   enabling (approvers who dominate its run_as; it binds to its closure and expires), disabling.
+//!   A run commits its action, receipt, outbox rows and run row together; webhook effects are
+//!   enqueued once and delivered at least once, and external effects are not reversible.
 //! * `GET  /v1/outbox`          outbound deliveries (`?target=`, `states`, `source`, `receipt`, `run`,
 //!   `since`, `limit`) for targets the caller may manage. Each change is enqueued once per endpoint
 //!   and delivered at least once; receivers dedupe on the event id.
@@ -160,6 +169,13 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/webhooks/{name}/deliveries", get(webhook_deliveries))
         .route("/v1/webhooks/{name}/{verb}", post(webhook_verb))
         .route("/v1/outbox", get(outbox_list))
+        .route("/v1/automations", get(automations_list))
+        .route("/v1/automations/kill", get(automation_get_kill).post(automation_kill))
+        .route("/v1/automations/{name}", get(automation_get))
+        .route("/v1/automations/{name}/runs", get(automation_runs))
+        .route("/v1/automations/{name}/runs/{id}", get(automation_run))
+        .route("/v1/automations/{name}/runs/{id}/rerun", post(automation_rerun))
+        .route("/v1/automations/{name}/{verb}", post(automation_verb))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -566,6 +582,7 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
             "propose": gov.can_propose(p),
             "observe": p.can_observe(),
             "configure_outbound": p.is_privileged() && !p.is_agent(),
+            "automate": !p.is_agent() && (gov.can_approve(p) || p.is_privileged()),
         },
         "governance": gov,
         "ui": { "title": cfg.ui.title },
@@ -1026,6 +1043,81 @@ async fn webhook_verb(
             return error_response(&Error::not_found(format!(
                 "webhook action '{other}' (test, rotate_secret, replay, resume)"
             )));
+        }
+    };
+    run(&s, &headers, action, named(body, name)).await
+}
+
+async fn automations_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.list", json!({})).await
+}
+
+async fn automation_get(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.get", json!({ "name": name })).await
+}
+
+/// `GET /v1/automations/kill`: the automation named `kill` (the path's POST is the switch).
+async fn automation_get_kill(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.get", json!({ "name": "kill" })).await
+}
+
+async fn automation_kill(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "automation.kill", body_or_empty(body)).await
+}
+
+async fn automation_runs(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            "state" | "states" => json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            "since" | "limit" => v.trim().parse::<i64>().map(Value::from).unwrap_or(Value::String(v)),
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    input.insert("name".into(), Value::String(name));
+    run(&s, &headers, "automation.runs", Value::Object(input)).await
+}
+
+async fn automation_run(
+    State(s): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    run(&s, &headers, "automation.runs", json!({ "name": name, "id": id })).await
+}
+
+async fn automation_rerun(
+    State(s): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("id".into(), Value::String(id));
+        m.insert("automation".into(), Value::String(name));
+    }
+    run(&s, &headers, "automation.rerun", input).await
+}
+
+async fn automation_verb(
+    State(s): State<AppState>,
+    Path((name, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "test" => "automation.test",
+        "enable" => "automation.enable",
+        "disable" => "automation.disable",
+        other => {
+            return error_response(&Error::not_found(format!("automation action '{other}' (test, enable, disable)")));
         }
     };
     run(&s, &headers, action, named(body, name)).await

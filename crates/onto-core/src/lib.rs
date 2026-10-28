@@ -50,6 +50,7 @@ pub mod quality;
 pub mod query;
 pub mod reason;
 pub mod rules;
+pub mod runs;
 pub mod schema;
 pub mod shape_model;
 pub mod shapes;

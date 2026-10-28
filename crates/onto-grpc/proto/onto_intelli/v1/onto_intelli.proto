@@ -1094,3 +1094,55 @@ service WebhookService {
   rpc Kill(WebhookKillRequest) returns (google.protobuf.Struct);              // webhook.kill
   rpc Outbox(OutboxListRequest) returns (google.protobuf.Struct);             // outbox.list
 }
+
+// ── Automate: change-triggered automations ───────────────────────────────
+// Automations are defined in the schema ([automations.<name>], through
+// SchemaService plan/apply/propose with put_automation). They run as the
+// service principal automation:<name> once a person who may approve schema
+// changes and dominates its run_as enables them; an enablement binds to the
+// closure hash and expires (enable_ttl_days). A run commits its action, the
+// receipt, its webhook outbox rows and the run row together; webhook effects
+// are enqueued once and delivered at least once, and external effects are not
+// reversible. Automation definitions are visible to everyone who can read
+// the schema. Responses are the JSON of the automation.* actions.
+
+message AutomationNameRequest {
+  string name = 1;
+  string workspace = 2;           // workspace of the audit event
+}
+
+message AutomationRunsRequest {
+  string name = 1;                // one automation's runs (empty: all)
+  repeated string state = 2;      // running | succeeded | failed | retry | skipped | refused | would_run | cancelled
+  int64 since = 3;                // started at or after (Unix ms)
+  uint32 limit = 4;
+  string id = 5;                  // one run
+}
+
+message AutomationTestRequest {
+  string name = 1;
+  string cursor = 2;              // a change ("<seq>.<n>"), or
+  string id = 3;                  // an entity, as if it was just updated
+}
+
+message AutomationRerunRequest {
+  string id = 1;                  // a skipped or failed run
+  string workspace = 2;
+}
+
+message AutomationKillRequest {
+  bool on = 1;                    // stop every automation of the tenant
+  bool off = 2;                   // run them again
+  string workspace = 3;
+}
+
+service AutomateService {
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // automation.list
+  rpc Get(AutomationNameRequest) returns (google.protobuf.Struct);            // automation.get
+  rpc Runs(AutomationRunsRequest) returns (google.protobuf.Struct);           // automation.runs
+  rpc Test(AutomationTestRequest) returns (google.protobuf.Struct);           // automation.test
+  rpc Enable(AutomationNameRequest) returns (google.protobuf.Struct);         // automation.enable
+  rpc Disable(AutomationNameRequest) returns (google.protobuf.Struct);        // automation.disable
+  rpc Rerun(AutomationRerunRequest) returns (google.protobuf.Struct);         // automation.rerun
+  rpc Kill(AutomationKillRequest) returns (google.protobuf.Struct);           // automation.kill
+}
