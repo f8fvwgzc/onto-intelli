@@ -429,8 +429,9 @@ pub const VISIBILITY_SQL: &str = "SELECT CAST(HAS_PERMS_BY_NAME(DB_NAME(), 'DATA
 pub const GRANTS_HIDDEN: &str = "map_grants: the crawl account lacks VIEW DEFINITION on the database, so DENYs and \
      role memberships are hidden from it: every table is restricted (no readers) until it has VIEW DEFINITION";
 
-/// `VISIBILITY_SQL`'s answer: only a plain yes maps grants.
-pub fn sees_all_permissions(answer: Option<i64>) -> bool {
+/// `VISIBILITY_SQL`'s answer: the crawl account has VIEW DEFINITION (only a
+/// plain yes), which grants mapping needs (necessary, not sufficient).
+pub fn has_view_definition(answer: Option<i64>) -> bool {
     answer == Some(1)
 }
 
@@ -443,7 +444,7 @@ pub fn grant_readers(
     perms: &[SelectPermission],
     members: &[RoleMember],
 ) -> (Readers, Option<&'static str>) {
-    if sees_all_permissions(answer) {
+    if has_view_definition(answer) {
         (table_readers(perms, members), None)
     } else {
         (BTreeMap::new(), Some(GRANTS_HIDDEN))
@@ -540,7 +541,7 @@ async fn map_grants(src: &mut (impl GrantSource + Send)) -> Result<(Readers, Opt
         Ok(answer) => answer,
         Err(e) => return unread(e),
     };
-    if !sees_all_permissions(answer) {
+    if !has_view_definition(answer) {
         let (readers, note) = grant_readers(answer, &[], &[]);
         return Ok((readers, note.map(String::from)));
     }
@@ -899,10 +900,11 @@ mod tests {
         // eve may be in DOMAIN\analysts: nobody can see.
         let denied = [group("DOMAIN\\analysts"), on("bob", "orders"), deny(on("eve", "orders"))];
         assert_eq!(readers_of(&denied, &[], "orders"), vec!["bob"]);
-        // Grants are read only when the crawl account sees every row.
-        assert!(sees_all_permissions(Some(1)));
+        // Grants are read only when the crawl account has VIEW DEFINITION
+        // (necessary, not sufficient).
+        assert!(has_view_definition(Some(1)));
         for answer in [Some(0), None, Some(2)] {
-            assert!(!sees_all_permissions(answer), "{answer:?}");
+            assert!(!has_view_definition(answer), "{answer:?}");
         }
     }
 
