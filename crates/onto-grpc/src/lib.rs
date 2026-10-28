@@ -68,7 +68,8 @@ pub const REVOKED_NS: &str = "auth.revoked";
 /// replica sees them. A revocation for every tenant is keyed by the id; one
 /// for the sessions of some tenants (a service token limited to them) by
 /// `<id>@<tenant>`, once per tenant. Expired rows are deleted at most every
-/// [`PRUNE_EVERY_MS`], by the revoke that finds them due.
+/// [`PRUNE_EVERY_MS`], after a revoke that finds them due, on a task of
+/// their own and [`PRUNE_BATCH`] rows at a time.
 ///
 /// Session authentication in every tenant therefore reads the default
 /// tenant. That is kept on purpose: every tenant lives in the same database,
@@ -84,6 +85,9 @@ struct HubRevocations {
 
 /// How often a revoke deletes the expired revocations.
 const PRUNE_EVERY_MS: i64 = 10 * 60 * 1000;
+
+/// Expired revocations deleted per statement.
+const PRUNE_BATCH: usize = 1_000;
 
 impl HubRevocations {
     fn new(hub: &Arc<Hub>) -> Self {
@@ -122,18 +126,30 @@ impl auth::Revocations for HubRevocations {
                 Some(tenants) => tenants.iter().map(|t| auth::scoped_id(id, Some(t))).collect(),
             };
             let until = i64::try_from(exp).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
-            let prune = self.prune_due();
+            let written = store.clone();
             tokio::task::spawn_blocking(move || {
                 keys.iter().try_for_each(|key| {
-                    store.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
-                })?;
-                if prune && let Err(e) = store.kv_purge_expired(REVOKED_NS) {
-                    tracing::warn!("deleting expired session revocations: {e}");
-                }
-                Ok(())
+                    written.kv_put(REVOKED_NS, key, &serde_json::json!({ "expires_at": exp }), Some(until))
+                })
             })
             .await
-            .map_err(|e| Error::Other(format!("revoking a session: {e}")))?
+            .map_err(|e| Error::Other(format!("revoking a session: {e}")))??;
+            // Off the request: the revoke has answered by the time this runs.
+            if self.prune_due() {
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        match store.kv_purge_expired(REVOKED_NS, PRUNE_BATCH) {
+                            Ok(n) if n as usize >= PRUNE_BATCH => continue,
+                            Ok(_) => break,
+                            Err(e) => {
+                                tracing::warn!("deleting expired session revocations: {e}");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Ok(())
         })
     }
 

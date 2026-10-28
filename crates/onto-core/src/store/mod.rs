@@ -261,11 +261,11 @@ pub trait Store: Send + Sync {
     fn kv_delete(&self, ns: &str, key: &str) -> Result<()>;
     /// All live entries of a namespace whose key starts with `prefix`, key order.
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>>;
-    /// Delete the expired entries of a namespace; how many. Reads skip them
-    /// anyway: this only keeps a namespace that nothing reads back whole
-    /// from growing. Stores that keep no expired rows need not.
-    fn kv_purge_expired(&self, ns: &str) -> Result<u64> {
-        let _ = ns;
+    /// Delete at most `limit` expired entries of a namespace; how many.
+    /// Reads skip them anyway: this only keeps a namespace that nothing
+    /// reads back whole from growing. Stores that keep no expired rows need not.
+    fn kv_purge_expired(&self, ns: &str, limit: usize) -> Result<u64> {
+        let _ = (ns, limit);
         Ok(0)
     }
     fn stats(&self) -> Result<StoreStats>;
@@ -460,13 +460,20 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn kv_purge_expired(&self, ns: &str) -> Result<u64> {
+    fn kv_purge_expired(&self, ns: &str, limit: usize) -> Result<u64> {
         let now = now_ms();
         let mut inner = self.inner.lock();
         let Some(map) = inner.kv.get_mut(ns) else { return Ok(0) };
-        let before = map.len();
-        map.retain(|_, (_, exp)| exp.is_none_or(|e| e > now));
-        Ok((before - map.len()) as u64)
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, (_, exp))| exp.is_some_and(|e| e <= now))
+            .map(|(k, _)| k.clone())
+            .take(limit)
+            .collect();
+        for k in &expired {
+            map.remove(k);
+        }
+        Ok(expired.len() as u64)
     }
 
     fn kv_scan(&self, ns: &str, prefix: &str) -> Result<Vec<(String, Value)>> {

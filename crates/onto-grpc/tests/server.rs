@@ -1087,8 +1087,8 @@ async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revok
     };
     let user = |n: u32, tenant: &str| json!({ "act_as": format!("user:{n}"), "roles": ["member"], "tenant": tenant });
     let svc = || "service-token-for-tests".to_string();
-    // A token limited to ws_1 revokes for ws_1 only. The other replica has
-    // never seen these ids, so it reads the store.
+    // A token limited to ws_1 revokes for ws_1 only (not for the look-alike
+    // WS-1). The other replica has never seen these ids, so it reads the store.
     let root = mint(svc(), user(3, "ws_1")).await;
     let derived = mint(root["token"].as_str().unwrap().to_string(), json!({})).await;
     let alias = mint(svc(), user(4, "WS-1")).await;
@@ -1102,7 +1102,7 @@ async fn a_revoked_session_is_refused_on_every_replica_whatever_tenant_the_revok
     let on_other = |minted: &Value| status(&bases[1], minted["token"].as_str().unwrap());
     assert_eq!(on_other(&root).await, 401, "the session");
     assert_eq!(on_other(&derived).await, 401, "a session minted from it: its login, for ws_1");
-    assert_eq!(on_other(&alias).await, 401, "WS-1 shares ws_1's schema name, so its revocations");
+    assert_eq!(on_other(&alias).await, 200, "WS-1 is another tenant than ws_1");
     assert_eq!(status(&bases[1], &elsewhere).await, 200, "the same id in ws_2");
     // A token limited to two tenants names one of them, and revokes in both.
     let other = mint(svc(), user(5, "ws_2")).await;

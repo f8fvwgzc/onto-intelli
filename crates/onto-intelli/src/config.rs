@@ -553,7 +553,8 @@ pub struct AuthConfig {
     /// tokens (`POST /v1/auth/session`). Set the same value on every
     /// replica; unset, each process signs with a random secret of its own.
     pub session_secret_env: Option<String>,
-    /// Longest session a token may mint.
+    /// Longest session a token may mint (at most 365 days: a longer value
+    /// is lowered to that, so a session never outlives its revocation).
     pub session_max_ttl_secs: u64,
 }
 

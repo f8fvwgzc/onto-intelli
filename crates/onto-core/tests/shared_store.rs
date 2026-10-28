@@ -251,20 +251,26 @@ fn history_is_append_only() {
     assert!(msg.contains("append-only"), "{msg}");
 }
 
-/// Expired KV rows of one namespace go; live ones and other namespaces stay.
+/// Expired KV rows of one namespace go, `limit` at a time; live ones and
+/// other namespaces stay.
 fn purge_suite(store: &dyn onto_core::store::Store) {
     let now = onto_core::time::now_ms();
-    for (ns, key, exp) in [("auth.revoked", "old", Some(now - 1_000)), ("auth.revoked", "live", Some(now + 600_000))]
-        .into_iter()
-        .chain([("auth.revoked", "kept", None), ("other", "old", Some(now - 1_000))])
-    {
+    for (ns, key, exp) in [
+        ("auth.revoked", "old1", Some(now - 1_000)),
+        ("auth.revoked", "old2", Some(now - 1_000)),
+        ("auth.revoked", "old3", Some(now - 1_000)),
+        ("auth.revoked", "live", Some(now + 600_000)),
+        ("auth.revoked", "kept", None),
+        ("other", "old", Some(now - 1_000)),
+    ] {
         store.kv_put(ns, key, &json!(1), exp).unwrap();
     }
-    assert_eq!(store.kv_purge_expired("auth.revoked").unwrap(), 1);
+    assert_eq!(store.kv_purge_expired("auth.revoked", 2).unwrap(), 2, "one batch");
+    assert_eq!(store.kv_purge_expired("auth.revoked", 2).unwrap(), 1, "the rest");
+    assert_eq!(store.kv_purge_expired("auth.revoked", 2).unwrap(), 0);
     let keys: Vec<String> = store.kv_scan("auth.revoked", "").unwrap().into_iter().map(|(k, _)| k).collect();
     assert_eq!(keys, ["kept", "live"]);
-    assert_eq!(store.kv_purge_expired("other").unwrap(), 1, "the other namespace was left alone");
-    assert_eq!(store.kv_purge_expired("auth.revoked").unwrap(), 0);
+    assert_eq!(store.kv_purge_expired("other", 2).unwrap(), 1, "the other namespace was left alone");
 }
 
 #[test]

@@ -74,10 +74,15 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 /// verified just before the expiry still finds it.
 pub const REVOCATION_GRACE_SECS: u64 = 60;
 
-/// The furthest ahead a revocation is kept, unless `session_max_ttl_secs`
-/// is longer: an id may claim any expiry, and a revocation that never
-/// expires would never be deleted.
+/// The furthest ahead a revocation is kept: an id may claim any expiry, and
+/// a revocation that never expires would never be deleted. No session lives
+/// that long: `session_max_ttl_secs` is held a day below it
+/// ([`SESSION_MAX_TTL_LIMIT`]).
 pub const REVOCATION_MAX_SECS: u64 = 366 * 24 * 3600;
+
+/// The most `auth.session_max_ttl_secs` may be (a longer value is lowered
+/// to it), so every session expires before its revocation could.
+pub const SESSION_MAX_TTL_LIMIT: u64 = REVOCATION_MAX_SECS - 24 * 3600;
 
 /// Where revoked session ids are kept, shared by every replica and by every
 /// tenant (a session id names no tenant): the default tenant's KV store,
@@ -355,7 +360,7 @@ impl Auth {
             dev,
             tokens,
             session_key,
-            session_max_ttl: cfg.session_max_ttl_secs.max(60),
+            session_max_ttl: session_max_ttl(cfg.session_max_ttl_secs),
             control,
             revocations: RwLock::new(None),
             revoked: Mutex::new(HashMap::new()),
@@ -376,8 +381,7 @@ impl Auth {
     /// drops the revocation, whatever `session_max_ttl_secs` is now. Ids
     /// minted before carry no expiry: those stay revoked until `exp_hint`,
     /// and at least as long as a session minted now could live. Never
-    /// further ahead than [`REVOCATION_MAX_SECS`] (or `session_max_ttl_secs`
-    /// when longer).
+    /// further ahead than [`REVOCATION_MAX_SECS`], which no session reaches.
     pub async fn revoke_session(&self, id: &str, tenants: Option<&[String]>, exp_hint: u64) -> Result<()> {
         let r = self.revocations.read().clone();
         let Some(r) = r else {
@@ -386,9 +390,9 @@ impl Auth {
         let now = now_secs();
         let until = match id_expiry(id) {
             Some(exp) => exp.saturating_add(REVOCATION_GRACE_SECS),
-            None => exp_hint.max(now + self.session_max_ttl),
+            None => exp_hint.max(now.saturating_add(self.session_max_ttl)),
         }
-        .min(now + self.session_max_ttl.max(REVOCATION_MAX_SECS) + REVOCATION_GRACE_SECS);
+        .min(now.saturating_add(REVOCATION_MAX_SECS).saturating_add(REVOCATION_GRACE_SECS));
         r.revoke(id, tenants, until).await?;
         let mut cache = self.revoked.lock();
         match tenants {
@@ -426,7 +430,7 @@ impl Auth {
             r.is_revoked(id, tenant).await.map_err(|e| AuthError::Unavailable(format!("revocations: {e}")))?;
         let mut cache = self.revoked.lock();
         if cache.len() > 100_000 {
-            cache.retain(|_, (r, at)| *r || now.duration_since(*at) < REVOCATION_TTL);
+            evict(&mut cache, now);
         }
         // A revoke on this replica may have cached `true` while this read
         // was in flight: a revocation is never taken back.
@@ -820,22 +824,42 @@ pub async fn guard_project_call(
 }
 
 /// A random session id.
+/// `auth.session_max_ttl_secs` as used: at least a minute, at most
+/// [`SESSION_MAX_TTL_LIMIT`].
+fn session_max_ttl(configured: u64) -> u64 {
+    if configured > SESSION_MAX_TTL_LIMIT {
+        tracing::warn!(
+            "auth.session_max_ttl_secs = {configured} is above the limit of {SESSION_MAX_TTL_LIMIT}: using the limit"
+        );
+    }
+    configured.clamp(60, SESSION_MAX_TTL_LIMIT)
+}
+
+/// Drop from the revocation cache what it no longer needs: a "not revoked"
+/// older than [`REVOCATION_TTL`], and a "revoked" whose session has expired
+/// (the expiry its id carries, plus [`REVOCATION_GRACE_SECS`]). Revocations
+/// of ids without an expiry stay.
+fn evict(cache: &mut HashMap<String, (bool, Instant)>, now: Instant) {
+    let secs = now_secs();
+    let lapsed = |key: &str| {
+        let id = key.split_once('@').map_or(key, |(id, _)| id);
+        id_expiry(id).is_some_and(|exp| exp.saturating_add(REVOCATION_GRACE_SECS) < secs)
+    };
+    cache.retain(|key, (revoked, at)| if *revoked { !lapsed(key) } else { now.duration_since(*at) < REVOCATION_TTL });
+}
+
 /// A session id: random, then the session's expiry ([`id_expiry`]).
 fn new_jti(exp: u64) -> String {
     format!("{}.{exp}", onto_control::keys::random_token(16))
 }
 
 /// The key of a revocation that holds for the sessions of one tenant only.
-/// Session ids never contain `@`. The tenant is reduced as its schema name
-/// is (lowercase, `[a-z0-9_]`; `onto_core::store::tenant_schema`), so ids
-/// that would share a schema share revocations too.
+/// Session ids never contain `@`. The tenant id is taken as it is, as
+/// tokens' `tenants` are: look-alike ids (`WS-1`, `ws_1`) are separate
+/// tenants on the memory backend, and on PostgreSQL the first id to open a
+/// schema claims it, so a look-alike never reaches its data.
 pub(crate) fn scoped_id(id: &str, tenant: Option<&str>) -> String {
-    let tenant: String = tenant
-        .unwrap_or_default()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
-        .collect();
-    format!("{id}@{tenant}")
+    format!("{id}@{}", tenant.unwrap_or_default())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1034,10 +1058,55 @@ mod tests {
         // Any expiry, from the caller or in the id, is capped (no wrap past i64 either).
         a.revoke_session("another-id", None, u64::MAX).await.unwrap();
         a.revoke_session(&format!("x.{}", u64::MAX), None, 0).await.unwrap();
-        let cap = now_secs() + max_ttl.max(REVOCATION_MAX_SECS) + REVOCATION_GRACE_SECS;
+        let cap = now_secs() + REVOCATION_MAX_SECS + REVOCATION_GRACE_SECS;
         for (id, _, until) in recorded.0.lock()[1..].iter() {
             assert!(*until <= cap && *until > now_secs() + REVOCATION_MAX_SECS - 60, "{id}: {until}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_session_never_outlives_its_revocation_whatever_the_limit_was() {
+        // A replica configured for two-year sessions, and one (or the same
+        // after a restart) that allows a minute now.
+        const SECRET: &str = "ONTO_TEST_SESSION_SECRET_LIMIT_CLAMP";
+        // SAFETY: set before these replicas read it; no other test reads it.
+        unsafe { std::env::set_var(SECRET, "a-session-secret-of-at-least-32-characters") };
+        let replica = |max_ttl| {
+            let mut cfg = config();
+            cfg.session_secret_env = Some(SECRET.into());
+            cfg.session_max_ttl_secs = max_ttl;
+            Auth::from_config(&cfg, false).unwrap()
+        };
+        let two_years = 2 * 365 * 24 * 3600;
+        let (before, now) = (replica(two_years), replica(60));
+        let recorded = Arc::new(Recorded::default());
+        now.set_revocations(recorded.clone());
+        let (_, s) = before.issue_session_from(Principal::viewer("u", "acme"), Some("acme".into()), two_years, None);
+        assert!(s.exp <= now_secs() + SESSION_MAX_TTL_LIMIT, "the limit is lowered at load");
+        now.revoke_session(s.jti.as_deref().unwrap(), None, 0).await.unwrap();
+        assert_eq!(recorded.0.lock()[0].2, s.exp + REVOCATION_GRACE_SECS, "revoked until the session expires");
+    }
+
+    #[test]
+    fn the_cache_forgets_revocations_of_expired_sessions_only() {
+        let now = Instant::now();
+        let (past, future) = (now_secs() - REVOCATION_GRACE_SECS - 10, now_secs() + 600);
+        let mut cache: HashMap<String, (bool, Instant)> = HashMap::new();
+        for (key, revoked) in [
+            (format!("gone.{past}"), true),
+            (format!("gone.{past}@acme"), true),
+            (format!("live.{future}"), true),
+            ("an-id-without-expiry".to_string(), true),
+            (format!("fresh.{future}"), false),
+        ] {
+            cache.insert(key, (revoked, now));
+        }
+        let stale = now.checked_sub(REVOCATION_TTL + Duration::from_secs(1)).unwrap();
+        cache.insert(format!("stale.{future}"), (false, stale));
+        evict(&mut cache, now);
+        let mut kept: Vec<String> = cache.into_keys().collect();
+        kept.sort();
+        assert_eq!(kept, ["an-id-without-expiry".to_string(), format!("fresh.{future}"), format!("live.{future}")]);
     }
 
     /// A store that cannot be read.
