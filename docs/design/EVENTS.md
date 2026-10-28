@@ -1692,3 +1692,23 @@ Review round 1 (phase 1 steps 8-12):
   and expired leases from their own indexes with the clock read once; fan-out counts each
   subscribed endpoint's open rows up to its pending cap (`Store::outbox_open_counts_for`).
 
+Build step 13 (docs):
+
+- docs/AUTOMATE.md is written from a run of a debug `onto serve` against PostgreSQL with a local
+  receiver (endpoint, signed delivery verified with both SDK helpers, an automation proposed by an
+  agent, approved, enabled, run and its receipt, a writeback with `Idempotency-Key`, SSRF and
+  reserved-id refusals, an expired enablement) and from `onto-bench --changes` and `--fanout`.
+  The expired enablement was made by editing the stored `expires_at` with the server stopped,
+  since the TTL is at least a day; the page says so.
+- Found while running, not fixed in this step: `traceparent` is never sent (no producer sets
+  `OutboxRow.otel_trace_id`; only `webhooks::test_row` takes one and its callers pass `None`), so
+  step 8's note that it is sent does not hold; leases are not released when a process stops
+  (also on Ctrl-C), so after a restart fan-out and the automation consumer wait for the old
+  lease to expire (up to 60 s; 18 to 49 s observed) before changes are enqueued or runs start.
+  onto-bench has no delivery-throughput scenario; the docs say delivery throughput was not
+  measured. In `--remote` mode the CLI prints a server error's code twice (`error: permission
+  denied: permission denied: …`, `error: invalid: invalid: …`): `remote_error` wraps the
+  server's message, which already starts with the code, in an `Error` whose display adds it again.
+- The configuration template said the automation retry delay is `min(base * 2^attempt, max)`;
+  the code (`RetryPolicy::delay_ms`) is `min(base * 2^(attempt - 1), max)`, as these notes say.
+  The comment is corrected.

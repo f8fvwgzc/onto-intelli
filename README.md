@@ -181,6 +181,10 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Derived properties** (functions over relations) | `onto show project:alpha` · `entity.get {derived: true}` |
 | **Governed metrics** with dimensions and certification, plus process KPIs from history and events: lead time (p50/p90), throughput, failure rate, volume | `onto metric` · `onto metric open_work --by team` · `onto ask "What is the deployment failure rate?"` |
 | **Time**: every write versioned; history, as-of reads, change feeds | `onto history issue:421` · `onto changes --days 7` · `onto ask "What changed in Project Alpha this week?"` |
+| **Change feed** — every commit's changes as records with a resumable cursor, filtered per reader (hidden entities become `entity.hidden`); a commit from a build that did not record changes appears as a gap; poll, or follow over server-sent events ([docs/AUTOMATE.md](docs/AUTOMATE.md)) | `onto watch` · `onto watch --once --after 13.0` · `GET /v1/changes/stream` |
+| **Webhooks** — CloudEvents 1.0 signed with Standard Webhooks, from an outbox: each change is enqueued once per endpoint and delivered at least once (dedupe on the event id); retries, a breaker, replay; the receiver sees only what its principal may; SSRF-guarded, metadata addresses never reachable; verify helpers in both SDKs | `onto webhook add ops https://… --secret env:HOOK_SECRET --kind issue` · `verify_webhook(secret, headers, body)` |
+| **Automate** — change-triggered automations defined in the schema (agents propose, people approve and enable), running one governed action and any number of webhooks as `automation:<name>`; a run's edits, receipt, outbox rows and run row commit together; bound to everything it reaches, expiring after 30 days; depth, rate and breaker guards ([docs/AUTOMATE.md](docs/AUTOMATE.md)) | `onto schema propose escalate.toml` · `onto automation enable escalate_blocked` · `onto automation runs` |
+| **HTTP writeback** — an action type's `writeback` effect posts to a registered target after the action commits, through the outbox with `Idempotency-Key: <receipt>:<effect>`; writeback is not reversible, so plans with it need confirmation; off by default | `writeback.add` · `onto do close_ticket issue=issue:1 --confirm` |
 | **What-if scenarios** on an isolated fork | `onto whatif task:31 done` · `scenario.run` |
 | **Entity alignment** — duplicate detection and merge with permanent id redirects | `onto dupes` · `onto merge person:kenji person:kenji.t` |
 | **Data quality** — required links, uniqueness, staleness, orphans, dangling provenance, duplicates, low-confidence facts, scored per kind | `onto quality` · `onto ask "Show me stale issues"` |
@@ -546,7 +550,9 @@ Sections: `[engine]` storage, database and workspace, `[ontology]` schema layers
 background crawls, `[llm]`, `[context]`
 token budget and expansion, `[cache]`, `[memory]`, `[reasoning]` deterministic intents,
 `[grpc]` listener and routes, `[mcp]` agent principal, writes and tool profile, `[auth]`, `[console]` the control plane, `[traces]` what is
-recorded and for how long. Lookup order: `--config`, `$ONTO_CONFIG`,
+recorded and for how long, `[changes]` change-feed retention and stream limits, `[webhooks]` delivery,
+retries and operator allow rules, `[automation]` limits, guards and the enablement TTL, `[writeback]`
+(off by default). Lookup order: `--config`, `$ONTO_CONFIG`,
 `./onto-intelli.toml`, `~/.config/onto-intelli/config.toml`.
 
 ## Memory
@@ -596,6 +602,8 @@ docs/PACKS.md         the ten industry packs
 docs/CATALOG.md       connectors, OntoRank, learned facts
 docs/ONTOLOGY_BUILDER.md  object, link and action types from a database; row sync; Object Explorer
 docs/CONTROL_PLANE.md the console: sign-in, projects, API keys, BYO LLM, traces, SDKs, repository connector
+docs/AUTOMATE.md      change feed, webhooks, automations and writeback, with a real run and benchmarks
+docs/STORAGE.md       PostgreSQL: migrations, tables, consistency across processes, rollbacks
 docs/UI.md            the web UI and console pages
 docs/RESEARCH.md      what v0.2 took from Palantir, Databricks, Glean, open-ontologies and arXiv
 sdk/typescript        TypeScript SDK (zero dependencies)
