@@ -893,6 +893,7 @@ pub(crate) fn writeback_rows(
         row.receipt = Some(receipt.to_string());
         row.run = run.map(str::to_string);
         row.cause = ctx.cause.clone();
+        row.otel_trace_id = ctx.trace_id.clone();
         row.payload = x.body.clone();
         calls.push(ExternalCall {
             effect: x.effect,

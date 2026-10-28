@@ -490,6 +490,58 @@ pub fn fail(row: &mut TraceRow, code: &str, message: &str) {
     row.error_message = Some(clip_bytes(message, 500));
 }
 
+// ── worker traces ────────────────────────────────────────────────────────
+
+/// `n` span ids that sort in the order given: a random 8-hex prefix and a
+/// sequence number from 1 (the first is a root's).
+pub fn span_ids(n: usize) -> Vec<String> {
+    let prefix = new_span_id()[..8].to_string();
+    (1..=n).map(|i| format!("{prefix}{i:08x}")).collect()
+}
+
+/// The trace row of work a background worker did (an automation run, a
+/// delivery attempt): no caller, so no session, user or API key; `source
+/// = "worker"`. `otel_trace_id` is the trace the work continues.
+pub fn worker_row(
+    id: String,
+    kind: &str,
+    name: String,
+    workspace: String,
+    principal: String,
+    otel_trace_id: Option<String>,
+) -> TraceRow {
+    TraceRow {
+        id,
+        name,
+        kind: kind.to_string(),
+        status: "ok".into(),
+        workspace,
+        user_id: Some(principal.clone()),
+        principal,
+        source: "worker".into(),
+        otel_trace_id: otel_trace_id.filter(|t| onto_core::trace::is_trace_id(t)),
+        metadata: json!({}),
+        version: crate::VERSION.to_string(),
+        ..Default::default()
+    }
+}
+
+/// A finished span of a worker trace.
+pub fn worker_span(trace: &TraceRow, id: String, parent: Option<&str>, name: String, ts: i64, ms: f64) -> SpanRow {
+    SpanRow {
+        trace_id: trace.id.clone(),
+        id,
+        parent_id: parent.map(str::to_string),
+        name,
+        kind: "span".into(),
+        ts,
+        duration_ms: ms,
+        status: "ok".into(),
+        attrs: json!({}),
+        ..Default::default()
+    }
+}
+
 // ── the sink ─────────────────────────────────────────────────────────────
 
 /// What the sink writes.

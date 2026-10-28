@@ -688,6 +688,11 @@ pub struct TracesConfig {
     /// Records waiting to be written; beyond this they are dropped and
     /// counted (`traces_dropped` in the ledger).
     pub queue: usize,
+    /// Webhook and writeback delivery attempts that become traces of kind
+    /// `delivery`: `failures` (retried and dead attempts), `all`, or `off`
+    /// (docs/design/EVENTS.md B.7). They never hold a body, a header, a
+    /// secret or a URL.
+    pub deliveries: String,
 }
 
 impl Default for TracesConfig {
@@ -701,15 +706,20 @@ impl Default for TracesConfig {
             flush_ms: 500,
             flush_records: 200,
             queue: 10_000,
+            deliveries: "failures".into(),
         }
     }
 }
 
 impl TracesConfig {
-    /// `calls` is `writes`, `all` or `none`, and the sizes are positive.
+    /// `calls` is `writes`, `all` or `none`, `deliveries` is `failures`,
+    /// `all` or `off`, and the sizes are positive.
     pub fn check(&self) -> Result<()> {
         if !matches!(self.calls.as_str(), "writes" | "all" | "none") {
             return Err(Error::Config(format!("traces.calls = '{}' (writes, all, none)", self.calls)));
+        }
+        if !matches!(self.deliveries.as_str(), "failures" | "all" | "off") {
+            return Err(Error::Config(format!("traces.deliveries = '{}' (failures, all, off)", self.deliveries)));
         }
         if self.queue == 0 || self.flush_records == 0 || self.retention_days == 0 {
             return Err(Error::Config("traces.queue, flush_records and retention_days must be positive".into()));
@@ -1266,6 +1276,18 @@ mod tests {
         assert!(cfg.traces.check().is_ok());
         let bad = Config::from_toml("[traces]\ncalls = 'some'\n").unwrap();
         assert!(bad.traces.check().unwrap_err().to_string().contains("writes, all, none"));
+    }
+
+    #[test]
+    fn delivery_traces_default_to_failures() {
+        assert_eq!(Config::from_toml("").unwrap().traces.deliveries, "failures");
+        assert_eq!(Config::from_toml(EXAMPLE_CONFIG).unwrap().traces.deliveries, "failures");
+        for ok in ["failures", "all", "off"] {
+            let c = Config::from_toml(&format!("[traces]\ndeliveries = '{ok}'\n")).unwrap();
+            assert!(c.traces.check().is_ok(), "{ok}");
+        }
+        let bad = Config::from_toml("[traces]\ndeliveries = 'some'\n").unwrap();
+        assert!(bad.traces.check().unwrap_err().to_string().contains("failures, all, off"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use onto_intelli::core::EventFilter;
 use onto_intelli::core::changes::{ChangeRetention, Cursor};
 use onto_intelli::core::outbox::{ConfigEvent, OutboxKind, OutboxRow, OutboxSelect, OutboxState, SOURCE_CHANGE};
 use onto_intelli::core::policy::ScopePrincipal;
+use onto_intelli::trace::TraceCtx;
 use onto_intelli::webhooks::{
     self, BREAKER_PREFIX, BreakerState, Endpoint, KILL_KEY, NS_CONTROL, NS_ENDPOINT, SecretRef,
 };
@@ -526,4 +527,142 @@ async fn a_missing_secret_names_its_reference_and_retries() {
     let e = retry.last_error.unwrap_or_default();
     assert!(e.contains("env:ONTO_TEST_SURELY_UNSET_WEBHOOK_SECRET"), "{e}");
     assert!(rx.hits().is_empty());
+}
+
+// ── traces (docs/design/EVENTS.md B.7, section 11) ─────────────────────
+
+const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// The trace id and span id of a received `traceparent`.
+fn traceparent_of(hit: &Hit) -> (String, String) {
+    let tp = hit.headers.get("traceparent").cloned().unwrap_or_default();
+    let parts: Vec<&str> = tp.split('-').collect();
+    assert!(parts.len() == 4 && parts[0] == "00" && parts[3] == "01", "{tp}");
+    assert!(parts[1].len() == 32 && parts[2].len() == 16, "{tp}");
+    (parts[1].to_string(), parts[2].to_string())
+}
+
+/// The delivery traces of `i`, oldest first, with their spans.
+async fn delivery_traces(i: &Intelli) -> Vec<Value> {
+    i.flush_traces().await;
+    let lead = Principal::admin("lead");
+    let list = i.call(&lead, "trace.list", json!({ "kind": "delivery" })).await.unwrap();
+    let mut out = Vec::new();
+    for t in list["traces"].as_array().unwrap().iter().rev() {
+        out.push(i.call(&lead, "trace.get", json!({ "id": t["id"] })).await.unwrap());
+    }
+    out
+}
+
+/// The root span of a trace detail.
+fn root_span(d: &Value) -> &Value {
+    d["spans"].as_array().unwrap().iter().find(|s| s["parent_id"].is_null()).expect("a root span")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_continues_its_trace_into_the_test_delivery() {
+    let rx = Receiver::start(vec![]).await;
+    let i = open(|_| {}).await;
+    put(&i, &endpoint("ops", &rx.url("/"), secret_file("ops", SECRET)));
+    let lead = Principal::admin("lead");
+    // The caller's traceparent: the delivery continues that trace.
+    let ctx = TraceCtx::from_source("http").with_traceparent(Some(&format!("00-{OTEL}-b7ad6b7169203331-01")));
+    let t = i.call_traced(&lead, "webhook.test", json!({ "name": "ops" }), ctx).await;
+    let first = t.result.unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(row(&i, &first).otel_trace_id.as_deref(), Some(OTEL));
+    wait_state(&i, &first, OutboxState::Delivered).await;
+    // Without one: the delivery continues the call's own trace.
+    let t = i.call_traced(&lead, "webhook.test", json!({ "name": "ops" }), TraceCtx::from_source("http")).await;
+    let own = t.trace_id.expect("webhook.test is traced as a write");
+    let second = t.result.unwrap()["id"].as_str().unwrap().to_string();
+    wait_state(&i, &second, OutboxState::Delivered).await;
+    let by_id: HashMap<String, Hit> = rx.hits().into_iter().map(|h| (h.headers["webhook-id"].clone(), h)).collect();
+    assert_eq!(traceparent_of(&by_id[&first]).0, OTEL);
+    assert_eq!(traceparent_of(&by_id[&second]).0, own);
+    assert_ne!(traceparent_of(&by_id[&first]).1, traceparent_of(&by_id[&second]).1, "a span per attempt");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_traces_hold_no_secret_signature_body_or_referenced_url() {
+    let rx = Receiver::start(vec![reply(500)]).await;
+    let i = open(|c| c.traces.deliveries = "all".into()).await;
+    // The URL comes from an operator reference: its value is never recorded.
+    let dir = std::env::temp_dir().join("onto-intelli-webhook-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let url_file = dir.join(format!("url-{}", onto_intelli::core::time::new_id("u")));
+    let url = rx.url("/hooks/review-hidden-path");
+    std::fs::write(&url_file, &url).unwrap();
+    put(&i, &endpoint("ops", &format!("file:{}", url_file.display()), secret_file("ops", SECRET)));
+    let id = test_delivery(&i, "ops");
+    wait_state(&i, &id, OutboxState::Delivered).await;
+    let hits = rx.hits();
+    assert_eq!(hits.len(), 2);
+    let traces = delivery_traces(&i).await;
+    assert_eq!(traces.len(), 2, "all: the failure and the delivery");
+    let key = &SECRET["whsec_".len()..];
+    for (d, hit) in traces.iter().zip(&hits) {
+        let text = d.to_string();
+        assert!(!text.contains(SECRET) && !text.contains(key), "no signing secret: {text}");
+        for h in &hits {
+            let sig = &h.headers["webhook-signature"];
+            assert!(!text.contains(sig.as_str()) && !text.contains(&sig["v1,".len()..]), "no signature: {text}");
+            assert!(!text.contains("a test delivery from onto-intelli"), "no body: {text}");
+        }
+        assert!(!text.contains(&url) && !text.contains("review-hidden-path") && !text.contains("127.0.0.1"), "{text}");
+        // The trace is the attempt the receiver saw: its id (the row
+        // continues no trace) and its root span are the traceparent's.
+        let (trace, span) = traceparent_of(hit);
+        assert_eq!(d["trace"]["id"], trace.as_str());
+        assert_eq!(root_span(d)["id"], span.as_str());
+        assert_eq!(
+            (d["trace"]["kind"].as_str(), d["trace"]["name"].as_str()),
+            (Some("delivery"), Some("webhook.deliver:ops"))
+        );
+        assert_eq!(d["trace"]["request_id"], id.as_str());
+        assert_eq!(d["trace"]["principal"], "webhook:ops");
+        assert!(d["trace"]["otel_trace_id"].is_null());
+    }
+    let (failed, delivered) = (&traces[0], &traces[1]);
+    assert_eq!(
+        (failed["trace"]["status"].as_str(), failed["trace"]["error_code"].as_str()),
+        (Some("error"), Some("retry"))
+    );
+    assert_eq!(failed["trace"]["error_message"], "http 500");
+    assert_eq!(root_span(failed)["attrs"]["http_status"], 500);
+    assert_eq!(root_span(failed)["attrs"]["attempt"], 1);
+    assert_eq!(delivered["trace"]["status"], "ok");
+    assert_eq!(root_span(delivered)["attrs"]["outcome"], "delivered");
+    assert_eq!(delivered["spans"].as_array().unwrap().len(), 2, "the attempt and its request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_traces_follow_traces_deliveries() {
+    // Default (failures): the failed attempt only.
+    let rx = Receiver::start(vec![reply(503)]).await;
+    let i = open(|_| {}).await;
+    assert_eq!(i.config().traces.deliveries, "failures");
+    put(&i, &endpoint("ops", &rx.url("/"), secret_file("ops", SECRET)));
+    let id = test_delivery(&i, "ops");
+    wait_state(&i, &id, OutboxState::Delivered).await;
+    let traces = delivery_traces(&i).await;
+    assert_eq!(traces.len(), 1, "{traces:?}");
+    assert_eq!(traces[0]["trace"]["error_code"], "retry");
+    // A dead row is a failure too.
+    let rx = Receiver::start(vec![reply(400)]).await;
+    put(&i, &endpoint("gone", &rx.url("/"), secret_file("gone", SECRET)));
+    let id = test_delivery(&i, "gone");
+    wait_state(&i, &id, OutboxState::Dead).await;
+    let traces = delivery_traces(&i).await;
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[1]["trace"]["error_code"], "dead");
+
+    // off: none, failed or not.
+    let rx = Receiver::start(vec![reply(500)]).await;
+    let i = open(|c| c.traces.deliveries = "off".into()).await;
+    put(&i, &endpoint("ops", &rx.url("/"), secret_file("ops", SECRET)));
+    let id = test_delivery(&i, "ops");
+    wait_state(&i, &id, OutboxState::Delivered).await;
+    assert!(delivery_traces(&i).await.is_empty());
+    // The traceparent is sent all the same.
+    assert!(rx.hits().iter().all(|h| h.headers.contains_key("traceparent")));
 }

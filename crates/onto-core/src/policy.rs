@@ -113,6 +113,13 @@ pub struct Principal {
     /// meets the depth limit. Never read from or written to JSON.
     #[serde(skip)]
     pub cause: Option<crate::changes::RunCause>,
+    /// The W3C trace id the request continues (its `traceparent` trace, or
+    /// the trace recording the call): contexts built for it carry it into
+    /// change records and outbox rows, and deliveries send it as
+    /// `traceparent` (docs/design/EVENTS.md B.7). Never read from or written
+    /// to JSON.
+    #[serde(skip)]
+    pub trace_id: Option<String>,
 }
 
 fn all_workspaces() -> Vec<String> {
@@ -121,7 +128,14 @@ fn all_workspaces() -> Vec<String> {
 
 impl Principal {
     pub fn new(id: impl Into<String>, roles: Vec<Role>, workspaces: Vec<String>) -> Self {
-        Self { id: id.into(), roles, workspaces, entity: None, via: None, cause: None }
+        Self { id: id.into(), roles, workspaces, entity: None, via: None, cause: None, trace_id: None }
+    }
+
+    /// The same principal continuing W3C trace `trace_id` (32 lowercase hex
+    /// characters; anything else is no trace).
+    pub fn with_trace(mut self, trace_id: Option<&str>) -> Self {
+        self.trace_id = trace_id.filter(|t| crate::trace::is_trace_id(t)).map(str::to_string);
+        self
     }
 
     pub fn system() -> Self {

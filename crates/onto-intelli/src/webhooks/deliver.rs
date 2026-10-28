@@ -13,6 +13,12 @@
 //! every `poll_secs` (or sooner, when a retry is due sooner); after a pass
 //! that found nothing more it settles the tenant's wake row, so a closed
 //! tenant is woken again only when work is due.
+//!
+//! Every request carries a W3C `traceparent`: the trace the row continues
+//! (the call or run that enqueued it), else the attempt's own, and the
+//! attempt's span. Attempts become traces of kind `delivery` as `[traces]
+//! deliveries` says (`failures`: retried and dead ones; `all`; `off`),
+//! without bodies, headers, secrets or URLs (docs/design/EVENTS.md B.7).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
@@ -25,6 +31,7 @@ use tokio::sync::{Notify, Semaphore};
 use onto_core::changes::{ChangeAt, FieldMode};
 use onto_core::outbox::{Attempt, ConfigEvent, OutboxKind, OutboxRow, OutboxState, SOURCE_CHANGE};
 use onto_core::time::now_ms;
+use onto_core::trace::{TraceRecord, is_trace_id, new_trace_id, traceparent};
 use onto_core::{Error, EventInput, Mutation, Ontology, Result};
 
 use super::{
@@ -36,6 +43,29 @@ use crate::config::WebhooksConfig;
 use crate::intelli::Intelli;
 use crate::net::{Reach, guarded_client};
 use crate::writeback::Target;
+
+/// The trace of one delivery attempt: its id (used in `traceparent` when
+/// the row continues no trace), the root span sent as the `traceparent`
+/// parent, and when the attempt started.
+#[derive(Clone)]
+struct AttemptTrace {
+    id: String,
+    span: String,
+    started: Instant,
+    start_ms: i64,
+}
+
+impl AttemptTrace {
+    fn new() -> Self {
+        let span = crate::trace::span_ids(1).remove(0);
+        AttemptTrace { id: new_trace_id(), span, started: Instant::now(), start_ms: now_ms() }
+    }
+}
+
+tokio::task_local! {
+    /// The attempt the current send task makes.
+    static ATTEMPT: AttemptTrace;
+}
 
 /// Requests in flight in this process, all tenants together.
 fn process_slots(n: usize) -> Arc<Semaphore> {
@@ -240,7 +270,8 @@ impl Worker {
                     attempt = row.attempts,
                     kind = row.kind.as_str()
                 );
-                tasks.spawn(tracing::Instrument::instrument(async move { w.send(&me, row, claimed).await }, span));
+                let send = ATTEMPT.scope(AttemptTrace::new(), async move { w.send(&me, row, claimed).await });
+                tasks.spawn(tracing::Instrument::instrument(send, span));
             }
             while let Some(r) = tasks.join_next().await {
                 if let Err(e) = r {
@@ -640,6 +671,7 @@ impl Worker {
                 return;
             }
         }
+        self.trace_attempt(me, row, &a, next, delay);
         if next == OutboxState::Dead {
             match row.kind {
                 OutboxKind::Webhook => {
@@ -661,6 +693,23 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Record the attempt as a `delivery` trace when `[traces] deliveries`
+    /// selects it.
+    fn trace_attempt(&self, me: &Arc<Intelli>, row: &OutboxRow, a: &Attempt, next: OutboxState, delay: i64) {
+        let failed = matches!(next, OutboxState::Retry | OutboxState::Dead);
+        let wanted = match me.config().traces.deliveries.as_str() {
+            "all" => true,
+            "failures" => failed,
+            _ => false,
+        };
+        if !wanted || !me.traces_enabled() {
+            return;
+        }
+        let Ok(at) = ATTEMPT.try_with(Clone::clone) else { return };
+        let ws = if row.workspace.is_empty() { me.default_workspace().to_string() } else { row.workspace.clone() };
+        me.send_trace(delivery_trace(&at, row, a, next, delay, ws));
     }
 
     async fn event(&self, me: &Arc<Intelli>, workspace: &str, action: &str, target: &str, payload: Value) {
@@ -805,12 +854,85 @@ impl Drop for Done {
     }
 }
 
-/// `req` with a `traceparent` header when `row` carries a trace id.
+/// `req` with a `traceparent` header: the trace `row` continues (else the
+/// attempt's own) and the attempt's span.
 fn traced(req: reqwest::RequestBuilder, row: &OutboxRow) -> reqwest::RequestBuilder {
-    match row.otel_trace_id.as_deref().filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
-        Some(t) => req.header("traceparent", format!("00-{t}-{:016x}-01", nonzero_span())),
-        None => req,
+    let at = ATTEMPT.try_with(Clone::clone).unwrap_or_else(|_| AttemptTrace::new());
+    req.header("traceparent", attempt_traceparent(&at, row))
+}
+
+/// The `traceparent` an attempt sends.
+fn attempt_traceparent(at: &AttemptTrace, row: &OutboxRow) -> String {
+    let trace = row.otel_trace_id.as_deref().filter(|t| is_trace_id(t)).unwrap_or(&at.id);
+    traceparent(trace, &at.span)
+}
+
+/// The `delivery` trace of one attempt (`[traces] deliveries`): its root
+/// span is the one the request named in `traceparent`, with a child for
+/// the HTTP exchange when a request was made. It keeps the row's id,
+/// target, source, attempt and outcome, the receiver's status and the
+/// attempt's error (which never holds a secret or a referenced URL), never
+/// the body, the headers (the signature among them), the receiver's answer
+/// or the URL.
+fn delivery_trace(
+    at: &AttemptTrace,
+    row: &OutboxRow,
+    a: &Attempt,
+    next: OutboxState,
+    delay: i64,
+    workspace: String,
+) -> TraceRecord {
+    let (word, principal) = match row.kind {
+        OutboxKind::Webhook => ("webhook", format!("webhook:{}", row.target)),
+        OutboxKind::Writeback => ("writeback", format!("writeback:{}", row.target)),
+    };
+    let mut t = crate::trace::worker_row(
+        at.id.clone(),
+        "delivery",
+        format!("{word}.deliver:{}", row.target),
+        workspace,
+        principal,
+        row.otel_trace_id.clone(),
+    );
+    t.ts = at.start_ms;
+    t.duration_ms = at.started.elapsed().as_secs_f64() * 1000.0;
+    t.request_id = Some(row.id.clone());
+    let failed = matches!(next, OutboxState::Retry | OutboxState::Dead);
+    if next != OutboxState::Delivered {
+        t.error_code = Some(next.as_str().to_string());
+        t.error_message = a.error.as_deref().map(|e| crate::trace::clip_bytes(e, 500));
     }
+    if failed {
+        t.status = "error".into();
+    }
+    let mut root = crate::trace::worker_span(&t, at.span.clone(), None, format!("{word}.deliver"), t.ts, t.duration_ms);
+    root.status = t.status.clone();
+    root.error = t.error_message.clone();
+    root.attrs = json!({
+        "outbox": row.id,
+        "kind": row.kind.as_str(),
+        "target": row.target,
+        "source": row.source,
+        "event_type": row.event_type,
+        "attempt": row.attempts,
+        "outcome": next.as_str(),
+        "http_status": a.status,
+        "retry_in_ms": (next == OutboxState::Retry).then_some(delay),
+        "receipt": row.receipt,
+        "run": row.run,
+    });
+    let mut spans = vec![root];
+    if a.status.is_some() || a.duration_ms > 0 {
+        let child = at.span[..8].to_string() + "00000002";
+        let ts = (now_ms() - a.duration_ms as i64).max(t.ts);
+        let mut s = crate::trace::worker_span(&t, child, Some(&at.span), "http.post".into(), ts, a.duration_ms as f64);
+        s.attrs = json!({ "http_status": a.status });
+        if failed {
+            s.status = "error".into();
+        }
+        spans.push(s);
+    }
+    TraceRecord { trace: t, spans }
 }
 
 /// What an attempt records of a failed send, and whether the outbound rules
@@ -876,12 +998,6 @@ async fn read_some(mut resp: reqwest::Response) -> Option<String> {
         return None;
     }
     Some(Attempt::clip(&String::from_utf8_lossy(&buf)))
-}
-
-fn nonzero_span() -> u64 {
-    let mut b = [0u8; 8];
-    let _ = getrandom::fill(&mut b);
-    u64::from_le_bytes(b).max(1)
 }
 
 #[cfg(test)]

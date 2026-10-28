@@ -686,7 +686,8 @@ pub fn enqueue_test(onto: &Ontology, ctx: &ActionContext, endpoint: &str) -> Res
     let Some(ep) = Endpoint::load(onto, endpoint)? else {
         return Err(Error::not_found(format!("webhook endpoint {endpoint}")));
     };
-    let row = test_row(&ep.name, &ctx.workspace, None);
+    // The caller's trace continues in the delivery (`traceparent`).
+    let row = test_row(&ep.name, &ctx.workspace, ctx.trace_id.clone());
     let id = row.id.clone();
     onto.enqueue_outbox(ctx, vec![row], Some(ConfigEvent::new("webhook.test", Some(&ep.name), json!({ "id": id }))))?;
     Ok(json!({ "id": id, "endpoint": ep.name, "state": "pending", "note": DELIVERY_NOTE }))

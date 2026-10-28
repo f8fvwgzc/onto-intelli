@@ -24,6 +24,7 @@ use onto_intelli::core::EventFilter;
 use onto_intelli::core::changes::ChangeRetention;
 use onto_intelli::core::outbox::{OutboxKind, OutboxQuery, OutboxRow, OutboxState, SOURCE_AUTOMATION};
 use onto_intelli::hub::{Secret, SecretBox};
+use onto_intelli::trace::TraceCtx;
 use onto_intelli::webhooks::{self, BACKLOG_PREFIX, Endpoint, NS_CONTROL};
 use onto_intelli::{Config, Intelli, Principal, Result, Role};
 
@@ -773,4 +774,38 @@ async fn an_endpoint_added_again_at_the_enabled_version_still_stops_the_automati
     let got = ok(&i, &lead(), "automation.get", json!({ "name": "tell" })).await;
     assert!(stale(&got), "{got}");
     assert_eq!(got["closure"]["changed_since_enabled"], json!(["endpoint:ops"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_delivery_continues_the_trace_of_the_write() {
+    const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
+    let rx = Receiver::start(vec![]).await;
+    let i = open(|_| {}).await;
+    let secret = add(
+        &i,
+        "tasks",
+        &rx.url("/"),
+        json!({ "kinds": ["task"] }),
+        json!({ "roles": "viewer", "workspaces": "acme" }),
+    )
+    .await;
+    let input = |id: &str| json!({ "id": id, "title": id, "workspace": "acme" });
+    // Under the caller's traceparent, and without one (the call's own trace).
+    let ctx = TraceCtx::from_source("http").with_traceparent(Some(&format!("00-{OTEL}-b7ad6b7169203331-01")));
+    i.call_traced(&lead(), "entity.upsert", input("task:a"), ctx).await.result.unwrap();
+    let own = i.call_traced(&lead(), "entity.upsert", input("task:b"), TraceCtx::from_source("http")).await;
+    own.result.unwrap();
+    let own = own.trace_id.expect("a write is traced");
+    until("two deliveries", || rx.hits().len() >= 2).await;
+    for h in rx.hits() {
+        let ev = verify(&h, &secret);
+        let want = if ev["subject"] == "task:a" { OTEL } else { own.as_str() };
+        let tp = h.headers.get("traceparent").unwrap().to_str().unwrap().to_string();
+        assert!(tp.starts_with(&format!("00-{want}-")), "{tp} for {}", ev["subject"]);
+        assert_eq!(ev["data"]["cause"]["trace_id"], want, "{ev}");
+    }
+    let rows =
+        i.ontology().store().outbox_list(&OutboxQuery { target: Some("tasks".into()), ..Default::default() }).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.otel_trace_id.is_some()), "{rows:?}");
 }

@@ -357,6 +357,10 @@ pub struct Cause {
     /// Written by a schema migration (`intent = "schema.migration"`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub migration: bool,
+    /// The W3C trace id of the call or run that wrote the change: webhook
+    /// deliveries of it and runs it triggers continue that trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 /// The intent schema migrations write with (`live_schema::migration_ctx`).
@@ -375,6 +379,7 @@ impl Cause {
             run: run.map(|r| r.run.clone()).filter(|r| !r.is_empty()),
             depth: run.map(|r| r.depth).unwrap_or(0),
             migration: ctx.intent.as_deref() == Some(MIGRATION_INTENT),
+            trace_id: ctx.trace_id.clone(),
         }
     }
 }

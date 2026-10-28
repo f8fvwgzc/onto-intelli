@@ -273,10 +273,24 @@ impl Intelli {
     /// Execute a claimed row and apply the breaker when it failed.
     fn execute(&self, row: &RunRow, def: &Automation, fence: &Fence) -> Result<RunRow> {
         let done = self.ontology().execute_run(row, def, fence, &self.retry_policy())?;
+        self.trace_run(&done);
         if done.state == RunState::Failed {
             self.breaker(&done.automation)?;
         }
         Ok(done)
+    }
+
+    /// Record a run that ended (not `running`, `retry` or `skipped`) as a
+    /// trace of kind `automation` (docs/design/EVENTS.md section 11): its id
+    /// is the run's `trace_id`, it continues the trace of the call that
+    /// wrote the trigger (`otel_trace_id`), the root span is the run and
+    /// each effect is a child span. No payload, plan, body or URL is kept;
+    /// the reason and effect errors are error texts (admins only).
+    pub(crate) fn trace_run(&self, run: &RunRow) {
+        if matches!(run.state, RunState::Running | RunState::Retry | RunState::Skipped) || !self.traces_enabled() {
+            return;
+        }
+        self.send_trace(run_trace(run, self.default_workspace()));
     }
 
     /// One round of the automation consumer: recovery when this process
@@ -349,6 +363,9 @@ impl Intelli {
         // lease lost and taken again at the same epoch).
         let recovered = onto.recover_runs(&fence, &retry, kill)?;
         report.recovered = recovered.len();
+        for r in &recovered {
+            self.trace_run(r);
+        }
         for r in recovered.iter().filter(|r| r.state == RunState::Failed) {
             self.breaker(&r.automation)?;
         }
@@ -470,6 +487,9 @@ impl Intelli {
         if !settled_rows.is_empty() {
             let ids = onto.record_runs(&settled_rows, Some(&fence))?;
             report.settled = ids.len();
+            for r in settled_rows.iter().filter(|r| ids.contains(&r.id)) {
+                self.trace_run(r);
+            }
             report.duplicates += settled_rows.len() - ids.len();
             let failed: HashSet<&str> = settled_rows
                 .iter()
@@ -524,7 +544,11 @@ impl Intelli {
                     }
                     None => {
                         let why = Some("cancelled: the automation is not active".to_string());
-                        store.run_update(&row.with_state(RunState::Cancelled, why), &[RunState::Retry], Some(fence))?;
+                        let mut done = row.with_state(RunState::Cancelled, why);
+                        done.finished_at = Some(now);
+                        if store.run_update(&done, &[RunState::Retry], Some(fence))? {
+                            self.trace_run(&done);
+                        }
                     }
                 }
             }
@@ -549,13 +573,83 @@ impl Intelli {
         let mut n = 0;
         for r in store.runs_list(&q)? {
             let id = r.id.clone();
-            if store.run_update(&r.with_state(RunState::Cancelled, Some(why.to_string())), &[RunState::Retry], None)? {
+            let mut done = r.with_state(RunState::Cancelled, Some(why.to_string()));
+            done.finished_at = Some(now_ms());
+            if store.run_update(&done, &[RunState::Retry], None)? {
                 n += 1;
+                self.trace_run(&done);
             }
             store.timers_delete(&format!("{RETRY_PREFIX}{id}"), None)?;
         }
         Ok(n)
     }
+}
+
+/// The `automation` trace of `run` (see [`Intelli::trace_run`]).
+fn run_trace(run: &RunRow, default_workspace: &str) -> onto_core::trace::TraceRecord {
+    let now = now_ms();
+    let id = run
+        .trace_id
+        .clone()
+        .filter(|t| onto_core::trace::is_trace_id(t))
+        .unwrap_or_else(onto_core::trace::new_trace_id);
+    let ws = if run.trigger.workspace.is_empty() { default_workspace } else { &run.trigger.workspace };
+    let name = format!("automation.run:{}", run.automation);
+    let mut t = crate::trace::worker_row(
+        id,
+        "automation",
+        name.clone(),
+        ws.to_string(),
+        run.principal.clone(),
+        run.trigger.trace_id.clone(),
+    );
+    let start = if run.started_at > 0 { run.started_at } else { now };
+    let end = run.finished_at.unwrap_or(now).max(start);
+    t.ts = start;
+    t.duration_ms = (end - start) as f64;
+    t.request_id = Some(run.id.clone());
+    t.intent = Some(run.principal.clone());
+    if matches!(run.state, RunState::Failed | RunState::Refused | RunState::Cancelled) {
+        t.status = "error".into();
+        t.error_code = Some(run.state.as_str().to_string());
+        t.error_message = run.reason.as_deref().map(|r| crate::trace::clip_bytes(r, 500));
+    }
+    let ids = crate::trace::span_ids(run.effects.len() + 1);
+    let mut root = crate::trace::worker_span(&t, ids[0].clone(), None, name, t.ts, t.duration_ms);
+    root.status = t.status.clone();
+    root.error = t.error_message.clone();
+    root.attrs = json!({
+        "run": run.id,
+        "automation": run.automation,
+        "state": run.state.as_str(),
+        "mode": run.mode,
+        "depth": run.depth,
+        "attempts": run.attempts,
+        "trigger": { "cursor": run.trigger.cursor.to_string(), "op": run.trigger.op.as_str(), "kind": run.trigger.kind },
+        "effects": run.effects.len(),
+    });
+    let mut spans = vec![root];
+    for (e, sid) in run.effects.iter().zip(ids.iter().skip(1)) {
+        let mut s = crate::trace::worker_span(
+            &t,
+            sid.clone(),
+            Some(&ids[0]),
+            format!("effect.{}:{}", e.kind, e.target),
+            end,
+            0.0,
+        );
+        // What the effect did, never what it carried (payloads, plans, bodies).
+        s.attrs = json!({
+            "index": e.index, "kind": e.kind, "target": e.target, "ok": e.ok,
+            "receipt": e.receipt, "outbox": e.outbox,
+        });
+        if !e.ok {
+            s.status = "error".into();
+        }
+        s.error = e.error.as_deref().map(|r| crate::trace::clip_bytes(r, 500));
+        spans.push(s);
+    }
+    onto_core::trace::TraceRecord { trace: t, spans }
 }
 
 // ── actions ──────────────────────────────────────────────────────────────
@@ -979,7 +1073,9 @@ impl Intelli {
                     )));
                 }
                 let reason = Some(format!("rerun by {}", p.id));
-                let queued = row.clone().with_state(RunState::Retry, reason);
+                let mut queued = row.clone().with_state(RunState::Retry, reason);
+                // A rerun is traced on its own: the earlier end was recorded.
+                queued.trace_id = Some(onto_core::trace::new_trace_id());
                 {
                     // The timer first, then the row: a row in `retry` always
                     // has the timer that resumes it. No round of this process

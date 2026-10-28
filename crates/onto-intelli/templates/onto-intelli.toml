@@ -247,6 +247,11 @@ calls = "writes"
 flush_ms = 500
 flush_records = 200
 queue = 10000                      # records waiting; beyond this they are dropped and counted
+# Webhook and writeback delivery attempts that become traces of kind
+# "delivery": "failures" (retried and dead attempts), "all", or "off". They
+# hold no body, header, secret or URL. Automation runs are always traced
+# (kind "automation") while traces are on.
+deliveries = "failures"
 
 # The change feed (changes.poll, changes.head, GET|POST /v1/changes/stream):
 # records of what each commit changed, filtered per reader. Whether commits

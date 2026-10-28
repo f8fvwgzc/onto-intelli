@@ -86,13 +86,26 @@ pub struct ActionContext {
     /// The automation run this write belongs to, copied into change records.
     #[serde(default)]
     pub cause: Option<crate::changes::RunCause>,
+    /// The W3C trace id this write continues (from the principal, or the
+    /// automation run's): copied into change records and outbox rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 impl ActionContext {
     pub fn new(principal: Principal, workspace: impl Into<String>) -> Self {
         // A request a trusted service marked as part of a cascade keeps it.
         let cause = principal.cause.clone();
-        Self { principal, workspace: workspace.into(), request_id: new_id("req"), intent: None, source: None, cause }
+        let trace_id = principal.trace_id.clone();
+        Self {
+            principal,
+            workspace: workspace.into(),
+            request_id: new_id("req"),
+            intent: None,
+            source: None,
+            cause,
+            trace_id,
+        }
     }
 
     pub fn system(workspace: impl Into<String>) -> Self {

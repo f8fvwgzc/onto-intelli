@@ -287,8 +287,23 @@ How delivery behaves (configured in `[webhooks]`; tested in
 - `webhook.replay`, `webhook.resume`, `webhook.rotate_secret`, `webhook.test`
   and the tenant switch `webhook.kill` are admin actions; `[webhooks] enabled
   = false` stops sending in one process (rows wait in the outbox).
-- `traceparent` is not sent in this version. The worker adds it when a row
-  carries a trace id, but no path that enqueues rows records one yet.
+- Every request carries a W3C `traceparent: 00-<trace id>-<span id>-01`.
+  The trace id is the one the row continues: the caller's own
+  `traceparent` when the call that wrote the change (or applied the action,
+  or sent `webhook.test`) had one, else the trace that recorded that call;
+  for a run's rows, the trigger's trace, else the run's own. A row that
+  continues no trace (a write made with `[traces] enabled = false` and no
+  `traceparent`) is sent under the attempt's own trace id. The span id is
+  new for every attempt. Change records carry the same id as
+  `cause.trace_id`. (The headers and body above were captured before
+  `traceparent` and `cause.trace_id` were added; a delivery now has both.)
+- Attempts become traces of kind `delivery` (`webhook.deliver:<endpoint>`,
+  `writeback.deliver:<target>`) as `[traces] deliveries` says: `failures`
+  (the default: attempts that end in `retry` or `dead`), `all`, or `off`.
+  The trace's root span is the span the request named in `traceparent`;
+  it keeps the row id, target, source, attempt number, outcome, HTTP status
+  and the attempt's error, never the body, the headers (so never the
+  signature), the receiver's answer, the signing secret or the URL.
 
 ## 3. Automations
 
@@ -769,6 +784,19 @@ as.
   attempt log (`[webhooks] retain_days`, 14) and final run rows
   (`[automation] retain_days`, 30). The `automation.run` events stay with
   the audit trail.
+- **Traces.** With `[traces] enabled`, every run that ends (succeeded,
+  failed, refused, cancelled, would_run; skipped runs only once a rerun
+  ends) is one trace of kind `automation`, named `automation.run:<name>`,
+  whose id is the run's `trace_id`: the root span is the run (state, mode,
+  depth, attempts, trigger cursor, op and kind) and each effect is a child
+  span (`effect.action:<type>`, `effect.webhook:<endpoint>`, with its
+  receipt or outbox id). It keeps no payload, plan or body; the run's
+  reason and effect errors are error texts, which observers who are not
+  admins see redacted. Its `otel_trace_id` is the trace the trigger was
+  written under, so `trace.list {otel_trace_id}` finds the call, the runs
+  it started and their deliveries together. A rerun is traced again under a
+  new id. Delivery attempts are traced as `[traces] deliveries` says
+  (section 2).
 - **Where the state lives.** docs/STORAGE.md lists the tables and
   migrations (0009 to 0013) and how to roll back past them;
   docs/CONTROL_PLANE.md lists the routes, the outbound address rules and the

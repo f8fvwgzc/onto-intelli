@@ -178,6 +178,10 @@ pub struct RunTrigger {
     /// The cascade depth of the change (0: not written by an automation).
     #[serde(default)]
     pub depth: u8,
+    /// The W3C trace id of the call that wrote the change: the run, its
+    /// writes and its deliveries continue it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 impl RunTrigger {
@@ -201,6 +205,7 @@ impl RunTrigger {
             actor: r.cause.actor.clone(),
             source: r.cause.source.clone(),
             depth: r.cause.depth,
+            trace_id: r.cause.trace_id.clone().filter(|t| crate::trace::is_trace_id(t)),
         }
     }
 }
@@ -283,9 +288,17 @@ impl RunRow {
             epoch: 0,
             started_at: 0,
             finished_at: None,
-            trace_id: None,
+            // The id of the run's `automation` trace, fixed at the claim so
+            // every execution of the run continues the same one.
+            trace_id: Some(crate::trace::new_trace_id()),
             means: RUN_MEANS.to_string(),
         }
+    }
+
+    /// The W3C trace id the run's writes and deliveries carry: the trace its
+    /// trigger continues, else the run's own `automation` trace.
+    pub fn continues_trace(&self) -> Option<String> {
+        self.trigger.trace_id.iter().chain(self.trace_id.iter()).find(|t| crate::trace::is_trace_id(t)).cloned()
     }
 
     /// The same row in `state` with `reason`.
@@ -517,6 +530,7 @@ impl Ontology {
         let mut ctx =
             ActionContext::new(p, ws).with_request_id(run.id.clone()).with_intent(source.clone()).with_source(source);
         ctx.cause = Some(RunCause { automation: run.automation.clone(), run: run.id.clone(), depth: run.depth });
+        ctx.trace_id = run.continues_trace();
         ctx
     }
 
@@ -646,6 +660,7 @@ impl Ontology {
                 row.run = Some(run.id.clone());
                 row.receipt = def.action().map(|_| receipt_id.clone());
                 row.cause = ctx.cause.clone();
+                row.otel_trace_id = ctx.trace_id.clone();
                 row.payload = payload.clone();
                 out.effects.push(RunEffect {
                     index: i,
@@ -1064,5 +1079,40 @@ mod tests {
         assert!(q.matches(&row));
         assert!(!RunQuery { states: vec![RunState::Failed], ..Default::default() }.matches(&row));
         assert_eq!(RunQuery { limit: Some(10_000), ..Default::default() }.limit(), MAX_LIST);
+    }
+
+    #[test]
+    fn runs_continue_the_trace_of_their_trigger_else_their_own() {
+        const OTEL: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        // A call's principal carries its trace into contexts, change causes
+        // and, through the trigger, the run's context.
+        let p = Principal::admin("ada").with_trace(Some(OTEL));
+        let ctx = ActionContext::new(p, "acme");
+        assert_eq!(ctx.trace_id.as_deref(), Some(OTEL));
+        let cause = crate::changes::Cause::of(&ctx);
+        assert_eq!(cause.trace_id.as_deref(), Some(OTEL));
+        assert!(Principal::admin("x").with_trace(Some("not-a-trace")).trace_id.is_none());
+        assert!(Principal::admin("x").with_trace(Some(&"0".repeat(32))).trace_id.is_none(), "all-zero is invalid");
+        let mut r: ChangeRecord = serde_json::from_value(json!({
+            "cursor": "3.0", "ts": 0, "op": "entity.update", "workspace": "acme", "kind": "issue", "id": "issue:1",
+        }))
+        .unwrap();
+        r.cause = cause;
+        let def: Automation = serde_json::from_value(json!({
+            "run_as": { "roles": ["member"], "workspaces": ["acme"] },
+            "trigger": { "on": "change" },
+            "effects": [{ "webhook": { "endpoint": "ops", "event": "x" } }]
+        }))
+        .unwrap();
+        let row = RunRow::new("a", "h", 1, &def, RunTrigger::of(&r));
+        let own = row.trace_id.clone().unwrap();
+        assert!(crate::trace::is_trace_id(&own) && own != OTEL, "every run has a trace of its own");
+        assert_eq!(row.continues_trace().as_deref(), Some(OTEL));
+        // A trigger written outside any trace: the run's own trace continues.
+        r.cause.trace_id = None;
+        let row = RunRow::new("a", "h", 1, &def, RunTrigger::of(&r));
+        assert_eq!(row.continues_trace(), row.trace_id);
+        // Not serialized from a principal, and kept on contexts as data.
+        assert!(!serde_json::to_string(&Principal::admin("ada").with_trace(Some(OTEL))).unwrap().contains(OTEL));
     }
 }

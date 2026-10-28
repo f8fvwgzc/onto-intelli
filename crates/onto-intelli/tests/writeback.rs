@@ -472,3 +472,62 @@ async fn a_target_added_again_at_the_enabled_version_still_stops_the_automation(
     );
     assert_eq!(got["closure"]["changed_since_enabled"], json!(["target:helpdesk"]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writeback_continues_the_callers_trace_and_traces_failed_attempts() {
+    const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
+    let rx = Receiver::start(vec![503]).await;
+    let i = open(true).await;
+    let added = ok(
+        &i,
+        &lead(),
+        "writeback.add",
+        json!({ "name": "helpdesk", "base_url": rx.url("/api"), "routes": { "close": "tickets/close" },
+                "generate_secret": true }),
+    )
+    .await;
+    let secret = added["secret"].as_str().unwrap().to_string();
+    let ctx = onto_intelli::trace::TraceCtx::from_source("http")
+        .with_traceparent(Some(&format!("00-{OTEL}-b7ad6b7169203331-01")));
+    let t = i.call_traced(&lead(), "action.apply", apply(true), ctx).await;
+    let r = t.result.unwrap();
+    assert_eq!(r["status"], "applied", "{r}");
+    let row = r["external"][0]["outbox"].as_str().unwrap().to_string();
+    assert_eq!(i.ontology().store().outbox_get(&row).unwrap().unwrap().otel_trace_id.as_deref(), Some(OTEL));
+    until("the row delivered", || row_state(&i, &row) == OutboxState::Delivered).await;
+    let hits = rx.hits();
+    assert_eq!(hits.len(), 2);
+    let spans: Vec<String> = hits
+        .iter()
+        .map(|h| {
+            let tp = h.header("traceparent");
+            assert!(tp.starts_with(&format!("00-{OTEL}-")) && tp.ends_with("-01") && tp.len() == 55, "{tp}");
+            tp[36..52].to_string()
+        })
+        .collect();
+    assert_ne!(spans[0], spans[1], "a span per attempt");
+
+    // [traces] deliveries = "failures": the 503 only, under the caller's trace.
+    i.flush_traces().await;
+    let list = ok(&i, &lead(), "trace.list", json!({ "kind": "delivery" })).await;
+    let traces = list["traces"].as_array().unwrap();
+    assert_eq!(traces.len(), 1, "{list}");
+    let d = ok(&i, &lead(), "trace.get", json!({ "id": traces[0]["id"] })).await;
+    assert_eq!(
+        (d["trace"]["name"].as_str(), d["trace"]["otel_trace_id"].as_str(), d["trace"]["error_code"].as_str()),
+        (Some("writeback.deliver:helpdesk"), Some(OTEL), Some("retry"))
+    );
+    let root = d["spans"].as_array().unwrap().iter().find(|s| s["parent_id"].is_null()).unwrap();
+    assert_eq!(root["id"], spans[0].as_str(), "the span the receiver was given");
+    assert_eq!((root["attrs"]["http_status"].as_u64(), root["attrs"]["kind"].as_str()), (Some(503), Some("writeback")));
+    let text = d.to_string();
+    assert!(!text.contains(&secret) && !text.contains(&secret["whsec_".len()..]), "{text}");
+    for h in &hits {
+        let sig = h.header("webhook-signature");
+        assert!(!sig.is_empty() && !text.contains(&sig) && !text.contains(&sig["v1,".len()..]), "{text}");
+    }
+    assert!(!text.contains("Payment timeout") && !text.contains(&rx.url("")), "no body and no URL: {text}");
+    // The action's own trace is in the same distributed trace.
+    let call = ok(&i, &lead(), "trace.get", json!({ "id": t.trace_id.unwrap() })).await;
+    assert_eq!(call["trace"]["otel_trace_id"], OTEL);
+}

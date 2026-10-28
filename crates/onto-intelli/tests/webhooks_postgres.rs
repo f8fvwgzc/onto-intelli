@@ -4,7 +4,9 @@
 //! tenant's wake row settles once nothing is pending. Fan-out of a change
 //! subscription with writers in both processes enqueues each change once
 //! (one fan-out holder at a time, fenced; the cursor is the dedupe key), and
-//! commits wake the tenant while it has a subscription.
+//! commits wake the tenant while it has a subscription. A traced write's
+//! trace id is kept in its change records and outbox rows, sent as
+//! `traceparent`, and a failed attempt is a `delivery` trace.
 #![cfg(feature = "postgres")]
 
 mod common;
@@ -22,12 +24,14 @@ use serde_json::json;
 use onto_intelli::config::AllowConfig;
 use onto_intelli::core::outbox::{ConfigEvent, OutboxQuery, OutboxState};
 use onto_intelli::core::policy::ScopePrincipal;
+use onto_intelli::trace::TraceCtx;
 use onto_intelli::webhooks::{self, Endpoint, NS_ENDPOINT, SecretRef};
 use onto_intelli::{ActionContext, Config, Hub, Principal, Role};
 
 #[derive(Clone, Default)]
 struct Receiver {
     ids: Arc<Mutex<Vec<String>>>,
+    traceparents: Arc<Mutex<Vec<String>>>,
     /// Statuses to answer with first (then 200).
     script: Arc<Mutex<Vec<u16>>>,
 }
@@ -35,6 +39,8 @@ struct Receiver {
 async fn handle(State(r): State<Receiver>, headers: HeaderMap, _body: Bytes) -> StatusCode {
     let id = headers.get("webhook-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     r.ids.lock().push(id);
+    let tp = headers.get("traceparent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    r.traceparents.lock().push(tp);
     let mut s = r.script.lock();
     StatusCode::from_u16(if s.is_empty() { 200 } else { s.remove(0) }).unwrap()
 }
@@ -42,7 +48,8 @@ async fn handle(State(r): State<Receiver>, headers: HeaderMap, _body: Bytes) -> 
 async fn receiver(script: Vec<u16>) -> (Receiver, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let r = Receiver { ids: Default::default(), script: Arc::new(Mutex::new(script)) };
+    let r =
+        Receiver { ids: Default::default(), traceparents: Default::default(), script: Arc::new(Mutex::new(script)) };
     let app = axum::Router::new().fallback(handle).with_state(r.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (r, port)
@@ -192,6 +199,71 @@ async fn two_processes_fan_out_each_change_once() {
 
     drop((ta, tb, a, b));
     common::drop_tenant(&url, &prefix, "fan");
+    let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+    let sys = onto_intelli::core::store::postgres::sys_schema(&prefix);
+    onto_intelli::core::sqlx::query(onto_intelli::core::sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS \"{sys}\" CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_traced_write_is_delivered_under_its_trace_on_postgres() {
+    const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
+    let Some(url) = common::database_url("a_traced_write_is_delivered_under_its_trace") else { return };
+    let prefix = common::unique("otr_");
+    let (rx, port) = receiver(vec![500]).await;
+    let mut cfg = config(&url, &prefix);
+    cfg.traces.enabled = true;
+    let hub = Hub::open(cfg).await.unwrap();
+    let t = hub.tenant("traced").await.unwrap();
+    let dir = std::env::temp_dir().join("onto-intelli-webhook-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("pg-trace-{}", onto_intelli::core::time::new_id("s")));
+    std::fs::write(&path, "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw").unwrap();
+    let lead = Principal::admin("lead");
+    t.call(
+        &lead,
+        "webhook.add",
+        json!({
+            "name": "tasks", "url": format!("http://127.0.0.1:{port}/in"), "secret": format!("file:{}", path.display()),
+            "filter": { "kinds": "task" }, "principal": { "roles": "viewer", "workspaces": "acme" },
+        }),
+    )
+    .await
+    .unwrap();
+    let ctx = TraceCtx::from_source("http").with_traceparent(Some(&format!("00-{OTEL}-b7ad6b7169203331-01")));
+    let input = json!({ "id": "task:x", "title": "T", "workspace": "acme" });
+    t.call_traced(&lead, "entity.upsert", input, ctx).await.result.unwrap();
+    let store = t.ontology().store().clone();
+    let delivered = || {
+        let rows = store.outbox_list(&OutboxQuery { target: Some("tasks".into()), ..Default::default() }).unwrap();
+        rows.len() == 1 && rows[0].state == OutboxState::Delivered
+    };
+    assert!(eventually(20, delivered).await, "{:?}", rx.ids.lock());
+    let rows = store.outbox_list(&OutboxQuery { target: Some("tasks".into()), ..Default::default() }).unwrap();
+    assert_eq!(rows[0].otel_trace_id.as_deref(), Some(OTEL));
+    let page = store.changes_since(Default::default(), 100).unwrap();
+    let rec = page.changes.iter().find(|(s, _)| s.record.id == "task:x").expect("the change").0.record.clone();
+    assert_eq!(rec.cause.trace_id.as_deref(), Some(OTEL));
+    let tps = rx.traceparents.lock().clone();
+    assert_eq!(tps.len(), 2, "a 500, then the retry");
+    assert!(tps.iter().all(|tp| tp.starts_with(&format!("00-{OTEL}-"))), "{tps:?}");
+    // The failed attempt is a delivery trace in the tenant's trace tables.
+    t.flush_traces().await;
+    let list = t.call(&lead, "trace.list", json!({ "kind": "delivery" })).await.unwrap();
+    let traces = list["traces"].as_array().unwrap();
+    assert_eq!(traces.len(), 1, "{list}");
+    assert_eq!((traces[0]["otel_trace_id"].as_str(), traces[0]["error_code"].as_str()), (Some(OTEL), Some("retry")));
+    let d = t.call(&lead, "trace.get", json!({ "id": traces[0]["id"] })).await.unwrap();
+    let root = d["spans"].as_array().unwrap().iter().find(|s| s["parent_id"].is_null()).unwrap().clone();
+    assert_eq!(root["id"].as_str(), Some(&tps[0][36..52]));
+    assert!(!d.to_string().contains("whsec_") && !d.to_string().contains(&format!(":{port}")), "{d}");
+
+    drop((t, hub));
+    common::drop_tenant(&url, &prefix, "traced");
     let pool = onto_intelli::core::sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
     let sys = onto_intelli::core::store::postgres::sys_schema(&prefix);
     onto_intelli::core::sqlx::query(onto_intelli::core::sqlx::AssertSqlSafe(format!(

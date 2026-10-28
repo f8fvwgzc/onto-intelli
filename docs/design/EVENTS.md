@@ -1318,8 +1318,8 @@ commit.
   end-of-seq cursor form?
 - Section 11 observability still open after review round 1 (built: the `automation.run` and
   `webhook.deliver` spans, `system.health` switches, paused counts and capture, `system.stats`
-  open outbox rows per target, runs per state over 1 h and worker rounds): traces of kind
-  `automation` and `delivery` with `[traces] deliveries = failures|all|off`, change lag per
+  open outbox rows per target, runs per state over 1 h and worker rounds; after step 13, traces
+  of kind `automation` and `delivery` with `[traces] deliveries = failures|all|off`): change lag per
   consumer and endpoint, gap records over 24 h, the latest gap in `system.health`, outbox
   pending/retry/dead split by state, and the same counters in `GET /v1/admin/tenants`.
 
@@ -1710,6 +1710,8 @@ Build step 13 (docs):
   measured. In `--remote` mode the CLI prints a server error's code twice (`error: permission
   denied: permission denied: …`, `error: invalid: invalid: …`): `remote_error` wraps the
   server's message, which already starts with the code, in an `Error` whose display adds it again.
+- Fixed after step 13 (traces): `traceparent` is sent on every delivery and writeback, and rows
+  carry the trace of the call or run that enqueued them (see "Traces" at the end).
 - Fixed after step 13 (server lifecycle): `onto serve` shuts down gracefully on SIGTERM (Unix) and
   Ctrl-C within `[grpc] shutdown_grace_secs` (20): it stops accepting, ends change streams with their
   final `end` frame (`tenant_closed`, saying the server is shutting down), stops the workers after
@@ -1723,3 +1725,49 @@ Build step 13 (docs):
 - The configuration template said the automation retry delay is `min(base * 2^attempt, max)`;
   the code (`RetryPolicy::delay_ms`) is `min(base * 2^(attempt - 1), max)`, as these notes say.
   The comment is corrected.
+
+Traces (after step 13; B.7 and section 11):
+
+- The trace a call continues travels on the principal (`Principal.trace_id`, never serialized,
+  like `cause`): `call_traced` sets it to the caller's `traceparent` trace, else the id of the
+  trace recording the call (no trace id when the call is not recorded and has no
+  `traceparent`). `ActionContext::new` copies it into `ActionContext.trace_id`, so every context
+  built for the request has it without touching the 60-odd places that build one. Commits copy
+  it into change records (`Cause.trace_id`, in the record's JSON; no migration: it lives in
+  `changes.doc`) and outbox rows (`otel_trace_id`): writeback rows, `webhook.test` rows and
+  change rows fanned out from the record.
+- Runs: `RunRow.trace_id` is drawn at `RunRow::new` (the claim), so every execution of a run
+  continues one trace; `RunTrigger.trace_id` copies the trigger change's. `run_ctx` sets the
+  context's trace to the trigger's, else the run's own, so a cascade (call → run → its writes →
+  their runs and deliveries) shares one W3C trace id. `automation.rerun` draws a new
+  `trace_id`: the earlier end was already recorded, and traces are insert-only.
+- `traceparent` is sent on every webhook and writeback request: `00-<trace>-<span>-01` with the
+  row's trace, else the attempt's own trace id, and a new span id per attempt (a task-local
+  `AttemptTrace` set when the send task starts, so the request and the attempt's trace share
+  the span).
+- Delivery traces (`[traces] deliveries`, default `failures`: attempts that end `retry` or
+  `dead`; `all` adds delivered and cancelled ones; `off`): kind `delivery`, `source = "worker"`,
+  principal `webhook:<name>` or `writeback:<name>`, `request_id` the row id, `otel_trace_id`
+  the row's trace; the root span is the one sent in `traceparent`, with an `http.post` child
+  when a request was made. Attributes: row id, kind, target, source, event type (the route for
+  writeback), attempt, outcome, HTTP status, retry delay, receipt, run. The attempt's error is
+  the trace's error text (it never holds a secret or a referenced URL; non-admin observers see
+  it redacted). No body, header, signature, receiver answer, secret or URL is recorded. Rows
+  released unsent (kill switch, shutdown, limits) are not attempts and are not traced.
+- Automation traces: one per run that ends (`succeeded`, `failed`, `refused`, `cancelled`,
+  `would_run`; not `skipped`, which a rerun may still run), written by the consumer after the
+  run's commit, recovery, settling or cancellation: kind `automation`, id the run's
+  `trace_id`, name `automation.run:<name>`, `otel_trace_id` the trigger's trace, the run's
+  store-clock start and end; the root span holds the run id, state, mode, depth, attempts and
+  the trigger's cursor, op and kind (no entity id: observers see attributes unredacted), and a
+  child span per effect holds its index, kind, target, ok, receipt and outbox id, never its plan
+  or payload. The run's reason and effect errors are error texts.
+- Tests: `onto-core` `runs::tests::runs_continue_the_trace_of_their_trigger_else_their_own`;
+  `onto-intelli` `webhooks.rs` (`a_call_continues_its_trace_into_the_test_delivery`,
+  `delivery_traces_hold_no_secret_signature_body_or_referenced_url`,
+  `delivery_traces_follow_traces_deliveries`), `webhook_endpoints.rs`
+  (`a_change_delivery_continues_the_trace_of_the_write`), `writeback.rs`
+  (`writeback_continues_the_callers_trace_and_traces_failed_attempts`), `automate.rs`
+  (`a_run_is_traced_and_continues_the_trace_of_its_trigger`), `webhooks_postgres.rs`
+  (`a_traced_write_is_delivered_under_its_trace_on_postgres`) and `config.rs`
+  (`delivery_traces_default_to_failures`).

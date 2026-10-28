@@ -195,6 +195,9 @@ max_content_bytes = 4096
 # Which engine calls become traces besides intelli.ask: "writes" (writing
 # actions and LLM-using actions), "all", or "none".
 calls = "writes"
+# Webhook and writeback delivery attempts that become traces of kind
+# "delivery": "failures" (retried and dead attempts), "all", or "off".
+deliveries = "failures"
 # Background writer: flush every this many ms or records.
 flush_ms = 500
 flush_records = 200
@@ -1271,6 +1274,18 @@ As built:
   `capture_content`, a call's `input` is `{input: <JSON text>}` (plus
   `question` when the input has one) and `output` `{output: <JSON text>}`,
   both clipped.
+* Background work of the change feed (docs/design/EVENTS.md B.7 and
+  section 11), with `source = "worker"`: every automation run that ends is
+  a trace of kind `automation` (`automation.run:<name>`, id = the run's
+  `trace_id`, root span the run, a child span per effect); delivery
+  attempts are traces of kind `delivery` (`webhook.deliver:<endpoint>`,
+  `writeback.deliver:<target>`) as `[traces] deliveries` selects
+  (`failures`, the default; `all`; `off`). Neither keeps a payload, body,
+  header, signature, secret or URL. Their `otel_trace_id` is the trace the
+  work continues: the caller's `traceparent` trace, else the trace that
+  recorded the causing call. Calls pass that id on to what they enqueue
+  (change records' `cause.trace_id`, outbox rows' `otel_trace_id`), and
+  deliveries send it as `traceparent`.
 * `eval.run`: each case is a trace of kind `eval` named `eval.case`
   (`metadata.case` is the case's name, tag `eval`, the session and source
   of the caller) with an `eval.pass` score (1 or 0, `source = "eval"`,

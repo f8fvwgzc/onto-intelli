@@ -147,6 +147,8 @@ fn change_row(endpoint: &str, r: &ChangeRecord) -> OutboxRow {
         format!("onto.{}", r.op.as_str()),
     );
     row.cursor = Some(r.cursor);
+    // The delivery continues the trace of the call that wrote the change.
+    row.otel_trace_id = r.cause.trace_id.clone().filter(|t| onto_core::trace::is_trace_id(t));
     if let Some(a) = &r.cause.automation {
         row.cause = Some(RunCause {
             automation: a.clone(),

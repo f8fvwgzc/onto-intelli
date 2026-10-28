@@ -864,3 +864,79 @@ async fn health_and_stats_show_switches_paused_counts_and_runs() {
     assert_eq!(s["outbound"]["runs_1h"]["states"]["failed"], 1, "{s}");
     assert!(s["workers"]["automation"].is_u64(), "{s}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_is_traced_and_continues_the_trace_of_its_trigger() {
+    const OTEL: &str = "0af7651916cd43dd8448eb211c80319c";
+    let rx = Receiver::start().await;
+    let i = open(|cfg| {
+        cfg.webhooks.enabled = true;
+        cfg.webhooks.poll_secs = 1;
+        cfg.webhooks.allow = vec![AllowConfig { host: "127.0.0.1".into(), cidrs: vec!["127.0.0.1/32".into()] }];
+    })
+    .await;
+    endpoint(
+        &i,
+        &format!("http://127.0.0.1:{}/hooks", rx.port),
+        json!({ "roles": ["member"], "workspaces": ["acme"] }),
+    )
+    .await;
+    define(&i, "resolve_blocked", resolve_blocked(true)).await;
+    issue(&i, "1", "triaged", "high").await;
+    ok(&i, &admin(), "automation.enable", json!({ "name": "resolve_blocked" })).await;
+    // The trigger is written under the caller's traceparent.
+    let ctx = onto_intelli::trace::TraceCtx::from_source("http")
+        .with_traceparent(Some(&format!("00-{OTEL}-b7ad6b7169203331-01")));
+    let w = i.call_traced(&admin(), "entity.upsert", json!({ "id": "issue:1", "state": "blocked" }), ctx).await;
+    w.result.unwrap();
+    drain(&i);
+    let all = runs(&i, "resolve_blocked").await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    let run = &all[0];
+    assert_eq!(run["state"], "succeeded", "{run}");
+    let trace_id = run["trace_id"].as_str().expect("the run's trace").to_string();
+    assert_eq!(trace_id.len(), 32);
+    assert_eq!(run["trigger"]["trace_id"], OTEL);
+
+    // Its outbox row and its own change carry the trigger's trace.
+    let row = run["effects"][1]["outbox"].as_str().unwrap();
+    assert_eq!(i.ontology().store().outbox_get(row).unwrap().unwrap().otel_trace_id.as_deref(), Some(OTEL));
+    let page = i.ontology().store().changes_since(Default::default(), 100).unwrap();
+    let own: Vec<_> =
+        page.changes.iter().filter(|(s, _)| s.record.cause.run.as_deref() == run["id"].as_str()).collect();
+    assert!(!own.is_empty());
+    assert!(own.iter().all(|(s, _)| s.record.cause.trace_id.as_deref() == Some(OTEL)));
+    // The delivery sends it as traceparent.
+    until("the delivery", || !rx.hits.lock().is_empty()).await;
+    let tp = rx.hits.lock()[0].0.get("traceparent").unwrap().to_str().unwrap().to_string();
+    assert!(tp.starts_with(&format!("00-{OTEL}-")), "{tp}");
+
+    // One `automation` trace: the run as the root span, a span per effect,
+    // no payload, plan or secret.
+    i.flush_traces().await;
+    let list = ok(&i, &admin(), "trace.list", json!({ "kind": "automation" })).await;
+    assert_eq!(list["traces"].as_array().unwrap().len(), 1, "{list}");
+    let d = ok(&i, &admin(), "trace.get", json!({ "id": trace_id })).await;
+    let t = &d["trace"];
+    assert_eq!(
+        (t["kind"].as_str(), t["name"].as_str(), t["status"].as_str()),
+        (Some("automation"), Some("automation.run:resolve_blocked"), Some("ok"))
+    );
+    assert_eq!(
+        (t["otel_trace_id"].as_str(), t["principal"].as_str()),
+        (Some(OTEL), Some("automation:resolve_blocked"))
+    );
+    assert_eq!(t["request_id"], run["id"]);
+    let spans = d["spans"].as_array().unwrap();
+    let root = spans.iter().find(|s| s["parent_id"].is_null()).unwrap();
+    assert_eq!(
+        (root["attrs"]["run"].as_str(), root["attrs"]["state"].as_str()),
+        (run["id"].as_str(), Some("succeeded"))
+    );
+    let mut effects: Vec<&str> =
+        spans.iter().filter(|s| s["parent_id"] == root["id"]).map(|s| s["name"].as_str().unwrap()).collect();
+    effects.sort();
+    assert_eq!(effects, vec!["effect.action:resolve", "effect.webhook:ops"]);
+    let text = d.to_string();
+    assert!(!text.contains("Issue 1") && !text.contains("auto: ") && !text.contains(SECRET), "{text}");
+}

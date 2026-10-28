@@ -79,7 +79,8 @@ pub struct TraceRow {
     pub duration_ms: f64,
     /// `intelli.ask`, `action.apply:<type>`, `ontology.refine`, …
     pub name: String,
-    /// `ask` | `action` | `call` | `eval`
+    /// `ask` | `action` | `call` | `eval` | `automation` (a run) | `delivery`
+    /// (a webhook or writeback attempt)
     pub kind: String,
     /// `ok` | `error`
     pub status: String,
@@ -94,7 +95,8 @@ pub struct TraceRow {
     pub session_id: Option<String>,
     /// The API key's prefix (never the key).
     pub api_key: Option<String>,
-    /// `http` | `grpc` | `mcp` | `cli` | `ffi` | `sdk` | `scheduler`
+    /// `http` | `grpc` | `mcp` | `cli` | `ffi` | `sdk` | `scheduler` |
+    /// `worker` (automation runs and deliveries)
     pub source: String,
     /// The W3C trace id of the caller's `traceparent`: the OpenTelemetry
     /// trace this call was part of. Several traces may share it (one per
@@ -704,6 +706,17 @@ pub fn new_trace_id() -> String {
 /// A new W3C span id: 16 lowercase hex characters, not all zero.
 pub fn new_span_id() -> String {
     hex_id(8)
+}
+
+/// Is `s` a W3C trace id (32 lowercase hex characters, not all zero)?
+pub fn is_trace_id(s: &str) -> bool {
+    is_hex_id(s, 32)
+}
+
+/// A W3C `traceparent` header (sampled) for trace `trace_id` and span
+/// `span_id`.
+pub fn traceparent(trace_id: &str, span_id: &str) -> String {
+    format!("00-{trace_id}-{span_id}-01")
 }
 
 fn is_hex_id(s: &str, len: usize) -> bool {

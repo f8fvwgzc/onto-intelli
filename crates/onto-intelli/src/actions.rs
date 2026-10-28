@@ -831,7 +831,10 @@ impl Intelli {
                 Traced::untraced(run.await)
             }
             a if a.starts_with("trace.") || !self.traces_call(a) => {
-                Traced::untraced(Box::pin(self.dispatch(p, action, input)).await)
+                // Not recorded, but the caller's trace still continues in
+                // what the call enqueues (change records, outbox rows).
+                let p = p.clone().with_trace(ctx.otel_trace_id.as_deref());
+                Traced::untraced(Box::pin(self.dispatch(&p, action, input)).await)
             }
             _ => self.call_recorded(p, action, input, ctx).await,
         }
@@ -851,8 +854,12 @@ impl Intelli {
     /// with the generation spans of any LLM call under it.
     async fn call_recorded(&self, p: &Principal, action: &str, input: Value, ctx: TraceCtx) -> Traced<Value> {
         let Some(tracer) = self.start_trace(&ctx) else {
-            return Traced::untraced(Box::pin(self.dispatch(p, action, input)).await);
+            let p = p.clone().with_trace(ctx.otel_trace_id.as_deref());
+            return Traced::untraced(Box::pin(self.dispatch(&p, action, input)).await);
         };
+        // What the call enqueues continues the caller's trace, else this one
+        // (docs/design/EVENTS.md B.7).
+        let p = &p.clone().with_trace(Some(ctx.otel_trace_id.as_deref().unwrap_or(tracer.id())));
         let ws = self.ws_or_default(input.get("workspace").and_then(Value::as_str).map(str::to_string));
         let (kind, name) = match action {
             "action.apply" => {
