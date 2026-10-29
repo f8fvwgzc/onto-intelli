@@ -1,13 +1,18 @@
 // A Server-Sent Events parser over a byte stream (the WHATWG
 // EventSource framing): `event:`, `data:` (joined with newlines), `id:`,
-// comments, and events ended by a blank line. Chunks may split anywhere,
-// including inside a multi-byte character or between `\r` and `\n`.
+// `retry:`, comments, and events ended by a blank line. Chunks may split
+// anywhere, including inside a multi-byte character or between `\r` and `\n`.
 
 export interface SseMessage {
   /** `message` when the event names none. */
   event: string;
   data: string;
   id?: string;
+  /**
+   * The reconnection time the stream asked for (`retry:`, milliseconds), as
+   * last set before this message; `undefined` when it set none.
+   */
+  retry?: number;
 }
 
 /** The messages of an SSE stream, in order. */
@@ -18,10 +23,12 @@ export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncGenerato
   let event = "";
   let data: string[] = [];
   let id: string | undefined;
+  let retry: number | undefined;
   let sawData = false;
   const line = (l: string): SseMessage | undefined => {
     if (l === "") {
-      const out = sawData ? { event: event || "message", data: data.join("\n"), id } : undefined;
+      const out: SseMessage | undefined = sawData ? { event: event || "message", data: data.join("\n"), id } : undefined;
+      if (out && retry !== undefined) out.retry = retry;
       event = "";
       data = [];
       sawData = false;
@@ -37,6 +44,8 @@ export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncGenerato
       data.push(value);
       sawData = true;
     } else if (field === "id") id = value;
+    // Only ASCII digits set it (WHATWG); anything else is ignored.
+    else if (field === "retry" && /^[0-9]+$/.test(value)) retry = Number(value);
     return undefined;
   };
   try {

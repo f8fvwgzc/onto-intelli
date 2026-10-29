@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use onto_core::Result;
 use onto_core::time::{fmt_date, now_ms};
 use onto_intelli::Hub;
-use onto_intelli::hub::{TenantHooks, TenantSettings};
+use onto_intelli::hub::{Secret, SecretBox, TenantHooks, TenantSettings};
 use onto_intelli::limits::{MonthToDate, UsageMeter};
 use onto_intelli::token::TokenUsage;
 use onto_intelli::trace::TraceSettings;
@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 
 use crate::llm::{limits_of, month_start, month_total};
 use crate::model::{Project, UsageDay};
-use crate::{Control, ControlStore};
+use crate::{Control, ControlStore, Vault};
 
 /// How often queued usage is written.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(10);
@@ -205,7 +205,47 @@ impl TenantHooks for ControlHooks {
             meter: Some(meter),
             version: project.settings_version.max(0) as u64,
             traces: trace_settings_of(&project),
+            secrets: c
+                .vault
+                .clone()
+                .map(|vault| Arc::new(VaultSecrets { vault, project_id: project.id.clone() }) as Arc<dyn SecretBox>),
         })
+    }
+}
+
+/// A project's outbound secrets (webhook signing secrets, …), sealed with
+/// the vault ([`Vault::seal_for`]) under AAD `onto/<purpose>/v1/<project>/<name>`.
+pub struct VaultSecrets {
+    vault: Arc<Vault>,
+    project_id: String,
+}
+
+impl VaultSecrets {
+    pub fn new(vault: Arc<Vault>, project_id: impl Into<String>) -> Self {
+        Self { vault, project_id: project_id.into() }
+    }
+}
+
+impl SecretBox for VaultSecrets {
+    fn seal(&self, purpose: &str, name: &str, plain: &[u8]) -> Result<String> {
+        use base64::Engine as _;
+        let blob = self.vault.seal_for(purpose, &self.project_id, name, plain)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+    }
+
+    fn open(&self, purpose: &str, name: &str, sealed: &str) -> Result<Secret> {
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(sealed.trim())
+            .map_err(|_| onto_core::Error::invalid("a sealed secret is base64"))?;
+        Ok(Secret::new(self.vault.open_for(purpose, &self.project_id, name, &blob)?))
+    }
+
+    fn rewrap(&self, sealed: &str) -> Result<Option<String>> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let blob = b64.decode(sealed.trim()).map_err(|_| onto_core::Error::invalid("a sealed secret is base64"))?;
+        Ok(self.vault.rewrap(&self.project_id, &blob)?.map(|new| b64.encode(new)))
     }
 }
 
@@ -424,5 +464,20 @@ mod tests {
         m.load(&store).await.unwrap();
         assert_eq!(m.month_to_date(), MonthToDate { cost_usd: 1.5, tokens: 125 });
         assert_eq!(m.flush(&store).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn sealed_outbound_secrets_move_to_the_new_master_key() {
+        use crate::vault::Vault;
+        let old = Arc::new(Vault::new(vec![1; 32], None).unwrap());
+        let sealed = VaultSecrets::new(old, "p1").seal("webhook-secret", "crm", b"whsec_x").unwrap();
+        // Rotating: the new key current, the old one previous.
+        let rotating = VaultSecrets::new(Arc::new(Vault::new(vec![2; 32], Some(vec![1; 32])).unwrap()), "p1");
+        let moved = rotating.rewrap(&sealed).unwrap().expect("the old key wrapped it");
+        assert!(rotating.rewrap(&moved).unwrap().is_none(), "already current");
+        // Once the previous key is gone only the rewrapped secret opens.
+        let after = VaultSecrets::new(Arc::new(Vault::new(vec![2; 32], None).unwrap()), "p1");
+        assert_eq!(after.open("webhook-secret", "crm", &moved).unwrap().expose(), b"whsec_x");
+        assert!(after.open("webhook-secret", "crm", &sealed).is_err());
     }
 }

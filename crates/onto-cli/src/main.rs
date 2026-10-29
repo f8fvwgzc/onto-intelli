@@ -5,6 +5,7 @@ mod assure;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -155,6 +156,29 @@ enum Command {
         days: f64,
         #[arg(long)]
         within: Option<String>,
+    },
+    /// The change feed: what each commit changed, filtered for you.
+    ///
+    /// Follows the feed live (from now, `--from earliest` or `--after` a
+    /// cursor) and resumes after the last cursor when the server cuts the
+    /// stream. `--once` prints one page after a cursor and the cursor to
+    /// resume from (`--after`).
+    Watch(WatchArgs),
+    /// Webhook endpoints: signed CloudEvents (Standard Webhooks) to your
+    /// receivers. Each change a filter subscribes to is enqueued once per
+    /// endpoint and delivered at least once; receivers dedupe on the event id.
+    Webhook {
+        #[command(subcommand)]
+        sub: WebhookCmd,
+    },
+    /// Automations: change-triggered runs of governed action types and
+    /// webhooks, defined in the schema ([automations.<name>]) and enabled by
+    /// a person. A run commits its action, receipt, outbox rows and run row
+    /// together; webhook effects are delivered at least once and external
+    /// effects are not reversible.
+    Automation {
+        #[command(subcommand)]
+        sub: AutomationCmd,
     },
     /// Evaluate a governed metric (or an ad-hoc one with --kind/--measure).
     Metric {
@@ -388,6 +412,70 @@ enum Command {
     Protos,
     /// Graph, memory, cache and token statistics.
     Stats,
+}
+
+#[derive(Subcommand)]
+enum WebhookCmd {
+    /// Endpoints with their status, principal and filter.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register an endpoint. Without --secret a whsec_ secret is generated
+    /// (it needs ONTO_MASTER_KEY to be sealed) and printed once; --secret
+    /// takes the secret itself or an env:VAR / file:/path reference.
+    Add {
+        name: String,
+        /// https URL (or env:VAR naming one).
+        url: String,
+        #[arg(long)]
+        secret: Option<String>,
+        /// Subscribe to changes of these kinds (repeatable).
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Subscribe to these ops (repeatable): entity.create, entity.update, link.create, ...
+        #[arg(long = "op")]
+        ops: Vec<String>,
+        /// Subscribe to every change (no kind or op narrowing).
+        #[arg(long)]
+        all: bool,
+        /// What the receiver may see: roles (repeatable, default viewer).
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        /// ... in these workspaces (repeatable, default the call's workspace).
+        #[arg(long = "sees")]
+        workspaces: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an endpoint (rows not yet sent to it are cancelled).
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum AutomationCmd {
+    /// Automations with their status (active, or why not).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Runs, newest first.
+    Runs {
+        /// One automation's runs (all when omitted).
+        name: Option<String>,
+        /// Only runs in this state (repeatable): succeeded, failed, retry, skipped, refused, ...
+        #[arg(long = "state")]
+        states: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable an automation: it runs on changes from now on, binds to what it
+    /// reaches (any change stops it) and expires after enable_ttl_days.
+    Enable { name: String },
+    /// Stop an automation (its pending retries are cancelled).
+    Disable { name: String },
 }
 
 #[derive(Subcommand)]
@@ -882,21 +970,417 @@ impl Backend {
                 let resp = req.send().await.map_err(|e| Error::Unavailable(format!("{base}: {e}")))?;
                 let status = resp.status();
                 let body: Value = resp.json().await.map_err(|e| Error::Other(format!("bad response: {e}")))?;
-                if status.is_success() {
-                    Ok(body)
-                } else {
-                    let msg = body["error"]["message"].as_str().unwrap_or("request failed").to_string();
-                    Err(match body["error"]["code"].as_str() {
-                        Some("not_found") => Error::NotFound(msg),
-                        Some("invalid_argument") => Error::Invalid(msg),
-                        Some("permission_denied") => Error::Denied(msg),
-                        Some("conflict") => Error::Conflict(msg),
-                        Some("resource_exhausted") => Error::Limited(msg),
-                        Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
-                        _ => Error::Other(msg),
-                    })
+                if status.is_success() { Ok(body) } else { Err(remote_error(&body)) }
+            }
+        }
+    }
+}
+
+/// A server's error answer as an engine error.
+/// The server's error as a local [`Error`]. The server's message is already
+/// the `Display` of its error, prefix included ("permission denied: ..."), so
+/// the prefix the local variant adds is taken off first: the code reads once.
+fn remote_error(body: &Value) -> Error {
+    let msg = body["error"]["message"].as_str().unwrap_or("request failed");
+    let bare = |prefix: &str| msg.strip_prefix(prefix).unwrap_or(msg).to_string();
+    match body["error"]["code"].as_str() {
+        Some("not_found") => Error::NotFound(bare("not found: ")),
+        Some("invalid_argument") => Error::Invalid(bare("invalid: ")),
+        Some("permission_denied") => Error::Denied(bare("permission denied: ")),
+        Some("conflict") => Error::Conflict(bare("conflict: ")),
+        Some("resource_exhausted") => Error::Limited(bare("limited: ")),
+        Some("unavailable") => Error::Unavailable(bare("unavailable: ")),
+        Some("unauthenticated") => Error::Denied(format!("{msg} (pass --token or set ONTO_TOKEN)")),
+        _ => Error::Other(msg.to_string()),
+    }
+}
+
+// ── onto watch ────────────────────────────────────────────────────────
+
+#[derive(clap::Args)]
+struct WatchArgs {
+    /// Print one page and exit, instead of following the feed live.
+    #[arg(long)]
+    once: bool,
+    /// Live: stop after this many records.
+    #[arg(long, conflicts_with = "once")]
+    count: Option<usize>,
+    /// Resume after this cursor: a previous page's next, like 42.0.
+    #[arg(long, conflicts_with = "from")]
+    after: Option<String>,
+    /// Without --after: earliest or now (default: earliest with --once, now live).
+    #[arg(long, value_parser = ["earliest", "now"])]
+    from: Option<String>,
+    /// Records scanned per page (default: [changes] page; at most 1000).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Entity kinds or interfaces (repeat or comma-separate).
+    #[arg(long, value_delimiter = ',')]
+    kinds: Vec<String>,
+    /// entity.create, entity.update, entity.delete, entity.hidden, link.*, schema.change, gap.
+    #[arg(long, value_delimiter = ',')]
+    ops: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    workspaces: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    ids: Vec<String>,
+    /// Relations (link records only).
+    #[arg(long, value_delimiter = ',')]
+    rels: Vec<String>,
+    /// Updates that changed any of these fields.
+    #[arg(long, value_delimiter = ',')]
+    props: Vec<String>,
+    /// Globs on the writer's source; !x excludes.
+    #[arg(long, value_delimiter = ',')]
+    sources: Vec<String>,
+    /// Ids, kinds, ops and changed field names only.
+    #[arg(long)]
+    ids_only: bool,
+    /// Leave out records written by schema migrations.
+    #[arg(long)]
+    no_migrations: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+impl WatchArgs {
+    /// The `changes.poll` input.
+    fn poll_input(&self) -> Value {
+        let mut input = json!({
+            "kinds": self.kinds, "ops": self.ops, "workspaces": self.workspaces, "ids": self.ids,
+            "rels": self.rels, "props": self.props, "sources": self.sources,
+        });
+        let m = input.as_object_mut().expect("an object");
+        if let Some(a) = &self.after {
+            m.insert("after".into(), json!(a));
+        }
+        if let Some(f) = &self.from {
+            m.insert("from".into(), json!(f));
+        }
+        if let Some(l) = self.limit {
+            m.insert("limit".into(), json!(l));
+        }
+        if self.ids_only {
+            m.insert("fields".into(), json!("ids"));
+        }
+        if self.no_migrations {
+            m.insert("include_migrations".into(), json!(false));
+        }
+        input
+    }
+}
+
+/// Print one record: a JSON line, or a styled line.
+fn emit(c: &Value, w: &WatchArgs, st: &Style) {
+    if w.json {
+        println!("{}", serde_json::to_string(c).unwrap_or_default());
+    } else {
+        println!("{}", change_line(c, st));
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// One record as a line: cursor, op, kind, id and what changed.
+fn change_line(c: &Value, st: &Style) -> String {
+    let strs = |v: &Value| -> Vec<String> {
+        v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    };
+    let detail = match c["op"].as_str().unwrap_or_default() {
+        "entity.update" if !c["state"].is_null() => {
+            format!("{} → {}", c["state"]["from"].as_str().unwrap_or("∅"), c["state"]["to"].as_str().unwrap_or("∅"))
+        }
+        "entity.update" | "link.update" => strs(&c["changed"]).join(", "),
+        "entity.create" if c["became_visible"] == true => "came into view".to_string(),
+        "schema.change" => format!("version {}", c["schema"]["version"]),
+        "gap" => {
+            let g = &c["gap"];
+            let n = strs(&g["entities"]).len() + g["links"].as_array().map_or(0, Vec::len);
+            let hidden = g["hidden"].as_u64().unwrap_or(0);
+            format!(
+                "{}: {n} changed without records{}; re-read with entity.find",
+                g["reason"].as_str().unwrap_or("?"),
+                if hidden > 0 { format!(" (+{hidden} you cannot see)") } else { String::new() }
+            )
+        }
+        _ => String::new(),
+    };
+    let kind = c["kind"].as_str().unwrap_or_default();
+    let id = c["id"].as_str().unwrap_or_default();
+    format!(
+        "{} {:<14} {} {}{}",
+        st.dim(c["cursor"].as_str().unwrap_or_default()),
+        c["op"].as_str().unwrap_or_default(),
+        st.cyan(kind),
+        st.bold(id),
+        if detail.is_empty() { String::new() } else { format!("  {detail}") }
+    )
+}
+
+async fn watch(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
+    if !w.once {
+        return follow(cli, w, st).await;
+    }
+    let be = backend(cli).await?;
+    let page = be.call("changes.poll", w.poll_input()).await?;
+    if w.json {
+        print_json(&page);
+        return Ok(());
+    }
+    if page["expired"] == true {
+        return Err(Error::Other(format!(
+            "cursor {} expired (floor {}, head {}): {}",
+            w.after.as_deref().unwrap_or("earliest"),
+            page["floor"],
+            page["head"],
+            page["message"].as_str().unwrap_or_default()
+        )));
+    }
+    let changes = page["changes"].as_array().cloned().unwrap_or_default();
+    if changes.is_empty() {
+        println!("No changes you may see{}.", w.after.as_deref().map(|a| format!(" after {a}")).unwrap_or_default());
+    }
+    for c in &changes {
+        println!("{}", change_line(c, st));
+    }
+    println!(
+        "{} {}  {}",
+        st.dim("next:"),
+        page["next"].as_str().unwrap_or_default(),
+        st.dim(&format!("(head {}, floor {}; resume with --after)", page["head"], page["floor"]))
+    );
+    Ok(())
+}
+
+/// Where a live stream stopped: its `end` or `reset` code, or `None` when
+/// the connection dropped.
+struct Stopped {
+    code: Option<String>,
+    message: String,
+}
+
+/// Where a live watch is: the last cursor received and the records printed.
+struct Follow {
+    cursor: Option<String>,
+    printed: usize,
+}
+
+impl Follow {
+    fn done(&self, w: &WatchArgs) -> bool {
+        w.count.is_some_and(|n| self.printed >= n)
+    }
+}
+
+/// Follow the change feed: print each record, resume after the last cursor
+/// when the server ends the stream for a reason that a reconnect fixes
+/// (`slow_consumer`, `tenant_closed`, `principal_changed`, a dropped
+/// connection with backoff), page with `changes.poll` after
+/// `too_far_behind`, and stop on an expired cursor or a refusal.
+async fn follow(cli: &Cli, w: &WatchArgs, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    let mut at = Follow { cursor: w.after.clone(), printed: 0 };
+    let mut failures = 0u32;
+    loop {
+        let stop = match &be {
+            Backend::Local { intelli, principal } => follow_local(intelli, principal, w, &mut at, st).await?,
+            Backend::Remote { .. } => follow_remote(&be, w, &mut at, st).await?,
+        };
+        if at.done(w) {
+            return Ok(());
+        }
+        let cursor = at.cursor.clone().unwrap_or_else(|| "the start".into());
+        match stop.code.as_deref() {
+            Some("slow_consumer" | "tenant_closed" | "principal_changed") => {
+                eprintln!("{}", st.dim(&format!("{}: resuming after {cursor}", stop.code.unwrap_or_default())));
+                failures = 0;
+            }
+            Some("too_far_behind") => {
+                eprintln!("{}", st.dim(&format!("too far behind: paging from {cursor} with changes.poll")));
+                page_up(&be, w, &mut at, st).await?;
+                if at.done(w) {
+                    return Ok(());
                 }
             }
+            Some("cursor_expired") => {
+                return Err(Error::Other(format!("cursor {cursor} expired: {}", stop.message)));
+            }
+            Some(code) => return Err(Error::Other(format!("the stream ended ({code}): {}", stop.message))),
+            None if matches!(be, Backend::Local { .. }) => {
+                return Err(Error::Other(format!("the stream ended: {}", stop.message)));
+            }
+            None => {
+                let wait = std::time::Duration::from_millis((500u64 << failures.min(6)).min(30_000));
+                eprintln!("{}", st.dim(&format!("{}; reconnecting in {:.1} s", stop.message, wait.as_secs_f64())));
+                tokio::time::sleep(wait).await;
+                failures += 1;
+            }
+        }
+    }
+}
+
+/// The stream input: the filter, and `from` (default now) without a cursor.
+fn stream_input(w: &WatchArgs, cursor: Option<&str>) -> Value {
+    let mut input = w.poll_input();
+    let m = input.as_object_mut().expect("an object");
+    m.remove("limit");
+    m.remove("after");
+    m.remove("from");
+    if cursor.is_none() {
+        m.insert("from".into(), json!(w.from.as_deref().unwrap_or("now")));
+    }
+    input
+}
+
+async fn follow_local(
+    intelli: &Arc<Intelli>,
+    principal: &Principal,
+    w: &WatchArgs,
+    at: &mut Follow,
+    st: &Style,
+) -> Result<Stopped> {
+    use onto_intelli::changes::{Frame, stream_request};
+    let (filter, start) = stream_request(stream_input(w, at.cursor.as_deref()), at.cursor.as_deref())?;
+    let mut sub = intelli.subscribe_changes(principal.clone(), filter, start, None).await?;
+    while let Some(frame) = sub.recv().await {
+        match frame {
+            Frame::Change(r) => {
+                at.cursor = Some(r.cursor.to_string());
+                emit(&serde_json::to_value(r.as_ref())?, w, st);
+                at.printed += 1;
+                if at.done(w) {
+                    return Ok(Stopped { code: None, message: String::new() });
+                }
+            }
+            Frame::Heartbeat { cursor, .. } => at.cursor = Some(cursor.to_string()),
+            Frame::Reset { code, message, .. } => return Ok(Stopped { code: Some(code.into()), message }),
+            Frame::End { code, cursor, message } => {
+                at.cursor.get_or_insert_with(|| cursor.to_string());
+                return Ok(Stopped { code: Some(code.into()), message });
+            }
+        }
+    }
+    Ok(Stopped { code: None, message: "the stream ended without a reason".into() })
+}
+
+/// One SSE message: event, id and data.
+fn sse_block(block: &str) -> (String, Option<String>, String) {
+    let (mut event, mut id, mut data) = ("message".to_string(), None, Vec::new());
+    for line in block.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let v = v.strip_prefix(' ').unwrap_or(v);
+        match k {
+            "event" => event = v.to_string(),
+            "id" => id = Some(v.to_string()),
+            "data" => data.push(v),
+            _ => {}
+        }
+    }
+    (event, id, data.join("\n"))
+}
+
+async fn follow_remote(be: &Backend, w: &WatchArgs, at: &mut Follow, st: &Style) -> Result<Stopped> {
+    let Backend::Remote { http, base, token, tenant } = be else {
+        return Err(Error::Other("not a remote backend".into()));
+    };
+    let mut req = http
+        .post(format!("{base}/v1/changes/stream"))
+        .header("accept", "text/event-stream")
+        .json(&stream_input(w, at.cursor.as_deref()));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    if let Some(t) = tenant {
+        req = req.header("x-onto-tenant", t);
+    }
+    if let Some(c) = &at.cursor {
+        req = req.header("last-event-id", c);
+    }
+    let mut resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Ok(Stopped { code: None, message: format!("{base}: {e}") }),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(match resp.json::<Value>().await {
+            Ok(body) if body["error"].is_object() => remote_error(&body),
+            _ => Error::Unavailable(format!("{base}/v1/changes/stream answered HTTP {status}")),
+        });
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(Stopped { code: None, message: "the server closed the stream".into() }),
+            Err(e) => return Ok(Stopped { code: None, message: format!("{base}: {e}") }),
+        };
+        buf.extend_from_slice(&chunk);
+        while let Some(at_end) = find_blank_line(&buf) {
+            let block: Vec<u8> = buf.drain(..at_end.1).collect();
+            let text = String::from_utf8_lossy(&block[..at_end.0]).replace("\r\n", "\n");
+            let (event, id, data) = sse_block(&text);
+            let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            match event.as_str() {
+                "change" => {
+                    at.cursor = id.or_else(|| v["cursor"].as_str().map(str::to_string));
+                    emit(&v, w, st);
+                    at.printed += 1;
+                    if at.done(w) {
+                        return Ok(Stopped { code: None, message: String::new() });
+                    }
+                }
+                "heartbeat" => at.cursor = id.or_else(|| v["cursor"].as_str().map(str::to_string)),
+                "reset" | "end" => {
+                    if let Some(c) = v["cursor"].as_str() {
+                        at.cursor.get_or_insert_with(|| c.to_string());
+                    }
+                    let code = v["code"].as_str().unwrap_or(event.as_str()).to_string();
+                    return Ok(Stopped { code: Some(code), message: v["message"].as_str().unwrap_or_default().into() });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The end of the first SSE message in `buf`: (where its text ends, where
+/// the next one starts).
+fn find_blank_line(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, i + 2));
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, i + 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// After `too_far_behind`: page with `changes.poll` up to the head.
+async fn page_up(be: &Backend, w: &WatchArgs, at: &mut Follow, st: &Style) -> Result<()> {
+    loop {
+        let mut input = stream_input(w, Some(""));
+        if let Some(l) = w.limit {
+            input["limit"] = json!(l);
+        }
+        input["after"] = json!(at.cursor.clone().unwrap_or_default());
+        let page = be.call("changes.poll", input).await?;
+        if page["expired"] == true {
+            return Err(Error::Other(format!(
+                "cursor {} expired: {}",
+                at.cursor.as_deref().unwrap_or_default(),
+                page["message"].as_str().unwrap_or_default()
+            )));
+        }
+        for c in page["changes"].as_array().into_iter().flatten() {
+            emit(c, w, st);
+            at.printed += 1;
+            if at.done(w) {
+                return Ok(());
+            }
+        }
+        let next = page["next"].as_str().unwrap_or_default().to_string();
+        let moved = at.cursor.as_deref() != Some(next.as_str());
+        let seq: u64 = next.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        at.cursor = Some(next);
+        if !moved || seq >= page["head"].as_u64().unwrap_or(0) {
+            return Ok(());
         }
     }
 }
@@ -1041,6 +1525,203 @@ fn print_crawl(st: &Style, c: &Value) {
     }
 }
 
+/// The input of `webhook.add` from the command line.
+#[allow(clippy::too_many_arguments)]
+fn webhook_add_input(
+    name: &str,
+    url: &str,
+    secret: Option<&str>,
+    kinds: &[String],
+    ops: &[String],
+    all: bool,
+    roles: &[String],
+    workspaces: &[String],
+) -> Value {
+    let mut input = json!({ "name": name, "url": url });
+    if let Some(s) = secret {
+        input["secret"] = json!(s);
+    }
+    if all || !kinds.is_empty() || !ops.is_empty() {
+        input["filter"] = json!({ "kinds": kinds, "ops": ops });
+    }
+    if !roles.is_empty() || !workspaces.is_empty() {
+        let roles = if roles.is_empty() { vec!["viewer".to_string()] } else { roles.to_vec() };
+        input["principal"] = json!({ "roles": roles, "workspaces": workspaces });
+    }
+    input
+}
+
+async fn webhook(cli: &Cli, sub: &WebhookCmd, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    match sub {
+        WebhookCmd::List { json: as_json } => {
+            let r = be.call("webhook.list", json!({})).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if r["kill"] == true {
+                println!("{}", st.red("deliveries are held: the tenant kill switch is on"));
+            }
+            if items.is_empty() {
+                println!(
+                    "No webhook endpoints. Add one: onto webhook add ops https://hooks.example.com/in --kind issue"
+                );
+            }
+            for e in items {
+                let p = &e["principal"];
+                let roles: Vec<&str> =
+                    p["roles"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let ws: Vec<&str> = p["workspaces"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let filter = if e["filter"].is_null() {
+                    "effects only".to_string()
+                } else {
+                    let kinds: Vec<&str> = e["filter"]["kinds"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if kinds.is_empty() {
+                        "all changes".to_string()
+                    } else {
+                        format!("changes of {}", kinds.join(", "))
+                    }
+                };
+                let status = e["status"].as_str().unwrap_or_default();
+                let status = if status == "active" { status.to_string() } else { st.red(status) };
+                println!(
+                    "{}  {}  {}  as {} in {}  {}  v{}{}",
+                    st.bold(e["name"].as_str().unwrap_or_default()),
+                    e["url"].as_str().unwrap_or_default(),
+                    status,
+                    roles.join("+"),
+                    ws.join(","),
+                    filter,
+                    e["version"],
+                    e["pending"].as_u64().filter(|n| *n > 0).map(|n| format!("  {n} pending")).unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        WebhookCmd::Add { name, url, secret, kinds, ops, all, roles, workspaces, json: as_json } => {
+            let input = webhook_add_input(name, url, secret.as_deref(), kinds, ops, *all, roles, workspaces);
+            let r = be.call("webhook.add", input).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let e = &r["endpoint"];
+            println!("Added {} ({}), secret {}", st.bold(name), e["status"].as_str().unwrap_or_default(), e["secret"]);
+            if let Some(s) = r["secret"].as_str() {
+                println!("Signing secret (shown once; store it with the receiver): {s}");
+            }
+            println!("{}", st.dim(r["note"].as_str().unwrap_or_default()));
+            Ok(())
+        }
+        WebhookCmd::Rm { name } => {
+            be.call("webhook.remove", json!({ "name": name })).await?;
+            println!("Removed {name}");
+            Ok(())
+        }
+    }
+}
+
+async fn automation(cli: &Cli, sub: &AutomationCmd, st: &Style) -> Result<()> {
+    let be = backend(cli).await?;
+    match sub {
+        AutomationCmd::List { json: as_json } => {
+            let r = be.call("automation.list", json!({})).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            if r["kill"] == true {
+                println!("{}", st.red("automations are stopped: the tenant kill switch is on"));
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!(
+                    "No automations. Define one in the schema ([automations.<name>]), then: onto automation enable <name>"
+                );
+            }
+            for a in items {
+                let status = match a["reason"].as_str() {
+                    None => "active".to_string(),
+                    Some(r) => st.red(&format!("inactive ({r})")),
+                };
+                let effects: Vec<String> = a["effects"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .map(|x| {
+                                format!(
+                                    "{} {}",
+                                    x["kind"].as_str().unwrap_or_default(),
+                                    x["target"].as_str().unwrap_or_default()
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "{}  {}  {}{}",
+                    st.bold(a["name"].as_str().unwrap_or_default()),
+                    status,
+                    effects.join(", "),
+                    a["expires_at"]
+                        .as_i64()
+                        .map(|t| format!("  expires {}", onto_intelli::core::time::fmt_ts(t)))
+                        .unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        AutomationCmd::Runs { name, states, limit, json: as_json } => {
+            let r = be.call("automation.runs", json!({ "name": name, "state": states, "limit": limit })).await?;
+            if *as_json {
+                print_json(&r);
+                return Ok(());
+            }
+            let items = r["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!("No runs.");
+            }
+            for run in items {
+                let state = run["state"].as_str().unwrap_or_default();
+                let state = if matches!(state, "succeeded" | "would_run") { state.to_string() } else { st.red(state) };
+                println!(
+                    "{}  {}  {}  {} {}  depth {}{}",
+                    run["id"].as_str().unwrap_or_default(),
+                    run["automation"].as_str().unwrap_or_default(),
+                    state,
+                    run["trigger"]["op"].as_str().unwrap_or_default(),
+                    run["trigger"]["id"].as_str().unwrap_or_default(),
+                    run["depth"],
+                    run["reason"].as_str().map(|r| format!("  {}", st.dim(r))).unwrap_or_default(),
+                );
+            }
+            if r["hidden"].as_u64().unwrap_or(0) > 0 {
+                println!("{}", st.dim(&format!("{} runs of automations you do not cover are hidden", r["hidden"])));
+            }
+            Ok(())
+        }
+        AutomationCmd::Enable { name } => {
+            let r = be.call("automation.enable", json!({ "name": name })).await?;
+            println!("Enabled {}", st.bold(name));
+            println!("{}", st.dim(r["note"].as_str().unwrap_or_default()));
+            Ok(())
+        }
+        AutomationCmd::Disable { name } => {
+            let r = be.call("automation.disable", json!({ "name": name })).await?;
+            println!("Disabled {name} ({} pending retries cancelled)", r["cancelled_retries"]);
+            Ok(())
+        }
+    }
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
@@ -1136,7 +1817,12 @@ fn main() {
     let main = std::thread::Builder::new()
         .name("main".into())
         .stack_size(8 << 20)
-        .spawn(|| tokio::runtime::Runtime::new().expect("starting the tokio runtime").block_on(cli_main()))
+        .spawn(|| {
+            let rt = tokio::runtime::Runtime::new().expect("starting the tokio runtime");
+            rt.block_on(cli_main());
+            // Blocking work still running (a crawl, a store call) does not hold the exit up.
+            rt.shutdown_timeout(Duration::from_secs(2));
+        })
         .expect("starting the main thread");
     if main.join().is_err() {
         // The panic message is printed; exit as a panicking main would.
@@ -1194,7 +1880,11 @@ fn local_config(cli: &Cli) -> Result<Config> {
 
 /// The local store (the `--tenant`'s, when given).
 async fn open_local(cli: &Cli) -> Result<(Arc<Intelli>, Config)> {
-    let cfg = local_config(cli)?;
+    let mut cfg = local_config(cli)?;
+    // One-off commands run no background workers (`onto serve` does): they
+    // would take leases and claim rows that wait to expire once they exit.
+    cfg.automation.workers = false;
+    cfg.webhooks.workers = false;
     let intelli = match &cli.tenant {
         Some(t) => onto_intelli::Hub::open(cfg.clone()).await?.tenant(t).await?,
         None => Intelli::open(cfg.clone()).await?,
@@ -1217,6 +1907,45 @@ async fn backend(cli: &Cli) -> Result<Backend> {
     }
 }
 
+/// What stops `onto serve`: Ctrl-C, and on Unix SIGTERM (what `docker stop`
+/// and Kubernetes send) and SIGINT. Installed before the banner, so a
+/// signal right after it is a graceful shutdown, not the default exit.
+struct StopSignal {
+    #[cfg(unix)]
+    unix: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl StopSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let unix = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+                (Ok(term), Ok(int)) => Some((term, int)),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("catching SIGTERM: {e}; only Ctrl-C stops gracefully");
+                    None
+                }
+            };
+            Self { unix }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        if let Some((term, int)) = self.unix.as_mut() {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            return;
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn run(cli: Cli, st: &Style) -> Result<()> {
     match &cli.command {
         Command::Init { dir, force } => init(dir, *force, st),
@@ -1229,9 +1958,29 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                 cfg.engine.postgres.tenant = t.clone();
             }
             let hub = onto_intelli::Hub::open(cfg.clone()).await?;
-            // Open the default tenant now: configuration problems show at startup.
-            let intelli = hub.tenant(hub.default_tenant()).await?;
             let control = if cfg.console.enabled { Some(open_control(&cfg).await?) } else { None };
+            // Everything that can fail at startup fails before the banner:
+            // the port, authentication (a reserved principal id), the
+            // console's rules, development mode on loopback only, routes.
+            let listener = onto_grpc::bind(&cfg.grpc.listen).await?;
+            let server = onto_grpc::prepare(
+                hub.clone(),
+                onto_grpc::ServeOptions { dev: *dev, control: control.clone() },
+                listener,
+            )
+            .await?;
+            // Open the default tenant now: configuration problems show at startup.
+            let intelli = match hub.tenant(hub.default_tenant()).await {
+                Ok(i) => i,
+                Err(e) => {
+                    hub.shutdown(Duration::from_secs(5)).await;
+                    return Err(e);
+                }
+            };
+            // Signals are caught from here on (not only once serving starts).
+            let mut stop = StopSignal::install();
+            // Stand for the deployment's wake scanner (PostgreSQL; one process is elected).
+            hub.start_wake_scanner();
             let mut auth = if *dev || cfg.auth.mode == "dev" {
                 st.red("DEVELOPMENT MODE, no authentication")
             } else {
@@ -1259,7 +2008,7 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             eprintln!(
                 "{} gRPC + HTTP on {} · storage {} · {} · tenant {}{} · llm {} ({})",
                 st.bold("onto-intelli"),
-                cfg.grpc.listen,
+                server.local_addr().map_or_else(|| cfg.grpc.listen.clone(), |a| a.to_string()),
                 cfg.engine.storage,
                 auth,
                 hub.default_tenant(),
@@ -1273,11 +2022,30 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
                     st.red("!")
                 );
             }
-            onto_grpc::serve_hub(hub, onto_grpc::ServeOptions { dev: *dev, control }, async {
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("\nshutting down");
-            })
-            .await
+            drop(intelli);
+            let grace = Duration::from_secs(cfg.grpc.shutdown_grace_secs);
+            let signal = async move {
+                stop.next().await;
+                eprintln!("\nshutting down (up to {}s; signal again to stop at once)", grace.as_secs());
+                // A second signal stops at once: what is still held expires on its own.
+                tokio::spawn(async move {
+                    stop.next().await;
+                    eprintln!("stopped at once");
+                    std::process::exit(130);
+                });
+            };
+            let released = server.run_graceful(signal, grace).await?;
+            eprintln!(
+                "stopped · released {}, {}{}",
+                n_of(released.leases as u64, "lease"),
+                n_of(released.claims as u64, "claimed outbox row"),
+                if released.cut > 0 {
+                    format!(" · {} cut at the deadline", n_of(released.cut as u64, "worker"))
+                } else {
+                    String::new()
+                }
+            );
+            Ok(())
         }
         Command::Ask { question, mode, json: as_json, context, stream, no_cache, budget } => {
             let q = question.join(" ");
@@ -1776,6 +2544,9 @@ async fn run(cli: Cli, st: &Style) -> Result<()> {
             }
             Ok(())
         }
+        Command::Watch(w) => watch(&cli, w, st).await,
+        Command::Webhook { sub } => webhook(&cli, sub, st).await,
+        Command::Automation { sub } => automation(&cli, sub, st).await,
         Command::Changes { days, within } => {
             let be = backend(&cli).await?;
             let r = be
@@ -2506,8 +3277,21 @@ async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
         }
         ConsoleCmd::RotateMasterKey { json: as_json } => {
             let report = control.rotate_master_key().await?;
+            // Webhook and writeback signing secrets live in each tenant.
+            let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            let mut secrets = onto_intelli::webhooks::RewrapReport::default();
+            for t in hub.known_tenants()? {
+                let intelli = hub.tenant(&t).await?;
+                if let Some(r) = control.rewrap_tenant_secrets(&t, intelli.ontology()).await? {
+                    secrets.rewrapped += r.rewrapped;
+                    secrets.current += r.current;
+                    secrets.failed.extend(r.failed.into_iter().map(|(what, why)| (format!("{t} {what}"), why)));
+                }
+            }
             if *as_json {
-                print_json(&json!(report));
+                let mut out = json!(report);
+                out["secrets"] = json!(secrets);
+                print_json(&out);
             } else {
                 println!(
                     "Rewrapped {} LLM keys under the current ONTO_MASTER_KEY; {} already were.",
@@ -2517,17 +3301,26 @@ async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
                 for (project, why) in &report.failed {
                     println!("  {} {project}: {why}", st.red("failed"));
                 }
-                if report.failed.is_empty() && report.rewrapped > 0 {
+                println!(
+                    "Rewrapped {} webhook and writeback secrets; {} already were.",
+                    st.bold(&secrets.rewrapped.to_string()),
+                    secrets.current
+                );
+                for (what, why) in &secrets.failed {
+                    println!("  {} {what}: {why}", st.red("failed"));
+                }
+                if report.failed.is_empty() && secrets.failed.is_empty() && report.rewrapped + secrets.rewrapped > 0 {
                     println!(
                         "{}",
                         st.dim("ONTO_MASTER_KEY_PREVIOUS can be removed once every replica runs on the new key.")
                     );
                 }
             }
-            if report.failed.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::Invalid(format!("{} keys did not decrypt", report.failed.len())))
+            match (report.failed.len(), secrets.failed.len()) {
+                (0, 0) => Ok(()),
+                (keys, secrets) => {
+                    Err(Error::Invalid(format!("{keys} LLM keys and {secrets} outbound secrets were not rewrapped")))
+                }
             }
         }
     }
@@ -2723,6 +3516,33 @@ mod tests {
     fn command_line_definition_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn remote_errors_name_their_code_once() {
+        use super::Error;
+        use serde_json::json;
+        // Every variant the server sends: its message is the server-side
+        // Display, so it already starts with the code's words.
+        for e in [
+            Error::NotFound("entity Order/1".into()),
+            Error::Invalid("bad template".into()),
+            Error::Denied("principal lacks automation.manage".into()),
+            Error::Conflict("version moved".into()),
+            Error::Limited("quota spent; retry in 5 s".into()),
+            Error::Unavailable("store is down".into()),
+        ] {
+            let body = json!({ "error": { "code": e.code(), "message": e.to_string() } });
+            let local = super::remote_error(&body);
+            assert_eq!(local.to_string(), e.to_string(), "{}", e.code());
+            assert_eq!(local.code(), e.code());
+        }
+        // A message without the prefix (another server, a proxy) is kept whole.
+        let body = json!({ "error": { "code": "permission_denied", "message": "no" } });
+        assert_eq!(super::remote_error(&body).to_string(), "permission denied: no");
+        // Internal errors carry no prefix and keep the message as sent.
+        let body = json!({ "error": { "code": "internal", "message": "storage: boom" } });
+        assert_eq!(super::remote_error(&body).to_string(), "storage: boom");
     }
 
     #[test]

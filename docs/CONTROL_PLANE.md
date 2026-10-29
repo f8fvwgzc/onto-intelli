@@ -113,7 +113,7 @@ What the console borrows, and from whom:
 | | `src/keys.rs` | Key generation, parsing, peppered SHA-256, constant-time check, key cache, batched `last_used_at`; the random, SHA-256 and HMAC helpers the rest of the crate uses. |
 | | `src/vault.rs` | AES-256-GCM envelope under `ONTO_MASTER_KEY`. |
 | | `src/llm.rs` | BYO LLM on `Control`: `LlmUpdate` (the `PUT …/llm` body), validation, `put_llm`, `delete_llm`, `llm_view`, `provider_for`, `test_llm`, `usage_report`, `rotate_master_key`, `limits_of`. |
-| | `src/net.rs` | The SSRF guard: `public_ip`, the `PublicOnly` DNS resolver, `check_url`, `check_headers`, `client`; stage 6: `check_git_url` (section 14). |
+| | `src/net.rs` | The SSRF guard: `public_ip`, the `PublicOnly` DNS resolver, `check_url`, `check_headers`, `client`, re-exported from `onto_intelli::net` since phase 1 of docs/design/EVENTS.md (webhook and writeback delivery share them); stage 6: `check_git_url` (section 14). |
 | | `src/oidc.rs` | Discovery, PKCE, JWKS cache, JWT verification, token exchange, userinfo; `Provider` per `[[console.oidc]]` entry. |
 | | `src/signin.rs` | The OIDC sign-in flow on `Control`: `oidc_start`, `oidc_callback` (section 7.4's rules), `exchange_ticket`, the start rate limit and the startup checks of the providers. |
 | | `src/hooks.rs` | `ControlHooks` (the `TenantHooks` implementation: per-project provider, limits, usage meter, trace settings), `Meter`, `install` (sets the hooks on the Hub and starts the usage and settings task), `Control::flush_usage`, `reload_usage`, `poll_settings`; stage 4: `trace_settings_of`, `check_trace_settings`. |
@@ -195,6 +195,9 @@ max_content_bytes = 4096
 # Which engine calls become traces besides intelli.ask: "writes" (writing
 # actions and LLM-using actions), "all", or "none".
 calls = "writes"
+# Webhook and writeback delivery attempts that become traces of kind
+# "delivery": "failures" (retried and dead attempts), "all", or "off".
+deliveries = "failures"
 # Background writer: flush every this many ms or records.
 flush_ms = 500
 flush_records = 200
@@ -604,6 +607,24 @@ maps its identities onto it:
 | API key with `impersonate` acting for a user | the `x-onto-act-as` value, `via = key:<prefix>` | from `x-onto-act-roles`, limited to `impersonate_roles` ⊆ the key's roles | ⊆ the key's |
 | Config token, CLI, dev | unchanged | unchanged | unchanged |
 
+**Reserved service principal ids.** `automation:`, `webhook:`, `writeback:`,
+`connector:` and `system` (`onto_core::policy::RESERVED_ID_PREFIXES`,
+compared case-insensitively) name the engine's own service principals: an
+automation runs as `automation:<name>`, a webhook endpoint's receiver sees
+what `webhook:<name>` may see. No credential may be or act as one:
+`x-onto-act-as` with such an id is 403 (API keys with impersonation and
+impersonating config tokens alike), a config token whose principal id is
+reserved is a configuration error at startup, and console users
+(`user:<id>`) and API keys (`key:<prefix>`) cannot produce one. Phase 1
+declares these principals locally, with a 30-day enablement for automations
+(`[automation] enable_ttl_days`), until Tutela issues them; Tutela must
+refuse to mint ids with these prefixes (a cross-core contract item).
+
+```text
+x-onto-act-as: automation:escalate_blocked
+{"error":{"code":"permission_denied","message":"automation:escalate_blocked is a reserved service principal id (automation:, webhook:, connector:, system); no credential may act as it"}}
+```
+
 `developer` and `observer` are custom roles (`Role::Custom`). Reading
 traces, sessions and metrics needs `Principal::can_observe()`: `admin`,
 `system`, `developer` or `observer`. An API key therefore reads traces only
@@ -1010,7 +1031,11 @@ blob = 0x01                              version
   (the secrets themselves are not re-encrypted; each row is replaced only if
   it still holds the blob that was rewrapped) and reports how many rows it
   changed, how many already were current, and the ones that failed to
-  decrypt (then it exits non-zero). Rotation: set the new key as
+  decrypt (then it exits non-zero). That covers the LLM keys and, in every
+  tenant, the sealed signing secrets of webhook endpoints and writeback
+  targets (`secret` and `previous_secret`, written again with a
+  `webhook.secret_rewrap` or `writeback.secret_rewrap` audit event and
+  their version unchanged, so enabled automations stay bound). Rotation: set the new key as
   `ONTO_MASTER_KEY` and the old one as `ONTO_MASTER_KEY_PREVIOUS` on every
   replica, run the command, then remove the previous key.
 * Without `ONTO_MASTER_KEY`, `PUT …/llm` with an `api_key` is refused
@@ -1255,6 +1280,31 @@ As built:
   `capture_content`, a call's `input` is `{input: <JSON text>}` (plus
   `question` when the input has one) and `output` `{output: <JSON text>}`,
   both clipped.
+* Background work of the change feed (docs/design/EVENTS.md B.7 and
+  section 11), with `source = "worker"`: every automation run that ends is
+  a trace of kind `automation` (`automation.run:<name>`, id = the run's
+  `trace_id`, root span the run, a child span per effect); delivery
+  attempts are traces of kind `delivery` (`webhook.deliver:<endpoint>`,
+  `writeback.deliver:<target>`) as `[traces] deliveries` selects
+  (`failures`, the default; `all`; `off`). Neither keeps a payload, body,
+  header, signature, secret or URL. Their `otel_trace_id` is the trace the
+  work continues: the caller's `traceparent` trace, else the trace that
+  recorded the causing call. Calls pass that id on to what they enqueue
+  (change records' `cause.trace_id`, outbox rows' `otel_trace_id`), and
+  deliveries send it as `traceparent`. Beyond the workspace rule, these
+  traces (principals `automation:`, `webhook:`, `writeback:`) show only to
+  callers who may see the run or delivery itself: who dominate the
+  automation's `run_as` (as `automation.runs`), or who may manage the
+  endpoint or target (as `outbox.list`); those of removed ones only to
+  tenant-wide admins. `trace.list` and `trace.session` leave the others
+  out, and `trace.get` answers `not_found`. So `trace.list
+  {otel_trace_id}` lists a call's runs and deliveries; it lists the call
+  as well only when the caller sent `traceparent` (otherwise the call's
+  own trace id is the one passed on, found with `trace.get`). Known gap
+  (docs run 2, not fixed): an `automation` trace's `ts` is when it was
+  written and its durations are 0, since the traced run row lacks the
+  claim's `started_at`; the run row has the run's times. docs/AUTOMATE.md
+  section 5 shows these traces from a real run.
 * `eval.run`: each case is a trace of kind `eval` named `eval.case`
   (`metadata.case` is the case's name, tag `eval`, the session and source
   of the caller) with an `eval.pass` score (1 or 0, `source = "eval"`,
@@ -1654,6 +1704,53 @@ gRPC handler builds the same context from the request metadata (source
 `grpc`) and returns `x-onto-trace-id` in the response metadata. The
 built-in proto's `AskRequest` gains `google.protobuf.Struct trace = 9` and
 `AskResponse` `string trace_id = 20`.
+
+### Change feed, webhooks, automations and writeback (`onto-grpc/src/http.rs`)
+
+Data-plane routes over the actions of docs/AUTOMATE.md, authenticated like
+any data-plane request. Each runs `run`'s checks (tenant admission and the
+reference guard below); the action decides who may. Agents never configure
+outbound delivery or enable automations; they reach automations only through
+`schema.propose`. Every action is also on `POST /v1/call/{action}` and the
+gRPC services listed after the table.
+
+| Method and path | Action | Who |
+|---|---|---|
+| `GET /v1/changes?after=&kinds=&…` | `changes.poll` | any reader; records are filtered per reader |
+| `GET /v1/changes/head` | `changes.head` | any reader |
+| `POST /v1/changes/capture` | `changes.capture` | admins of every workspace |
+| `GET\|POST /v1/changes/stream` | the SSE stream (`retry:`, `id:` = cursor) | any reader; re-authenticated every `[changes] reauth_secs` |
+| `GET /v1/webhooks` | `webhook.list` | admins; endpoints the caller does not dominate show their URL's origin only |
+| `POST /v1/webhooks` | `webhook.add` | admins who dominate the endpoint principal |
+| `PATCH\|DELETE /v1/webhooks/{name}` | `webhook.update`, `webhook.remove` | as add |
+| `GET /v1/webhooks/{name}/deliveries` | `webhook.deliveries` | as add (it shows receiver responses) |
+| `POST /v1/webhooks/{name}/{test\|rotate_secret\|replay\|resume}` | `webhook.<verb>` | as add |
+| `POST /v1/webhooks/kill` | `webhook.kill` | on: admins; off: dominance over every endpoint |
+| `GET /v1/outbox` | `outbox.list` | admins; rows of endpoints they do not dominate are hidden and counted |
+| `GET\|POST /v1/writeback/targets` | `writeback.list`, `writeback.add` | admins; add dominates `{admin, workspaces}` of the target |
+| `DELETE /v1/writeback/targets/{name}`, `POST …/{name}/test` | `writeback.remove`, `writeback.test` | as add |
+| `GET /v1/automations`, `GET /v1/automations/{name}` | `automation.list`, `automation.get` | schema readers |
+| `GET /v1/automations/{name}/runs`, `…/runs/{id}` | `automation.runs` | schema readers; runs show to callers who dominate `run_as`, others are counted in `hidden` |
+| `POST /v1/automations/{name}/test` | `automation.test` | any reader; evaluated as the run principal and the caller together |
+| `POST /v1/automations/{name}/{enable\|disable}` | `automation.enable`, `automation.disable` | enable: approvers or admins who dominate `run_as`; disable: those, or any admin |
+| `POST /v1/automations/{name}/runs/{id}/rerun` | `automation.rerun` | as enable |
+| `POST /v1/automations/kill` | `automation.kill` | admins, never agents |
+
+"Dominates" is `onto_core::policy::dominates`: the caller is not an agent
+and covers every workspace and role of the principal the configuration acts
+as (an admin in those workspaces covers every role). `kill` is not a valid
+endpoint name (`POST /v1/webhooks/kill` is the switch); a `GET
+/v1/automations/kill` reads an automation named `kill`. Refusals for want of
+dominance are audited as `authorization.denied`.
+
+gRPC: `ChangeService` (Poll, Head, Capture), `WebhookService` (Add, Update,
+Remove, List, Test, RotateSecret, Deliveries, Replay, Resume, Kill, Outbox),
+`AutomateService` (List, Get, Runs, Test, Enable, Disable, Rerun, Kill) and
+`WritebackService` (Add, List, Remove, Test), all unary with `Struct`
+requests and responses, mapped in `BUILTIN_ROUTES`. The change stream is
+HTTP only in this version. Inbound `x-onto-cause-depth` and
+`x-onto-cause-run` (an automation's cause, sent back by a service that a
+webhook started) are read from config tokens only, and only raise the depth.
 
 ### MCP over HTTP (`onto-grpc/src/mcp_http.rs`)
 
@@ -2265,6 +2362,45 @@ As built:
   too. As built (stage 6) the guard is `async fn guard_project_call(credential,
   action, &mut input, allow_private)`; HTTP routes, the generic `Call` and the
   dynamic gRPC routes pass `Auth::allow_private_urls()`.
+* **Outbound webhooks and writeback** (`onto_intelli::net`, docs/AUTOMATE.md):
+  endpoint URLs and writeback base URLs are checked when they are written and
+  again at every request, where the client's resolver judges every address
+  right before connecting (no rebinding window; IP literals are checked
+  before the request is built). Rules:
+  * `https://` only, unless the host is allow-listed (or
+    `console.allow_private_urls` in development); no userinfo, no fragment.
+  * Always refused, allow-listed or not: link-local and metadata ranges
+    (169.254.0.0/16, fe80::/10, 100.100.100.200/32, fd00:ec2::254/128),
+    0.0.0.0/8, multicast, broadcast, reserved (240.0.0.0/4), and their
+    IPv4-mapped and NAT64 forms (the local-use prefix 64:ff9b:1::/48 whole). `https://169.254.169.254/` and
+    `https://[::ffff:169.254.169.254]/` are refused with "a link-local,
+    metadata or reserved address".
+  * Loopback and private ranges are refused unless the operator allow-lists
+    the host: `[[webhooks.allow]] host = "hooks.internal.example"` (or
+    `"*.suffix"`, or an address) with `cidrs`, and that name may then
+    resolve only into those CIDRs. A rule whose CIDRs touch the always-refused
+    ranges is a configuration error at startup. Rules never apply to
+    endpoints or targets a project credential registered (`restricted`):
+    those reach public addresses only. There are no per-project allow lists.
+  * Redirects are not followed and no proxy is used. A writeback request URL
+    is the base (with a trailing `/`) joined with a relative route that may
+    not contain `//`, `@`, `\` or `..`, and the worker asserts that the host
+    and port are the base's.
+  * Errors about a URL that came from an `env:`/`file:` reference name the
+    reference and the kind of failure, never the value or the refused
+    address.
+* **References to the server's environment** (`guard_call`, onto-grpc
+  auth.rs): `env:` and `file:` strings are accepted only in the inputs of
+  `REF_ACTIONS` (`connector.add`, `webhook.add`, `webhook.update`,
+  `webhook.rotate_secret`, `writeback.add`), and there only from the
+  operator: a config token or dev mode, without `x-onto-act-as`. Anywhere
+  else they are plain data. Resolution errors name the reference, never its
+  value. Without `ONTO_MASTER_KEY` a server has no sealer for webhook and
+  writeback secrets, so plaintext and generated secrets are refused and the
+  operator registers references.
+* **Reserved principal ids**: `automation:`, `webhook:`, `connector:` and
+  `system` are refused as `x-onto-act-as` values and as config-token
+  principal ids (section 5).
 * **Roles**: enforced on the server for every console route (section 5); the
   UI only hides what the server refuses anyway. The last owner cannot be
   removed or demoted.

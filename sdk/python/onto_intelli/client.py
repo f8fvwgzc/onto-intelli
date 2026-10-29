@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterator, List, Mapping, Optional, TypedDict, Union
 
+from .changes import Changes
 from .errors import OntoError
 from .sse import parse_sse
 
@@ -356,6 +357,8 @@ class Onto:
         self.traces = _Traces(self)
         self.sessions = _Sessions(self)
         self.auth = _Auth(self)
+        #: The change feed: ``subscribe`` (a live stream), ``poll``, ``head``.
+        self.changes = Changes(self)
 
     def __repr__(self) -> str:
         return "Onto(url={!r}, tenant={!r}, workspace={!r}, api_key={})".format(
@@ -373,6 +376,7 @@ class Onto:
         stream: bool = False,
         session_id: Optional[str] = None,
         workspace: Optional[str] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
     ) -> Any:
         """One request with the retries of 429 and 503; the open response."""
         headers = {"accept": "text/event-stream" if stream else "application/json"}
@@ -387,6 +391,7 @@ class Onto:
         sid = session_id or self.session_id
         if sid:
             headers["x-onto-session-id"] = sid
+        headers.update(extra_headers or {})
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")

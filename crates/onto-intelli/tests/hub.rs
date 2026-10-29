@@ -64,6 +64,81 @@ async fn every_listed_action_is_dispatched() {
     }
 }
 
+#[tokio::test]
+async fn change_feed_actions_through_the_hub() {
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let a = hub.tenant("ws_a").await.unwrap();
+    let b = hub.tenant("ws_b").await.unwrap();
+    seed::load_demo(&a, "acme").await.unwrap();
+    let admin = Principal::admin("x");
+    let head = a.call(&admin, "changes.head", json!({})).await.unwrap();
+    assert_eq!(head["capture"], true, "{head}");
+    let start = head["cursor"].as_str().unwrap().to_string();
+    let b_head = b.call(&admin, "changes.head", json!({})).await.unwrap();
+
+    a.call(&admin, "entity.upsert", json!({ "id": "task:feed", "title": "Feed", "workspace": "acme" })).await.unwrap();
+    let page = a.call(&admin, "changes.poll", json!({ "after": start })).await.unwrap();
+    let changes = page["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{page}");
+    assert_eq!((changes[0]["op"].as_str(), changes[0]["id"].as_str()), (Some("entity.create"), Some("task:feed")));
+    assert_eq!(changes[0]["cause"]["source"], "api");
+    assert_eq!(page["next"], changes[0]["cursor"]);
+    assert_eq!(page["expired"], false);
+    // The other tenant's feed did not move.
+    assert_eq!(b.call(&admin, "changes.head", json!({})).await.unwrap(), b_head);
+
+    // Readers get what they may see; next still moves past the rest.
+    let outsider = Principal::named("user:o", &["viewer"], &["elsewhere"]).unwrap();
+    let theirs = a.call(&outsider, "changes.poll", json!({ "after": start })).await.unwrap();
+    assert!(theirs["changes"].as_array().unwrap().is_empty(), "{theirs}");
+    assert_eq!(theirs["next"], page["next"]);
+    let nobody = Principal::named("user:n", &[], &["acme"]).unwrap();
+    assert!(a.call(&nobody, "changes.head", json!({})).await.is_err(), "no read role");
+
+    // Agents read the feed but never switch capture.
+    let agent = Principal::named("agent:bot", &["admin", "agent"], &["*"]).unwrap();
+    assert!(a.call(&agent, "changes.poll", json!({ "from": "now" })).await.is_ok());
+    let err = a.call(&agent, "changes.capture", json!({ "on": false })).await.unwrap_err();
+    assert!(matches!(err, onto_intelli::Error::Denied(ref m) if m.contains("not open to agents")), "{err}");
+    assert!(a.admit(&agent, "changes.capture", &json!({})).is_err());
+    assert!(a.admit(&agent, "changes.poll", &json!({})).is_ok());
+    assert!(a.admit(&agent, "changes.stream", &json!({})).is_ok(), "a read outside the table");
+    // Nor does an admin of one workspace.
+    let scoped = Principal::named("user:w", &["admin"], &["acme"]).unwrap();
+    assert!(matches!(
+        a.call(&scoped, "changes.capture", json!({ "on": false })).await.unwrap_err(),
+        onto_intelli::Error::Denied(_)
+    ));
+
+    // Off, an unrecorded write, on: the old cursor is expired, with a message.
+    let off = a.call(&admin, "changes.capture", json!({ "on": false })).await.unwrap();
+    assert_eq!(off["capture"], false);
+    a.call(&admin, "entity.patch", json!({ "id": "task:feed", "title": "Unrecorded" })).await.unwrap();
+    let on = a.call(&admin, "changes.capture", json!({ "off": false })).await.unwrap();
+    assert_eq!(on["capture"], true);
+    let expired = a.call(&admin, "changes.poll", json!({ "after": page["next"] })).await.unwrap();
+    assert_eq!(expired["expired"], true, "{expired}");
+    assert!(expired["message"].as_str().unwrap().contains("not pinned to a cursor"), "{expired}");
+    let resumed = a.call(&admin, "changes.poll", json!({ "after": on["cursor"] })).await.unwrap();
+    assert_eq!(resumed["expired"], false);
+    let audit = a.call(&admin, "event.list", json!({ "action": "changes.capture" })).await.unwrap();
+    assert_eq!(audit["events"].as_array().unwrap().len(), 2, "{audit}");
+
+    // Inputs are checked.
+    for bad in [
+        json!({ "after": "soon" }),
+        json!({ "after": start, "from": "now" }),
+        json!({ "from": "yesterday" }),
+        json!({ "ops": ["entity.created"] }),
+        json!({ "fields": "some" }),
+    ] {
+        let err = a.call(&admin, "changes.poll", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "{bad}: {err}");
+        assert!(err.to_string().contains("changes.poll"), "{bad}: {err}");
+    }
+    assert_eq!(a.call(&admin, "changes.capture", json!({})).await.unwrap_err().code(), "invalid_argument");
+}
+
 mod hooks {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -146,6 +221,7 @@ mod hooks {
             meter: Some(meter.clone()),
             version: 2,
             traces: onto_intelli::trace::TraceSettings { retention_days: Some(3), capture_content: Some(false) },
+            secrets: None,
         };
         assert_eq!(t.call(&p, "intelli.ask", q.clone()).await.unwrap()["provider"], "mock", "until refreshed");
         assert!((t.trace_retention_days(), t.captures_content()) == (30, true));
@@ -264,4 +340,72 @@ async fn every_write_action_is_classified_for_agents() {
             assert_eq!(refused, !open, "{} (agent_raw_writes = {raw_writes})", a.name);
         }
     }
+}
+
+#[tokio::test]
+async fn an_evicted_tenant_ends_its_streams_and_leaves_one_ontology() {
+    use onto_intelli::changes::{Frame, Start};
+    use onto_intelli::core::changes::ChangeFilter;
+
+    let hub = Hub::open(Config::in_memory()).await.unwrap();
+    let t = hub.tenant("t").await.unwrap();
+    let admin = Principal::admin("x");
+    let mut sub = t.subscribe_changes(admin.clone(), ChangeFilter::default(), Start::Now, None).await.unwrap();
+    t.call(&admin, "entity.upsert", json!({ "id": "task:live", "title": "live" })).await.unwrap();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await.unwrap() {
+        Some(Frame::Change(r)) => assert_eq!(r.id, "task:live"),
+        other => panic!("expected the record: {other:?}"),
+    }
+    // The ring holds the record and counts toward the tenant's memory.
+    assert!(t.changes().bytes() > 0);
+    assert_eq!(t.estimated_bytes(), t.ontology().estimated_bytes() + t.changes().bytes() as u64);
+    let stats = hub.tenant_stats();
+    assert_eq!((stats[0].streams, stats[0].ring_bytes), (1, t.changes().bytes() as u64), "{stats:?}");
+
+    let old = std::sync::Arc::downgrade(&t);
+    drop(t);
+    assert!(hub.evict("t"));
+    let last = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match sub.recv().await {
+                Some(Frame::End { code, .. }) => return code,
+                Some(_) => {}
+                None => panic!("the stream ended without an end frame"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(last, "tenant_closed");
+    assert!(sub.recv().await.is_none(), "end is the last frame");
+    // Nothing keeps the evicted tenant alive: the next request opens the only one.
+    for _ in 0..100 {
+        if old.strong_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(old.strong_count(), 0, "the stream released the evicted tenant");
+    let again = hub.tenant("t").await.unwrap();
+    assert!(!again.is_closing());
+    assert_eq!(again.changes().subscribers(), 0);
+    assert_eq!(hub.open_tenants(), vec!["t"]);
+}
+
+/// While a shutdown drains, a tenant that is already open keeps serving
+/// the requests still in flight; only opening a tenant is refused.
+#[tokio::test]
+async fn a_draining_hub_serves_open_tenants_and_opens_none() {
+    let mut cfg = Config::in_memory();
+    cfg.engine.tenancy = "multi".into();
+    let hub = Hub::open(cfg).await.unwrap();
+    let open = hub.resolve(None).await.unwrap();
+    hub.tenant("ws_a").await.unwrap();
+    hub.begin_shutdown();
+    let again = hub.resolve(None).await.expect("the open default tenant still serves");
+    assert!(std::sync::Arc::ptr_eq(&open, &again));
+    assert!(hub.tenant("ws_a").await.is_ok(), "an open tenant still serves");
+    let Err(refused) = hub.tenant("ws_new").await else { panic!("no tenant opens while draining") };
+    assert!(matches!(refused, onto_intelli::Error::Unavailable(_)), "{refused}");
+    assert!(!hub.open_tenants().contains(&"ws_new".to_string()), "a refused tenant leaves no slot");
 }

@@ -1,6 +1,7 @@
 //! Outbound requests a project chooses the target of (its LLM base URL,
 //! and the git and PostgreSQL URLs of connectors its credentials register):
-//! the SSRF guard of docs/CONTROL_PLANE.md section 14.
+//! the SSRF guard of docs/CONTROL_PLANE.md section 14. The client and the
+//! checks are [`onto_intelli::net`]'s (docs/design/EVENTS.md B.5).
 //!
 //! Unless `console.allow_private_urls` is set, a URL must be `https` and its
 //! host must resolve only to public addresses. The check runs on the
@@ -13,138 +14,15 @@
 //! the IPv4 address inside). Redirects are never followed and no proxy is
 //! used.
 
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
-
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-
 use onto_core::{Error, Result};
 
-/// Header names a project may not set: they carry credentials. So does a
-/// name with a part (between `-`, `_` or `.`) that is one of
-/// [`CREDENTIAL_WORDS`], starts with `auth`, or ends with `token`, `secret`,
-/// `password` or `apikey` (`x-goog-api-key`, `x-portkey-api-key`,
-/// `helicone-auth`, `x-auth-token`, `x-accesstoken`, …).
-pub const CREDENTIAL_HEADERS: [&str; 5] = ["authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"];
-
-/// Parts of header names that mark a credential.
-pub const CREDENTIAL_WORDS: [&str; 9] =
-    ["key", "token", "secret", "password", "passwd", "credential", "credentials", "cookie", "signature"];
-
-/// Does the header `name` (any case) carry credentials? Extra headers are
-/// stored in plaintext and shown to every project member, so such headers
-/// are refused; the provider's key goes in `api_key`, sealed.
-pub fn credential_header(name: &str) -> bool {
-    let n = name.trim().to_ascii_lowercase();
-    CREDENTIAL_HEADERS.contains(&n.as_str())
-        || n.split(['-', '_', '.']).any(|part| {
-            CREDENTIAL_WORDS.contains(&part)
-                || part.starts_with("auth")
-                || ["token", "secret", "password", "apikey"].iter().any(|w| part.ends_with(w))
-        })
-}
-
-pub use onto_intelli::net::public_ip;
-
-/// A DNS resolver that answers only with public addresses: a name with any
-/// non-public address is refused.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PublicOnly;
-
-impl Resolve for PublicOnly {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if addrs.is_empty() {
-                return Err(format!("{host} has no addresses").into());
-            }
-            if let Some(bad) = addrs.iter().find(|a| !public_ip(a.ip())) {
-                return Err(format!(
-                    "refused: {host} resolves to {}, not a public address (console.allow_private_urls is off)",
-                    bad.ip()
-                )
-                .into());
-            }
-            Ok(Box::new(addrs.into_iter()) as Addrs)
-        })
-    }
-}
-
-/// Check a project-chosen base URL: `https` (or `http` with
-/// `allow_private`), a host, no credentials, query or fragment, and an IP
-/// literal host only when public (or `allow_private`). Returns it without a
-/// trailing `/`.
-pub fn check_url(raw: &str, allow_private: bool) -> Result<String> {
-    let raw = raw.trim();
-    let url = url::Url::parse(raw).map_err(|e| Error::invalid(format!("base_url '{raw}': {e}")))?;
-    match url.scheme() {
-        "https" => {}
-        "http" if allow_private => {}
-        "http" => {
-            return Err(Error::invalid(format!(
-                "base_url '{raw}' must be https:// (http:// needs console.allow_private_urls)"
-            )));
-        }
-        other => return Err(Error::invalid(format!("base_url '{raw}': scheme {other} is not http(s)"))),
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(Error::invalid("base_url may not carry credentials; use the api_key field"));
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(Error::invalid("base_url may not have a query or a fragment"));
-    }
-    let ip = match url.host() {
-        None => return Err(Error::invalid(format!("base_url '{raw}' has no host"))),
-        Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
-        Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
-        Some(url::Host::Domain(_)) => None,
-    };
-    if let Some(ip) = ip
-        && !allow_private
-        && !public_ip(ip)
-    {
-        return Err(Error::invalid(format!(
-            "base_url '{raw}': {ip} is not a public address (console.allow_private_urls is off)"
-        )));
-    }
-    Ok(raw.trim_end_matches('/').to_string())
-}
-
-/// Check extra request headers: valid names and values, and none that
-/// carries credentials.
-pub fn check_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<()> {
-    if headers.len() > 20 {
-        return Err(Error::invalid("at most 20 extra headers"));
-    }
-    for (k, v) in headers {
-        let name = reqwest::header::HeaderName::from_bytes(k.trim().as_bytes())
-            .map_err(|_| Error::invalid(format!("'{k}' is not a valid header name")))?;
-        if credential_header(name.as_str()) {
-            return Err(Error::invalid(format!(
-                "header {k} carries credentials and may not be set (the API key goes in api_key)"
-            )));
-        }
-        if reqwest::header::HeaderValue::from_str(v).is_err() || v.len() > 1024 {
-            return Err(Error::invalid(format!("the value of header {k} is not a valid header value")));
-        }
-    }
-    Ok(())
-}
-
-/// The HTTP client of project providers: no redirects, no proxy, the given
-/// timeout, and (unless `allow_private`) the [`PublicOnly`] resolver.
-pub fn client(allow_private: bool, timeout: Duration) -> Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(timeout)
-        .connect_timeout(timeout.min(Duration::from_secs(10)));
-    if !allow_private {
-        b = b.dns_resolver(PublicOnly);
-    }
-    b.build().map_err(|e| Error::Config(format!("http client: {e}")))
-}
+/// The guarded client, the URL and header checks and the address rules live
+/// in [`onto_intelli::net`] (shared with webhook delivery); they are
+/// re-exported here.
+pub use onto_intelli::net::{
+    AllowRule, CREDENTIAL_HEADERS, CREDENTIAL_WORDS, Cidr, Guarded, PublicOnly, Reach, always_denied, check_headers,
+    check_target_url, check_url, client, credential_header, guarded_client, join_route, public_ip,
+};
 
 /// Check a git URL a project credential registers (a repository
 /// connector) with [`onto_intelli::connectors::repo::restricted_reach`]:
@@ -173,6 +51,7 @@ pub async fn check_pg_url(raw: &str, allow_private: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::dns::Resolve;
 
     #[tokio::test]
     async fn git_urls() {

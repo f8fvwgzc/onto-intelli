@@ -54,6 +54,7 @@ lets an admin apply a change that touches locked definitions ([Locks](#locks)).
 | `put_action_type` / `delete_action_type` | `name`, `def` | parameters, preconditions, effects, roles, risk |
 | `put_rule` / `delete_rule` | `def` / `name` | `{ name, chain: [...], infer }` or `{ name, when: [[s, p, o], ...], then: [s, p, o] }` ([Rules](#rules)) |
 | `put_shape` / `delete_shape` | `name`, `def` / `name` | a shape ([Shapes](#shapes)) |
+| `put_automation` / `delete_automation` | `name`, `def` / `name` | a change-triggered automation (`run_as`, `trigger`, `conditions`, `effects`; docs/design/EVENTS.md Part C). Defining one does not enable it; a changed definition stays inactive until a person enables it again. Automation definitions are visible to everyone who can read the schema, so they may not hold `env:`, `file:` or `sealed:` references. At most `[automation] max_automations` per schema, checked at apply and propose |
 | `put_metric` / `delete_metric` | `name`, `def` | |
 | `put_glossary_term` / `delete_glossary_term` | `section` (`kinds`, `relations`, `dimensions`), `word`, `target` | |
 | `set_analysis` | `def` | root-cause, impact, scope and containment relations |

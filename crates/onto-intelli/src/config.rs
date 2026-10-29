@@ -40,6 +40,15 @@ pub struct Config {
     pub console: ConsoleConfig,
     /// Traces of asks, actions and calls (docs/CONTROL_PLANE.md section 9).
     pub traces: TracesConfig,
+    /// Reading the change feed (`changes.poll`). Capture itself is a tenant
+    /// property (`changes.capture`), not process configuration.
+    pub changes: ChangesConfig,
+    /// Webhook delivery from the outbox (docs/design/EVENTS.md Part B).
+    pub webhooks: WebhooksConfig,
+    /// Change-triggered automations (docs/design/EVENTS.md Part C).
+    pub automation: AutomationConfig,
+    /// HTTP writeback effects of action types (docs/design/EVENTS.md Part D).
+    pub writeback: WritebackConfig,
     /// Directory relative paths are resolved against (the config file's dir).
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -80,6 +89,9 @@ pub struct EngineConfig {
     /// Close the least recently used PostgreSQL tenants while the open ones'
     /// estimated memory (`estimated_bytes`) is above this many MiB (0: no budget).
     pub tenant_memory_budget_mb: u64,
+    /// The deployment's wake scanner (PostgreSQL, `Hub::start_wake_scanner`)
+    /// polls this often when no wake notice arrives (0: no scanner here).
+    pub wake_poll_secs: u64,
     pub postgres: PostgresConfig,
 }
 
@@ -96,6 +108,7 @@ impl Default for EngineConfig {
             max_open_tenants: 512,
             tenant_idle_secs: 1800,
             tenant_memory_budget_mb: 0,
+            wake_poll_secs: 20,
             postgres: PostgresConfig::default(),
         }
     }
@@ -421,6 +434,11 @@ pub struct GrpcConfig {
     /// Proto files (relative to `proto_dirs`) whose services are mapped by `routes`.
     pub proto_files: Vec<String>,
     pub routes: Vec<RouteConfig>,
+    /// `onto serve` on SIGTERM or Ctrl-C: how long open connections and
+    /// background workers get to finish before the leases, claimed outbox
+    /// rows and the wake scanner lock this process holds are released and
+    /// it exits (keep it below your orchestrator's termination grace period).
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for GrpcConfig {
@@ -434,6 +452,7 @@ impl Default for GrpcConfig {
             proto_dirs: Vec::new(),
             proto_files: Vec::new(),
             routes: Vec::new(),
+            shutdown_grace_secs: 20,
         }
     }
 }
@@ -670,6 +689,11 @@ pub struct TracesConfig {
     /// Records waiting to be written; beyond this they are dropped and
     /// counted (`traces_dropped` in the ledger).
     pub queue: usize,
+    /// Webhook and writeback delivery attempts that become traces of kind
+    /// `delivery`: `failures` (retried and dead attempts), `all`, or `off`
+    /// (docs/design/EVENTS.md B.7). They never hold a body, a header, a
+    /// secret or a URL.
+    pub deliveries: String,
 }
 
 impl Default for TracesConfig {
@@ -683,18 +707,378 @@ impl Default for TracesConfig {
             flush_ms: 500,
             flush_records: 200,
             queue: 10_000,
+            deliveries: "failures".into(),
         }
     }
 }
 
 impl TracesConfig {
-    /// `calls` is `writes`, `all` or `none`, and the sizes are positive.
+    /// `calls` is `writes`, `all` or `none`, `deliveries` is `failures`,
+    /// `all` or `off`, and the sizes are positive.
     pub fn check(&self) -> Result<()> {
         if !matches!(self.calls.as_str(), "writes" | "all" | "none") {
             return Err(Error::Config(format!("traces.calls = '{}' (writes, all, none)", self.calls)));
         }
+        if !matches!(self.deliveries.as_str(), "failures" | "all" | "off") {
+            return Err(Error::Config(format!("traces.deliveries = '{}' (failures, all, off)", self.deliveries)));
+        }
         if self.queue == 0 || self.flush_records == 0 || self.retention_days == 0 {
             return Err(Error::Config("traces.queue, flush_records and retention_days must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
+/// `[changes]`: reading the change feed (docs/design/EVENTS.md, Part A).
+/// Whether commits record changes is a tenant property, switched with the
+/// `changes.capture` action, so replicas never disagree about it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChangesConfig {
+    /// Change records older than this many days are removed (whole commits)
+    /// and the floor raised over them, hourly while the tenant is open
+    /// (0: no age limit).
+    pub retain_days: u64,
+    /// Keep at most this many change records per tenant (0: no count
+    /// limit). Whole commits are removed, so slightly fewer may remain.
+    pub retain_max_rows: u64,
+    /// Records scanned per `changes.poll` page when the call gives no
+    /// `limit`, and per stream page (1 to 1000).
+    pub page: usize,
+    /// Records kept in memory per tenant while it has streams (the ring;
+    /// allocated only while subscribed and counted in the memory budget).
+    pub ring: usize,
+    /// Milliseconds one stream page may spend filtering before it is split.
+    pub eval_budget_ms: u64,
+    /// A stream sends a heartbeat (the last cursor scanned) this often.
+    pub heartbeat_secs: u64,
+    /// A stream whose client reads nothing for this long ends `slow_consumer`.
+    pub stall_timeout_secs: u64,
+    /// Commits (seqs) a stream may be behind the head before it ends
+    /// `too_far_behind` (page with `changes.poll`, then stream again).
+    pub max_backfill_seqs: u64,
+    /// Streams authenticate their request again this often; a revoked
+    /// credential or a changed principal ends the stream.
+    pub reauth_secs: u64,
+    /// Streams per tenant in this process.
+    pub max_subscribers: usize,
+    /// Streams per principal id per tenant in this process.
+    pub max_subscribers_per_principal: usize,
+    /// Streams in this process, all tenants together.
+    pub max_subscribers_process: usize,
+}
+
+impl Default for ChangesConfig {
+    fn default() -> Self {
+        Self {
+            retain_days: 7,
+            retain_max_rows: 5_000_000,
+            page: 500,
+            ring: 4096,
+            eval_budget_ms: 50,
+            heartbeat_secs: 15,
+            stall_timeout_secs: 60,
+            max_backfill_seqs: 100_000,
+            reauth_secs: 60,
+            max_subscribers: 200,
+            max_subscribers_per_principal: 20,
+            max_subscribers_process: 2000,
+        }
+    }
+}
+
+impl ChangesConfig {
+    /// `page` is 1 to [`onto_core::changes::MAX_PAGE`]; times, the ring and
+    /// the limits are at least 1.
+    pub fn check(&self) -> Result<()> {
+        let max = onto_core::changes::MAX_PAGE;
+        if self.page == 0 || self.page > max {
+            return Err(Error::Config(format!("changes.page = {} (1 to {max})", self.page)));
+        }
+        let at_least_one = [
+            ("ring", self.ring as u64),
+            ("eval_budget_ms", self.eval_budget_ms),
+            ("heartbeat_secs", self.heartbeat_secs),
+            ("stall_timeout_secs", self.stall_timeout_secs),
+            ("max_backfill_seqs", self.max_backfill_seqs),
+            ("reauth_secs", self.reauth_secs),
+            ("max_subscribers", self.max_subscribers as u64),
+            ("max_subscribers_per_principal", self.max_subscribers_per_principal as u64),
+            ("max_subscribers_process", self.max_subscribers_process as u64),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("changes.{name} = {v} (at least 1)")));
+        }
+        if self.retain_days > 36_500 {
+            return Err(Error::Config(format!("changes.retain_days = {} (0 to 36500)", self.retain_days)));
+        }
+        Ok(())
+    }
+
+    /// What one retention pass keeps.
+    pub fn retention(&self) -> onto_core::changes::ChangeRetention {
+        onto_core::changes::ChangeRetention {
+            keep_ms: (self.retain_days > 0).then(|| self.retain_days as i64 * 86_400_000),
+            keep_rows: (self.retain_max_rows > 0).then_some(self.retain_max_rows),
+        }
+    }
+}
+
+/// `[webhooks]`: delivering the outbox (docs/design/EVENTS.md Part B). Each
+/// row is enqueued once per endpoint and delivered at least once; receivers
+/// dedupe on the event id. Delivery concurrency limits are per process.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhooksConfig {
+    /// Run the delivery worker in this process (`false`: the process kill
+    /// switch; rows wait in the outbox).
+    pub enabled: bool,
+    /// Start the fan-out of change subscriptions and the delivery worker
+    /// (webhook and writeback rows) in this process. onto-cli's local
+    /// commands turn them off outside `serve`, so a one-off command takes no
+    /// fan-out lease and claims no outbox row that would then wait for the
+    /// lease to expire after it exits.
+    pub workers: bool,
+    /// Endpoints per tenant (enforced when one is added).
+    pub max_endpoints: usize,
+    /// Seconds one request may take.
+    pub timeout_secs: u64,
+    /// The worker looks for due rows at least this often (it also wakes on
+    /// commits that enqueue rows).
+    pub poll_secs: u64,
+    /// Attempts before a row is dead.
+    pub max_attempts: u32,
+    /// Retry delay: `min(base * 2^(attempt-1), max)` with ±20% jitter;
+    /// `Retry-After` is honoured up to the max.
+    pub backoff_base_secs: u64,
+    pub backoff_max_secs: u64,
+    /// Bodies larger than this are not sent (`dead: payload_too_large`).
+    pub max_payload_bytes: usize,
+    /// Requests in flight per endpoint in this process.
+    pub max_in_flight_per_endpoint: usize,
+    /// Requests in flight per tenant in this process.
+    pub max_in_flight_per_tenant: usize,
+    /// Requests in flight in this process, all tenants together.
+    pub max_in_flight_process: usize,
+    /// Consecutive failures that pause an endpoint (the breaker opens) …
+    pub pause_after_failures: u32,
+    /// … for this long; then one probe is sent (half-open). A failed probe
+    /// doubles the pause, up to an hour.
+    pub pause_secs: u64,
+    /// Undelivered rows an endpoint may have before fan-out pauses it.
+    pub pending_cap: u64,
+    /// Finished rows and attempt logs older than this are removed.
+    pub retain_days: u64,
+    /// Operator rules: a host that may resolve into private CIDRs. Never
+    /// applied to endpoints or targets a project registered.
+    pub allow: Vec<AllowConfig>,
+}
+
+/// `[[webhooks.allow]]`: `host` (`hooks.internal.example` or
+/// `*.suffix`) may resolve only into `cidrs`. Link-local and metadata
+/// ranges are never reachable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllowConfig {
+    pub host: String,
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workers: true,
+            max_endpoints: 50,
+            timeout_secs: 10,
+            poll_secs: 20,
+            max_attempts: 15,
+            backoff_base_secs: 10,
+            backoff_max_secs: 3600,
+            max_payload_bytes: 262_144,
+            max_in_flight_per_endpoint: 4,
+            max_in_flight_per_tenant: 8,
+            max_in_flight_process: 64,
+            pause_after_failures: 20,
+            pause_secs: 300,
+            pending_cap: 100_000,
+            retain_days: 14,
+            allow: Vec::new(),
+        }
+    }
+}
+
+/// The longest any `retain_days` may be (a hundred years).
+pub const MAX_RETAIN_DAYS: u64 = 36_500;
+
+/// The store-clock cutoff `retain_days` before `now` (saturating).
+pub fn retention_cutoff(now: i64, retain_days: u64) -> i64 {
+    now.saturating_sub((retain_days.min(MAX_RETAIN_DAYS) as i64).saturating_mul(86_400_000))
+}
+
+impl WebhooksConfig {
+    /// Every limit and time is at least 1, the backoff maximum is not below
+    /// its base, and the allow rules parse.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [
+            ("max_endpoints", self.max_endpoints as u64),
+            ("timeout_secs", self.timeout_secs),
+            ("poll_secs", self.poll_secs),
+            ("max_attempts", self.max_attempts as u64),
+            ("backoff_base_secs", self.backoff_base_secs),
+            ("backoff_max_secs", self.backoff_max_secs),
+            ("max_payload_bytes", self.max_payload_bytes as u64),
+            ("max_in_flight_per_endpoint", self.max_in_flight_per_endpoint as u64),
+            ("max_in_flight_per_tenant", self.max_in_flight_per_tenant as u64),
+            ("max_in_flight_process", self.max_in_flight_process as u64),
+            ("pause_after_failures", self.pause_after_failures as u64),
+            ("pause_secs", self.pause_secs),
+            ("pending_cap", self.pending_cap),
+            ("retain_days", self.retain_days),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("webhooks.{name} = {v} (at least 1)")));
+        }
+        if self.retain_days > MAX_RETAIN_DAYS {
+            return Err(Error::Config(format!("webhooks.retain_days = {} (1 to 36500)", self.retain_days)));
+        }
+        if self.backoff_max_secs < self.backoff_base_secs {
+            return Err(Error::Config("webhooks.backoff_max_secs is below backoff_base_secs".into()));
+        }
+        self.allow_rules()?;
+        Ok(())
+    }
+
+    /// The parsed `[[webhooks.allow]]` rules.
+    pub fn allow_rules(&self) -> Result<Vec<crate::net::AllowRule>> {
+        self.allow.iter().map(|a| crate::net::AllowRule::new(&a.host, &a.cidrs)).collect()
+    }
+}
+
+/// `[automation]`: change-triggered automations (docs/design/EVENTS.md
+/// Part C). Definitions are schema (`[automations.<name>]`, `put_automation`);
+/// whether one runs is its enablement, which expires after
+/// `enable_ttl_days` so a person re-enables it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutomationConfig {
+    /// Run automations in this process (`false`: the process kill switch).
+    pub enabled: bool,
+    /// Start the automation workers (onto-cli's local commands turn them off
+    /// outside `serve`).
+    pub workers: bool,
+    /// Automations per tenant schema, enforced when a schema change is
+    /// applied or proposed (never when a stored schema is loaded).
+    pub max_automations: usize,
+    /// Cascade depth limit: a change at depth `d` triggers runs at `d + 1`;
+    /// runs over `min(max_depth, the automation's max_depth)` are refused.
+    pub max_depth: u8,
+    /// Runs per tenant per minute; over it triggers become `skipped` runs.
+    pub max_runs_per_minute: u32,
+    /// Runs per automation per minute when its `rate.per_minute` is unset.
+    pub default_rate_per_minute: u32,
+    /// Runs per (automation, subject) per hour when its
+    /// `rate.per_subject_per_hour` is unset (kept per process: approximate
+    /// across lease handoffs).
+    pub default_per_subject_per_hour: u32,
+    /// Consecutive failed runs that pause an automation.
+    pub pause_after_failures: u32,
+    /// Days an enablement lasts before a person must enable it again.
+    pub enable_ttl_days: u32,
+    /// The automation consumer's lease (renewed at a third of it).
+    pub lease_secs: u64,
+    /// Retry delay `min(base * 2^attempt, max)` for runs that failed on
+    /// unavailability or contention.
+    pub retry_base_secs: u64,
+    pub retry_max_secs: u64,
+    pub retry_max_attempts: u32,
+    /// Days final run rows are kept (1 to 36500); the `automation.run`
+    /// events are the audit trail and stay.
+    pub retain_days: u64,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workers: true,
+            max_automations: 100,
+            max_depth: 3,
+            max_runs_per_minute: 600,
+            default_rate_per_minute: 60,
+            default_per_subject_per_hour: 10,
+            pause_after_failures: 5,
+            enable_ttl_days: 30,
+            lease_secs: 60,
+            retry_base_secs: 10,
+            retry_max_secs: 3600,
+            retry_max_attempts: 8,
+            retain_days: 30,
+        }
+    }
+}
+
+impl AutomationConfig {
+    /// Every limit and time is at least 1 and the retry maximum is not below
+    /// its base.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [
+            ("max_automations", self.max_automations as u64),
+            ("max_depth", self.max_depth as u64),
+            ("max_runs_per_minute", self.max_runs_per_minute as u64),
+            ("default_rate_per_minute", self.default_rate_per_minute as u64),
+            ("default_per_subject_per_hour", self.default_per_subject_per_hour as u64),
+            ("pause_after_failures", self.pause_after_failures as u64),
+            ("enable_ttl_days", self.enable_ttl_days as u64),
+            ("lease_secs", self.lease_secs),
+            ("retry_base_secs", self.retry_base_secs),
+            ("retry_max_secs", self.retry_max_secs),
+            ("retry_max_attempts", self.retry_max_attempts as u64),
+            ("retain_days", self.retain_days),
+        ];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("automation.{name} = {v} (at least 1)")));
+        }
+        if self.retain_days > MAX_RETAIN_DAYS {
+            return Err(Error::Config(format!("automation.retain_days = {} (1 to 36500)", self.retain_days)));
+        }
+        if self.retry_max_secs < self.retry_base_secs {
+            return Err(Error::Config("automation.retry_max_secs is below retry_base_secs".into()));
+        }
+        Ok(())
+    }
+}
+
+/// `[writeback]`: HTTP writeback effects of action types (docs/design/EVENTS.md
+/// Part D). Off by default: while it is off, a plan with a writeback effect
+/// is refused and this process sends no writeback rows. Writeback is not
+/// reversible; action.undo does not undo the external write. Rows are
+/// enqueued once and delivered at least once, with `Idempotency-Key:
+/// <receipt>:<effect>`; the receiver must honour it. Retries, backoff, the
+/// breaker, the payload limit and the allow rules are `[webhooks]`'s.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WritebackConfig {
+    /// Plan and send writeback effects in this process.
+    pub enabled: bool,
+    /// Targets per tenant (enforced when one is added).
+    pub max_targets: usize,
+    /// Seconds one request may take.
+    pub timeout_secs: u64,
+}
+
+impl Default for WritebackConfig {
+    fn default() -> Self {
+        Self { enabled: false, max_targets: 20, timeout_secs: 15 }
+    }
+}
+
+impl WritebackConfig {
+    /// Every limit and time is at least 1.
+    pub fn check(&self) -> Result<()> {
+        let at_least_one = [("max_targets", self.max_targets as u64), ("timeout_secs", self.timeout_secs)];
+        if let Some((name, v)) = at_least_one.iter().find(|(_, v)| *v == 0) {
+            return Err(Error::Config(format!("writeback.{name} = {v} (at least 1)")));
         }
         Ok(())
     }
@@ -843,6 +1227,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retain_days_are_bounded_and_cutoffs_saturate() {
+        let mut w = WebhooksConfig { retain_days: 36_501, ..Default::default() };
+        assert!(w.check().unwrap_err().to_string().contains("webhooks.retain_days = 36501 (1 to 36500)"));
+        w.retain_days = u64::MAX;
+        assert!(w.check().is_err());
+        w.retain_days = 36_500;
+        assert!(w.check().is_ok());
+        assert_eq!(AutomationConfig::default().retain_days, 30);
+        let mut a = AutomationConfig { retain_days: 0, ..Default::default() };
+        assert!(a.check().unwrap_err().to_string().contains("automation.retain_days = 0 (at least 1)"));
+        a.retain_days = 106_751_991_168;
+        assert!(a.check().is_err());
+        // The cutoff never overflows, and is never in the future.
+        let now = 1_793_000_000_000;
+        assert_eq!(retention_cutoff(now, 14), now - 14 * 86_400_000);
+        for days in [u64::MAX, 106_751_991_168, 1 << 62] {
+            let c = retention_cutoff(now, days);
+            assert!(c <= now && c == now - 36_500 * 86_400_000, "{days}: {c}");
+        }
+        assert_eq!(retention_cutoff(i64::MIN + 5, 1), i64::MIN);
+    }
+
+    #[test]
     fn example_config_parses() {
         let cfg = Config::from_toml(EXAMPLE_CONFIG).unwrap();
         assert_eq!(cfg.ontology.schema, "builtin:enterprise");
@@ -870,6 +1277,59 @@ mod tests {
         assert!(cfg.traces.check().is_ok());
         let bad = Config::from_toml("[traces]\ncalls = 'some'\n").unwrap();
         assert!(bad.traces.check().unwrap_err().to_string().contains("writes, all, none"));
+    }
+
+    #[test]
+    fn delivery_traces_default_to_failures() {
+        assert_eq!(Config::from_toml("").unwrap().traces.deliveries, "failures");
+        assert_eq!(Config::from_toml(EXAMPLE_CONFIG).unwrap().traces.deliveries, "failures");
+        for ok in ["failures", "all", "off"] {
+            let c = Config::from_toml(&format!("[traces]\ndeliveries = '{ok}'\n")).unwrap();
+            assert!(c.traces.check().is_ok(), "{ok}");
+        }
+        let bad = Config::from_toml("[traces]\ndeliveries = 'some'\n").unwrap();
+        assert!(bad.traces.check().unwrap_err().to_string().contains("failures, all, off"));
+    }
+
+    #[test]
+    fn automation_section_defaults_and_checks() {
+        let example = Config::from_toml(EXAMPLE_CONFIG).unwrap();
+        let d = AutomationConfig::default();
+        let a = &example.automation;
+        assert!(a.enabled && a.workers);
+        assert_eq!(
+            (a.max_automations, a.max_depth, a.enable_ttl_days, a.pause_after_failures),
+            (d.max_automations, d.max_depth, d.enable_ttl_days, d.pause_after_failures)
+        );
+        assert_eq!((d.max_automations, d.max_depth, d.enable_ttl_days), (100, 3, 30));
+        assert!(a.check().is_ok());
+        let zero = Config::from_toml("[automation]\nmax_automations = 0\n").unwrap();
+        assert!(zero.automation.check().unwrap_err().to_string().contains("automation.max_automations = 0"));
+        let inverted = Config::from_toml("[automation]\nretry_base_secs = 60\nretry_max_secs = 10\n").unwrap();
+        assert!(inverted.automation.check().unwrap_err().to_string().contains("retry_max_secs"));
+    }
+
+    #[test]
+    fn writeback_section_defaults_and_checks() {
+        let example = Config::from_toml(EXAMPLE_CONFIG).unwrap();
+        let w = &example.writeback;
+        assert!(!w.enabled, "writeback is off unless an operator turns it on");
+        assert_eq!((w.max_targets, w.timeout_secs), (20, 15));
+        assert!(w.check().is_ok());
+        let on = Config::from_toml(
+            "[writeback]
+enabled = true
+",
+        )
+        .unwrap();
+        assert!(on.writeback.enabled && on.writeback.check().is_ok());
+        let zero = Config::from_toml(
+            "[writeback]
+timeout_secs = 0
+",
+        )
+        .unwrap();
+        assert!(zero.writeback.check().unwrap_err().to_string().contains("writeback.timeout_secs = 0"));
     }
 
     #[test]

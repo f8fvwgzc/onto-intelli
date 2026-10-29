@@ -6,6 +6,25 @@
 //! ```text
 //! cargo run --release -p onto-bench -- --url postgres://onto:onto@127.0.0.1:55445/onto --entities 1000000
 //! ```
+//!
+//! `--changes` runs the change feed scenarios instead (docs/design/EVENTS.md
+//! section 12): commit latency with change capture off and on, and write
+//! latency and delivery lag with 0, 50 and 200 live stream subscribers on
+//! one tenant.
+//!
+//! `--fanout` runs the webhook fan-out scenario (docs/design/EVENTS.md
+//! section 12): a crawl of `--crawl` entities in commits of 500, on a tenant
+//! with no endpoints and on one with 50 subscribed endpoints (each to one of
+//! five kinds, so each entity matches ten), timing the commits and how fast
+//! fan-out enqueues the outbox rows. Deliveries are off: rows are enqueued,
+//! not sent.
+//!
+//! `--delivery` runs the webhook delivery scenario (docs/design/EVENTS.md
+//! section 12): a local HTTP receiver on 127.0.0.1 and, for each count in
+//! `--endpoints`, a fresh tenant with that many endpoints; it times each
+//! delivery from the commit to the receiver, one task per commit with
+//! nothing queued and during a burst of about `--rows` deliveries, and the
+//! rows per second the burst drains at.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +40,7 @@ use onto_intelli::{ActionContext, Config, Entity, Intelli};
 
 #[cfg(feature = "count-alloc")]
 mod alloc;
+mod delivery;
 
 #[cfg(feature = "count-alloc")]
 #[global_allocator]
@@ -48,6 +68,39 @@ struct Args {
     /// then stop and keep the tenant; measure later with --skip-load.
     #[arg(long)]
     load_only: bool,
+    /// Run the change feed scenarios (capture off/on, 0/50/200 subscribers)
+    /// on a small tenant instead of the load benchmark.
+    #[arg(long)]
+    changes: bool,
+    /// Commits per change feed scenario.
+    #[arg(long, default_value_t = 500)]
+    writes: usize,
+    /// Run the webhook fan-out scenario (0 and 50 endpoints during a crawl).
+    #[arg(long)]
+    fanout: bool,
+    /// Entities the fan-out scenario's crawl writes.
+    #[arg(long, default_value_t = 100_000)]
+    crawl: usize,
+    /// Run the webhook delivery scenario (a local receiver on 127.0.0.1).
+    #[arg(long)]
+    delivery: bool,
+    /// Endpoint counts of the delivery scenario, one fresh tenant each (1 to 50).
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 50])]
+    endpoints: Vec<usize>,
+    /// Deliveries in each burst of the delivery scenario (tasks × endpoints).
+    #[arg(long, default_value_t = 20_000)]
+    rows: usize,
+    /// Single-task commits timed in each idle run of the delivery scenario.
+    #[arg(long, default_value_t = 200)]
+    latency_commits: usize,
+    /// Override `[webhooks] max_in_flight_per_tenant` (default 8) in the
+    /// delivery scenario.
+    #[arg(long)]
+    in_flight_tenant: Option<usize>,
+    /// Override `[webhooks] max_in_flight_per_endpoint` (default 4) in the
+    /// delivery scenario.
+    #[arg(long)]
+    in_flight_endpoint: Option<usize>,
 }
 
 const WORDS: &[&str] = &[
@@ -329,6 +382,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let opts = PgOptions { max_connections: 16, ..Default::default() };
     let shared = PgShared::connect(&args.url, &opts)?;
+    if args.changes {
+        return changes_bench(&args, &shared, &opts).await;
+    }
+    if args.fanout {
+        return fanout_bench(&args, &shared, &opts).await;
+    }
+    if args.delivery {
+        return delivery::delivery_bench(&args, &shared, &opts).await;
+    }
     let mut report: Vec<String> = Vec::new();
 
     let gen_t = Instant::now();
@@ -559,6 +621,237 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !args.keep {
         shared.tenant(&args.tenant, opts)?.drop_tenant()?;
+    }
+    Ok(())
+}
+
+/// The change feed scenarios on a fresh tenant `<tenant>_changes`: single
+/// entity commits through the engine with capture off and on, then with 0,
+/// 50 and 200 open streams (one principal each, so no two share an
+/// evaluation: the worst case), and how long a commit takes to reach a
+/// subscriber.
+async fn changes_bench(args: &Args, shared: &PgShared, opts: &PgOptions) -> Result<(), Box<dyn std::error::Error>> {
+    use onto_intelli::changes::{Frame, Start};
+    use onto_intelli::core::changes::ChangeFilter;
+
+    let tenant = format!("{}_changes", args.tenant);
+    shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
+    let mut cfg = Config::in_memory();
+    cfg.engine.storage = "postgres".into();
+    cfg.engine.default_workspace = "bench".into();
+    cfg.memory.enabled = false;
+    cfg.cache.enabled = false;
+    cfg.traces.enabled = false;
+    cfg.connectors.background = false;
+    cfg.changes.max_subscribers = 1000;
+    cfg.changes.max_subscribers_process = 1000;
+    let store: Arc<dyn Store> = Arc::new(shared.tenant(&tenant, opts.clone())?);
+    let intelli = Intelli::open_with_store(cfg, store, onto_intelli::llm::build(&Default::default())?).await?;
+    let onto = intelli.ontology().clone();
+    let p = Principal::admin("bench");
+    let ctx = ActionContext::new(p.clone(), "bench");
+    let n = args.writes;
+    let mut seq = 0usize;
+    let mut write = |samples: &mut Vec<f64>| -> Result<(), onto_intelli::Error> {
+        seq += 1;
+        let t = Instant::now();
+        onto.upsert(&ctx, EntityInput::new("task", format!("c{seq}"), format!("change bench {seq}")))?;
+        samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
+    };
+    // Warm the connection pool and the plan cache.
+    let mut warm = Vec::new();
+    for _ in 0..50 {
+        write(&mut warm)?;
+    }
+
+    let mut stats: Vec<Stat> = Vec::new();
+    for on in [false, true] {
+        onto.set_capture(&ctx, on)?;
+        let mut s = Stat {
+            name: if on { "commit, capture on" } else { "commit, capture off" },
+            detail: "one entity upsert through the engine (PostgreSQL)".into(),
+            samples: Vec::new(),
+        };
+        for _ in 0..n {
+            write(&mut s.samples)?;
+        }
+        stats.push(s);
+    }
+
+    let mut lag =
+        Stat { name: "delivery lag", detail: "commit start → frame at 1 subscriber".into(), samples: Vec::new() };
+    for subscribers in [0usize, 50, 200] {
+        let mut drains = Vec::new();
+        for k in 0..subscribers {
+            let who = Principal::admin(format!("bench-{k}"));
+            let mut sub = intelli.subscribe_changes(who, ChangeFilter::default(), Start::Now, None).await?;
+            drains.push(tokio::spawn(async move { while sub.recv().await.is_some() {} }));
+        }
+        let name = match subscribers {
+            0 => "commit, 0 streams",
+            50 => "commit, 50 streams",
+            _ => "commit, 200 streams",
+        };
+        let mut s =
+            Stat { name, detail: format!("capture on, {subscribers} subscribers draining"), samples: Vec::new() };
+        for _ in 0..n {
+            write(&mut s.samples)?;
+        }
+        stats.push(s);
+        if subscribers == 50 {
+            // Lag: one more subscriber, timed from the commit to its frame.
+            let mut sub = intelli
+                .subscribe_changes(Principal::admin("bench-lag"), ChangeFilter::default(), Start::Now, None)
+                .await?;
+            for _ in 0..100 {
+                let mut one = Vec::new();
+                let t = Instant::now();
+                write(&mut one)?;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), sub.recv()).await {
+                        Ok(Some(Frame::Change(_))) => break,
+                        Ok(Some(_)) => {}
+                        _ => return Err("no frame within 10 s".into()),
+                    }
+                }
+                lag.samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        let ring = intelli.changes().bytes();
+        eprintln!("{subscribers} subscribers: ring {} records, {ring} bytes", intelli.changes().ring_len());
+        // Drop the subscriptions; their producers stop on the closed channels.
+        for d in drains {
+            d.abort();
+        }
+        let t = Instant::now();
+        while intelli.changes().subscribers() > 0 && t.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    stats.push(lag);
+
+    println!("## Change feed ({n} commits per row)\n");
+    println!("| Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |\n|---|---|---:|---:|---:|---:|---:|");
+    for s in &mut stats {
+        println!("{}", s.row());
+    }
+    drop(intelli);
+    if !args.keep {
+        shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
+    }
+    Ok(())
+}
+
+/// Webhook fan-out during a crawl: commit latency with 0 and with 50
+/// subscribed endpoints, and the rate at which fan-out enqueues their rows.
+async fn fanout_bench(args: &Args, shared: &PgShared, opts: &PgOptions) -> Result<(), Box<dyn std::error::Error>> {
+    use onto_intelli::core::Mutation;
+
+    const KINDS: [&str; 5] = ["task", "issue", "service", "project", "person"];
+    const BATCH: usize = 500;
+    let total = args.crawl.max(BATCH);
+    let mut stats: Vec<Stat> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for endpoints in [0usize, 50] {
+        let tenant = format!("{}_fanout{endpoints}", args.tenant);
+        shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
+        let mut cfg = Config::in_memory();
+        cfg.engine.storage = "postgres".into();
+        cfg.engine.default_workspace = "bench".into();
+        cfg.memory.enabled = false;
+        cfg.cache.enabled = false;
+        cfg.traces.enabled = false;
+        cfg.connectors.background = false;
+        // Rows are enqueued, not sent; no automations.
+        cfg.webhooks.enabled = false;
+        cfg.automation.workers = false;
+        let store: Arc<dyn Store> = Arc::new(shared.tenant(&tenant, opts.clone())?);
+        let intelli =
+            Intelli::open_with_store(cfg, store.clone(), onto_intelli::llm::build(&Default::default())?).await?;
+        let onto = intelli.ontology().clone();
+        let p = Principal::admin("bench");
+        let ctx = ActionContext::new(p.clone(), "bench");
+        onto.set_capture(&ctx, true)?;
+        for k in 0..endpoints {
+            intelli
+                .call(
+                    &p,
+                    "webhook.add",
+                    json!({
+                        "name": format!("ep{k}"),
+                        "url": format!("https://hooks.example.com/bench/{k}"),
+                        "secret": "env:ONTO_BENCH_HOOK_SECRET",
+                        "filter": { "kinds": [KINDS[k % KINDS.len()]], "ops": ["entity.create"] },
+                        "principal": { "roles": "admin", "workspaces": "*" },
+                    }),
+                )
+                .await?;
+        }
+        let started = Instant::now();
+        let mut s = Stat {
+            name: if endpoints == 0 { "crawl commit, 0 endpoints" } else { "crawl commit, 50 endpoints" },
+            detail: format!("{BATCH} new entities per commit, fan-out running"),
+            samples: Vec::new(),
+        };
+        let mut n = 0usize;
+        while n < total {
+            let muts: Vec<Mutation> = (n..(n + BATCH).min(total))
+                .map(|i| {
+                    let kind = KINDS[i % KINDS.len()];
+                    Mutation::Upsert(EntityInput::new(kind, format!("f{i}"), format!("{kind} {i}")))
+                })
+                .collect();
+            n += muts.len();
+            let o = onto.clone();
+            let c = ctx.clone();
+            let t = Instant::now();
+            tokio::task::spawn_blocking(move || o.apply(&c, muts)).await??;
+            s.samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let crawl = started.elapsed();
+        stats.push(s);
+        if endpoints > 0 {
+            // Fan-out has caught up when every endpoint's cursor is at the head.
+            let head = onto.change_head()?;
+            let names: Vec<String> = (0..endpoints).map(|k| format!("webhook:ep{k}")).collect();
+            loop {
+                let behind =
+                    names.iter().filter(|c| store.consumer_get(c).ok().flatten().is_none_or(|x| x < head)).count();
+                if behind == 0 {
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(1800) {
+                    return Err(format!("fan-out did not catch up in 30 min ({behind} endpoints behind)").into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let done = started.elapsed();
+            let rows: u64 = store.outbox_open_counts()?.iter().map(|(_, n)| n).sum();
+            lines.push(format!(
+                "- 50 endpoints: {total} entities crawled in {:.1} s; fan-out enqueued {rows} rows and caught up \
+                 {:.1} s after the crawl began ({:.0} rows/s, {:.0} entities/s through fan-out).",
+                crawl.as_secs_f64(),
+                done.as_secs_f64(),
+                rows as f64 / done.as_secs_f64(),
+                total as f64 / done.as_secs_f64()
+            ));
+        } else {
+            lines.push(format!("- 0 endpoints: {total} entities crawled in {:.1} s.", crawl.as_secs_f64()));
+        }
+        drop(intelli);
+        if !args.keep {
+            shared.tenant(&tenant, opts.clone())?.drop_tenant()?;
+        }
+    }
+    println!("## Webhook fan-out during a crawl ({total} entities, commits of {BATCH})\n");
+    println!("| Operation | What | Runs | p50 ms | p99 ms | mean ms | max ms |\n|---|---|---:|---:|---:|---:|---:|");
+    for s in &mut stats {
+        println!("{}", s.row());
+    }
+    println!();
+    for l in lines {
+        println!("{l}");
     }
     Ok(())
 }

@@ -77,8 +77,78 @@ TLS is rustls with aws-lc-rs and needs no system library.
 | `0002_vectors` | `entities.embedding halfvec(512)` with an HNSW index (cosine), and `entities.embedded` |
 | `0003_append_only` | triggers that refuse `UPDATE` on `events`, `entity_versions` and `link_versions` |
 | `0004_hot_updates` | `fillfactor = 85` on `entities`, so updates that change no indexed column stay HOT |
+| `0005_traces` | traces, spans and scores (docs/CONTROL_PLANE.md section 9), insert-only |
+| `0006_trace_otel` | the OpenTelemetry trace and parent span of a traced call |
+| `0007_tenant_identity` | the tenant id that owns the schema |
+| `0008_audit_no_delete` | triggers that refuse `DELETE` and `TRUNCATE` on the audit trail and history (retention excepted) |
+| `0009_changes` | the change feed: `changes` (append-only), `changes_meta` (capture switch and `floor`), `entity_versions.change_seq`, `head.min_writer`, and the deferred trigger that turns an uncaptured commit into a `gap` record |
+| `0010_leases` | `now_ms()` (the database clock), `leases` with fencing epochs, `consumers` (change cursors), `timers` |
+| `0011_outbox` | `outbox` (webhook deliveries and writeback calls) and `delivery_attempts` (append-only) |
+| `0012_automate` | `automation_runs` |
+| `0013_outbox_claim` | outbox indexes for claims (due rows, expired leases) and for open rows per target |
+| `0014_feed_counters` | partial indexes for the section 11 counters: gap records by time (`changes_gaps`) and outbox rows per target and state for pending, inflight, retry and dead (`outbox_stats`) |
 
 Released migrations never change; a schema change is a new migration.
+
+### Upgrades and rollbacks
+
+The newer-schema refusal applies to every replica, at every open. A
+replica still on the old build keeps writing to tenants it already has open
+(its commits reach the change feed as `gap` records), but it cannot open a
+tenant again once a newer build has migrated it, and replicas re-open
+tenants routinely (after `engine.tenant_idle_secs`, or when
+`engine.max_open_tenants` or the memory budget closes one). During a rolling
+deploy, either drain the old replicas before the new ones open tenants, or
+raise `tenant_idle_secs` and `max_open_tenants` on the old replicas for the
+duration of the roll. Otherwise some requests on old replicas fail with a
+request to upgrade until the roll finishes.
+
+Rolling back past `0009_changes` and `0010_leases` (the change feed and
+leases): both are additive for older writers and idempotent (`IF NOT
+EXISTS`, `OR REPLACE`, `ON CONFLICT DO NOTHING`). To start an older build on
+a migrated tenant, delete its `schema_migrations` rows with `version >= 9`
+first. The tables and the gap trigger stay; the older build ignores the
+tables, and the trigger turns each of its state-changing commits into a
+`gap` record, so change-feed readers see what they missed. A later upgrade
+applies the migrations again, and its first commit records changes again.
+
+Rolling back past `0011_outbox`, `0012_automate`, `0013_outbox_claim` and
+`0014_feed_counters` (webhooks, automations, writeback and their counters):
+the tables and indexes are additive and an older build ignores them; delete
+the `schema_migrations` rows with `version >= 11` (or `>= 9`, as above)
+first. Rolling back past `0014_feed_counters` alone needs only its row
+deleted (`version >= 14`): its two indexes are partial and an older build
+never reads them. Applying it builds both indexes, which reads the
+`changes` and `outbox` tables once and holds writes to them meanwhile. The schema needs one more step.
+An older build reads the head schema version whole when it opens a tenant:
+a version whose `changes` hold `put_automation` or `delete_automation`
+(builds before step 10 do not know them), or a head schema with an action
+type that has a `writeback` effect (builds before step 12 count it as no
+effect), makes it refuse the tenant. Before starting such a build:
+
+1. Remove what it does not know with `schema.apply`: `delete_automation`
+   for every automation, and `put_action_type` without the `writeback`
+   effects (or `delete_action_type`) for action types that have one.
+2. Apply one more ordinary schema change (for example a `put_glossary_term`),
+   so the head version's `changes` hold only operations the older build
+   knows; removing the automations alone leaves `delete_automation` in the
+   head.
+
+Rolling forward again needs nothing: the newer build reads every version.
+
+**Reserved tenant ids.** Since the change feed, `{prefix}_sys` (`onto_sys`)
+is the deployment's shared schema (the `wake` table), so the tenant ids
+`sys` and `_sys` (any case) are refused. A tenant created under such an id
+by an earlier version must be renamed before upgrading. The new build
+refuses to create the shared schema inside it and says how. Example for
+`onto_`:
+
+```sql
+ALTER SCHEMA onto_sys RENAME TO onto_sys_tenant;
+UPDATE onto_sys_tenant.tenant_identity SET tenant = 'sys_tenant';
+```
+
+After the rename, the tenant is addressed as `sys_tenant`.
 
 ## Tenants and tables
 
@@ -95,9 +165,14 @@ At most `engine.max_open_tenants` (default 512, 0 for no limit) stay open, and
 while the open ones' estimated memory is above `engine.tenant_memory_budget_mb`
 (default 0: no budget) the least recently used close; the one just used
 always stays. A closed tenant opens again on its next request.
-`GET /v1/admin/tenants` (operators) lists the open tenants with their
+`GET /v1/admin/tenants` (operators: an admin config token for every tenant,
+`tenants = ["*"]`, or dev mode) lists the open tenants with their
 `estimated_bytes` (`Ontology::estimated_bytes`, an estimate from their
-contents), and `system.stats` shows a tenant's own. A console sign-up
+contents) and their outbound counters (`outbound`: outbox rows per state,
+change lag per consumer and endpoint, gap records over 24 hours and the
+latest gap, runs per state over the last hour, paused automations and
+endpoints; see docs/AUTOMATE.md, operating notes), and `system.stats` shows
+a tenant's own. A console sign-up
 creates the first project's schema without opening it.
 
 | table | holds |
@@ -112,6 +187,83 @@ creates the first project's schema without opening it.
 | `head` | the commit sequence |
 | `schema_migrations` | the migrations applied to this tenant |
 | `tenant_identity` | the tenant id that owns this schema |
+| `traces`, `spans`, `scores` | traces of the engine's work (docs/CONTROL_PLANE.md section 9) |
+| `changes`, `changes_meta` | the change feed and its capture switch and floor (below) |
+| `leases`, `consumers`, `timers` | background work: who holds it, where each consumer is in the feed, what is due |
+| `outbox`, `delivery_attempts` | webhook deliveries and writeback calls, and every attempt to send one (below) |
+| `automation_runs` | one row per trigger an automation acted on (below) |
+
+The deployment also has one shared schema, `{prefix}_sys`, holding the
+`wake` table: one row per tenant whose background work (fan-out, deliveries,
+automation retries) is due, read by the elected wake scanner so closed
+tenants are opened when, and only when, they have work.
+
+## Change feed, outbox and automation runs
+
+These tables hold phase 1 of docs/design/EVENTS.md; docs/AUTOMATE.md shows
+them in use. Every time in them is the database clock (`now_ms()`), never a
+process clock.
+
+**Change feed.** The commit that changes entities, links or the schema also
+inserts one `changes` row per changed item, keyed `(seq, n)` (the cursor
+`<seq>.<n>`). A row holds the record without the entity document; create and
+update records join the version that commit wrote (`entity_versions` by
+`change_seq`), so documents are not stored twice. `changes` is append-only
+like the audit trail. A state-changing commit that recorded no changes (an
+older build, `Store::bulk_import`, anything that bypasses the engine's commit
+path) gets a `gap` record from a deferred trigger on `commits`, when the
+tenant's `changes_meta.capture` is on.
+
+**Outbox.** One row per webhook delivery or writeback call, unique on
+`(target, dedupe)`: a change is enqueued once per endpoint (`dedupe` = the
+cursor), an effect once per receipt or run (`<receipt>:<effect>`,
+`<run>:<effect>`). Rows from actions and automation runs are inserted in the
+commit that made the change. Change-sourced rows hold only the cursor; the
+body is rendered when the row is sent. Workers claim rows with `FOR UPDATE
+SKIP LOCKED` and a claim token and lease (`inflight`, `lease_until`); a
+worker whose lease expired cannot finish a row another worker claimed since.
+States: `pending`, `inflight`, `retry`, `delivered`, `dead`, `cancelled`.
+Each send appends a `delivery_attempts` row (append-only; retention alone
+deletes). Delivery is at least once: receivers dedupe on the row id, which is
+the CloudEvent `id` and `webhook-id`.
+
+**Automation runs.** A run is claimed with `INSERT … ON CONFLICT (automation,
+trigger_key) DO NOTHING RETURNING id` in its own statement, so a duplicate
+trigger is settled by the claim and never retried. The run's graph edits,
+receipt, outbox rows and finished run row then commit in one transaction,
+fenced by the consumer's lease epoch: a `running` row means nothing of that
+commit happened, and recovery executes it again. Over-limit triggers are
+`skipped` rows that `automation.rerun` can run. Retries are `timers` rows
+(`retry:<run>`).
+
+**Leases and fencing.** Fan-out (`webhook:fanout`) and the automation
+consumer (`automation:consumer`) each run in one process per tenant under a
+`leases` row. The epoch grows when the holder changes, and their writes
+commit only while the writer still holds the lease at its epoch. On a
+graceful shutdown (`onto serve` on SIGTERM or Ctrl-C, within `[grpc]
+shutdown_grace_secs`) a process releases its leases, fenced like its
+writes (`UPDATE leases … WHERE name, holder and epoch match`: a holder whose
+epoch is stale releases nothing), gives back the outbox rows it claimed and
+did not settle, and closes the wake scanner's lock session, so the next
+process takes over at once. A process that is killed leaves them to expire
+(60 s at most): give the orchestrator a stop timeout above
+`shutdown_grace_secs` plus 5 s (`docker stop` waits only 10 s by default;
+docker-compose.yml sets `stop_grace_period: 30s`). Either way consumers resume from their cursors in
+`consumers` and runs claimed under an older epoch are recovered, so nothing
+is skipped. A released row keeps its holder and epoch; only `until` moves to
+just before the database clock's now, so the next holder takes it with the
+next epoch. In the docs run (docs/AUTOMATE.md, "A restart") both rows read
+`until` about 0.6 s in the past right after SIGTERM, and the restarted
+process held them at epoch 2 and delivered a change made while it was down
+0.28 s after it started.
+
+**Retention.** One task per open tenant, 5 minutes after it opens and then
+hourly, trims: change records by `[changes] retain_days` (7) and
+`retain_max_rows`, whole commits at a time, raising `changes_meta.floor` in
+the same transaction (a cursor below the floor is expired and readers get
+`reset`); finished outbox rows and their attempts by `[webhooks]
+retain_days` (14); final run rows by `[automation] retain_days` (30). The
+`automation.run` audit events stay with the event log.
 
 ## Vectors
 

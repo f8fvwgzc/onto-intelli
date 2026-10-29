@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["postgres", "http-llm", "mysql", "sqlserver", "mongodb"]
+default = ["postgres", "http-llm", "outbound", "mysql", "sqlserver", "mongodb"]
 # Durable storage: PostgreSQL 16+ with pgvector (the only durable backend).
 postgres = ["onto-core/postgres"]
 # Read-only metadata connectors for other databases (the catalog and the ontology builder).
@@ -18,7 +18,10 @@ mysql = ["onto-core/postgres", "dep:sqlx-mysql"]
 sqlserver = ["dep:tiberius", "dep:tokio-util"]
 mongodb = ["dep:mongodb", "dep:bson"]
 # OpenAI-compatible (OpenAI, Ollama, vLLM, LM Studio, OpenRouter) and Anthropic providers.
-http-llm = ["dep:reqwest"]
+http-llm = ["dep:reqwest", "outbound"]
+# Outbound HTTP the engine sends itself: the guarded client (SSRF rules) and
+# signed webhook deliveries from the outbox.
+outbound = ["dep:reqwest", "dep:hmac"]
 
 [dependencies]
 onto-core.workspace = true
@@ -30,6 +33,10 @@ serde_json.workspace = true
 parking_lot.workspace = true
 toml.workspace = true
 sha2.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+url.workspace = true
+hmac = { workspace = true, optional = true }
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
@@ -43,3 +50,5 @@ bson = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+# A local webhook receiver for the delivery tests.
+axum.workspace = true

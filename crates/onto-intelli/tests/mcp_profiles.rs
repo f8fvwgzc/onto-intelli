@@ -184,6 +184,29 @@ async fn withheld_tools_are_not_callable_and_write_rules_still_apply() {
     assert!(!r["result"]["structuredContent"]["bindings"].as_array().unwrap().is_empty(), "{r}");
 }
 
+#[tokio::test]
+async fn poll_changes_is_a_read_tool_in_governance_catalog_and_retrieval() {
+    let homes: Vec<&str> =
+        MCP_PROFILES.iter().copied().filter(|p| *p != "full" && profile_offers(p, "poll_changes")).collect();
+    assert_eq!(homes, vec!["catalog", "governance", "retrieval"]);
+    let tool = tool_actions().into_iter().find(|t| t.0 == "poll_changes").expect("poll_changes is a tool");
+    assert_eq!((tool.1, tool.2), ("changes.poll", false), "a read of changes.poll, never a write");
+
+    let i = demo().await;
+    let mcp = McpServer::new(i.clone(), agent(), false).with_profile("retrieval").unwrap();
+    assert!(listed(&mcp).await.contains("poll_changes"), "listed without allow_writes");
+    let head = i.call(&Principal::admin("lead"), "changes.head", json!({})).await.unwrap();
+    i.call(&Principal::admin("lead"), "entity.upsert", json!({ "id": "task:mcp", "title": "Via MCP" })).await.unwrap();
+    let r = call(&mcp, "poll_changes", json!({ "after": head["cursor"], "kinds": ["task"] })).await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let out = &r["result"]["structuredContent"];
+    assert_eq!(out["changes"][0]["id"], "task:mcp", "{out}");
+    let bad = call(&mcp, "poll_changes", json!({ "after": "soon" })).await;
+    assert_eq!(bad["result"]["isError"], true, "{bad}");
+    let authoring = McpServer::new(i, agent(), false).with_profile("authoring").unwrap();
+    assert_eq!(call(&authoring, "poll_changes", json!({})).await["error"]["code"], -32602);
+}
+
 #[test]
 fn profile_precedence_is_cli_then_env_then_config() {
     assert_eq!(choose_profile(None, None, "catalog"), "catalog");
@@ -252,4 +275,34 @@ async fn initialize_counts_add_up_to_every_tool() {
     assert_eq!(offered + withheld + hidden, all.len());
     assert!(text.contains(&format!("{offered} of {} tools offered", all.len())), "{text}");
     assert!(text.contains(&format!("{hidden} write tools hidden by allow_writes = false")), "{text}");
+}
+
+#[tokio::test]
+async fn automation_tools_are_reads_in_their_profiles() {
+    for (tool, action) in [
+        ("list_automations", "automation.list"),
+        ("automation_runs", "automation.runs"),
+        ("test_automation", "automation.test"),
+    ] {
+        let t = tool_actions().into_iter().find(|t| t.0 == tool).unwrap_or_else(|| panic!("{tool} is a tool"));
+        assert_eq!((t.1, t.2), (action, false), "{tool} reads, never writes");
+    }
+    let homes = |tool: &str| -> Vec<&str> {
+        MCP_PROFILES.iter().copied().filter(|p| *p != "full" && profile_offers(p, tool)).collect()
+    };
+    assert_eq!(homes("list_automations"), vec!["governance"]);
+    assert_eq!(homes("automation_runs"), vec!["governance"]);
+    assert_eq!(homes("test_automation"), vec!["authoring", "governance"]);
+
+    let i = demo().await;
+    let mcp = McpServer::new(i, agent(), false).with_profile("governance").unwrap();
+    let names = listed(&mcp).await;
+    for tool in ["list_automations", "automation_runs", "test_automation"] {
+        assert!(names.contains(tool), "{tool} listed without allow_writes");
+    }
+    let r = call(&mcp, "list_automations", json!({})).await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert!(r["result"]["structuredContent"]["items"].is_array(), "{r}");
+    let r = call(&mcp, "test_automation", json!({ "name": "nope", "id": "task:1" })).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
 }

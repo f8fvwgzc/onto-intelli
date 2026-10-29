@@ -106,6 +106,20 @@ pub struct Principal {
     /// as the source of its audit events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// The cascade a trusted service says this request belongs to
+    /// (`x-onto-cause-depth` and `x-onto-cause-run` from a config token,
+    /// docs/design/EVENTS.md C.6): contexts built for it carry it, so its
+    /// changes keep the depth and a loop through another service still
+    /// meets the depth limit. Never read from or written to JSON.
+    #[serde(skip)]
+    pub cause: Option<crate::changes::RunCause>,
+    /// The W3C trace id the request continues (its `traceparent` trace, or
+    /// the trace recording the call): contexts built for it carry it into
+    /// change records and outbox rows, and deliveries send it as
+    /// `traceparent` (docs/design/EVENTS.md B.7). Never read from or written
+    /// to JSON.
+    #[serde(skip)]
+    pub trace_id: Option<String>,
 }
 
 fn all_workspaces() -> Vec<String> {
@@ -114,7 +128,14 @@ fn all_workspaces() -> Vec<String> {
 
 impl Principal {
     pub fn new(id: impl Into<String>, roles: Vec<Role>, workspaces: Vec<String>) -> Self {
-        Self { id: id.into(), roles, workspaces, entity: None, via: None }
+        Self { id: id.into(), roles, workspaces, entity: None, via: None, cause: None, trace_id: None }
+    }
+
+    /// The same principal continuing W3C trace `trace_id` (32 lowercase hex
+    /// characters; anything else is no trace).
+    pub fn with_trace(mut self, trace_id: Option<&str>) -> Self {
+        self.trace_id = trace_id.filter(|t| crate::trace::is_trace_id(t)).map(str::to_string);
+        self
     }
 
     pub fn system() -> Self {
@@ -197,6 +218,82 @@ impl Principal {
     }
 }
 
+/// Principal ids that belong to the engine's own service principals. No
+/// credential may act as them (`x-onto-act-as`), and no configured token may
+/// carry them: otherwise a caller could write records attributed to an
+/// automation, a webhook or a connector, and read or undo what they wrote.
+/// A prefix ending in `:` reserves every id that starts with it; `system`
+/// reserves `system` itself and `system:<anything>`.
+pub const RESERVED_ID_PREFIXES: &[&str] = &["automation:", "webhook:", "writeback:", "connector:", "system"];
+
+/// Whether `id` is a reserved service principal id ([`RESERVED_ID_PREFIXES`]),
+/// compared case-insensitively and ignoring surrounding whitespace.
+pub fn is_reserved_id(id: &str) -> bool {
+    let id = id.trim().to_ascii_lowercase();
+    RESERVED_ID_PREFIXES.iter().any(|p| {
+        if p.ends_with(':') {
+            id.starts_with(p)
+        } else {
+            id == *p || id.strip_prefix(p).is_some_and(|rest| rest.starts_with(':'))
+        }
+    })
+}
+
+/// What a configured principal may do, without its id: the roles and
+/// workspaces a webhook endpoint, writeback target or automation acts with
+/// (`run_as = { roles = [...], workspaces = [...] }`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopePrincipal {
+    #[serde(default)]
+    pub roles: Vec<Role>,
+    #[serde(default)]
+    pub workspaces: Vec<String>,
+}
+
+impl ScopePrincipal {
+    pub fn new(roles: Vec<Role>, workspaces: Vec<String>) -> Self {
+        Self { roles, workspaces }
+    }
+
+    /// The principal `id` acting with this scope.
+    pub fn principal(&self, id: impl Into<String>) -> Principal {
+        Principal::new(id, self.roles.clone(), self.workspaces.clone())
+    }
+}
+
+/// Whether `a` may configure something that acts as `b`: `a` can already do
+/// everything `b` can. Required on every mutating outbound operation
+/// (webhook endpoints, writeback targets, automation enablement), so a
+/// narrower admin cannot redirect a broader principal's output.
+///
+/// - `a` is not an agent, and `b` holds neither `system` nor `agent`.
+/// - Every workspace of `b` is one of `a`'s (`b` holding `*` needs `a` to hold `*`).
+/// - `a` admin (or system) in those workspaces covers every role of `b`.
+///   Otherwise `viewer` in `b` needs read access, `member` write access,
+///   every custom role of `b` must be held by `a`, and `admin` in `b` needs
+///   `a` admin.
+pub fn dominates(a: &Principal, b: &ScopePrincipal) -> bool {
+    if a.is_agent() || b.roles.iter().any(|r| matches!(r, Role::System | Role::Agent)) {
+        return false;
+    }
+    let a_all = a.workspaces.iter().any(|w| w == "*");
+    for w in &b.workspaces {
+        let covered = if w == "*" { a_all } else { a.in_workspace(w) };
+        if !covered {
+            return false;
+        }
+    }
+    if a.is_privileged() {
+        return true;
+    }
+    b.roles.iter().all(|r| match r {
+        Role::Viewer => a.allows(Access::Read),
+        Role::Member => a.allows(Access::Write),
+        Role::Admin | Role::System | Role::Agent => false,
+        Role::Custom(_) => a.has_role(r),
+    })
+}
+
 /// Authorize `access` in `ws` (and on `entity`, when given).
 pub fn check(p: &Principal, access: Access, ws: &str, entity: Option<&Entity>, graph: &Graph) -> Result<()> {
     if !p.in_workspace(ws) {
@@ -269,5 +366,64 @@ mod tests {
         assert!(Principal::named("v", &["viewer", "observer"], &["*"]).unwrap().can_observe());
         assert!(!Principal::member("m", "*").can_observe());
         assert!(!Principal::new("k", vec![Role::Agent], vec!["*".into()]).can_observe());
+    }
+
+    #[test]
+    fn reserved_ids() {
+        for id in [
+            "automation:payroll",
+            "webhook:hook1",
+            "connector:crm",
+            "writeback:helpdesk",
+            "system",
+            "System",
+            " SYSTEM ",
+            "system:wake",
+            "Automation:X",
+            "WEBHOOK:",
+        ] {
+            assert!(is_reserved_id(id), "{id}");
+        }
+        for id in ["user:kenji", "key:onto_sk_ab", "systems-team", "systemd", "nexc-backend", "automations", "ops"] {
+            assert!(!is_reserved_id(id), "{id}");
+        }
+    }
+
+    fn scope(roles: &[&str], ws: &[&str]) -> ScopePrincipal {
+        let p = Principal::named("x", roles, ws).unwrap();
+        ScopePrincipal::new(p.roles, p.workspaces)
+    }
+
+    #[test]
+    fn dominance() {
+        let admin_all = Principal::admin("a");
+        let admin_ws1 = Principal::new("a1", vec![Role::Admin], vec!["ws1".into()]);
+        let member_ws1 = Principal::member("m", "ws1");
+        let viewer_ws1 = Principal::viewer("v", "ws1");
+        let triager = Principal::named("t", &["member", "triager"], &["ws1", "ws2"]).unwrap();
+        let agent_admin = Principal::new("g", vec![Role::Admin, Role::Agent], vec!["*".into()]);
+
+        // A scoped admin cannot configure something acting over every workspace.
+        assert!(dominates(&admin_all, &scope(&["admin"], &["*"])));
+        assert!(!dominates(&admin_ws1, &scope(&["viewer"], &["*"])));
+        assert!(dominates(&admin_ws1, &scope(&["admin", "member", "triager"], &["ws1"])));
+        assert!(!dominates(&admin_ws1, &scope(&["viewer"], &["ws1", "ws2"])));
+        // Built-in roles by access; admin in b needs admin in a.
+        assert!(dominates(&member_ws1, &scope(&["viewer", "member"], &["ws1"])));
+        assert!(!dominates(&member_ws1, &scope(&["admin"], &["ws1"])));
+        assert!(dominates(&viewer_ws1, &scope(&["viewer"], &["ws1"])));
+        assert!(!dominates(&viewer_ws1, &scope(&["member"], &["ws1"])));
+        // Custom roles must be held.
+        assert!(dominates(&triager, &scope(&["member", "triager"], &["ws2"])));
+        assert!(!dominates(&member_ws1, &scope(&["triager"], &["ws1"])));
+        assert!(!dominates(&triager, &scope(&["approver"], &["ws1"])));
+        // Agents never dominate; nobody dominates system or agent scopes.
+        assert!(!dominates(&agent_admin, &scope(&["viewer"], &["ws1"])));
+        assert!(!dominates(&admin_all, &scope(&["agent"], &["ws1"])));
+        assert!(!dominates(&Principal::system(), &scope(&["system"], &["*"])));
+        assert!(dominates(&Principal::system(), &scope(&["admin"], &["*"])));
+        // The scope's own principal.
+        let p = scope(&["member"], &["ws1"]).principal("automation:triage");
+        assert_eq!((p.id.as_str(), p.workspaces.as_slice()), ("automation:triage", ["ws1".to_string()].as_slice()));
     }
 }

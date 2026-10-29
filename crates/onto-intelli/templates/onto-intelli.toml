@@ -15,6 +15,8 @@ ingest_queue = 1024           # async ingestion backpressure
 # max_open_tenants = 512        # least recently used close past this (0: no limit)
 # tenant_idle_secs = 1800       # unused this long (0: never)
 # tenant_memory_budget_mb = 0   # least recently used close while the open ones' estimate is above it (0: none)
+# One process per deployment (elected) opens closed tenants whose background work is due; `onto serve` stands:
+# wake_poll_secs = 20           # its fallback poll when no wake notice arrives (0: this process never scans)
 
 # [engine.postgres]
 # tenant = "acme"               # one PostgreSQL schema per tenant: {schema_prefix}{tenant}
@@ -108,6 +110,14 @@ health = true                 # grpc.health.v1
 http = true                   # JSON on the same port: POST /v1/call/{action}, /v1/ask
 proto_dirs = ["protos"]
 proto_files = ["acme/tickets/v1/tickets.proto"]
+# On SIGTERM or Ctrl-C: seconds for open connections and background workers to
+# finish before this process gives back its leases and claimed outbox rows (so a
+# replacement takes over at once) and exits; connections still open then are
+# cut. Keep it at least 5 s below the orchestrator's stop timeout: Kubernetes
+# waits 30 s by default; `docker stop` and Docker Compose only 10 s (use
+# `docker stop -t 30`, or `stop_grace_period: 30s` as docker-compose.yml does,
+# or lower this). Killed before then, the process leaves its leases to expire.
+shutdown_grace_secs = 20
 
 # Map RPCs of your own protos onto engine actions (`onto actions` lists them).
 # Templates read the request with {{field.path}}; a value that is exactly one
@@ -240,3 +250,86 @@ calls = "writes"
 flush_ms = 500
 flush_records = 200
 queue = 10000                      # records waiting; beyond this they are dropped and counted
+# Webhook and writeback delivery attempts that become traces of kind
+# "delivery": "failures" (retried and dead attempts), "all", or "off". They
+# hold no body, header, secret or URL. Automation runs are always traced
+# (kind "automation") while traces are on.
+deliveries = "failures"
+
+# The change feed (changes.poll, changes.head, GET|POST /v1/changes/stream):
+# records of what each commit changed, filtered per reader. Whether commits
+# record changes is a tenant property, switched with the changes.capture action
+# (admins of every workspace).
+[changes]
+retain_days = 7                    # change records older than this are removed hourly, whole commits (0: no age limit)
+retain_max_rows = 5000000          # and at most this many are kept per tenant (0: no count limit)
+page = 500                         # records scanned per changes.poll or stream page without a limit (1..1000)
+ring = 4096                        # records per tenant in memory, only while it has streams (counted in the memory budget)
+eval_budget_ms = 50                # filtering time per stream page before the page is split
+heartbeat_secs = 15                # streams send the last cursor scanned this often
+stall_timeout_secs = 60            # a client that reads nothing this long is cut (slow_consumer)
+max_backfill_seqs = 100000         # commits behind the head before a stream ends too_far_behind
+reauth_secs = 60                   # streams re-authenticate their request this often
+max_subscribers = 200              # streams per tenant per process
+max_subscribers_per_principal = 20
+max_subscribers_process = 2000
+
+# Webhook delivery from the outbox (docs/design/EVENTS.md Part B): signed
+# CloudEvents (Standard Webhooks signatures). Each change is enqueued once per
+# endpoint and delivered at least once; receivers dedupe on the event id.
+# Delivery concurrency limits are per process.
+[webhooks]
+enabled = true                     # false: this process sends nothing (rows wait in the outbox)
+workers = true                     # fan-out and delivery workers (onto's one-off commands run none)
+max_endpoints = 50                 # per tenant
+timeout_secs = 10
+poll_secs = 20                     # fallback poll; commits that enqueue rows wake the worker at once
+max_attempts = 15
+backoff_base_secs = 10             # retry delay min(base * 2^(attempt-1), max) with jitter; Retry-After up to max
+backoff_max_secs = 3600
+max_payload_bytes = 262144         # larger bodies are not sent (dead: payload_too_large)
+max_in_flight_per_endpoint = 4     # per process
+max_in_flight_per_tenant = 8       # per process
+max_in_flight_process = 64
+pause_after_failures = 20          # consecutive failures pause an endpoint ...
+pause_secs = 300                   # ... this long, then one probe (a failed probe doubles it, up to 1 h)
+pending_cap = 100000
+retain_days = 14                   # finished rows and attempt logs (1 to 36500; trimmed 5 min after a tenant opens, then hourly)
+# Operator rules: a host that may resolve into private CIDRs (never for
+# endpoints a project registered; link-local and metadata ranges never).
+# [[webhooks.allow]]
+# host = "hooks.internal.example"  # or "*.internal.example"
+# cidrs = ["10.20.0.0/16"]
+
+# Change-triggered automations (docs/design/EVENTS.md Part C). Definitions
+# are schema ([automations.<name>], put_automation through schema.apply or a
+# proposal) and are visible to everyone who can read the schema; a person who
+# may approve schema changes enables each one, and the enablement expires.
+[automation]
+enabled = true                     # false: this process runs no automations
+workers = true
+max_automations = 100              # per tenant, at schema.apply/propose (never when a schema loads)
+max_depth = 3                      # cascade limit (an automation's own max_depth may lower it)
+max_runs_per_minute = 600          # per tenant; over it, triggers become skipped runs (rerunnable)
+default_rate_per_minute = 60       # per automation, when rate.per_minute is unset
+default_per_subject_per_hour = 10  # per (automation, subject), when rate.per_subject_per_hour is unset
+pause_after_failures = 5           # consecutive failed runs pause an automation
+enable_ttl_days = 30               # a person re-enables after this (phase 1 local principals)
+lease_secs = 60
+retry_base_secs = 10               # retry delay min(base * 2^(attempt-1), max)
+retry_max_secs = 3600
+retry_max_attempts = 8
+retain_days = 30                   # final run rows (1 to 36500); the automation.run events stay
+
+# HTTP writeback effects of action types (docs/design/EVENTS.md Part D): an
+# action type's `writeback = { target, route, body }` effect posts the body to
+# a registered target (writeback.add) through the outbox after the action
+# commits, with Idempotency-Key: <receipt>:<effect> (the receiver must honour
+# it). Writeback is not reversible; action.undo does not undo the external
+# write. Off by default: while off, plans with a writeback effect are refused.
+# Retries, the breaker, the payload limit and [[webhooks.allow]] apply as for
+# webhooks.
+[writeback]
+enabled = false
+max_targets = 20                   # per tenant
+timeout_secs = 15

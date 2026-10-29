@@ -280,7 +280,7 @@ export interface Whoami {
   dev_mode: boolean;
   version: string;
   schema_version: number;
-  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean };
+  capabilities: { read: boolean; write: boolean; apply_schema: boolean; approve: boolean; propose: boolean; observe?: boolean; configure_outbound?: boolean; automate?: boolean };
   console?: { user: string; role: string; org: string } | null;
   credential?: string;
   ui: { title: string };
@@ -903,4 +903,147 @@ export interface PackInstalled {
   sample_links: number;
   sample_links_skipped: number;
   revision?: number;
+}
+
+// ── webhooks (webhook.* and outbox.list) ───────────────────────────────
+
+export interface ChangeFilter {
+  kinds?: string[];
+  ops?: string[];
+  workspaces?: string[];
+  ids?: string[];
+  rels?: string[];
+  props?: string[];
+  sources?: string[];
+  include_migrations: boolean;
+  fields: "full" | "ids";
+}
+
+export interface WebhookEndpoint {
+  name: string;
+  principal_id: string;
+  /** Full URL for endpoints the caller may manage, else its origin. */
+  url: string;
+  /** `env:VAR`, `file:/path` or `sealed (kek …)`: never the secret. */
+  secret: string;
+  previous_secret?: string;
+  previous_until?: number;
+  principal: { roles: string[]; workspaces: string[] };
+  filter: ChangeFilter | null;
+  enabled: boolean;
+  status: "active" | "paused" | "disabled";
+  paused: { reason: string; since?: number; until?: number; pending?: number; failures?: number } | null;
+  restricted: boolean;
+  version: number;
+  created_by: string;
+  created_at: number;
+  may_manage: boolean;
+  pending?: number;
+  cursor?: string;
+}
+
+export interface WebhookList {
+  items: WebhookEndpoint[];
+  kill: boolean;
+  max_endpoints: number;
+  note: string;
+}
+
+export type OutboxState = "pending" | "inflight" | "retry" | "delivered" | "dead" | "cancelled";
+
+export interface OutboxRow {
+  id: string;
+  created_at: number;
+  kind: "webhook" | "writeback";
+  target: string;
+  dedupe: string;
+  source: string;
+  workspace: string;
+  cursor?: string;
+  event_type: string;
+  state: OutboxState;
+  attempts: number;
+  next_at: number;
+  last_status?: number;
+  last_error?: string;
+  delivered_at?: number;
+}
+
+export interface DeliveryAttempt {
+  outbox_id: string;
+  attempt: number;
+  ts: number;
+  state: OutboxState;
+  status?: number;
+  error?: string;
+  duration_ms: number;
+  response?: string;
+}
+
+// ── automate (crates/onto-intelli/src/automate.rs) ───────────────────────
+
+export interface AutomationEffectSummary {
+  kind: "action" | "webhook";
+  target: string;
+  event?: string;
+}
+
+export interface AutomationItem {
+  name: string;
+  principal_id: string;
+  description: string;
+  mode: "live" | "shadow";
+  run_as: { roles: string[]; workspaces: string[] };
+  trigger: { on: string; kinds?: string[]; ops?: string[]; workspaces?: string[]; rels?: string[]; props?: string[]; state?: { from?: string[]; to?: string[] }; sources?: string[] };
+  effects: AutomationEffectSummary[];
+  status: "active" | "inactive";
+  reason: string | null;
+  enabled: boolean;
+  enabled_by: string | null;
+  enabled_at: number | null;
+  expires_at: number | null;
+  paused: { reason: string; since: number } | null;
+  may_enable: boolean;
+}
+
+export interface AutomationList {
+  items: AutomationItem[];
+  kill: boolean;
+  process_enabled: boolean;
+  note: string;
+}
+
+export type RunState = "running" | "succeeded" | "failed" | "retry" | "skipped" | "refused" | "would_run" | "cancelled";
+
+export interface AutomationRunEffect {
+  index: number;
+  kind: "action" | "webhook";
+  target: string;
+  ok: boolean;
+  receipt?: string;
+  outbox?: string;
+  error?: string;
+  plan?: Record<string, unknown>;
+}
+
+export interface AutomationRun {
+  id: string;
+  automation: string;
+  trigger_key: string;
+  mode: "live" | "shadow";
+  depth: number;
+  state: RunState;
+  reason?: string;
+  trigger: { on: string; cursor: string; op: string; id: string; kind: string; workspace: string; subject: string; actor: string; state?: { from?: string; to?: string } };
+  principal: string;
+  effects: AutomationRunEffect[];
+  attempts: number;
+  started_at: number;
+  finished_at?: number;
+}
+
+export interface AutomationRuns {
+  items: AutomationRun[];
+  hidden: number;
+  note: string;
 }

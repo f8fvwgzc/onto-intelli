@@ -17,10 +17,14 @@ use onto_core::{
 use onto_core::{Decision, Migration, Ontology, ProposalInput, ProposalStatus, SchemaChangeSet, SearchMode};
 
 use crate::assurance;
+use crate::automate;
+use crate::changes;
 use crate::ingest::normalize_record;
 use crate::intelli::{AskRequest, Intelli};
 use crate::memory::{MemoryScope, RecallOptions, RememberInput};
 use crate::trace::{self, TraceCtx, Traced};
+use crate::webhooks;
+use crate::writeback;
 use onto_core::trace::{MetricsQuery, ScoreRow, SessionQuery, TraceDetail, TraceQuery};
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -219,7 +223,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     a(
         "schema.plan",
         false,
-        "Dry run of a schema change set: validation, diff, impact (entities/links, breaking), migration. Input: SchemaChangeSet.",
+        "Dry run of a schema change set: validation, diff, impact (entities/links, breaking), migration, enabled automations it would stop (lint). Input: SchemaChangeSet.",
     ),
     a(
         "schema.apply",
@@ -441,8 +445,142 @@ pub const ACTIONS: &[ActionInfo] = &[
         true,
         "Write a sheet's rows as objects with a mapping; when absent, the rows go into the existing object type the sheet names (kind, else induced), column by column, and a type the schema lacks must be applied from model.induce first. dry_run validates only. Input: {csv, mapping?, kind?, key?, workspace?, dry_run?}.",
     ),
-    a("system.stats", false, "Graph, memory, cache, token and ingestion statistics."),
-    a("system.health", false, "Liveness and version."),
+    a(
+        "changes.poll",
+        false,
+        "One page of the change feed after a cursor: records the caller may see that the filter wants (gap records always pass), next (the last cursor scanned), head, floor, and expired with a message when the cursor is older than the floor. Delivery is at least once; exactly once is not offered. Input: {after? | from?: earliest (default) | now, limit? (at most 1000), kinds?, ops?, workspaces?, ids?, rels?, props?, sources?, fields?: full | ids, include_migrations? | exclude_migrations?}.",
+    ),
+    a("changes.head", false, "The change feed's position: {cursor, head, floor, capture}."),
+    a(
+        "changes.capture",
+        true,
+        "Turn change recording on or off for the tenant (admins of every workspace, never agents); turning it on after a period off expires every older cursor, since nothing was recorded meanwhile. Input: {on | off, workspace?}.",
+    ),
+    a(
+        "webhook.list",
+        false,
+        "Webhook endpoints by name: URL (its origin only for endpoints the caller may not manage), secret reference (never the secret), principal, change filter, status (active, paused, disabled), version, and pending rows and cursor for endpoints the caller manages; plus the tenant kill switch. Admins, never agents.",
+    ),
+    a(
+        "webhook.add",
+        true,
+        "Register a webhook endpoint: signed CloudEvents (Standard Webhooks) to an https URL, as the endpoint's principal sees the data. With a filter, every change it wants from now on is enqueued once and delivered at least once; dedupe on the event id. No secret: a whsec_ secret is generated, sealed and returned once. Admins who dominate the principal (default viewer in the call's workspace), never agents. Input: {name, url, secret?, filter?: {kinds?, ops?, workspaces?, ids?, rels?, props?, sources?, fields?, exclude_migrations?}, principal?: {roles, workspaces}, disabled?, workspace?}.",
+    ),
+    a(
+        "webhook.update",
+        true,
+        "Change a webhook endpoint (its version moves): url, secret (replaced, no overlap; see webhook.rotate_secret), filter or clear_filter, principal, enabled or disabled. Admins who dominate the old and new principal. Input: {name, url?, secret?, filter?, clear_filter?, principal?, enabled? | disabled?, workspace?}.",
+    ),
+    a(
+        "webhook.remove",
+        true,
+        "Remove a webhook endpoint; rows not yet sent to it are cancelled. Admins who dominate its principal. Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.test",
+        true,
+        "Enqueue a test delivery (onto.webhook.test) to an endpoint. Admins who dominate its principal. Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.rotate_secret",
+        true,
+        "Rotate an endpoint's signing secret: the new one (given, or generated and returned once) signs from now, the previous one also signs for keep_secs (default a day). Input: {name, secret?, keep_secs?, workspace?}.",
+    ),
+    a(
+        "webhook.deliveries",
+        false,
+        "An endpoint's deliveries, newest first, or one delivery with its attempts (status, error, the start of the receiver's response). Admins who dominate its principal. Input: {name, id?, states?, since?, limit?}.",
+    ),
+    a(
+        "webhook.replay",
+        true,
+        "Send an endpoint's deliveries again (by ids, or created since a time; retry, delivered, dead and cancelled by default). They keep their ids, so receivers that dedupe see repeats. Input: {name, ids? | since?, states?, workspace?}.",
+    ),
+    a(
+        "webhook.resume",
+        true,
+        "Resume a paused endpoint: clears a pause, an open breaker and a backlog pause (fan-out pauses it again while it is over its cap). Input: {name, workspace?}.",
+    ),
+    a(
+        "webhook.kill",
+        true,
+        "The tenant's webhook kill switch: on holds every delivery in the outbox (change subscriptions keep their cursors); off resumes them (admins who dominate every endpoint). Input: {on | off, workspace?}.",
+    ),
+    a(
+        "outbox.list",
+        false,
+        "Outbound deliveries waiting, sent or given up, newest first, for targets the caller may manage. Input: {target?, states?, source?, receipt?, run?, since?, limit?}.",
+    ),
+    a(
+        "automation.list",
+        false,
+        "Automations by name: description, mode, run_as, trigger, effects, status (active, or inactive with the reason: not_enabled, paused, stale_definition, enablement_expired, killed), who enabled it and when it expires, and whether the caller may enable it; plus the tenant kill switch. Definitions are visible to everyone who can read the schema.",
+    ),
+    a(
+        "automation.get",
+        false,
+        "One automation: its definition, status, enablement and closure (the items its enablement binds to, and those that changed since). Input: {name}.",
+    ),
+    a(
+        "automation.runs",
+        false,
+        "Automation runs, newest first (ties by id): state (running, succeeded, failed, retry, skipped, refused, would_run, cancelled), reason, trigger, effects with receipts and outbox ids; runs of automations the caller does not dominate are counted as hidden. Input: {name?, state?, since?, limit?} or {id}.",
+    ),
+    a(
+        "automation.test",
+        false,
+        "A dry run of an automation against a change (cursor) or an entity as if it was just updated (id; refused for a trigger with a state guard or props, which need a cursor), rendered and planned as the run principal and the caller together: whether the trigger admits it, the conditions, the plan and the webhook payloads. Writes nothing. Input: {name, cursor? | id?}.",
+    ),
+    a(
+        "automation.enable",
+        true,
+        "Enable an automation (approvers and admins who dominate its run_as, never agents; every endpoint it reaches must dominate run_as too). It runs on changes from now on, binds to its closure hash (any change to what it reaches stops it) and expires after [automation] enable_ttl_days. Webhook effects are enqueued once and delivered at least once. Input: {name, workspace?}.",
+    ),
+    a(
+        "automation.disable",
+        true,
+        "Stop an automation (admins, or whoever may enable it); its pending retries are cancelled. Input: {name, workspace?}.",
+    ),
+    a(
+        "automation.rerun",
+        true,
+        "Run a skipped or failed run again (as enable); it is evaluated and planned on the graph at its commit. Input: {id, workspace?}.",
+    ),
+    a(
+        "automation.kill",
+        true,
+        "The tenant's automation kill switch: on stops every automation (changes made meanwhile never start runs; pending retries are cancelled); off resumes them (admins who may enable every enabled automation). Input: {on | off, workspace?}.",
+    ),
+    a(
+        "writeback.add",
+        true,
+        "Register an HTTP writeback target for action types' writeback effects: a base https URL (or an operator env:/file: reference), named routes (relative paths under it), the workspaces whose actions may use it (default the call's) and an optional signing secret (Standard Webhooks headers; plaintext is sealed, generate_secret returns one once). Writeback is not reversible; action.undo does not undo the external write. Each call is enqueued once and delivered at least once with Idempotency-Key: <receipt>:<effect>, which the receiver must honour. Admins of every workspace it serves, never agents. Input: {name, base_url, routes: {name: path}, workspaces?, secret?, generate_secret?, workspace?}.",
+    ),
+    a(
+        "writeback.list",
+        false,
+        "Writeback targets by name: base URL (its origin only, and route names only, for targets the caller may not manage), routes, workspaces, secret reference (never the secret), version; plus whether [writeback] enabled is on. Admins, never agents.",
+    ),
+    a(
+        "writeback.remove",
+        true,
+        "Remove a writeback target: rows not yet sent to it are cancelled, plans that name it are refused and automations that reach it stop. Admins of every workspace it serves. Input: {name, workspace?}.",
+    ),
+    a(
+        "writeback.test",
+        false,
+        "Check a writeback target without sending anything (a request could write): its references resolve, and its base URL and every route (or one) pass the outbound rules. Admins of every workspace it serves. Input: {name, route?}.",
+    ),
+    a(
+        "system.stats",
+        false,
+        "Graph, memory, cache, token and ingestion statistics; outbox rows per target and state, change lag per consumer and endpoint, gap records over 24 h and runs per state over 1 h.",
+    ),
+    a(
+        "system.health",
+        false,
+        "Liveness and version, the webhook and automation switches and paused counts, change capture and the latest gap record.",
+    ),
     a("system.whoami", false, "The caller's principal and what it may do (write, apply, approve, propose schema)."),
     a(
         "trace.list",
@@ -705,13 +843,17 @@ impl Intelli {
                 Traced::untraced(run.await)
             }
             a if a.starts_with("trace.") || !self.traces_call(a) => {
-                Traced::untraced(Box::pin(self.dispatch(p, action, input)).await)
+                // Not recorded, but the caller's trace still continues in
+                // what the call enqueues (change records, outbox rows).
+                let p = p.clone().with_trace(ctx.otel_trace_id.as_deref());
+                Traced::untraced(Box::pin(self.dispatch(&p, action, input)).await)
             }
             _ => self.call_recorded(p, action, input, ctx).await,
         }
     }
 
     /// Does `[traces] calls` make a trace of `action`?
+    /// (Secret-bearing actions are traced without content: [`secret_bearing`].)
     fn traces_call(&self, action: &str) -> bool {
         match self.config().traces.calls.as_str() {
             "all" => true,
@@ -724,8 +866,12 @@ impl Intelli {
     /// with the generation spans of any LLM call under it.
     async fn call_recorded(&self, p: &Principal, action: &str, input: Value, ctx: TraceCtx) -> Traced<Value> {
         let Some(tracer) = self.start_trace(&ctx) else {
-            return Traced::untraced(Box::pin(self.dispatch(p, action, input)).await);
+            let p = p.clone().with_trace(ctx.otel_trace_id.as_deref());
+            return Traced::untraced(Box::pin(self.dispatch(&p, action, input)).await);
         };
+        // What the call enqueues continues the caller's trace, else this one
+        // (docs/design/EVENTS.md B.7).
+        let p = &p.clone().with_trace(Some(ctx.otel_trace_id.as_deref().unwrap_or(tracer.id())));
         let ws = self.ws_or_default(input.get("workspace").and_then(Value::as_str).map(str::to_string));
         let (kind, name) = match action {
             "action.apply" => {
@@ -735,7 +881,11 @@ impl Intelli {
             other => ("call", other.to_string()),
         };
         let mut row = trace::base_row(&ctx, p, kind, &name, &ws);
-        if tracer.captures() {
+        // Outbound configuration carries signing secrets (given, generated
+        // and rotated ones are returned once) and receivers' URLs: its call
+        // traces keep no input or output, whatever capture_content says.
+        let capture = tracer.captures() && !secret_bearing(action);
+        if capture {
             let mut m = Map::new();
             if let Some(q) = input.get("question").and_then(Value::as_str).and_then(|q| tracer.text(q)) {
                 m.insert("question".into(), Value::String(q));
@@ -766,7 +916,7 @@ impl Intelli {
                         row.name = format!("action.undo:{t}");
                     }
                 }
-                row.output = tracer.text(&v.to_string()).map(|o| json!({ "output": o }));
+                row.output = if capture { tracer.text(&v.to_string()).map(|o| json!({ "output": o })) } else { None };
                 if let Some(e) = tracer.llm_error() {
                     trace::fail(&mut row, "llm_error", &e);
                 }
@@ -778,15 +928,36 @@ impl Intelli {
         Traced { result, trace_id: Some(id) }
     }
 
+    /// The checks every call passes before it runs, for the action table
+    /// and for surfaces that serve an action outside it (the change stream):
+    /// agents run only the write actions open to them ([`AGENT_WRITES`],
+    /// raw writes with `governance.agent_raw_writes`). The action's own arm
+    /// checks roles, workspaces and governance.
+    pub fn admit(&self, p: &Principal, action: &str, input: &Value) -> Result<()> {
+        agent_may_write(p, action, input, self.ontology().options().governance.agent_raw_writes)
+    }
+
     /// The action table itself.
     async fn dispatch(&self, p: &Principal, action: &str, input: Value) -> Result<Value> {
         let onto = self.ontology();
-        agent_may_write(p, action, &input, onto.options().governance.agent_raw_writes)?;
+        self.admit(p, action, &input)?;
         if GRAPH_READS.contains(&action) || assurance::GRAPH_READS.contains(&action) {
             return blocking(|| graph_call(onto, p, self.default_workspace(), action, input));
         }
         if assurance::CALLS.contains(&action) {
             return blocking(|| self.assurance_call(p, action, input));
+        }
+        if changes::CALLS.contains(&action) {
+            return blocking(|| self.changes_call(p, action, input));
+        }
+        if webhooks::CALLS.contains(&action) {
+            return blocking(|| self.webhooks_call(p, action, input));
+        }
+        if automate::CALLS.contains(&action) {
+            return blocking(|| self.automate_call(p, action, input));
+        }
+        if writeback::CALLS.contains(&action) {
+            return blocking(|| self.writeback_call(p, action, input));
         }
         let ws_hint = input.get("workspace").and_then(Value::as_str).map(str::to_string);
         match action {
@@ -1266,7 +1437,7 @@ impl Intelli {
                 let i: crate::modeling::ApplyDraftIn = parse(action, input)?;
                 self.apply_ontology_draft(p, i).await
             }
-            "system.stats" => self.stats(),
+            "system.stats" => self.stats(p),
             "system.whoami" => {
                 let gov = &onto.options().governance;
                 Ok(json!({
@@ -1277,6 +1448,8 @@ impl Intelli {
                         "apply_schema": gov.can_apply(p) && gov.live_edits,
                         "approve": gov.can_approve(p),
                         "propose": gov.can_propose(p),
+                        "configure_outbound": p.is_privileged() && !p.is_agent(),
+                        "automate": !p.is_agent() && (gov.can_approve(p) || p.is_privileged()),
                     },
                     "schema_version": onto.schema_version(),
                 }))
@@ -1287,6 +1460,7 @@ impl Intelli {
                 "revision": onto.revision(),
                 "llm": self.llm().name(),
                 "llm_available": self.llm().unavailable().is_none(),
+                "outbound": self.outbound_health(),
             })),
             "system.actions" => Ok(json!({ "actions": ACTIONS })),
             a if a.starts_with("trace.") => self.trace_action(p, a, input),
@@ -1319,6 +1493,7 @@ impl Intelli {
                     )));
                 }
                 let mut page = store.trace_list(&q)?;
+                self.retain_worker_traces(p, &mut page.traces, |t| &t.principal);
                 if redact {
                     page.traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
                 }
@@ -1327,7 +1502,7 @@ impl Intelli {
             "trace.get" => {
                 let i: IdIn = parse(action, input)?;
                 let mut d = self.find_trace(&i.id)?;
-                check_trace_workspace(p, &d)?;
+                self.check_trace(p, &d)?;
                 if redact {
                     d.redact();
                 }
@@ -1351,6 +1526,7 @@ impl Intelli {
                 let i: SessionIn = parse(action, input)?;
                 let traces = store.trace_session(&i.id, i.limit.unwrap_or(onto_core::trace::DEFAULT_LIST))?;
                 let mut traces: Vec<_> = traces.into_iter().filter(|t| p.in_workspace(&t.workspace)).collect();
+                self.retain_worker_traces(p, &mut traces, |t| &t.principal);
                 if redact {
                     traces.iter_mut().for_each(onto_core::trace::TraceRow::redact);
                 }
@@ -1366,6 +1542,32 @@ impl Intelli {
             }
             other => Err(Error::not_found(format!("action '{other}' (see system.actions)"))),
         }
+    }
+
+    /// Traces of the outbound workers (kinds `automation` and `delivery`,
+    /// principals `automation:`, `webhook:`, `writeback:`) are kept only for
+    /// callers who may see the run or the delivery itself: who dominate the
+    /// automation's `run_as` (as `automation.runs` shows runs), or who may
+    /// manage the endpoint or target (as `outbox.list` shows rows); those
+    /// of removed ones only for tenant-wide admins. Other traces stay.
+    fn retain_worker_traces<T>(&self, p: &Principal, rows: &mut Vec<T>, principal: impl Fn(&T) -> &String) {
+        if !rows.iter().any(|t| crate::intelli::OutboundScopes::is_worker(principal(t))) {
+            return;
+        }
+        let scopes = crate::intelli::OutboundScopes::load(self);
+        rows.retain(|t| scopes.worker(p, principal(t)));
+    }
+
+    /// The caller may read this trace: its workspace, and for a worker's
+    /// trace, its automation, endpoint or target
+    /// ([`retain_worker_traces`](Self::retain_worker_traces)).
+    fn check_trace(&self, p: &Principal, d: &TraceDetail) -> Result<()> {
+        check_trace_workspace(p, d)?;
+        let id = &d.trace.principal;
+        if crate::intelli::OutboundScopes::is_worker(id) && !crate::intelli::OutboundScopes::load(self).worker(p, id) {
+            return Err(Error::not_found(format!("trace {}", d.trace.id)));
+        }
+        Ok(())
     }
 
     /// A trace by id; when it is not stored yet, the queue is flushed and it
@@ -1416,7 +1618,7 @@ impl Intelli {
                 p.id
             )));
         }
-        check_trace_workspace(p, &d)?;
+        self.check_trace(p, &d)?;
         if let Some(s) = &i.span_id
             && !d.spans.iter().any(|x| &x.id == s)
         {
@@ -1928,4 +2130,13 @@ pub fn graph_call(onto: &Ontology, p: &Principal, default_ws: &str, action: &str
         a if assurance::GRAPH_READS.contains(&a) => assurance::graph_read(onto, p, a, input),
         other => Err(Error::invalid(format!("{other} is not a read-only graph action"))),
     }
+}
+
+/// Actions whose input or output may hold a signing secret, a credential or
+/// a receiver's URL with its token: webhook endpoints, writeback targets and
+/// connectors. Their call traces record no content.
+pub(crate) fn secret_bearing(action: &str) -> bool {
+    crate::webhooks::CALLS.contains(&action)
+        || crate::writeback::CALLS.contains(&action)
+        || action.starts_with("connector.")
 }

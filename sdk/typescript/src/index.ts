@@ -37,10 +37,15 @@ import type {
   TracePage,
 } from "./types.ts";
 import { parseSse } from "./sse.ts";
+import { Changes } from "./changes.ts";
 
 export type * from "./types.ts";
 export { parseSse } from "./sse.ts";
 export type { SseMessage } from "./sse.ts";
+export { Changes } from "./changes.ts";
+export type { ChangesTransport, PollOptions, SubscribeOptions } from "./changes.ts";
+export { WEBHOOK_TOLERANCE_SECS, WebhookVerificationError, signWebhook, signingKey, verifyWebhook } from "./webhooks.ts";
+export type { CloudEvent, VerifyOptions, WebhookHeaders } from "./webhooks.ts";
 
 export const VERSION = "0.2.0";
 
@@ -247,7 +252,34 @@ export class Onto {
     if (typeof f !== "function") throw new OntoError(0, "invalid_argument", "onto-intelli: no fetch (Node 18+ or pass fetch)");
     this.#fetch = f;
     this.#headers = { ...(options.headers ?? {}) };
+    this.changes = new Changes({
+      json: <T>(method: string, path: string, body?: unknown, signal?: AbortSignal) =>
+        this.#json<T>({ method, path, body, opts: { signal } }),
+      stream: async (body, lastEventId, signal) => {
+        const { res, release } = await this.#send({
+          method: "POST",
+          path: "/v1/changes/stream",
+          body,
+          stream: true,
+          opts: { signal },
+          extraHeaders: lastEventId === undefined ? undefined : { "last-event-id": lastEventId },
+        });
+        if (!res.body) {
+          release();
+          throw new OntoError(res.status, "internal", "the stream has no body");
+        }
+        return { body: res.body, release };
+      },
+      error: (status, code, message) => new OntoError(status, code, message),
+      status: (e) => (e instanceof OntoError && e.status > 0 ? e.status : undefined),
+    });
   }
+
+  /**
+   * The change feed: `subscribe` (a live stream that reconnects after the
+   * last cursor), `poll` and `head`.
+   */
+  readonly changes: Changes;
 
   /** What `console.log` shows: never the key. */
   toJSON(): object {

@@ -621,7 +621,7 @@ async fn a_full_queue_is_counted_in_the_ledger() {
         r.unwrap();
     }
     assert!(i.ledger().traces_dropped >= 1, "{:?}", i.ledger());
-    assert!(i.stats().unwrap()["ledger"]["traces_dropped"].as_u64().unwrap() >= 1);
+    assert!(i.stats(&admin()).unwrap()["ledger"]["traces_dropped"].as_u64().unwrap() >= 1);
     tokio::time::timeout(Duration::from_secs(5), i.flush_traces()).await.expect("flushing never hangs");
 }
 

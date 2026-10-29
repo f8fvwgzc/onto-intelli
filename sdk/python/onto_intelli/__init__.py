@@ -30,8 +30,10 @@ from .client import (
     TracePage,
     TraceRow,
 )
+from .changes import Changes
 from .errors import OntoError
 from .sse import SseMessage, parse_sse
+from .webhooks import WebhookVerificationError, sign_webhook, verify_webhook
 
 __version__ = VERSION
 
@@ -41,6 +43,7 @@ __all__ = [
     "AskRequest",
     "AskResponse",
     "AskTrace",
+    "Changes",
     "Entity",
     "MintedSession",
     "Onto",
@@ -56,5 +59,8 @@ __all__ = [
     "TraceMetrics",
     "TracePage",
     "TraceRow",
+    "WebhookVerificationError",
     "parse_sse",
+    "sign_webhook",
+    "verify_webhook",
 ]

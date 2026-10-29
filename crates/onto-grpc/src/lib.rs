@@ -252,11 +252,14 @@ pub async fn serve_hub(
     opts: ServeOptions,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let listen = hub.config().grpc.listen.clone();
-    let addr: SocketAddr = listen.parse().map_err(|e| Error::Config(format!("grpc.listen '{listen}': {e}")))?;
-    let listener =
-        tokio::net::TcpListener::bind(addr).await.map_err(|e| Error::Unavailable(format!("bind {addr}: {e}")))?;
+    let listener = bind(&hub.config().grpc.listen).await?;
     serve_hub_on(hub, opts, listener, shutdown).await
+}
+
+/// Bind `grpc.listen` (an address such as `127.0.0.1:50051`).
+pub async fn bind(listen: &str) -> Result<tokio::net::TcpListener> {
+    let addr: SocketAddr = listen.parse().map_err(|e| Error::Config(format!("grpc.listen '{listen}': {e}")))?;
+    tokio::net::TcpListener::bind(addr).await.map_err(|e| Error::Unavailable(format!("bind {addr}: {e}")))
 }
 
 /// Serve on an already-bound listener (tests, port 0, socket activation).
@@ -274,6 +277,125 @@ pub async fn serve_hub_on(
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    prepare(hub, opts, listener).await?.run(shutdown).await
+}
+
+/// A server whose configuration was checked (authentication, the console's
+/// startup rules, development mode on loopback only, routes and protos) on
+/// a bound port, not yet serving. `onto serve` prepares before it prints
+/// its banner, so a configuration error never follows a "listening" line.
+pub struct Prepared {
+    hub: Arc<Hub>,
+    router: axum::Router,
+    table: Arc<RouteTable>,
+    listener: tokio::net::TcpListener,
+}
+
+/// How long [`Prepared::run_graceful`] waits for cut connections to end.
+const CUT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+mod conn {
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::TcpStream;
+    use tonic::transport::server::{Connected, TcpConnectInfo};
+
+    type Cut = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// An accepted connection that ends when its cut signal turns `true`:
+    /// every read and write after that fails, so the connection task
+    /// serving it (and the request it was handling) ends.
+    pub(crate) struct Cuttable {
+        io: TcpStream,
+        cut: Option<Cut>,
+        was_cut: bool,
+    }
+
+    impl Cuttable {
+        pub(crate) fn new(io: TcpStream, cut: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
+            let cut = cut.map(|mut rx| -> Cut {
+                Box::pin(async move {
+                    // A dropped sender (the server is gone) cuts too.
+                    let _ = rx.wait_for(|c| *c).await;
+                })
+            });
+            Self { io, cut, was_cut: false }
+        }
+
+        fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+            if let Some(f) = &mut self.cut
+                && f.as_mut().poll(cx).is_ready()
+            {
+                self.cut = None;
+                self.was_cut = true;
+            }
+            if self.was_cut {
+                Err(io::Error::new(io::ErrorKind::ConnectionAborted, "cut at the shutdown deadline"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Connected for Cuttable {
+        type ConnectInfo = TcpConnectInfo;
+
+        fn connect_info(&self) -> TcpConnectInfo {
+            self.io.connect_info()
+        }
+    }
+
+    impl AsyncRead for Cuttable {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if let Err(e) = self.check(cx) {
+                return Poll::Ready(Err(e));
+            }
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Cuttable {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Err(e) = self.check(cx) {
+                return Poll::Ready(Err(e));
+            }
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            if let Err(e) = self.check(cx) {
+                return Poll::Ready(Err(e));
+            }
+            Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.io.is_write_vectored()
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Err(e) = self.check(cx) {
+                return Poll::Ready(Err(e));
+            }
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+}
+
+/// Check everything that can fail at startup and build the router.
+pub async fn prepare(hub: Arc<Hub>, opts: ServeOptions, listener: tokio::net::TcpListener) -> Result<Prepared> {
     let dev = opts.dev || hub.config().auth.mode == "dev";
     let addr = listener.local_addr().ok();
     if dev {
@@ -287,15 +409,113 @@ pub async fn serve_hub_on(
         tracing::warn!("DEVELOPMENT MODE: no authentication, every caller is {}", hub.config().auth.dev_principal.id);
     }
     check_console(hub.config(), opts.control.as_deref(), dev)?;
-    let (router, table) = router_hub(hub, &opts).await?;
-    tracing::info!(?addr, routes = table.routes.len(), "onto-intelli listening (gRPC + HTTP/JSON)");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    tonic::transport::Server::builder()
-        .accept_http1(true)
-        .add_routes(tonic::service::Routes::from(router))
-        .serve_with_incoming_shutdown(incoming, shutdown)
-        .await
-        .map_err(|e| Error::Unavailable(format!("server: {e}")))
+    let (router, table) = router_hub(hub.clone(), &opts).await?;
+    Ok(Prepared { hub, router, table, listener })
+}
+
+impl Prepared {
+    /// The bound address.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.local_addr().ok()
+    }
+
+    /// Serve until `shutdown` resolves, then until open connections close.
+    /// The hub is left as it is (another server may share it).
+    pub async fn run(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        self.serve(shutdown, None).await
+    }
+
+    /// [`run`](Self::run), with every accepted connection tied to `cut`:
+    /// once it turns `true`, the connections still open end (tonic serves
+    /// each one in its own task, which dropping the serve future leaves
+    /// running).
+    async fn serve(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        cut: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<()> {
+        use tokio_stream::StreamExt as _;
+        let addr = self.listener.local_addr().ok();
+        tracing::info!(?addr, routes = self.table.routes.len(), "onto-intelli listening (gRPC + HTTP/JSON)");
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(self.listener)
+            .map(move |io| io.map(|io| conn::Cuttable::new(io, cut.clone())));
+        tonic::transport::Server::builder()
+            .accept_http1(true)
+            .add_routes(tonic::service::Routes::from(self.router))
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+            .map_err(|e| Error::Unavailable(format!("server: {e}")))
+    }
+
+    /// Serve until `shutdown` resolves, then shut down gracefully within
+    /// `grace`: stop accepting connections, close the hub's tenants (change
+    /// streams end with their final frame, workers start no new round, no
+    /// tenant opens; open tenants keep serving the requests in flight), let
+    /// open requests and the workers' current rounds finish, cut the
+    /// connections still open at the deadline (their requests end
+    /// unanswered), and release the leases, claimed outbox rows and wake
+    /// scanner lock this process holds (fenced: only the current holder at
+    /// its epoch), so a replacement process takes over at once. Use it when
+    /// this server owns the hub.
+    pub async fn run_graceful(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        grace: std::time::Duration,
+    ) -> Result<onto_intelli::Released> {
+        let hub = self.hub.clone();
+        let at: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
+        let fired = Arc::new(tokio::sync::Notify::new());
+        let signal = {
+            let (hub, at, fired) = (hub.clone(), at.clone(), fired.clone());
+            async move {
+                shutdown.await;
+                let _ = at.set(tokio::time::Instant::now());
+                tracing::info!(
+                    grace_secs = grace.as_secs(),
+                    "shutting down: no new connections, streams end, workers stop"
+                );
+                hub.begin_shutdown();
+                fired.notify_one();
+            }
+        };
+        let (cut, cuts) = tokio::sync::watch::channel(false);
+        let mut serve = Box::pin(self.serve(signal, Some(cuts)));
+        let finished = tokio::select! {
+            r = &mut serve => Some(r),
+            _ = async {
+                fired.notified().await;
+                let start = at.get().copied().unwrap_or_else(tokio::time::Instant::now);
+                tokio::time::sleep_until(start + grace).await;
+            } => None,
+        };
+        let drained = match finished {
+            Some(r) => r,
+            None => {
+                // Connections still open at the deadline are cut here: their
+                // reads and writes fail, so each connection task ends; the
+                // server returns once the last one has.
+                tracing::warn!("connections still open after {grace:?}: cutting them");
+                let _ = cut.send(true);
+                if tokio::time::timeout(CUT_WAIT, &mut serve).await.is_err() {
+                    tracing::warn!("connections still open {CUT_WAIT:?} after the cut");
+                }
+                Ok(())
+            }
+        };
+        drop(serve);
+        // The server may have stopped on its own (an error): stop the rest too.
+        let deadline = at.get().map_or_else(|| tokio::time::Instant::now() + grace, |t| *t + grace);
+        let released = hub.finish_shutdown(deadline).await;
+        tracing::info!(
+            leases = released.leases,
+            claims = released.claims,
+            crawls = released.crawls,
+            cut = released.cut,
+            failed = released.failed,
+            "released what this process held"
+        );
+        drained.map(|()| released)
+    }
 }
 
 /// Startup rules of the control plane: a control store when the console is

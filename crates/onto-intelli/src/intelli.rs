@@ -1,13 +1,13 @@
 //! The orchestrator: deterministic retrieval first, the LLM only for reasoning.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use onto_core::store::{MemoryStore, Store};
 use onto_core::time::new_id;
@@ -18,6 +18,7 @@ use onto_core::{
 
 use crate::answer;
 use crate::cache::TtlCache;
+use crate::changes::{ChangeHub, Reauth, Start, Subscription};
 use crate::config::Config;
 use crate::context::{self, ContextInput, ContextPack};
 use crate::conversation::{Conversation, Conversations};
@@ -178,6 +179,19 @@ fn ms(t: Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0
 }
 
+/// Gap records over this window are counted (`system.stats`).
+const GAP_WINDOW_MS: i64 = 24 * 3_600_000;
+/// Runs of the last hour counted at most (`system.stats`).
+const RUNS_COUNT_CAP: usize = 10_000;
+
+/// Paused automations and endpoints (`system.health`, admin tenants).
+struct Paused {
+    automations_enabled: Option<usize>,
+    automations: Option<usize>,
+    endpoints: Option<usize>,
+    endpoints_total: Option<usize>,
+}
+
 pub struct Intelli {
     config: Config,
     onto: Ontology,
@@ -199,6 +213,43 @@ pub struct Intelli {
     ingest: IngestQueue,
     asks: AtomicUsize,
     started: Instant,
+    /// Live change streams of this tenant in this process.
+    changes: Arc<ChangeHub>,
+    /// Set when the hub closes this tenant: streams and workers end.
+    closing: watch::Sender<bool>,
+    /// When an open stream last sent a heartbeat (ms; 0 = never).
+    stream_touch: AtomicI64,
+    /// Seals and opens outbound secrets (the control plane's vault).
+    secrets: parking_lot::RwLock<Option<Arc<dyn crate::hub::SecretBox>>>,
+    /// Wakes the delivery worker: a commit enqueued outbox rows, or another
+    /// process committed.
+    outbox_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the fan-out of change subscriptions: something was committed.
+    fanout_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the automation consumer: something was committed, or an
+    /// automation was enabled, rerun or switched.
+    automation_wake: Arc<tokio::sync::Notify>,
+    /// The automation consumer's state in this process.
+    automation: parking_lot::Mutex<crate::automate::Runtime>,
+    /// Which workers commits wake, and how often they ran.
+    wants: Arc<Wants>,
+    /// Leases, claimed rows and workers of this tenant in this process,
+    /// released on shutdown (crate::lifecycle).
+    holdings: crate::lifecycle::Holdings,
+    /// The server is shutting down (not only this tenant closing).
+    stopping: AtomicBool,
+}
+
+/// Commits wake the fan-out only while the tenant has an enabled change
+/// subscription, and the automation consumer only while it has an enabled
+/// automation; their rounds keep these up to date (they start on, so the
+/// first commit wakes both). Actions that change what they want wake them
+/// explicitly, and both poll as well.
+struct Wants {
+    fanout: AtomicBool,
+    automation: AtomicBool,
+    fanout_rounds: AtomicU64,
+    automation_rounds: AtomicU64,
 }
 
 impl Intelli {
@@ -225,6 +276,10 @@ impl Intelli {
         let schema = load_schema(&config)?;
         config.traces.check()?;
         config.mcp.check()?;
+        config.changes.check()?;
+        config.webhooks.check()?;
+        config.automation.check()?;
+        config.writeback.check()?;
         let traces = config.traces.enabled.then(|| TraceSink::spawn(store.clone(), &config.traces));
         let onto = Ontology::open(
             schema,
@@ -236,6 +291,8 @@ impl Intelli {
                 governance: config.governance.clone(),
                 sync_reads: config.engine.read_consistency == "strong",
                 follow_interval_ms: config.engine.follow_interval_ms,
+                max_automations: config.automation.max_automations,
+                writeback: config.writeback.enabled,
             },
         )?;
         let memory = Memory::open(store.clone(), config.memory.clone())?;
@@ -243,7 +300,47 @@ impl Intelli {
         let c = &config.cache;
         let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
         let crawl = config.connectors.clone();
+        let changes = ChangeHub::new(&onto, config.changes.clone());
+        let outbox_wake = Arc::new(tokio::sync::Notify::new());
+        let wake = outbox_wake.clone();
+        let fanout_wake = Arc::new(tokio::sync::Notify::new());
+        let fanout = fanout_wake.clone();
+        let automation_wake = Arc::new(tokio::sync::Notify::new());
+        let automation = automation_wake.clone();
+        let wants = Arc::new(Wants {
+            fanout: AtomicBool::new(true),
+            automation: AtomicBool::new(true),
+            fanout_rounds: AtomicU64::new(0),
+            automation_rounds: AtomicU64::new(0),
+        });
+        let wanted = wants.clone();
+        onto.on_change(move |c| {
+            // Rows this process enqueued, or another process's commit (which
+            // may have enqueued some): look for due rows now.
+            if c.outbox > 0 || c.request_id == "sync" {
+                wake.notify_one();
+            }
+            // A commit may hold records a subscription or an automation
+            // wants: wake only the workers that have one.
+            if wanted.fanout.load(Ordering::Relaxed) {
+                fanout.notify_one();
+            }
+            if wanted.automation.load(Ordering::Relaxed) {
+                automation.notify_one();
+            }
+        });
         let me = Arc::new(Self {
+            secrets: parking_lot::RwLock::new(None),
+            outbox_wake,
+            fanout_wake,
+            automation_wake,
+            automation: parking_lot::Mutex::new(crate::automate::Runtime::new()),
+            wants,
+            holdings: Default::default(),
+            stopping: AtomicBool::new(false),
+            changes,
+            closing: watch::Sender::new(false),
+            stream_touch: AtomicI64::new(0),
             answers: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             resolutions: TtlCache::new(c.max_entries, Duration::from_secs(c.answer_ttl_secs)),
             completions: TtlCache::new(c.max_entries, Duration::from_secs(c.llm_ttl_secs)),
@@ -269,6 +366,14 @@ impl Intelli {
         if me.traces.is_some() {
             spawn_trace_retention(&me);
         }
+        let store = me.onto.store();
+        if store.keeps_changes() || store.keeps_outbox() || store.keeps_runs() {
+            spawn_retention(&me);
+        }
+        #[cfg(feature = "outbound")]
+        crate::webhooks::spawn_delivery(&me, me.outbox_wake.clone())?;
+        crate::webhooks::spawn_fanout(&me, me.fanout_wake.clone());
+        crate::automate::spawn_automation_workers(&me, me.automation_wake.clone());
         Ok(me)
     }
 
@@ -324,6 +429,331 @@ impl Intelli {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The tenant's change streams.
+    pub fn changes(&self) -> &Arc<ChangeHub> {
+        &self.changes
+    }
+
+    /// Open a live change stream for `p` (see [`ChangeHub::subscribe`]).
+    /// The stream holds only a weak reference to this tenant: it ends
+    /// `tenant_closed` when the tenant closes. `reauth` re-derives the
+    /// caller's principal every `changes.reauth_secs`.
+    pub async fn subscribe_changes(
+        self: &Arc<Self>,
+        p: Principal,
+        f: onto_core::changes::ChangeFilter,
+        start: Start,
+        reauth: Option<Reauth>,
+    ) -> Result<Subscription> {
+        self.changes.subscribe(Arc::downgrade(self), p, f, start, reauth).await
+    }
+
+    /// Close this tenant for streams and background work: they end (streams
+    /// with `tenant_closed`). The hub calls it when it forgets the tenant.
+    pub fn close(&self) {
+        self.closing.send_replace(true);
+    }
+
+    /// The tenant's sealer of outbound secrets (`None` without a master key).
+    pub fn secrets(&self) -> Option<Arc<dyn crate::hub::SecretBox>> {
+        self.secrets.read().clone()
+    }
+
+    /// Set by the hub from the tenant's settings.
+    pub fn set_secrets(&self, s: Option<Arc<dyn crate::hub::SecretBox>>) {
+        *self.secrets.write() = s;
+    }
+
+    /// Wake the delivery worker (rows were enqueued or replayed).
+    pub fn wake_outbox(&self) {
+        self.outbox_wake.notify_one();
+    }
+
+    /// Wakes the automation consumer.
+    pub(crate) fn automation_wake(&self) -> &Arc<tokio::sync::Notify> {
+        &self.automation_wake
+    }
+
+    pub(crate) fn automation_runtime(&self) -> &parking_lot::Mutex<crate::automate::Runtime> {
+        &self.automation
+    }
+
+    /// Wakes the fan-out of change subscriptions.
+    pub(crate) fn wake_fanout(&self) {
+        self.fanout_wake.notify_one();
+    }
+
+    /// Whether commits wake the fan-out (an enabled change subscription).
+    pub(crate) fn set_wants_fanout(&self, on: bool) {
+        self.wants.fanout.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether commits wake the automation consumer (an enabled automation).
+    pub(crate) fn set_wants_automation(&self, on: bool) {
+        self.wants.automation.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_fanout_round(&self) {
+        self.wants.fanout_rounds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_automation_round(&self) {
+        self.wants.automation_rounds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Switches and paused counts of webhooks and automations, whether the
+    /// change feed captures, and its latest gap record (docs/design/EVENTS.md
+    /// section 11), for `system.health`. A store error leaves the field `null`.
+    pub fn outbound_health(&self) -> Value {
+        let onto = &self.onto;
+        let store = onto.store();
+        let paused = self.paused_counts();
+        let automation = store.keeps_runs().then(|| {
+            json!({
+                "process_enabled": self.config.automation.enabled,
+                "kill": onto_core::runs::killed(&**store).ok(),
+                "enabled": paused.automations_enabled,
+                "paused": paused.automations,
+            })
+        });
+        let webhooks = store.keeps_outbox().then(|| {
+            json!({
+                "process_enabled": self.config.webhooks.enabled,
+                "kill": crate::webhooks::killed(onto).ok(),
+                "endpoints": paused.endpoints_total,
+                "paused": paused.endpoints,
+            })
+        });
+        // Cap 0: the newest gap only, nothing counted.
+        let latest_gap = store.keeps_changes().then(|| store.gap_stats(i64::MAX, 0).ok().map(|g| g.latest)).flatten();
+        json!({
+            "changes": { "capture": onto.capture_enabled(), "latest_gap": latest_gap.flatten() },
+            "automation": automation,
+            "webhooks": webhooks,
+        })
+    }
+
+    /// Enabled automations that are paused, and enabled endpoints that are
+    /// paused (by an operator, the breaker or their backlog), out of all
+    /// endpoints. `None` where the store keeps neither or could not say.
+    fn paused_counts(&self) -> Paused {
+        let onto = &self.onto;
+        let store = onto.store();
+        let now = onto_core::time::now_ms();
+        let en = store.keeps_runs().then(|| onto_core::automate::Enablements::load(&**store).ok()).flatten();
+        let automations_enabled = en.as_ref().map(|e| e.states.values().filter(|s| s.enabled).count());
+        let automations = en.as_ref().map(|e| e.states.values().filter(|s| s.enabled && s.paused.is_some()).count());
+        let (endpoints_total, endpoints) = if store.keeps_outbox() {
+            let eps = crate::webhooks::Endpoint::list(onto).ok();
+            let control: Vec<(String, Value)> =
+                store.kv_scan(crate::webhooks::NS_CONTROL, "").unwrap_or_default().into_iter().collect();
+            let held = |name: &str| {
+                control.iter().any(|(k, v)| {
+                    (k == &format!("{}{name}", crate::webhooks::BACKLOG_PREFIX) && !v.is_null())
+                        || (k == &format!("{}{name}", crate::webhooks::BREAKER_PREFIX)
+                            && serde_json::from_value::<crate::webhooks::BreakerState>(v.clone())
+                                .is_ok_and(|b| b.is_open()))
+                })
+            };
+            let paused = eps.as_ref().map(|eps| {
+                eps.iter()
+                    .filter(|e| {
+                        e.enabled
+                            && (e.paused.as_ref().is_some_and(|p| p.until.is_none_or(|u| u > now)) || held(&e.name))
+                    })
+                    .count()
+            });
+            (eps.as_ref().map(Vec::len), paused)
+        } else {
+            (None, None)
+        };
+        Paused { automations_enabled, automations, endpoints, endpoints_total }
+    }
+
+    /// The outbound counters of docs/design/EVENTS.md section 11, as an
+    /// operator sees them (`GET /v1/admin/tenants`): outbox rows per target
+    /// and state (pending, inflight, retry, dead; each counted up to
+    /// [`OUTBOX_STATS_CAP`](onto_core::outbox::OUTBOX_STATS_CAP)) and open
+    /// rows per target, how far each change consumer is behind (per
+    /// consumer, and per webhook endpoint), gap records over 24 hours with
+    /// the latest, and runs per state over the last hour. Every count is
+    /// bounded by its cap, never a whole table: it reads an index range, and
+    /// on an outbox not vacuumed since its rows last changed also up to the
+    /// cap of heap rows per target and state. A store error leaves the
+    /// field `null`. Consumers of removed endpoints are left out.
+    /// `system.stats` shows [`outbound_stats_for`](Self::outbound_stats_for).
+    pub fn outbound_stats(&self) -> Value {
+        self.outbound_view(None)
+    }
+
+    /// [`outbound_stats`](Self::outbound_stats) as `p` may see it
+    /// (`system.stats`): admins who are not agents see the endpoints and
+    /// writeback targets they may manage (whose principal they dominate),
+    /// the change consumers of those endpoints and, tenant-wide admins only,
+    /// every other consumer and what removed endpoints and targets left;
+    /// they also see the runs per state. Everyone else sees the open outbox
+    /// total and the gap counts, never a name, cursor or per-target count.
+    pub fn outbound_stats_for(&self, p: &Principal) -> Value {
+        self.outbound_view(Some(p))
+    }
+
+    fn outbound_view(&self, p: Option<&Principal>) -> Value {
+        use onto_core::outbox::{OUTBOX_STATS_CAP, STATS_COUNT_CAP};
+        let store = self.onto.store();
+        let admin = p.is_none_or(|p| p.is_privileged() && !p.is_agent());
+        let scopes = OutboundScopes::load(self);
+        // Operators (no principal) see everything a tenant-wide admin does.
+        let sees_target = |name: &str| p.is_none_or(|p| scopes.outbox_target(p, name));
+        let mut hidden = 0usize;
+        let clock = store.clock_ms().unwrap_or_else(|_| onto_core::time::now_ms());
+        let by_state = store.keeps_outbox().then(|| store.outbox_state_counts(OUTBOX_STATS_CAP).ok()).flatten();
+        let mut open_total = 0u64;
+        let mut hidden_targets = std::collections::HashSet::new();
+        let (open, outbox) = match by_state {
+            Some(rows) => {
+                let mut open = serde_json::Map::new();
+                let mut targets = serde_json::Map::new();
+                for (target, state, n) in rows {
+                    if state.is_open() {
+                        open_total += n;
+                    }
+                    if !admin {
+                        continue;
+                    }
+                    if !sees_target(&target) {
+                        hidden_targets.insert(target);
+                        continue;
+                    }
+                    if state.is_open() {
+                        let o = open.entry(target.clone()).or_insert(json!(0));
+                        *o = json!(o.as_u64().unwrap_or(0) + n);
+                    }
+                    let t = targets.entry(target).or_insert_with(|| json!({}));
+                    t[state.as_str()] = json!(n);
+                }
+                (Some(open), Some(json!({ "cap": OUTBOX_STATS_CAP, "targets": targets })))
+            }
+            None => (None, None),
+        };
+        hidden += hidden_targets.len();
+        let lag = (admin && store.keeps_changes()).then(|| store.consumer_lags().ok()).flatten().map(|lags| {
+            let mut consumers = serde_json::Map::new();
+            let mut endpoints = serde_json::Map::new();
+            for l in lags {
+                let v = json!({
+                    "cursor": l.cursor,
+                    "behind": l.behind,
+                    "age_ms": l.age_ms,
+                    "updated_at": l.updated_at,
+                    "expired": l.expired,
+                });
+                if let Some(ep) = l.name.strip_prefix(crate::webhooks::CONSUMER_PREFIX) {
+                    // The cursor of a removed endpoint is no consumer at all.
+                    if !scopes.has_endpoint(ep) {
+                        continue;
+                    }
+                    if !p.is_none_or(|p| scopes.endpoint(p, ep)) {
+                        hidden += 1;
+                        continue;
+                    }
+                    endpoints.insert(ep.to_string(), v.clone());
+                } else if !p.is_none_or(OutboundScopes::everywhere) {
+                    hidden += 1;
+                    continue;
+                }
+                consumers.insert(l.name, v);
+            }
+            json!({ "consumers": consumers, "endpoints": endpoints })
+        });
+        let gaps = store
+            .keeps_changes()
+            .then(|| store.gap_stats(clock - GAP_WINDOW_MS, STATS_COUNT_CAP).ok())
+            .flatten()
+            .map(|g| json!({ "count": g.count, "capped": g.capped, "latest": g.latest }));
+        if !admin {
+            return json!({
+                "outbox_open_total": store.keeps_outbox().then_some(open_total),
+                "gaps_24h": gaps,
+                "note": "per-target outbox counts, change lag and runs are shown to admins",
+            });
+        }
+        let runs =
+            store.keeps_runs().then(|| store.runs_state_counts(clock - 3_600_000, RUNS_COUNT_CAP).ok()).flatten().map(
+                |rows| {
+                    let counted: u64 = rows.iter().map(|(_, n)| n).sum();
+                    let states: serde_json::Map<String, Value> =
+                        rows.into_iter().map(|(st, n)| (st.as_str().to_string(), json!(n))).collect();
+                    json!({ "states": states, "counted": counted, "capped": counted >= RUNS_COUNT_CAP as u64 })
+                },
+            );
+        let mut v = json!({ "outbox_open": open, "outbox": outbox, "lag": lag, "gaps_24h": gaps, "runs_1h": runs });
+        if hidden > 0 {
+            // Targets and consumers of endpoints, targets and automations the
+            // caller may not manage.
+            v["hidden"] = json!(hidden);
+        }
+        v
+    }
+
+    /// [`outbound_stats`](Self::outbound_stats) with the paused automations
+    /// and endpoints, for `GET /v1/admin/tenants`.
+    pub fn outbound_counters(&self) -> Value {
+        let mut v = self.outbound_stats();
+        let p = self.paused_counts();
+        v["paused"] = json!({ "automations": p.automations, "endpoints": p.endpoints });
+        v
+    }
+
+    /// Rounds the fan-out and the automation consumer ran in this process
+    /// since the tenant opened (what commits and polls cost), and whether
+    /// commits wake them now.
+    pub fn worker_rounds(&self) -> Value {
+        let w = &self.wants;
+        json!({
+            "fanout": w.fanout_rounds.load(Ordering::Relaxed),
+            "automation": w.automation_rounds.load(Ordering::Relaxed),
+            "commits_wake_fanout": w.fanout.load(Ordering::Relaxed),
+            "commits_wake_automation": w.automation.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn is_closing(&self) -> bool {
+        *self.closing.borrow()
+    }
+
+    /// The server is shutting down (its streams end saying so).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn holdings(&self) -> &crate::lifecycle::Holdings {
+        &self.holdings
+    }
+
+    pub(crate) fn closing_signal(&self) -> watch::Receiver<bool> {
+        self.closing.subscribe()
+    }
+
+    /// An open stream is alive (it counts toward the idle timer, never
+    /// toward the open-tenant count or the memory budget).
+    pub fn touch_stream(&self) {
+        self.stream_touch.store(onto_core::time::now_ms(), Ordering::Relaxed);
+    }
+
+    /// When an open stream last sent a heartbeat (Unix ms; 0 = never).
+    pub fn stream_touched(&self) -> i64 {
+        self.stream_touch.load(Ordering::Relaxed)
+    }
+
+    /// Estimated memory: the ontology plus the change stream ring.
+    pub fn estimated_bytes(&self) -> u64 {
+        self.onto.estimated_bytes() + self.changes.bytes() as u64
     }
 
     pub fn ontology(&self) -> &Ontology {
@@ -459,6 +889,35 @@ impl Intelli {
     pub fn vacuum_traces(&self) -> Result<u64> {
         let before = onto_core::time::now_ms() - i64::from(self.trace_retention_days()) * 86_400_000;
         self.onto.store().trace_vacuum(before, Duration::from_secs(60))
+    }
+
+    /// Remove change records past `[changes] retain_days` and
+    /// `retain_max_rows` (whole commits) and raise the floor over them in the
+    /// same step, so their cursors read as expired, never as a silent skip.
+    /// Blocking: the retention task runs it on the blocking pool.
+    pub fn vacuum_changes(&self) -> Result<onto_core::changes::ChangeVacuum> {
+        self.onto.store().vacuum_changes(&self.config.changes.retention())
+    }
+
+    /// Delete finished outbox rows and attempt logs older than `[webhooks]
+    /// retain_days`, and final run rows older than `[automation]
+    /// retain_days`, by the store's clock (whatever the delivery and
+    /// automation switches of this process are). Returns `(outbox, runs)`.
+    /// Blocking: the retention task runs it on the blocking pool.
+    pub fn vacuum_outbound(&self) -> Result<(u64, u64)> {
+        let store = self.onto.store();
+        let now = store.clock_ms()?;
+        let outbox = if store.keeps_outbox() {
+            store.outbox_vacuum(crate::config::retention_cutoff(now, self.config.webhooks.retain_days))?
+        } else {
+            0
+        };
+        let runs = if store.keeps_runs() {
+            store.runs_vacuum(crate::config::retention_cutoff(now, self.config.automation.retain_days))?
+        } else {
+            0
+        };
+        Ok((outbox, runs))
     }
 
     pub fn default_workspace(&self) -> &str {
@@ -1185,13 +1644,21 @@ impl Intelli {
         }
     }
 
-    pub fn stats(&self) -> Result<Value> {
+    /// `system.stats` as `p` may see it (the outbound counters are scoped:
+    /// [`outbound_stats_for`](Self::outbound_stats_for)).
+    pub fn stats(&self, p: &Principal) -> Result<Value> {
         let llm = self.llm();
         Ok(json!({
             "version": crate::VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
             "ontology": self.onto.stats()?,
-            "estimated_bytes": self.onto.estimated_bytes(),
+            "estimated_bytes": self.estimated_bytes(),
+            "changes": {
+                "subscribers": self.changes.subscribers(),
+                "subscribers_process": ChangeHub::process_subscribers(),
+                "ring_records": self.changes.ring_len(),
+                "ring_bytes": self.changes.bytes(),
+            },
             "memory": self.memory.stats(),
             "llm": {
                 "provider": llm.name(),
@@ -1199,6 +1666,8 @@ impl Intelli {
                 "available": llm.unavailable().is_none(),
                 "unavailable_reason": llm.unavailable(),
             },
+            "outbound": self.outbound_stats_for(p),
+            "workers": self.worker_rounds(),
             "ledger": self.ledger(),
             "caches": {
                 "answers": self.answers.stats(),
@@ -1225,6 +1694,41 @@ fn spawn_trace_retention(me: &Arc<Intelli>) {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!("trace retention: {e}"),
                 Err(e) => tracing::warn!("trace retention: {e}"),
+            }
+        }
+    });
+}
+
+/// Trim the change feed ([`Intelli::vacuum_changes`]), the outbox and the
+/// run rows ([`Intelli::vacuum_outbound`]) 5 minutes after the tenant opens,
+/// then hourly, for as long as it is open (a tenant that idles out before an
+/// hour still gets its pass). Every process with the tenant open runs it; a
+/// change pass is one transaction that locks the floor, so passes from
+/// several replicas only repeat the same trim.
+fn spawn_retention(me: &Arc<Intelli>) {
+    let weak = Arc::downgrade(me);
+    tokio::spawn(async move {
+        let mut wait = Duration::from_secs(300);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = Duration::from_secs(3600);
+            let Some(me) = weak.upgrade() else { break };
+            let me2 = me.clone();
+            if me.onto.store().keeps_changes() {
+                match tokio::task::spawn_blocking(move || me2.vacuum_changes()).await {
+                    Ok(Ok(v)) if v.deleted > 0 => {
+                        tracing::info!(rows = v.deleted, floor = v.floor, "change retention")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("change retention: {e}"),
+                    Err(e) => tracing::warn!("change retention: {e}"),
+                }
+            }
+            match tokio::task::spawn_blocking(move || me.vacuum_outbound()).await {
+                Ok(Ok((outbox, runs))) if outbox + runs > 0 => tracing::info!(outbox, runs, "outbox and run retention"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("outbox and run retention: {e}"),
+                Err(e) => tracing::warn!("outbox and run retention: {e}"),
             }
         }
     });
@@ -1259,5 +1763,87 @@ fn open_store(cfg: &Config) -> Result<Arc<dyn Store>> {
             Ok(Arc::new(onto_core::store::PgStore::connect(&cfg.engine.resolve_database_url()?, &pg.tenant, opts)?))
         }
         other => Err(Error::Config(format!("unknown engine.storage '{other}' (postgres, memory)"))),
+    }
+}
+
+/// Who may see what of the outbound workers (docs/design/EVENTS.md 6.1): a
+/// webhook endpoint's or writeback target's counters and traces go to
+/// callers who dominate its principal (who may manage it), an automation's
+/// to callers who dominate its `run_as` (as `automation.runs` shows runs);
+/// those of removed ones to tenant-wide admins only. A list that fails to
+/// load leaves its names to tenant-wide admins.
+pub(crate) struct OutboundScopes {
+    endpoints: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    targets: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    automations: std::collections::HashMap<String, onto_core::policy::ScopePrincipal>,
+    /// The endpoint list loaded (otherwise no consumer is taken for a
+    /// removed endpoint's).
+    endpoints_known: bool,
+}
+
+impl OutboundScopes {
+    pub(crate) fn load(i: &Intelli) -> Self {
+        let onto = i.ontology();
+        let listed = crate::webhooks::Endpoint::list(onto);
+        let endpoints_known = listed.is_ok();
+        let endpoints = listed.unwrap_or_default().into_iter().map(|e| (e.name.clone(), e.principal.clone())).collect();
+        let targets = crate::writeback::Target::list(onto)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.name.clone(), t.scope()))
+            .collect();
+        let automations = onto.schema().automations.iter().map(|(n, d)| (n.clone(), d.run_as.clone())).collect();
+        Self { endpoints, targets, automations, endpoints_known }
+    }
+
+    /// A privileged caller of every workspace who is not an agent.
+    pub(crate) fn everywhere(p: &Principal) -> bool {
+        p.is_privileged() && !p.is_agent() && p.workspaces.iter().any(|w| w == "*")
+    }
+
+    fn sees(p: &Principal, scope: Option<&onto_core::policy::ScopePrincipal>) -> bool {
+        match scope {
+            Some(sp) => onto_core::policy::dominates(p, sp),
+            None => Self::everywhere(p),
+        }
+    }
+
+    /// The endpoint exists (or the list could not be read).
+    pub(crate) fn has_endpoint(&self, name: &str) -> bool {
+        !self.endpoints_known || self.endpoints.contains_key(name)
+    }
+
+    pub(crate) fn endpoint(&self, p: &Principal, name: &str) -> bool {
+        Self::sees(p, self.endpoints.get(name))
+    }
+
+    /// An outbox target name: an endpoint's, a writeback target's, or both.
+    pub(crate) fn outbox_target(&self, p: &Principal, name: &str) -> bool {
+        match (self.endpoints.get(name), self.targets.get(name)) {
+            (None, None) => Self::everywhere(p),
+            (e, t) => e.is_none_or(|sp| Self::sees(p, Some(sp))) && t.is_none_or(|sp| Self::sees(p, Some(sp))),
+        }
+    }
+
+    /// A trace or record of the principal `id`: a worker's
+    /// (`automation:<name>`, `webhook:<name>`, `writeback:<name>`) only as
+    /// its automation, endpoint or target says; any other principal's, yes.
+    pub(crate) fn worker(&self, p: &Principal, id: &str) -> bool {
+        if let Some(n) = id.strip_prefix(onto_core::automate::PRINCIPAL_PREFIX) {
+            Self::sees(p, self.automations.get(n))
+        } else if let Some(n) = id.strip_prefix(crate::webhooks::CONSUMER_PREFIX) {
+            Self::sees(p, self.endpoints.get(n))
+        } else if let Some(n) = id.strip_prefix("writeback:") {
+            Self::sees(p, self.targets.get(n))
+        } else {
+            true
+        }
+    }
+
+    /// A worker principal id (see [`worker`](Self::worker)).
+    pub(crate) fn is_worker(id: &str) -> bool {
+        id.starts_with(onto_core::automate::PRINCIPAL_PREFIX)
+            || id.starts_with(crate::webhooks::CONSUMER_PREFIX)
+            || id.starts_with("writeback:")
     }
 }

@@ -12,7 +12,7 @@ use crate::graph::{Graph, LinkKey};
 use crate::live_schema;
 use crate::model::{Id, Mutation, MutationResult};
 use crate::similarity::VectorIndex;
-use crate::store::StoreNotice;
+use crate::store::{CHANGES_META_NOTICE, StoreNotice};
 use crate::text::TextIndex;
 use crate::{Error, Result};
 
@@ -121,10 +121,12 @@ impl Ontology {
             let revision = self.inner.revision.fetch_add(1, Ordering::SeqCst) + 1;
             let change = ChangeSet {
                 revision,
+                seq: report.seq,
                 workspace: String::new(),
                 request_id: "sync".into(),
                 entities: Vec::new(),
                 links: report.links,
+                outbox: 0,
             };
             for l in self.inner.listeners.read().clone() {
                 l(&change);
@@ -325,7 +327,15 @@ pub(crate) fn spawn_vectorizer(inner: &Arc<Inner>) -> Result<()> {
 /// ends when the ontology is dropped.
 pub(crate) fn spawn_follower(inner: &Arc<Inner>, interval: Duration) -> Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
+    let meta = Arc::downgrade(inner);
     inner.store.subscribe(Arc::new(move |n: StoreNotice| {
+        // Another process switched change capture (or notices were lost):
+        // re-read the tenant's setting.
+        if (matches!(&n, StoreNotice::Kv { ns, .. } if ns == CHANGES_META_NOTICE) || matches!(n, StoreNotice::Resync))
+            && let Some(inner) = meta.upgrade()
+        {
+            let _ = Ontology { inner }.refresh_capture();
+        }
         if !matches!(n, StoreNotice::Kv { .. }) {
             let _ = tx.send(());
         }

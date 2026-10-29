@@ -510,3 +510,88 @@ export interface MintedSession {
   principal: JsonObject;
   tenant: string | null;
 }
+
+// ── change feed ──────────────────────────────────────────────────────────
+
+export type ChangeOp =
+  | "entity.create"
+  | "entity.update"
+  | "entity.delete"
+  | "entity.hidden"
+  | "link.create"
+  | "link.update"
+  | "link.delete"
+  | "schema.change"
+  | "gap";
+
+/** Which records a stream or a poll wants; dimensions combine with AND. `gap` records always pass. */
+export interface ChangeFilter {
+  /** Entity kinds or interfaces (a link matches through either end). */
+  kinds?: string[];
+  ops?: ChangeOp[];
+  workspaces?: string[];
+  /** Entity ids (at most 1000; a link matches through either end). */
+  ids?: string[];
+  /** Relations (canonical, inverse or `^rel`): link records only. */
+  rels?: string[];
+  /** Updates that changed any of these fields. */
+  props?: string[];
+  /** Globs on the writer's source; `!x` excludes. */
+  sources?: string[];
+  /** `ids`: ids, kinds, ops and changed field names only. */
+  fields?: "full" | "ids";
+  /** Records written by schema migrations (default true). */
+  includeMigrations?: boolean;
+}
+
+/** One change as this reader gets it. `cursor` is `"<seq>.<n>"`. */
+export interface Change {
+  cursor: string;
+  ts: number;
+  op: ChangeOp;
+  workspace: string;
+  kind: string;
+  id: string;
+  revision?: number;
+  changed?: string[];
+  state?: { from?: string | null; to?: string | null };
+  moved?: JsonObject;
+  /** Old values of the changed fields (only when you could see the entity before and after). */
+  before?: JsonObject;
+  /** The entity as the change left it (create, update). */
+  entity?: Entity;
+  entity_missing?: boolean;
+  /** You could not see the entity before this change: treat it as an upsert. */
+  became_visible?: boolean;
+  link?: JsonObject;
+  schema?: JsonObject;
+  /** A commit written without records: re-read with `entities.find` (not pinned to a cursor). */
+  gap?: { reason: string; origin?: string; entities: string[]; links: string[][]; hidden?: number };
+  cause: JsonObject;
+}
+
+export interface ChangePage {
+  changes: Change[];
+  /** Resume after this cursor (the last one scanned). */
+  next: string;
+  head: number;
+  floor: number;
+  /** The cursor is older than the floor: records may be missing. */
+  expired: boolean;
+  message?: string;
+}
+
+export interface ChangeHead {
+  cursor: string;
+  head: number;
+  floor: number;
+  capture: boolean;
+}
+
+/** A stream's `reset`: the cursor expired. */
+export interface ChangeReset {
+  code: string;
+  floor: number;
+  head: number;
+  message: string;
+}

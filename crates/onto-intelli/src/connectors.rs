@@ -942,6 +942,8 @@ impl Intelli {
         if !onto.try_lease(&lease, &holder, 30 * 60_000)? {
             return Err(Error::Conflict(format!("connector {} is being crawled by another process", spec.name)));
         }
+        // Given back on shutdown if the crawl is still running then.
+        self.holdings().crawling(&lease, &holder);
         let started = now_ms();
         let result = async {
             let allow_private = self.config().console.allow_private_urls;
@@ -971,6 +973,7 @@ impl Intelli {
             st.last_error = Some(e.to_string());
             let _ = save_state(&onto, &spec.name, &st);
         }
+        self.holdings().crawled(&lease);
         let _ = onto.release_lease(&lease, &holder);
         result
     }

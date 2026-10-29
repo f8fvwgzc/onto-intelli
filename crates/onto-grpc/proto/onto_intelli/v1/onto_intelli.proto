@@ -477,7 +477,8 @@ message HealthStatus {
 // rename_object_type {from, to} · put_property {object_type, name, def, migrations?} ·
 // delete_property {object_type, name, migrations?} · rename_property {object_type, from, to} ·
 // put_link_type {name, def, migrations?} · delete_link_type {name, migrations?} ·
-// rename_link_type {from, to} · put_interface/put_action_type/put_metric {name, def} ·
+// rename_link_type {from, to} · put_interface/put_action_type/put_metric/put_shape {name, def} ·
+// put_automation {name, def} (a change-triggered automation; enabled separately) ·
 // put_rule {def} · delete_* {name} · put_glossary_term {section, word, target} ·
 // delete_glossary_term {section, word} · set_analysis {def}.
 // Migrations: {action: delete_entities|retype|map_states|set_default|convert|drop_values|
@@ -951,4 +952,236 @@ service AssuranceService {
   rpc InstallPack(PackInstallRequest) returns (google.protobuf.Struct);       // pack.install
   rpc InduceSheet(SheetRequest) returns (google.protobuf.Struct);             // model.induce
   rpc IngestSheet(SheetIngestRequest) returns (google.protobuf.Struct);       // ingest.sheet
+}
+
+// ── Change feed: what each commit changed, filtered per reader ───────────
+// Unary in this version: Poll reads one page after a cursor, Head says where
+// the feed is, Capture switches recording for the tenant (admins of every
+// workspace). Responses are the JSON of changes.poll, changes.head and
+// changes.capture. Proto3 drops false values, hence exclude_migrations and
+// off. Delivery is at least once; exactly once is not offered.
+
+message ChangesPollRequest {
+  string after = 1;               // a previous page's next ("42.0"); empty: see from
+  string from = 2;                // without after: earliest (default) | now
+  uint32 limit = 3;               // records scanned (default [changes] page, at most 1000)
+  repeated string kinds = 4;      // entity kinds or interfaces (links match through either end)
+  repeated string ops = 5;        // entity.create | entity.update | entity.delete | entity.hidden | link.* | schema.change | gap
+  repeated string workspaces = 6;
+  repeated string ids = 7;        // at most 1000
+  repeated string rels = 8;       // link records only
+  repeated string props = 9;      // updates that changed any of these fields
+  repeated string sources = 10;   // globs on the writer's source; !x excludes
+  string fields = 11;             // full (default) | ids
+  bool exclude_migrations = 12;   // leave out records written by schema migrations
+}
+
+message ChangesCaptureRequest {
+  bool on = 1;                    // record changes
+  bool off = 2;                   // stop recording (proto3 drops on = false)
+  string workspace = 3;           // workspace of the audit event
+}
+
+service ChangeService {
+  rpc Poll(ChangesPollRequest) returns (google.protobuf.Struct);        // changes.poll
+  rpc Head(google.protobuf.Empty) returns (google.protobuf.Struct);     // changes.head
+  rpc Capture(ChangesCaptureRequest) returns (google.protobuf.Struct);  // changes.capture
+}
+
+// ── Webhooks: signed CloudEvents to registered endpoints ─────────────────
+// Endpoints receive CloudEvents 1.0 (structured JSON) signed the Standard
+// Webhooks way (webhook-id, webhook-timestamp, webhook-signature). An
+// endpoint sees what its principal may read. With a filter it subscribes to
+// the change feed: each change is enqueued once per endpoint and delivered at
+// least once; receivers dedupe on the event id. Admins only, never agents,
+// and the caller must dominate the endpoint's principal. Responses are the
+// JSON of the webhook.* and outbox.list actions. Proto3 drops false values,
+// hence disabled, clear_filter, exclude_migrations and off.
+
+message WebhookFilter {
+  repeated string kinds = 1;      // entity kinds or interfaces (links match through either end)
+  repeated string ops = 2;        // entity.create | entity.update | entity.delete | entity.hidden | link.* | schema.change | gap
+  repeated string workspaces = 3;
+  repeated string ids = 4;
+  repeated string rels = 5;
+  repeated string props = 6;
+  repeated string sources = 7;
+  string fields = 8;              // full (default) | ids
+  bool exclude_migrations = 9;
+}
+
+message WebhookPrincipal {
+  repeated string roles = 1;      // what the receiver may see: viewer, member, admin or custom roles
+  repeated string workspaces = 2; // a subset of the caller's
+}
+
+message WebhookAddRequest {
+  string name = 1;                // [a-z0-9_-], at most 40; principal id webhook:<name>
+  string url = 2;                 // https (or an operator env:/file: reference)
+  string secret = 3;              // empty: a whsec_ secret is generated, sealed and returned once
+  WebhookFilter filter = 4;       // set: subscribe to the change feed from now on
+  WebhookPrincipal principal = 5; // default: viewer in the call's workspace
+  bool disabled = 6;
+  string workspace = 7;           // workspace of the audit event
+}
+
+message WebhookUpdateRequest {
+  string name = 1;
+  string url = 2;
+  string secret = 3;
+  WebhookFilter filter = 4;
+  bool clear_filter = 5;          // drop the change subscription
+  WebhookPrincipal principal = 6;
+  bool enabled = 7;
+  bool disabled = 8;
+  string workspace = 9;
+}
+
+message WebhookNameRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message WebhookRotateRequest {
+  string name = 1;
+  string secret = 2;              // empty: generated and returned once
+  uint64 keep_secs = 3;           // the previous secret also signs this long (default a day)
+  string workspace = 4;
+}
+
+message WebhookDeliveriesRequest {
+  string name = 1;
+  string id = 2;                  // one delivery with its attempts
+  repeated string states = 3;     // pending | inflight | retry | delivered | dead | cancelled
+  int64 since = 4;                // created at or after (Unix ms)
+  uint32 limit = 5;
+}
+
+message WebhookReplayRequest {
+  string name = 1;
+  repeated string ids = 2;
+  int64 since = 3;
+  repeated string states = 4;     // default: retry, delivered, dead, cancelled
+  string workspace = 5;
+}
+
+message WebhookKillRequest {
+  bool on = 1;                    // hold every delivery in the outbox
+  bool off = 2;                   // resume deliveries
+  string workspace = 3;
+}
+
+message OutboxListRequest {
+  string target = 1;
+  repeated string states = 2;
+  string source = 3;              // change | action | automation | test
+  string receipt = 4;
+  string run = 5;
+  int64 since = 6;
+  uint32 limit = 7;
+}
+
+service WebhookService {
+  rpc Add(WebhookAddRequest) returns (google.protobuf.Struct);                // webhook.add
+  rpc Update(WebhookUpdateRequest) returns (google.protobuf.Struct);          // webhook.update
+  rpc Remove(WebhookNameRequest) returns (google.protobuf.Struct);            // webhook.remove
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // webhook.list
+  rpc Test(WebhookNameRequest) returns (google.protobuf.Struct);              // webhook.test
+  rpc RotateSecret(WebhookRotateRequest) returns (google.protobuf.Struct);    // webhook.rotate_secret
+  rpc Deliveries(WebhookDeliveriesRequest) returns (google.protobuf.Struct);  // webhook.deliveries
+  rpc Replay(WebhookReplayRequest) returns (google.protobuf.Struct);          // webhook.replay
+  rpc Resume(WebhookNameRequest) returns (google.protobuf.Struct);            // webhook.resume
+  rpc Kill(WebhookKillRequest) returns (google.protobuf.Struct);              // webhook.kill
+  rpc Outbox(OutboxListRequest) returns (google.protobuf.Struct);             // outbox.list
+}
+
+// ── Automate: change-triggered automations ───────────────────────────────
+// Automations are defined in the schema ([automations.<name>], through
+// SchemaService plan/apply/propose with put_automation). They run as the
+// service principal automation:<name> once a person who may approve schema
+// changes and dominates its run_as enables them; an enablement binds to the
+// closure hash and expires (enable_ttl_days). A run commits its action, the
+// receipt, its webhook outbox rows and the run row together; webhook effects
+// are enqueued once and delivered at least once, and external effects are not
+// reversible. Automation definitions are visible to everyone who can read
+// the schema. Responses are the JSON of the automation.* actions.
+
+message AutomationNameRequest {
+  string name = 1;
+  string workspace = 2;           // workspace of the audit event
+}
+
+message AutomationRunsRequest {
+  string name = 1;                // one automation's runs (empty: all)
+  repeated string state = 2;      // running | succeeded | failed | retry | skipped | refused | would_run | cancelled
+  int64 since = 3;                // started at or after (Unix ms)
+  uint32 limit = 4;
+  string id = 5;                  // one run
+}
+
+message AutomationTestRequest {
+  string name = 1;
+  string cursor = 2;              // a change ("<seq>.<n>"), or
+  string id = 3;                  // an entity, as if it was just updated (not for state or props guards)
+}
+
+message AutomationRerunRequest {
+  string id = 1;                  // a skipped or failed run
+  string workspace = 2;
+}
+
+message AutomationKillRequest {
+  bool on = 1;                    // stop every automation of the tenant
+  bool off = 2;                   // run them again
+  string workspace = 3;
+}
+
+service AutomateService {
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // automation.list
+  rpc Get(AutomationNameRequest) returns (google.protobuf.Struct);            // automation.get
+  rpc Runs(AutomationRunsRequest) returns (google.protobuf.Struct);           // automation.runs
+  rpc Test(AutomationTestRequest) returns (google.protobuf.Struct);           // automation.test
+  rpc Enable(AutomationNameRequest) returns (google.protobuf.Struct);         // automation.enable
+  rpc Disable(AutomationNameRequest) returns (google.protobuf.Struct);        // automation.disable
+  rpc Rerun(AutomationRerunRequest) returns (google.protobuf.Struct);         // automation.rerun
+  rpc Kill(AutomationKillRequest) returns (google.protobuf.Struct);           // automation.kill
+}
+
+// ── Writeback: HTTP writeback targets ────────────────────────────────────
+// An action type's writeback = { target, route, body } effect posts its body,
+// rendered strictly when the action is planned, to a registered target
+// through the outbox after the action commits, with Idempotency-Key:
+// <receipt>:<effect> (the receiver must honour it) and Standard Webhooks
+// signature headers when the target has a secret. Each call is enqueued once
+// and delivered at least once. Writeback is not reversible; action.undo does
+// not undo the external write. A plan with a writeback effect needs a
+// person's confirmation unless the action type declares unattended for the
+// caller's kind, and is refused while [writeback] enabled is off. Responses
+// are the JSON of the writeback.* actions.
+
+message WritebackAddRequest {
+  string name = 1;                // [a-z0-9_-], at most 40 (shared with webhook endpoint names)
+  string base_url = 2;            // https (or an operator env:/file: reference)
+  map<string, string> routes = 3; // route name -> relative path under base_url
+  repeated string workspaces = 4; // actions in these workspaces may use it (default: the call's)
+  string secret = 5;              // signing secret (sealed); empty: unsigned
+  bool generate_secret = 6;       // generate a whsec_ secret, returned once
+  string workspace = 7;           // workspace of the audit event
+}
+
+message WritebackNameRequest {
+  string name = 1;
+  string workspace = 2;
+}
+
+message WritebackTestRequest {
+  string name = 1;
+  string route = 2;               // one route (default: every route); nothing is sent
+}
+
+service WritebackService {
+  rpc Add(WritebackAddRequest) returns (google.protobuf.Struct);              // writeback.add
+  rpc List(google.protobuf.Empty) returns (google.protobuf.Struct);           // writeback.list
+  rpc Remove(WritebackNameRequest) returns (google.protobuf.Struct);          // writeback.remove
+  rpc Test(WritebackTestRequest) returns (google.protobuf.Struct);            // writeback.test
 }

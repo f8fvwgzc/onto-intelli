@@ -1,5 +1,6 @@
 //! Live schema: object types, properties, link types, interfaces, action
-//! types, rules, shapes, metrics and glossary terms changed as data at runtime.
+//! types, rules, shapes, automations, metrics and glossary terms changed as
+//! data at runtime.
 //!
 //! A [`SchemaChangeSet`] is validated (the resulting schema must compile),
 //! previewed with an impact report over the live graph ([`SchemaPlan`]:
@@ -40,6 +41,7 @@ use serde_json::{Map, Value, json};
 
 pub use crate::action_types::Risk;
 use crate::action_types::{ActionType, Check};
+use crate::automate::{Automation, Enablements};
 use crate::engine::{ActionContext, Extra};
 use crate::graph::{Graph, LinkKey};
 use crate::locks::{self, LockViolation, SchemaLock};
@@ -214,6 +216,15 @@ pub enum SchemaChange {
         def: Shape,
     },
     DeleteShape {
+        name: String,
+    },
+    /// Define or replace an automation. Enablement is state: a changed
+    /// definition is inactive until a person enables it again.
+    PutAutomation {
+        name: String,
+        def: Automation,
+    },
+    DeleteAutomation {
         name: String,
     },
     PutMetric {
@@ -475,6 +486,11 @@ pub struct SchemaPlan {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shapes: Option<PlanShapes>,
+    /// Findings of lint checks that compare the change with stored state:
+    /// `automation_closure_changed` for each enabled automation the change
+    /// would stop (it stays inactive until a person enables it again).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lint: Vec<crate::lint::Finding>,
 }
 
 /// What a plan's shape delta means.
@@ -585,6 +601,7 @@ impl SchemaPlan {
     pub(crate) fn with_reader_view(&mut self, fresh: &SchemaPlan, set: &SchemaChangeSet) {
         self.consequences = fresh.consequences.clone();
         self.shapes = fresh.shapes.clone();
+        self.lint = fresh.lint.clone();
         self.locked_violations = fresh.locked_violations.clone();
         (self.risk, self.risk_reasons) = assess_risk(self, set);
     }
@@ -813,6 +830,8 @@ pub struct SchemaStatus {
     pub rules: usize,
     #[serde(default)]
     pub shapes: usize,
+    #[serde(default)]
+    pub automations: usize,
     pub metrics: usize,
     pub governance: Governance,
     /// Why changed schema files were not imported on open.
@@ -842,6 +861,8 @@ impl SchemaChange {
             SchemaChange::DeleteRule { .. } => "delete_rule",
             SchemaChange::PutShape { .. } => "put_shape",
             SchemaChange::DeleteShape { .. } => "delete_shape",
+            SchemaChange::PutAutomation { .. } => "put_automation",
+            SchemaChange::DeleteAutomation { .. } => "delete_automation",
             SchemaChange::PutMetric { .. } => "put_metric",
             SchemaChange::DeleteMetric { .. } => "delete_metric",
             SchemaChange::PutGlossaryTerm { .. } => "put_glossary_term",
@@ -864,6 +885,8 @@ impl SchemaChange {
             | SchemaChange::DeleteRule { name }
             | SchemaChange::PutShape { name, .. }
             | SchemaChange::DeleteShape { name }
+            | SchemaChange::PutAutomation { name, .. }
+            | SchemaChange::DeleteAutomation { name }
             | SchemaChange::PutMetric { name, .. }
             | SchemaChange::DeleteMetric { name } => name.clone(),
             SchemaChange::RenameObjectType { from, to } | SchemaChange::RenameLinkType { from, to } => {
@@ -1091,6 +1114,9 @@ pub(crate) fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result
                     *i = to.clone();
                 }
             }
+            for a in s.automations.values_mut() {
+                a.rename_prop(&kinds, still_declared, from, to);
+            }
         }
         SchemaChange::PutLinkType { name, def, .. } => {
             if !s.link_types.contains_key(name) {
@@ -1165,6 +1191,15 @@ pub(crate) fn apply_one(s: &mut Schema, c: &SchemaChange) -> std::result::Result
         }
         SchemaChange::DeleteShape { name } => {
             s.shapes.remove(name).ok_or_else(|| format!("unknown shape {name}"))?;
+        }
+        SchemaChange::PutAutomation { name, def } => {
+            if !s.automations.contains_key(name) {
+                check_new_name("automation", name)?;
+            }
+            s.automations.insert(name.clone(), def.clone());
+        }
+        SchemaChange::DeleteAutomation { name } => {
+            s.automations.remove(name).ok_or_else(|| format!("unknown automation {name}"))?;
         }
         SchemaChange::PutMetric { name, def } => {
             if !s.metrics.contains_key(name) {
@@ -1261,6 +1296,9 @@ fn rewrite_kind(s: &mut Schema, from: &str, to: &str) {
         if let Some(k) = &mut m.kind {
             swap(k);
         }
+    }
+    for a in s.automations.values_mut() {
+        a.rename_kind(from, to);
     }
     // Horn rules name kinds as the object of `a`.
     let swap_value = |v: &mut Value| {
@@ -1373,6 +1411,9 @@ fn rewrite_rel(s: &mut Schema, from: &str, to: &str) {
     for m in s.metrics.values_mut() {
         m.dimensions.values_mut().for_each(path);
     }
+    for a in s.automations.values_mut() {
+        a.rename_rels(&step);
+    }
     let fix_check = |c: &mut Check| {
         if let Some(r) = &mut c.rel {
             step(r);
@@ -1426,6 +1467,7 @@ fn sections(s: &Schema) -> Vec<(&'static str, BTreeMap<String, Value>)> {
         ("metrics", entries(&s.metrics)),
         ("rules", s.rules.iter().map(|r| (r.name.clone(), serde_json::to_value(r).unwrap_or(Value::Null))).collect()),
         ("shapes", entries(&s.shapes)),
+        ("automations", entries(&s.automations)),
         ("glossary.kinds", strings(&s.glossary.kinds)),
         ("glossary.relations", strings(&s.glossary.relations)),
         ("glossary.dimensions", strings(&s.glossary.dimensions)),
@@ -1531,6 +1573,8 @@ pub fn changes_between(a: &Schema, b: &Schema) -> Vec<SchemaChange> {
             "metrics" => SchemaChange::PutMetric { def: b.metrics[&name].clone(), name },
             "shapes" if removed => SchemaChange::DeleteShape { name },
             "shapes" => SchemaChange::PutShape { def: b.shapes[&name].clone(), name },
+            "automations" if removed => SchemaChange::DeleteAutomation { name },
+            "automations" => SchemaChange::PutAutomation { def: b.automations[&name].clone(), name },
             "rules" if removed => SchemaChange::DeleteRule { name },
             "rules" => match b.rules.iter().find(|r| r.name == name) {
                 Some(r) => SchemaChange::PutRule { def: r.clone() },
@@ -2563,6 +2607,25 @@ fn summarize(base: &Schema, c: &SchemaChange) -> String {
             )
         }
         SchemaChange::DeleteShape { name } => format!("delete shape {name}"),
+        SchemaChange::PutAutomation { name, def } => {
+            let t = def.change_trigger();
+            let on = if t.kinds.is_empty() { "any kind".to_string() } else { t.kinds.join(", ") };
+            let effects: Vec<String> = def
+                .effects
+                .iter()
+                .map(|e| match (&e.action, &e.webhook) {
+                    (Some(a), _) => format!("action {}", a.ty),
+                    (_, Some(w)) => format!("webhook {}", w.endpoint),
+                    _ => "?".into(),
+                })
+                .collect();
+            format!(
+                "{} automation {name} (on changes to {on}: {}; not enabled by this change)",
+                verb(base.automations.contains_key(name)),
+                effects.join(", ")
+            )
+        }
+        SchemaChange::DeleteAutomation { name } => format!("delete automation {name}"),
         SchemaChange::PutMetric { name, .. } => format!("{} metric {name}", verb(base.metrics.contains_key(name))),
         SchemaChange::DeleteMetric { name } => format!("delete metric {name}"),
         SchemaChange::PutGlossaryTerm { section, word, target } => {
@@ -3115,6 +3178,9 @@ pub fn assess_risk(plan: &SchemaPlan, set: &SchemaChangeSet) -> (Risk, Vec<Strin
             medium.push(format!("removes or moves a definition: {op} {}", c.target()));
         }
     }
+    for f in plan.lint.iter().filter(|f| f.check == crate::lint::CLOSURE_CHANGED) {
+        medium.push(format!("stops enabled {} until a person enables it again", f.target));
+    }
     if let Some(c) = &plan.consequences {
         if c.removed > 0 {
             medium.push(format!("{} facts the closure holds now disappear from it", c.removed));
@@ -3411,6 +3477,7 @@ impl Ontology {
             action_types: s.action_types.len(),
             rules: s.rules.len(),
             shapes: s.shapes.len(),
+            automations: s.automations.len(),
             metrics: s.metrics.len(),
             governance: self.options().governance.clone(),
             import_error: self.schema_import_error(),
@@ -3458,6 +3525,7 @@ impl Ontology {
         // The facts are collected; the rules run without the read guard, so
         // a plan does not hold writers (and readers queued behind them) back.
         drop(g);
+        self.check_automations(&active.schema, &mut planned)?;
         let (consequences, before) = job.finish(&active.schema);
         if let Some(before) = before {
             self.keep_closure(p, &ReasonOptions::default(), revision, active.version, before);
@@ -3483,6 +3551,23 @@ impl Ontology {
         };
         drop(g);
         Some((active.version, job.finish(&active.schema).0))
+    }
+
+    /// The automation rules of a plan: the `max_automations` limit (only
+    /// here, at apply and propose, never when a schema is loaded) and the
+    /// enabled automations the change would stop (`plan.lint`).
+    fn check_automations(&self, base: &Schema, planned: &mut Planned) -> Result<()> {
+        let Some(new) = &planned.schema else { return Ok(()) };
+        if let Err(e) = crate::automate::check_limit(base, new, self.options().max_automations) {
+            planned.plan.errors.push(e.to_string().trim_start_matches("invalid: ").to_string());
+            planned.plan.valid = false;
+        }
+        if new.automations.is_empty() && base.automations.is_empty() {
+            return Ok(());
+        }
+        let enabled = Enablements::load(&**self.store())?;
+        planned.plan.lint = crate::lint::closure_findings(base, new, &enabled);
+        Ok(())
     }
 
     /// Stage the migration to surface validation errors in the plan.
@@ -3558,6 +3643,7 @@ impl Ontology {
             let active = o.active_schema();
             let mut planned = plan(&active.schema, active.version, g, &set, o.options().strict);
             o.check_migration(g, &mut planned, &ctx.principal);
+            o.check_automations(&active.schema, &mut planned)?;
             planned.plan.consequences = match &early {
                 Some((v, c)) if *v == active.version => Some(c.clone()),
                 Some(_) => Some(Consequences::skipped(
@@ -3647,6 +3733,16 @@ impl Ontology {
                 });
                 kv.extend(followed.kv);
             }
+            // Renames reach outbound configuration in the same commit:
+            // webhook endpoints' change filters follow renamed kinds and
+            // relations (their version moves, so automations that reach them
+            // are enabled again by a person).
+            let renames = renames_of(&set.changes);
+            let rewritten = rewrite_endpoint_filters(&**o.store(), &renames)?;
+            if !rewritten.is_empty() {
+                payload["webhook_filters"] = json!(rewritten.iter().map(|(_, k, _)| k).collect::<Vec<_>>());
+            }
+            kv.extend(rewritten);
             let event = o.event(ctx, &ctx.workspace, "schema.change", None, now, payload, Vec::new());
             let mut events = origin.events.clone();
             events.push(event);
@@ -3656,6 +3752,8 @@ impl Ontology {
                 events,
                 schema: Some((Arc::new(schema), version)),
                 reindex: planned.reindex.clone(),
+                renames,
+                ..Default::default()
             };
             Ok((planned.mutations, extra, (SchemaVersionInfo::from(&sv), planned.plan)))
         })?;
@@ -3765,6 +3863,7 @@ impl Ontology {
                 SchemaChange::DeleteMetric { name } => current.metrics.contains_key(name),
                 SchemaChange::DeleteRule { name } => current.rules.iter().any(|r| &r.name == name),
                 SchemaChange::DeleteShape { name } => current.shapes.contains_key(name),
+                SchemaChange::DeleteAutomation { name } => current.automations.contains_key(name),
                 _ => true,
             };
             if still {
@@ -3811,6 +3910,71 @@ pub struct SchemaRevert {
     pub plan: Option<SchemaPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<SchemaApplied>,
+}
+
+/// The kind and relation renames of a change set, for its change record.
+fn renames_of(changes: &[SchemaChange]) -> Vec<crate::changes::Rename> {
+    use crate::changes::{Rename, RenameWhat};
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::RenameObjectType { from, to } => {
+                Some(Rename { what: RenameWhat::Kind, from: from.clone(), to: to.clone() })
+            }
+            SchemaChange::RenameLinkType { from, to } => {
+                Some(Rename { what: RenameWhat::Rel, from: from.clone(), to: to.clone() })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `webhook.endpoint` values whose change filter names a renamed kind
+/// (`filter.kinds`) or relation (`filter.rels`, also as `^rel`), rewritten to
+/// the new names with their `version` bumped, as KV writes for the schema
+/// commit. Endpoint values are read as JSON: onto-core does not own their
+/// type, only the filter it defines ([`crate::changes::ChangeFilter`]).
+pub(crate) fn rewrite_endpoint_filters(
+    store: &dyn crate::store::Store,
+    renames: &[crate::changes::Rename],
+) -> Result<Vec<(String, String, Value)>> {
+    use crate::changes::RenameWhat;
+    if renames.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ns = crate::outbox::NS_WEBHOOK_ENDPOINT;
+    let mut out = Vec::new();
+    for (name, mut v) in store.kv_scan(ns, "")? {
+        let Some(filter) = v.get_mut("filter").and_then(Value::as_object_mut) else { continue };
+        let mut touched = false;
+        for r in renames {
+            let (key, inverse) = match r.what {
+                RenameWhat::Kind => ("kinds", false),
+                RenameWhat::Rel => ("rels", true),
+            };
+            let Some(list) = filter.get_mut(key).and_then(Value::as_array_mut) else { continue };
+            for item in list.iter_mut() {
+                let Some(text) = item.as_str() else { continue };
+                let new = if text == r.from {
+                    Some(r.to.clone())
+                } else if inverse && text.strip_prefix('^') == Some(r.from.as_str()) {
+                    Some(format!("^{}", r.to))
+                } else {
+                    None
+                };
+                if let Some(n) = new {
+                    *item = Value::String(n);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            let version = v.get("version").and_then(Value::as_u64).unwrap_or(0) + 1;
+            v["version"] = json!(version);
+            out.push((ns.to_string(), name, v));
+        }
+    }
+    Ok(out)
 }
 
 /// Migrations run with system authority across workspaces, attributed to the caller.

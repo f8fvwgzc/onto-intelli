@@ -25,7 +25,8 @@ ActionContext (actor, workspace, request_id, intent, source)
    → authorization (workspace isolation, role, entity ACL)    — denials are audited too
    → validation against the schema (kinds, states, property types, relation endpoints)
    → staged copy-on-write overlay (batch is all-or-nothing)
-   → durable write (entities, vectors, links, events, history in one PostgreSQL transaction)
+   → durable write (entities, vectors, links, events, history, change records and
+     outbox rows in one PostgreSQL transaction)
    → graph + index update, revision bump, change listeners
 ```
 
@@ -46,6 +47,7 @@ Artifacts and knowledge carry `source` (upload, github, ai_generation, ...), `de
 | Agent retrieval / context graph | sync | small, deterministic, permission-filtered |
 | LLM | async, streaming | the only slow step |
 | Ingestion (webhooks, bulk, connectors) | async queue | queries never wait on writes |
+| Outbound (webhooks, writeback) | async, outbox | commits never wait on receivers |
 | Audit | inline, cheap | one row per action in the same transaction |
 | Caches | sync | keyed by graph revision — invalidation is free |
 
@@ -178,6 +180,68 @@ it is released. A run cut by a bound says so: a closure that stopped is a
 lower bound (its certificate still checks, and says so), a cut shape run
 never `conforms`, and a plan whose closures stopped or refused terms is
 `undetermined` rather than conservative.
+
+## 10. Events out: change feed, outbox, Automate
+
+Phase 1 of [design/EVENTS.md](design/EVENTS.md); [AUTOMATE.md](AUTOMATE.md)
+shows it running.
+
+```text
+ commit (Ontology::apply / transact)
+   ├─ graph edits, events, history
+   ├─ change records (changes)  ──► changes.poll · SSE stream      (filtered per reader)
+   │                           ──► fan-out ──► outbox rows (cursor only)
+   │                           ──► automation consumer ──► run: one transact
+   │                                   graph edits + receipt + outbox rows + run row + event
+   └─ outbox rows of actions (writeback)
+                         outbox ──► delivery worker ──► receivers
+                                    (CloudEvents + Standard Webhooks, Idempotency-Key)
+```
+
+**Changes are computed where the write is.** `commit_locked` sees the graph
+before the commit and the staged batch, so it is the one place that knows
+old and new values for every write path. Records are written in the commit
+itself. A state-changing commit that did not record changes (an older build,
+a bulk import) becomes a `gap` record, made by a deferred trigger in
+PostgreSQL. A reader learns that it missed something; it is never told
+nothing happened.
+
+**Outside effects go through one outbox.** Rows from actions and automation
+runs commit with the change that caused them, so a change and its delivery
+are never split by a crash. Change-sourced rows hold only the cursor and are
+rendered, and checked for visibility, when sent. Each row is enqueued once
+and delivered at least once: receivers dedupe on the signed event id, and
+writeback receivers on `Idempotency-Key`. External writes are not reversible, so a
+plan with one needs confirmation and `action.undo` says what it did not undo.
+
+**Automations are schema; running them is a person's decision.**
+Definitions go through `schema.apply` or proposals (agents propose only).
+Enabling binds to a hash of everything the automation reaches and expires,
+because onto cannot tell when the person who enabled it loses the right to.
+A run is claimed by `(automation, trigger_key)`, so a duplicate is settled by
+the claim. Its effects commit in one fenced transaction, so a crash leaves a
+`running` row that recovery executes again.
+
+**One worker per job per tenant, by the database clock.** Fan-out and the
+automation consumer hold leases whose epochs fence their writes; leases,
+claims and timers use `now_ms()` in SQL, since process clocks skew. Change
+streams are pulled per subscriber from a per-tenant hub, and filtering runs
+off the async runtime in slices, so a slow client or a large page never
+holds the graph lock for long. Delivery concurrency limits are per process.
+A graceful shutdown (`Hub::begin_shutdown`, then `finish_shutdown`) ends
+streams with a final frame, lets workers finish their round, and releases
+the leases (fenced by epoch), claimed rows and wake scanner lock it holds,
+so the next process takes over at once instead of when the leases expire
+(0.28 s from start to delivering a change made while it was down, in the
+docs run).
+
+**Outbound work continues the caller's trace.** A call's W3C trace id (its
+`traceparent`, else the trace that recorded it) travels on the principal
+into change records and outbox rows; runs continue their trigger's. Every
+webhook and writeback request sends it as `traceparent`, delivery attempts
+and runs become traces of kind `delivery` and `automation`, and the section
+11 counters (change lag, gaps, outbox states, runs) read capped index
+ranges into `system.stats`, `system.health` and `GET /v1/admin/tenants`.
 
 ## Performance notes
 

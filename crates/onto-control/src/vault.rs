@@ -9,7 +9,11 @@
 //!      ‖ nonce_d[12] ‖ AES-256-GCM(DEK, nonce_d, secret,   aad = "onto/llm-key/v1/" ‖ project_id)
 //! ```
 //!
-//! The AAD binds a blob to its project and purpose. `kek_id` picks
+//! The AAD binds a blob to its project and purpose. Other secrets of a
+//! project ([`Vault::seal_for`]: webhook signing secrets, …) use the same
+//! envelope with `aad = "onto/" ‖ purpose ‖ "/v1/" ‖ project_id ‖ "/" ‖ name`
+//! for the secret, so a blob opens only for its purpose, project and name.
+//! `kek_id` picks
 //! `ONTO_MASTER_KEY` or `ONTO_MASTER_KEY_PREVIOUS` (decryption only);
 //! [`Vault::rewrap`] moves a blob to the current KEK without touching the
 //! secret's ciphertext.
@@ -130,41 +134,61 @@ impl Vault {
 
     /// Encrypt `secret` for `project_id` under the current KEK.
     pub fn seal(&self, project_id: &str, secret: &[u8]) -> Result<Vec<u8>> {
+        self.seal_aad(project_id, &format!("{SECRET_AAD}{project_id}"), secret)
+    }
+
+    /// Encrypt another secret of a project: `purpose` (`webhook-secret`, …)
+    /// and `name` (the endpoint, …) are bound to it with the project, so it
+    /// opens only with [`open_for`](Self::open_for) and the same three.
+    pub fn seal_for(&self, purpose: &str, project_id: &str, name: &str, secret: &[u8]) -> Result<Vec<u8>> {
+        self.seal_aad(project_id, &purpose_aad(purpose, project_id, name)?, secret)
+    }
+
+    /// The secret in a blob [`seal_for`](Self::seal_for) sealed with the same purpose, project and name.
+    pub fn open_for(&self, purpose: &str, project_id: &str, name: &str, blob: &[u8]) -> Result<Vec<u8>> {
+        let aad = purpose_aad(purpose, project_id, name)?;
+        let dek = self.dek(project_id, blob, "secret")?;
+        open(&dek, &aad, &blob[HEADER_LEN..]).ok_or_else(|| {
+            Error::Invalid("the stored secret does not decrypt (altered, or another project's or endpoint's)".into())
+        })
+    }
+
+    fn seal_aad(&self, project_id: &str, aad: &str, secret: &[u8]) -> Result<Vec<u8>> {
         let dek = random_bytes(DEK_LEN);
         let mut blob = Vec::with_capacity(HEADER_LEN + NONCE_LEN + secret.len() + TAG_LEN);
         blob.push(VERSION);
         blob.extend_from_slice(&self.current.id);
         blob.extend_from_slice(&seal(&self.current.bytes, &format!("{DEK_AAD}{project_id}"), &dek)?);
-        blob.extend_from_slice(&seal(&dek, &format!("{SECRET_AAD}{project_id}"), secret)?);
+        blob.extend_from_slice(&seal(&dek, aad, secret)?);
         Ok(blob)
     }
 
-    fn kek_for(&self, blob: &[u8]) -> Result<&Kek> {
+    fn kek_for(&self, blob: &[u8], what: &str) -> Result<&Kek> {
         if blob.len() < HEADER_LEN + NONCE_LEN + TAG_LEN || blob[0] != VERSION {
-            return Err(Error::Invalid("the stored LLM API key is not a version 1 envelope".into()));
+            return Err(Error::Invalid(format!("the stored {what} is not a version 1 envelope")));
         }
         let id = &blob[1..1 + KEK_ID_LEN];
         [Some(&self.current), self.previous.as_ref()].into_iter().flatten().find(|k| k.id == id).ok_or_else(|| {
             Error::Invalid(format!(
-                "the stored LLM API key was encrypted under master key {}, which is neither ONTO_MASTER_KEY \
+                "the stored {what} was encrypted under master key {}, which is neither ONTO_MASTER_KEY \
                  nor ONTO_MASTER_KEY_PREVIOUS",
                 crate::keys::hex(id)
             ))
         })
     }
 
-    fn dek(&self, project_id: &str, blob: &[u8]) -> Result<Vec<u8>> {
-        let kek = self.kek_for(blob)?;
+    fn dek(&self, project_id: &str, blob: &[u8], what: &str) -> Result<Vec<u8>> {
+        let kek = self.kek_for(blob, what)?;
         open(&kek.bytes, &format!("{DEK_AAD}{project_id}"), &blob[1 + KEK_ID_LEN..HEADER_LEN])
             .filter(|d| d.len() == DEK_LEN)
             .ok_or_else(|| {
-                Error::Invalid("the stored LLM API key does not decrypt (altered, or another project's)".into())
+                Error::Invalid(format!("the stored {what} does not decrypt (altered, or another project's)"))
             })
     }
 
     /// The secret in a blob sealed for `project_id`.
     pub fn open(&self, project_id: &str, blob: &[u8]) -> Result<Vec<u8>> {
-        let dek = self.dek(project_id, blob)?;
+        let dek = self.dek(project_id, blob, "LLM API key")?;
         open(&dek, &format!("{SECRET_AAD}{project_id}"), &blob[HEADER_LEN..]).ok_or_else(|| {
             Error::Invalid("the stored LLM API key does not decrypt (altered, or another project's)".into())
         })
@@ -173,10 +197,10 @@ impl Vault {
     /// The blob with its DEK wrapped under the current KEK (the secret's
     /// ciphertext is kept); `None` when it already is.
     pub fn rewrap(&self, project_id: &str, blob: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.kek_for(blob)?.id == self.current.id {
+        if self.kek_for(blob, "LLM API key")?.id == self.current.id {
             return Ok(None);
         }
-        let dek = self.dek(project_id, blob)?;
+        let dek = self.dek(project_id, blob, "LLM API key")?;
         let mut out = Vec::with_capacity(blob.len());
         out.push(VERSION);
         out.extend_from_slice(&self.current.id);
@@ -184,6 +208,18 @@ impl Vault {
         out.extend_from_slice(&blob[HEADER_LEN..]);
         Ok(Some(out))
     }
+}
+
+/// `onto/<purpose>/v1/<project>/<name>`; purpose and name are
+/// `[A-Za-z0-9_-]` (no `/`, so two triples never share an AAD).
+fn purpose_aad(purpose: &str, project_id: &str, name: &str) -> Result<String> {
+    let ok = |s: &str| {
+        !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !ok(purpose) || !ok(name) || purpose == "dek" {
+        return Err(Error::invalid("a sealed secret's purpose and name are [A-Za-z0-9_-], 1 to 64 characters"));
+    }
+    Ok(format!("onto/{purpose}/v1/{project_id}/{name}"))
 }
 
 #[cfg(test)]
@@ -245,5 +281,26 @@ mod tests {
         assert!(Vault::from_values(Some("short".into()), None).is_err());
         let err = Vault::from_values(Some(hex64), Some("bad".into())).unwrap_err();
         assert!(err.to_string().contains("ONTO_MASTER_KEY_PREVIOUS"), "{err}");
+    }
+
+    #[test]
+    fn purpose_bound_secrets() {
+        let v = vault(1, None);
+        let blob = v.seal_for("webhook-secret", "prj_a", "ops", b"whsec_abc").unwrap();
+        assert_eq!(v.open_for("webhook-secret", "prj_a", "ops", &blob).unwrap(), b"whsec_abc");
+        // Bound to the purpose, the project and the name.
+        assert!(v.open_for("webhook-secret", "prj_a", "billing", &blob).is_err());
+        assert!(v.open_for("writeback-secret", "prj_a", "ops", &blob).is_err());
+        assert!(v.open_for("webhook-secret", "prj_b", "ops", &blob).is_err());
+        assert!(v.open("prj_a", &blob).is_err(), "not an LLM key");
+        let llm = v.seal("prj_a", b"sk-1").unwrap();
+        assert!(v.open_for("llm-key", "prj_a", "x", &llm).is_err());
+        assert!(v.seal_for("a/b", "prj_a", "ops", b"x").is_err());
+        assert!(v.seal_for("webhook-secret", "prj_a", "o/ps", b"x").is_err());
+        // The previous KEK still opens it; errors never show the secret.
+        let new = vault(2, Some(1));
+        assert_eq!(new.open_for("webhook-secret", "prj_a", "ops", &blob).unwrap(), b"whsec_abc");
+        let e = vault(3, None).open_for("webhook-secret", "prj_a", "ops", &blob).unwrap_err().to_string();
+        assert!(e.contains("stored secret") && !e.contains("whsec"), "{e}");
     }
 }

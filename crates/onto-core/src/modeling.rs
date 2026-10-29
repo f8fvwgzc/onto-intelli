@@ -271,9 +271,14 @@ fn table_glob(pattern: &str, full: &str, name: &str) -> bool {
 }
 
 /// `*` matches any run of characters; case-insensitive.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob(pattern: &str, text: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) =
         (pattern.to_lowercase().chars().collect(), text.to_lowercase().chars().collect());
+    glob_chars(&p, &t)
+}
+
+/// [`glob`] on characters already lowercased (patterns parsed once).
+pub(crate) fn glob_chars(p: &[char], t: &[char]) -> bool {
     let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
     while ti < t.len() {
         if pi < p.len() && p[pi] == '*' {

@@ -18,6 +18,11 @@
 //!   no hash-map iteration reaches the output.
 //!
 //! The checks, their severities and what they flag are the [`CHECKS`] table.
+//! One check reads stored state as well as the schema:
+//! `automation_closure_changed` compares enabled automations with the
+//! schema, so for a schema that defines automations it runs only when the
+//! enablements are given ([`lint_with`]; `schema.lint` and `schema.plan` read
+//! them) and is listed in `not_run` otherwise.
 //! Lint reads any [`Schema`] value, including one that never went through
 //! `Schema::compile`: it lints a compiled copy when the schema compiles, and
 //! otherwise resolves declared inverse names itself (only `compile` fills the
@@ -36,10 +41,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::action_types::{ActionType, CheckKind, ParamType, placeholders};
+use crate::automate::{Automation, Enablements, StateGuard};
+use crate::changes::{self, Cause, ChangeOp, ChangeRecord, LinkChange, StateMove, VisStub};
 use crate::engine::{ActionContext, Extra};
 use crate::graph::Graph;
 use crate::model::Entity;
-use crate::policy::{self, Access, Principal};
+use crate::policy::{self, Access, Principal, Role};
 use crate::reason::{self, RuleLine, Vocabulary};
 use crate::schema::{Cardinality, LinkType, PropType, PropertyDef, Schema};
 use crate::shape_model::{Shape, ShapePath};
@@ -185,9 +193,49 @@ pub const CHECKS: &[CheckInfo] = &[
         "A rule's when uses `a <name>` where the name is neither a type, an interface nor a class some rule \
          derives.",
     ),
+    check(
+        "automation_reference",
+        Severity::Error,
+        false,
+        "An automation names an unknown kind, relation, property, state or action type, a parameter its action \
+         type does not declare, or leaves out one the action type requires.",
+    ),
+    check(
+        "automation_privilege",
+        Severity::Warning,
+        false,
+        "An automation runs as admin or in every workspace, or its run_as cannot do what its action type needs \
+         (every run would be refused).",
+    ),
+    check(
+        "automation_loop",
+        Severity::Warning,
+        false,
+        "Automations whose actions write changes that trigger each other in a cycle (or itself, with allow_self). \
+         The depth guard stops the cascade at max_depth, but every step up to it runs.",
+    ),
+    check(
+        CLOSURE_CHANGED,
+        Severity::Warning,
+        false,
+        "An enabled automation no longer matches what was enabled (its definition, an action type it runs, or an \
+         endpoint or target it reaches changed), so it is inactive until a person enables it again. Reads the \
+         stored enablements.",
+    ),
+    check(
+        "automation_gap_blind",
+        Severity::Warning,
+        false,
+        "A change-triggered automation does not see bulk imports or uncaptured writes: those commits appear as \
+         gap records, and gap records never trigger runs.",
+    ),
     check("unused_type", Severity::Info, true, "No visible object is of this type or one of its subtypes."),
     check("unused_link_type", Severity::Info, true, "No visible link of this type exists."),
 ];
+
+/// The check that compares enabled automations with a schema; it needs the
+/// stored enablements (see [`lint_with`]).
+pub const CLOSURE_CHANGED: &str = "automation_closure_changed";
 
 /// The table entry of a check.
 pub fn check_info(name: &str) -> Option<&'static CheckInfo> {
@@ -310,7 +358,7 @@ pub struct LintQuery {
 /// Run every check. Graph checks run when `g` is given and count only what
 /// `can_read` admits.
 pub fn lint(schema: &Schema, g: Option<&Graph>, can_read: &dyn Fn(&Entity) -> bool) -> LintReport {
-    run(schema, g, can_read, CHECKS.iter().map(|c| c.name).collect())
+    run(schema, g, can_read, CHECKS.iter().map(|c| c.name).collect(), None)
 }
 
 /// Run the named checks (all when `checks` is `None` or empty). An unknown
@@ -320,6 +368,18 @@ pub fn lint_checks(
     g: Option<&Graph>,
     can_read: &dyn Fn(&Entity) -> bool,
     checks: Option<&[String]>,
+) -> Result<LintReport> {
+    lint_with(schema, g, can_read, checks, None)
+}
+
+/// [`lint_checks`] with the stored automation enablements, so
+/// `automation_closure_changed` runs too.
+pub fn lint_with(
+    schema: &Schema,
+    g: Option<&Graph>,
+    can_read: &dyn Fn(&Entity) -> bool,
+    checks: Option<&[String]>,
+    enabled: Option<&Enablements>,
 ) -> Result<LintReport> {
     let selected = match checks {
         None | Some([]) => CHECKS.iter().map(|c| c.name).collect(),
@@ -339,7 +399,41 @@ pub fn lint_checks(
             sel
         }
     };
-    Ok(run(schema, g, can_read, selected))
+    Ok(run(schema, g, can_read, selected, enabled))
+}
+
+/// `automation_closure_changed` findings for the enabled automations that
+/// match their enablement under `base` and would not under `new`: what a
+/// change from `base` to `new` would stop.
+pub fn closure_findings(base: &Schema, new: &Schema, enabled: &Enablements) -> Vec<Finding> {
+    let before = enabled.stale(base);
+    enabled
+        .stale(new)
+        .into_iter()
+        .filter(|(name, _)| !before.contains_key(name))
+        .map(|(name, items)| closure_finding(&name, &items))
+        .collect()
+}
+
+fn closure_finding(name: &str, items: &[String]) -> Finding {
+    let target = format!("automation:{name}");
+    Finding {
+        id: finding_id(CLOSURE_CHANGED, &target),
+        check: CLOSURE_CHANGED.into(),
+        severity: Severity::Warning,
+        message: format!(
+            "enabled automation {name} does not match its enablement: {} changed, so it is inactive \
+             (stale_definition) until a person enables it again",
+            items.join(", ")
+        ),
+        fix: format!(
+            "review what changed, then enable {name} again (automation.enable, by an approver who dominates its run_as)"
+        ),
+        target,
+        accepted: false,
+        dismissed: false,
+        note: None,
+    }
 }
 
 fn run(
@@ -347,6 +441,7 @@ fn run(
     g: Option<&Graph>,
     can_read: &dyn Fn(&Entity) -> bool,
     selected: BTreeSet<&'static str>,
+    enabled: Option<&Enablements>,
 ) -> LintReport {
     // `Schema::resolve_rel` reads an inverse-name map only `compile` fills
     // (and serde skips), so lint a compiled copy when the schema compiles.
@@ -384,6 +479,15 @@ fn run(
     l.unused_interface();
     l.duplicate_label();
     l.unknown_rule_class();
+    l.automation_reference();
+    l.automation_privilege();
+    l.automation_loop();
+    if let Some(e) = enabled
+        && l.on(CLOSURE_CHANGED)
+    {
+        l.findings.extend(e.stale(schema).iter().map(|(name, items)| closure_finding(name, items)));
+    }
+    l.automation_gap_blind();
     if let Some(g) = g {
         l.unused(g, can_read);
     }
@@ -399,6 +503,11 @@ fn run(
     for c in CHECKS.iter().filter(|c| selected.contains(c.name)) {
         if c.needs_graph && g.is_none() {
             not_run.push(NotRun { check: c.name.into(), reason: "needs a graph".into() });
+        } else if c.name == CLOSURE_CHANGED && enabled.is_none() && !schema.automations.is_empty() {
+            not_run.push(NotRun {
+                check: c.name.into(),
+                reason: "needs the stored automation enablements (schema.lint and schema.plan read them)".into(),
+            });
         } else {
             checks_run.push(c.name.to_string());
             if RULE_CHECKS.contains(&c.name) {
@@ -548,6 +657,25 @@ impl Derived {
 enum Head {
     Class(String),
     Rel(String),
+}
+
+/// A change an action type's effects can write (for `automation_loop`).
+struct Write {
+    op: ChangeOp,
+    /// The entity's kinds (`[kinds, []]`), or a link's `[from, to]` kinds as
+    /// stored; empty: any kind.
+    kinds: [Vec<String>; 2],
+    /// The stored (canonical) relation of a link write.
+    rel: String,
+    /// Fields an update sets (`title`, `state`, property names).
+    changed: Vec<String>,
+    /// The state it sets: `Some(None)` for a templated state, `None` for none.
+    state: Option<Option<String>>,
+}
+
+/// `issue, task` or `any kind`.
+fn kinds_text(kinds: &[String]) -> String {
+    if kinds.is_empty() { "any object type".into() } else { kinds.join(", ") }
 }
 
 impl<'a> Linter<'a> {
@@ -1439,6 +1567,436 @@ impl<'a> Linter<'a> {
         }
     }
 
+    /// Does `prop` name a field a change can carry for one of `kinds` (any
+    /// object type when empty): a built-in field or a declared property?
+    fn known_prop(&self, kinds: &[String], prop: &str) -> bool {
+        const FIELDS: &[&str] = &["title", "state", "aliases", "provenance", "workspace", "kind"];
+        let s = self.schema;
+        if FIELDS.contains(&prop) {
+            return true;
+        }
+        if kinds.is_empty() {
+            return s.object_types.keys().any(|k| s.prop_def(k, prop).is_some())
+                || s.interfaces.values().any(|i| i.properties.contains_key(prop));
+        }
+        kinds.iter().any(|k| {
+            s.prop_def(k, prop).is_some()
+                || s.interfaces.get(k).is_some_and(|i| i.properties.contains_key(prop))
+                || s.concrete_kinds(k).iter().any(|c| s.prop_def(c, prop).is_some())
+        })
+    }
+
+    /// States `kinds` list (`None` when no kind among them lists states, so
+    /// any state is allowed).
+    fn states_of(&self, kinds: &[String]) -> Option<BTreeSet<String>> {
+        let s = self.schema;
+        let mut out = BTreeSet::new();
+        for k in kinds {
+            for c in s.concrete_kinds(k) {
+                if let Some(t) = s.object_types.get(&c) {
+                    out.extend(t.states.iter().cloned());
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn automation_reference(&mut self) {
+        const C: &str = "automation_reference";
+        if !self.on(C) {
+            return;
+        }
+        let s = self.schema;
+        let mut found = Vec::new();
+        for (name, a) in &s.automations {
+            let mut problems = Vec::new();
+            let t = a.change_trigger();
+            for k in t.kinds.iter().filter(|k| !s.is_type_or_interface(k)) {
+                problems.push(format!("trigger kind {k} is not an object type or interface"));
+            }
+            for r in t.rels.iter().filter(|r| !self.declared_rel(r)) {
+                problems.push(format!("trigger relation {r} is not a link type or inverse name"));
+            }
+            let link_only = !t.rels.is_empty() || (!t.ops.is_empty() && t.ops.iter().all(|op| op.is_link()));
+            if !link_only {
+                for p in t.props.iter().filter(|p| !self.known_prop(&t.kinds, p)) {
+                    problems.push(format!("trigger property {p} is not declared on {}", kinds_text(&t.kinds)));
+                }
+            }
+            let states = self.states_of(&t.kinds);
+            let unknown_state = |what: &str, st: &String, problems: &mut Vec<String>| {
+                if states.as_ref().is_some_and(|all| !all.contains(st)) {
+                    problems.push(format!("{what} state {st} is not a state of {}", kinds_text(&t.kinds)));
+                }
+            };
+            if let Some(StateGuard { from, to }) = &t.state {
+                for st in from.iter().chain(to) {
+                    unknown_state("trigger", st, &mut problems);
+                }
+            }
+            for (i, c) in a.conditions.iter().enumerate() {
+                if let Some(rel) = &c.rel
+                    && !self.declared_rel(rel)
+                {
+                    problems.push(format!("condition {i}: relation {rel} is not a link type or inverse name"));
+                }
+                if matches!(c.check, CheckKind::PropEq | CheckKind::PropSet)
+                    && let Some(p) = &c.prop
+                    && !self.known_prop(&t.kinds, p)
+                {
+                    problems.push(format!("condition {i}: property {p} is not declared on {}", kinds_text(&t.kinds)));
+                }
+                if matches!(c.check, CheckKind::StateIn | CheckKind::StateNotIn) {
+                    for st in &c.values {
+                        unknown_state(&format!("condition {i}:"), st, &mut problems);
+                    }
+                }
+            }
+            if let Some(eff) = a.action() {
+                match s.action_types.get(&eff.ty) {
+                    None => problems.push(format!("action type {} is not defined", eff.ty)),
+                    Some(at) => {
+                        for p in eff.params.keys().filter(|p| !at.parameters.contains_key(*p)) {
+                            problems.push(format!("action type {} has no parameter {p}", eff.ty));
+                        }
+                        for (p, d) in &at.parameters {
+                            if d.required && d.default.is_none() && !eff.params.contains_key(p) {
+                                problems
+                                    .push(format!("action type {} requires parameter {p}, which is not given", eff.ty));
+                            }
+                        }
+                    }
+                }
+            }
+            if !problems.is_empty() {
+                found.push((
+                    format!("automation:{name}"),
+                    format!("automation {name}: {}", problems.join("; ")),
+                    format!(
+                        "point [automations.{name}] at names the schema defines (or define them in the same change set)"
+                    ),
+                ));
+            }
+        }
+        for (t, m, f) in found {
+            self.push(C, t, m, f);
+        }
+    }
+
+    fn automation_privilege(&mut self) {
+        const C: &str = "automation_privilege";
+        if !self.on(C) {
+            return;
+        }
+        let s = self.schema;
+        let mut found = Vec::new();
+        for (name, a) in &s.automations {
+            let mut why = Vec::new();
+            let p = a.principal(name);
+            if p.has(Role::Admin) {
+                why.push(
+                    "it runs as admin, so it sees restricted entities and may do anything in its workspaces"
+                        .to_string(),
+                );
+            }
+            if p.workspaces.iter().any(|w| w == "*") {
+                why.push("it acts in every workspace (\"*\")".to_string());
+            }
+            if let Some(eff) = a.action()
+                && let Some(at) = s.action_types.get(&eff.ty)
+            {
+                if !p.allows(Access::Write) {
+                    why.push(format!("run_as cannot write, so every run of action {} would be refused", eff.ty));
+                } else if !at.roles.is_empty() && !p.is_privileged() && !at.roles.iter().any(|r| p.has_role(r)) {
+                    let roles: Vec<&str> = at.roles.iter().map(Role::as_str).collect();
+                    why.push(format!(
+                        "run_as holds none of the roles action {} allows ({}), so every run would be refused",
+                        eff.ty,
+                        roles.join(", ")
+                    ));
+                }
+            }
+            if !why.is_empty() {
+                found.push((
+                    format!("automation:{name}"),
+                    format!("automation {name}: {}", why.join("; ")),
+                    format!(
+                        "give [automations.{name}] run_as the narrowest roles and workspaces its action needs \
+                         (the person who enables it must dominate run_as)"
+                    ),
+                ));
+            }
+        }
+        for (t, m, f) in found {
+            self.push(C, t, m, f);
+        }
+    }
+
+    /// `(base relation, [from kinds, to kinds])` of a link effect's relation
+    /// and ends as written (an inverse name swaps the ends).
+    fn stored_link(&self, rel: &str, ends: [Vec<String>; 2]) -> (String, [Vec<String>; 2]) {
+        let resolved = self.schema.resolve_rel(rel).or_else(|| {
+            let bare = rel.strip_prefix('^');
+            match bare {
+                Some(b) => Some((b.to_string(), crate::schema::Dir::In)),
+                None => self.inverses.get(rel).map(|b| (b.clone(), crate::schema::Dir::In)),
+            }
+        });
+        match resolved {
+            Some((base, crate::schema::Dir::In)) => {
+                let [from, to] = ends;
+                (base, [to, from])
+            }
+            Some((base, _)) => (base, ends),
+            None => (rel.trim_start_matches('^').to_string(), ends),
+        }
+    }
+
+    /// The changes an action type's effects can write, as far as the schema
+    /// says (an entity parameter's kinds; any kind when it names none).
+    fn action_writes(&self, at: &ActionType) -> Vec<Write> {
+        let kinds_of = |t: &str| -> Vec<String> {
+            match placeholders(t).first() {
+                Some(root) => match at.parameters.get(root) {
+                    Some(p) if p.ty == ParamType::Entity => p.kinds.clone(),
+                    _ => Vec::new(),
+                },
+                None => t.split_once(':').map(|(k, _)| vec![k.to_string()]).unwrap_or_default(),
+            }
+        };
+        let literal = |t: &str| placeholders(t).is_empty().then(|| t.to_string());
+        let mut out = Vec::new();
+        let link = |out: &mut Vec<Write>, op: ChangeOp, rel: &str, from: Vec<String>, to: Vec<String>| {
+            let (rel, kinds) = self.stored_link(rel, [from, to]);
+            out.push(Write { op, kinds, rel, changed: Vec::new(), state: None });
+        };
+        for e in &at.effects {
+            if let Some(p) = &e.patch {
+                let mut changed: Vec<String> = p.props.keys().cloned().collect();
+                if p.title.is_some() {
+                    changed.push("title".into());
+                }
+                if p.state.is_some() {
+                    changed.push("state".into());
+                }
+                let state = p.state.as_deref().map(literal);
+                out.push(Write {
+                    op: ChangeOp::EntityUpdate,
+                    kinds: [kinds_of(&p.id), Vec::new()],
+                    rel: String::new(),
+                    changed,
+                    state,
+                });
+            }
+            if let Some(c) = &e.create {
+                let state = c.state.as_deref().map(literal);
+                out.push(Write {
+                    op: ChangeOp::EntityCreate,
+                    kinds: [vec![c.kind.clone()], Vec::new()],
+                    rel: String::new(),
+                    changed: Vec::new(),
+                    state,
+                });
+                for l in &c.links {
+                    link(&mut out, ChangeOp::LinkCreate, &l.rel, vec![c.kind.clone()], kinds_of(&l.to));
+                }
+            }
+            if let Some(d) = &e.delete {
+                out.push(Write {
+                    op: ChangeOp::EntityDelete,
+                    kinds: [kinds_of(d), Vec::new()],
+                    rel: String::new(),
+                    changed: Vec::new(),
+                    state: None,
+                });
+            }
+            if let Some(l) = &e.link {
+                link(&mut out, ChangeOp::LinkCreate, &l.rel, kinds_of(&l.from), kinds_of(&l.to));
+                if e.replace {
+                    link(&mut out, ChangeOp::LinkDelete, &l.rel, kinds_of(&l.from), Vec::new());
+                }
+            }
+            if let Some(l) = &e.unlink {
+                link(&mut out, ChangeOp::LinkDelete, &l.rel, kinds_of(&l.from), kinds_of(&l.to));
+            }
+        }
+        out
+    }
+
+    /// Can a write of automation `src` (acting in `src_ws`) start a run of `b`?
+    fn triggers(&self, b: &Automation, w: &Write, src: &str, src_ws: &[String]) -> bool {
+        let t = b.change_trigger();
+        if let Some(g) = &t.state {
+            let state_ok = matches!(w.op, ChangeOp::EntityCreate | ChangeOp::EntityUpdate)
+                && match &w.state {
+                    None => false,
+                    Some(None) => true,
+                    Some(Some(st)) => g.to.is_empty() || g.to.contains(st),
+                };
+            if !state_ok {
+                return false;
+            }
+        }
+        if !t.workspaces.is_empty() && !src_ws.iter().any(|w| w == "*" || t.workspaces.contains(w)) {
+            return false;
+        }
+        let cause = Cause {
+            actor: format!("automation:{src}"),
+            source: Some(format!("automation:{src}")),
+            automation: Some(src.to_string()),
+            depth: 1,
+            ..Cause::default()
+        };
+        // An end the action does not narrow may be of any kind: try the
+        // trigger's own kinds there.
+        let candidates = |ks: &[String]| -> Vec<String> {
+            if ks.is_empty() {
+                if t.kinds.is_empty() { vec![String::new()] } else { t.kinds.clone() }
+            } else {
+                let mut out: Vec<String> = ks.iter().flat_map(|k| self.schema.concrete_kinds(k)).collect();
+                out.extend(ks.iter().cloned());
+                out
+            }
+        };
+        let filter = t.filter();
+        let workspace = t.workspaces.first().cloned().unwrap_or_default();
+        let mut records = Vec::new();
+        let blank = |op: ChangeOp, kind: String| ChangeRecord {
+            cursor: Default::default(),
+            ts: 0,
+            op,
+            workspace: workspace.clone(),
+            kind,
+            id: String::new(),
+            revision: None,
+            changed: w.changed.clone(),
+            state: None::<StateMove>,
+            moved: None,
+            before: Default::default(),
+            entity: None,
+            entity_missing: false,
+            became_visible: false,
+            link: None,
+            schema: None,
+            gap: None,
+            cause: cause.clone(),
+        };
+        if w.op.is_link() {
+            for (i, ks) in w.kinds.iter().enumerate() {
+                for k in candidates(ks) {
+                    let stub = |kind: &str| VisStub { kind: kind.to_string(), ..Default::default() };
+                    let ends = if i == 0 { [stub(&k), stub("")] } else { [stub(""), stub(&k)] };
+                    let mut r = blank(w.op, w.rel.clone());
+                    r.link = Some(LinkChange { rel: w.rel.clone(), ends, ..Default::default() });
+                    records.push(r);
+                }
+            }
+        } else {
+            for k in candidates(&w.kinds[0]) {
+                records.push(blank(w.op, k));
+            }
+        }
+        records.iter().any(|r| changes::matches(&filter, self.schema, r))
+    }
+
+    fn automation_loop(&mut self) {
+        const C: &str = "automation_loop";
+        if !self.on(C) {
+            return;
+        }
+        let s = self.schema;
+        let names: Vec<&String> = s.automations.keys().collect();
+        let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (a_name, a) in &s.automations {
+            let Some(at) = a.action().and_then(|e| s.action_types.get(&e.ty)) else { continue };
+            let writes = self.action_writes(at);
+            for (b_name, b) in &s.automations {
+                if a_name == b_name && !b.allow_self {
+                    continue;
+                }
+                if writes.iter().any(|w| self.triggers(b, w, a_name, &a.run_as.workspaces)) {
+                    edges.entry(a_name.as_str()).or_default().insert(b_name.as_str());
+                }
+            }
+        }
+        let reach = |from: &str| -> BTreeSet<&str> {
+            let mut seen = BTreeSet::new();
+            let mut todo: VecDeque<&str> = edges.get(from).into_iter().flatten().copied().collect();
+            while let Some(n) = todo.pop_front() {
+                if seen.insert(n) {
+                    todo.extend(edges.get(n).into_iter().flatten().copied());
+                }
+            }
+            seen
+        };
+        let reaches: BTreeMap<&str, BTreeSet<&str>> = names.iter().map(|n| (n.as_str(), reach(n))).collect();
+        let mut cycles: BTreeSet<Vec<&str>> = BTreeSet::new();
+        for n in &names {
+            let n = n.as_str();
+            if !reaches[n].contains(n) {
+                continue;
+            }
+            let scc: Vec<&str> =
+                names.iter().map(|m| m.as_str()).filter(|m| reaches[n].contains(m) && reaches[m].contains(n)).collect();
+            cycles.insert(scc);
+        }
+        let mut found = Vec::new();
+        for scc in cycles {
+            let target = scc.iter().map(|n| format!("automation:{n}")).collect::<Vec<_>>().join(", ");
+            let mut steps = Vec::new();
+            for a in &scc {
+                for b in edges.get(a).into_iter().flatten().filter(|b| scc.contains(b)) {
+                    steps.push(format!("{a} → {b}"));
+                }
+            }
+            let message = if scc.len() == 1 {
+                format!(
+                    "automation {} can trigger itself (allow_self = true): its action writes a change its own trigger \
+                     matches; the depth guard stops the cascade at max_depth, but every step up to it runs",
+                    scc[0]
+                )
+            } else {
+                format!(
+                    "automations {} can trigger each other in a cycle ({}): each one's action writes a change the next \
+                     one's trigger matches; the depth guard stops the cascade at max_depth, but every step up to it runs",
+                    scc.join(", "),
+                    steps.join(", ")
+                )
+            };
+            found.push((
+                target,
+                message,
+                "narrow a trigger (kinds, ops, state, or sources = [\"!automation:*\"]) or add a condition so the \
+                 cycle ends"
+                    .to_string(),
+            ));
+        }
+        for (t, m, f) in found {
+            self.push(C, t, m, f);
+        }
+    }
+
+    fn automation_gap_blind(&mut self) {
+        const C: &str = "automation_gap_blind";
+        if !self.on(C) {
+            return;
+        }
+        let names: Vec<String> = self.schema.automations.keys().cloned().collect();
+        for name in names {
+            self.push(
+                C,
+                format!("automation:{name}"),
+                format!(
+                    "automation {name} runs on committed changes only: a bulk import, or a commit from a build that \
+                     did not record changes, appears as a gap record, and gap records never trigger runs"
+                ),
+                "after a bulk import, review the entities its gap record names (changes.poll lists them); no \
+                 automation runs for them"
+                    .to_string(),
+            );
+        }
+    }
+
     fn unused(&mut self, g: &Graph, can_read: &dyn Fn(&Entity) -> bool) {
         let s = self.schema;
         if self.on("unused_type") {
@@ -1499,11 +2057,12 @@ impl Ontology {
             return Err(Error::Denied(format!("{} has no read role", p.id)));
         }
         let feedback = self.feedback_map()?;
+        let enabled = Enablements::load(&**self.store())?;
         let schema = self.schema();
         let version = self.schema_version();
         let g = self.reader(p)?;
         let can = |e: &Entity| policy::visible(p, e, &g);
-        let mut report = lint_checks(&schema, Some(&g), &can, q.checks.as_deref())?;
+        let mut report = lint_with(&schema, Some(&g), &can, q.checks.as_deref(), Some(&enabled))?;
         drop(g);
         report.schema_version = Some(version);
         Ok(apply_feedback(report, &feedback, q.include_dismissed))
@@ -1545,7 +2104,8 @@ impl Ontology {
         let (_, fb) = self.transact(ctx, |o, g| {
             let schema = o.schema();
             let can = |e: &Entity| policy::visible(p, e, g);
-            let report = lint(&schema, Some(g), &can);
+            let enabled = Enablements::load(&**o.store())?;
+            let report = lint_with(&schema, Some(g), &can, None, Some(&enabled))?;
             let Some(f) = report.findings.into_iter().find(|f| f.id == id) else {
                 return Err(Error::not_found(format!("lint finding {id} (schema.lint lists the current ids)")));
             };
@@ -1618,7 +2178,7 @@ mod tests {
     fn check_table_is_consistent() {
         let names: BTreeSet<&str> = CHECKS.iter().map(|c| c.name).collect();
         assert_eq!(names.len(), CHECKS.len(), "check names are unique");
-        assert_eq!(CHECKS.len(), 19);
+        assert_eq!(CHECKS.len(), 24);
         for c in CHECKS {
             assert!(!c.about.is_empty() && c.about.ends_with('.'), "{} is documented", c.name);
         }
@@ -1632,6 +2192,22 @@ mod tests {
         let r = lint(&s, None, &none);
         assert_eq!(r.checks_run.len(), CHECKS.len() - 2);
         assert_eq!(r.not_run.iter().map(|n| n.check.as_str()).collect::<Vec<_>>(), ["unused_type", "unused_link_type"]);
+        // A schema with automations needs the enablements for the closure check.
+        let mut with_auto = s.clone();
+        with_auto
+            .extend_toml(
+                "[automations.a]\nrun_as = { roles = [\"member\"], workspaces = [\"acme\"] }\n\
+                 trigger = { on = \"change\", kinds = [\"issue\"] }\n\
+                 effects = [{ action = { type = \"resolve\", params = { issue = \"{trigger.id}\" } } }]\n",
+            )
+            .unwrap();
+        let r = lint(&with_auto, None, &none);
+        assert_eq!(
+            r.not_run.iter().map(|n| n.check.as_str()).collect::<Vec<_>>(),
+            [CLOSURE_CHANGED, "unused_type", "unused_link_type"]
+        );
+        let with_state = lint_with(&with_auto, None, &none, None, Some(&Enablements::default())).unwrap();
+        assert_eq!(with_state.checks_run.len(), CHECKS.len() - 2);
         assert_eq!(r.means, MEANS);
         let only = lint_checks(&s, None, &none, Some(&["missing_inverse".to_string()])).unwrap();
         assert_eq!(only.checks_run, ["missing_inverse"]);

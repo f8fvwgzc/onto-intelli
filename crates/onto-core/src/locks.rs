@@ -4,8 +4,8 @@
 //! A lock names one definition by section and name and lives in the KV
 //! namespace [`NS_LOCKS`] under the key `<section>/<name>`. The sections are
 //! `object_types`, `link_types`, `interfaces`, `rules`, `metrics`,
-//! `action_types`, `shapes` and `properties` (a property is named
-//! `<object type>.<property>`).
+//! `action_types`, `shapes`, `automations` and `properties` (a property is
+//! named `<object type>.<property>`).
 //!
 //! A schema change violates a lock when it deletes or renames the locked
 //! definition (a property lock is also violated by deleting or renaming the
@@ -45,8 +45,17 @@ use crate::{Error, Ontology, Result};
 pub const NS_LOCKS: &str = "schema.lock";
 
 /// Sections a lock can name.
-pub const SECTIONS: &[&str] =
-    &["object_types", "link_types", "interfaces", "rules", "metrics", "action_types", "shapes", "properties"];
+pub const SECTIONS: &[&str] = &[
+    "object_types",
+    "link_types",
+    "interfaces",
+    "rules",
+    "metrics",
+    "action_types",
+    "shapes",
+    "automations",
+    "properties",
+];
 
 /// One active lock.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +153,7 @@ pub fn target_exists(schema: &Schema, section: &str, name: &str) -> std::result:
         "metrics" => schema.metrics.contains_key(name),
         "action_types" => schema.action_types.contains_key(name),
         "shapes" => schema.shapes.contains_key(name),
+        "automations" => schema.automations.contains_key(name),
         "properties" => {
             let Some((kind, prop)) = name.split_once('.') else {
                 return Err(format!("a property lock names <object type>.<property>, not '{name}'"));
@@ -278,6 +288,10 @@ fn touches(base: &Schema, c: &SchemaChange) -> Vec<Touched> {
         SchemaChange::DeleteRule { name } => out.push(touched("rules", name, Touch::Delete, deletes)),
         SchemaChange::PutShape { name, .. } => out.push(touched("shapes", name, Touch::BreakingChange, edits)),
         SchemaChange::DeleteShape { name } => out.push(touched("shapes", name, Touch::Delete, deletes)),
+        SchemaChange::PutAutomation { name, .. } => {
+            out.push(touched("automations", name, Touch::BreakingChange, edits))
+        }
+        SchemaChange::DeleteAutomation { name } => out.push(touched("automations", name, Touch::Delete, deletes)),
         SchemaChange::PutMetric { name, .. } => out.push(touched("metrics", name, Touch::BreakingChange, edits)),
         SchemaChange::DeleteMetric { name } => out.push(touched("metrics", name, Touch::Delete, deletes)),
         SchemaChange::PutGlossaryTerm { .. }

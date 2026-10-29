@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Blocks, Boxes, GitPullRequestArrow, LogOut, Map as MapIcon, Search, Shapes, ShieldCheck, Table2 } from "lucide-react";
+import { Blocks, Boxes, GitPullRequestArrow, LogOut, Map as MapIcon, Search, Shapes, ShieldCheck, Table2, Webhook } from "lucide-react";
 
 import { useOpenProposals, useWhoami } from "../lib/queries";
 import { href, useRoute } from "../lib/router";
@@ -16,6 +16,7 @@ export const NAV = [
   { key: "build", label: "Builder", short: "Build", icon: Blocks },
   { key: "proposals", label: "Proposals", short: "Proposals", icon: GitPullRequestArrow },
   { key: "assure", label: "Assurance", short: "Assure", icon: ShieldCheck },
+  { key: "automate", label: "Automate", short: "Automate", icon: Webhook },
 ] as const;
 
 /** The app frame. With a console session it adds the project switcher and the Project group (ConsoleShell). */

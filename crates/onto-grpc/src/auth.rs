@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use onto_control::{Control, OrgRole, User};
 use onto_intelli::config::AuthConfig;
+use onto_intelli::core::policy::is_reserved_id;
 use onto_intelli::{Error, Principal, Result, Role};
 
 pub const ACT_AS: &str = "x-onto-act-as";
@@ -224,6 +225,21 @@ pub struct Caller {
     /// Set when a session token (not a key or a config token) authenticated
     /// the request: a session it mints may not outlive it.
     pub session: Option<SessionInfo>,
+    /// The credential may address every tenant: a config token whose
+    /// `tenants` is `["*"]`, development mode, or a session not bound to a
+    /// tenant. Only such callers see the whole process (operators).
+    pub all_tenants: bool,
+}
+
+impl Caller {
+    /// An operator of the whole process: a privileged principal acting for
+    /// itself (no act-as) on a credential that may address every tenant.
+    pub fn is_operator(&self) -> bool {
+        self.all_tenants
+            && !self.credential.is_project()
+            && self.principal.is_privileged()
+            && self.principal.via.is_none()
+    }
 }
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -243,6 +259,16 @@ pub fn presented(h: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
+/// Console users (`user:<id>`) and API keys (`key:<prefix>`) can never carry
+/// a reserved service principal id; checked anyway, so a future id scheme
+/// cannot start issuing them unnoticed.
+fn not_reserved(p: Principal) -> std::result::Result<Principal, AuthError> {
+    if is_reserved_id(&p.id) {
+        return Err(AuthError::Forbidden(format!("{} is a reserved service principal id", p.id)));
+    }
+    Ok(p)
+}
+
 /// The `x-onto-act-*` principal of a call, or `base` when none is named.
 /// `limit_roles`: only `allowed_roles` may be granted (off in dev mode).
 fn act_for(
@@ -257,6 +283,11 @@ fn act_for(
     };
     if !may_impersonate {
         return Err(AuthError::Forbidden(format!("{} may not act for other principals", base.id)));
+    }
+    if is_reserved_id(act_as) {
+        return Err(AuthError::Forbidden(format!(
+            "{act_as} is a reserved service principal id (automation:, webhook:, connector:, system); no credential may act as it"
+        )));
     }
     let roles: Vec<Role> = match header(h, ACT_ROLES) {
         Some(v) => list(v)
@@ -317,6 +348,13 @@ impl Auth {
         };
         let mut tokens = Vec::new();
         for t in &cfg.tokens {
+            if is_reserved_id(&t.principal.id) {
+                return Err(Error::Config(format!(
+                    "auth token principal {} is a reserved service principal id (automation:, webhook:, connector:, system): \
+                     choose another id",
+                    t.principal.id
+                )));
+            }
             let value = match (&t.token_env, &t.token) {
                 (Some(var), _) => std::env::var(var).ok(),
                 (None, Some(tok)) => Some(tok.clone()),
@@ -657,7 +695,8 @@ impl Auth {
                 }
                 None => Credential::Session,
             };
-            return Ok(Caller { principal: claims.principal, tenant, credential, session });
+            let all_tenants = claims.tenant.is_none() && claims.key.is_none();
+            return Ok(Caller { principal: claims.principal, tenant, credential, session, all_tenants });
         }
         if let Some(tok) = presented.filter(|t| t.starts_with(KEY_PREFIX)) {
             return self.key_caller(tok, h, tenant).await;
@@ -682,11 +721,13 @@ impl Auth {
             (None, Some(dev)) => (dev.clone(), true, Vec::new(), vec!["*".to_string()], Credential::Dev),
             (None, None) => return Err(AuthError::Unauthenticated("missing bearer token".into())),
         };
+        let all_tenants = tenants.iter().any(|t| t == "*");
         let tenant = token_tenant(&base.id, &tenants, tenant)?;
         // In dev mode anything goes; otherwise only the roles the token may grant.
         let limit = self.dev.is_none() || token.is_some();
-        let principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
-        Ok(Caller { principal, tenant, credential, session: None })
+        let mut principal = act_for(base, h, impersonate, &allowed_roles, limit)?;
+        principal.cause = inbound_cause(&credential, h);
+        Ok(Caller { principal, tenant, credential, session: None, all_tenants })
     }
 
     /// A console session on the data plane: `x-onto-tenant` names a project
@@ -706,12 +747,14 @@ impl Auth {
         let Some((project, role)) = control.membership(&user.id, &r).await.map_err(unavailable)? else {
             return Err(AuthError::Forbidden(format!("user {} is not a member of project {r}", user.id)));
         };
-        let principal = Principal::new(format!("user:{}", user.id), role.principal_roles(), vec!["*".into()]);
+        let principal =
+            not_reserved(Principal::new(format!("user:{}", user.id), role.principal_roles(), vec!["*".into()]))?;
         Ok(Caller {
             principal,
             tenant: Some(project.r#ref),
             credential: Credential::Console { user: user.id, role, org: project.org_id },
             session: None,
+            all_tenants: false,
         })
     }
 
@@ -737,13 +780,14 @@ impl Auth {
         // impersonate_roles ⊆ the key's roles is checked when the key is
         // created; checked again here so an edited row cannot widen it.
         let allowed: Vec<Role> = key.impersonate_roles.iter().filter(|r| roles.contains(r)).cloned().collect();
-        let base = Principal::new(format!("key:{}", key.prefix), roles, key.workspaces.clone());
+        let base = not_reserved(Principal::new(format!("key:{}", key.prefix), roles, key.workspaces.clone()))?;
         let principal = act_for(base, h, key.impersonate, &allowed, true)?;
         Ok(Caller {
             principal,
             tenant: Some(project.r#ref.clone()),
             credential: Credential::ApiKey { id: key.id, prefix: key.prefix, project: project.r#ref },
             session: None,
+            all_tenants: false,
         })
     }
 
@@ -774,25 +818,106 @@ fn token_tenant(id: &str, allowed: &[String], asked: Option<String>) -> std::res
     }
 }
 
-/// Calls a project credential (API key, console session) may not make,
-/// because they would act on the server rather than the project: a
-/// connector whose URL is `env:VAR` (it would read the server's
-/// environment) or a filesystem path, a repository connector whose git URL
-/// fails the SSRF rules (`https://` resolving only to public addresses,
-/// unless `allow_private`, which is `console.allow_private_urls`), and a
-/// PostgreSQL connector whose URL fails them (a TCP host resolving only to
-/// public addresses, no Unix socket, no `host`/`hostaddr`/`port`/`options`
-/// or SSL file parameters). A connector such a credential registers is
-/// marked `restricted` in `input`, whatever the input said, so every crawl
-/// checks its URL again and connects only to the addresses it checked.
-/// Operators (config tokens, the CLI) are not limited.
-pub async fn guard_project_call(
+/// The cascade depth a trusted service says a request is at.
+pub const CAUSE_DEPTH: &str = "x-onto-cause-depth";
+/// The run (in the trusted service) a request belongs to.
+pub const CAUSE_RUN: &str = "x-onto-cause-run";
+
+/// The inbound cause of a request (docs/design/EVENTS.md C.6): only a config
+/// token (a trusted service such as texc-symphony) may send it, and only to
+/// raise the depth (`max(0, header)`; a depth of 0 is no cause). Every other
+/// credential's headers are ignored. The run id is kept to 100 characters of
+/// `[A-Za-z0-9_.:-]`.
+pub fn inbound_cause(credential: &Credential, h: &HeaderMap) -> Option<onto_intelli::core::changes::RunCause> {
+    if !matches!(credential, Credential::Config { .. }) {
+        return None;
+    }
+    let depth = header(h, CAUSE_DEPTH)?.parse::<i64>().ok()?.clamp(0, u8::MAX as i64) as u8;
+    if depth == 0 {
+        return None;
+    }
+    let run: String = header(h, CAUSE_RUN)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        .take(100)
+        .collect();
+    Some(onto_intelli::core::changes::RunCause { automation: String::new(), run, depth })
+}
+
+/// Actions whose inputs may hold server references (`env:VAR`,
+/// `file:/path`; docs/design/EVENTS.md section 6.3). In every other action
+/// such a string is plain data: nothing resolves it.
+pub const REF_ACTIONS: &[&str] =
+    &["connector.add", "webhook.add", "webhook.update", "webhook.rotate_secret", "writeback.add"];
+
+/// The operator, who alone registers server references and unrestricted
+/// endpoints: development mode, or a config token (whatever tenants it may
+/// address: the operator configured it) acting as itself, without
+/// `x-onto-act-as`.
+fn is_operator(credential: &Credential, principal: &Principal) -> bool {
+    matches!(credential, Credential::Config { .. } | Credential::Dev) && principal.via.is_none()
+}
+
+/// The first string in `v` (at any depth) that is an `env:` or `file:` reference.
+fn first_reference(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if onto_intelli::webhooks::is_reference(s) => {
+            // Only the reference's name: `env:VAR` or `file:/path` (never a value).
+            Some(s.trim().chars().take(200).collect())
+        }
+        Value::Array(a) => a.iter().find_map(first_reference),
+        Value::Object(m) => m.values().find_map(first_reference),
+        _ => None,
+    }
+}
+
+/// The checks a call gets before it runs, from what authenticated it
+/// (docs/design/EVENTS.md section 6.3):
+///
+/// * Only the operator may register server references: in
+///   [`REF_ACTIONS`], an `env:`/`file:` string anywhere in the input needs
+///   a config token or development mode, without `x-onto-act-as` (an
+///   impersonating config token acts for someone else, not as the
+///   operator). Everyone else is refused; the error names the reference,
+///   never a value.
+/// * What anyone but the operator registers in [`REF_ACTIONS`] (a browser
+///   session, an impersonating config token, a project credential) is
+///   marked `restricted` in `input`,
+///   whatever the input said, so every use checks its URL again, reaches
+///   public addresses only and ignores operator allow rules.
+/// * Project credentials (API keys, console sessions) additionally may not
+///   act on the server: a connector on a filesystem path, a repository
+///   connector whose git URL fails the SSRF rules (`https://` resolving only
+///   to public addresses, unless `allow_private`, which is
+///   `console.allow_private_urls`), or a database connector whose URL fails
+///   them (a TCP host resolving only to public addresses, no Unix socket, no
+///   parameter that moves the connection or reads a file).
+pub async fn guard_call(
     credential: &Credential,
+    principal: &Principal,
     action: &str,
     input: &mut Value,
     allow_private: bool,
 ) -> Result<()> {
-    if !credential.is_project() || action != "connector.add" {
+    if !REF_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    let operator = is_operator(credential, principal);
+    if !operator && let Some(r) = first_reference(input) {
+        let who = if principal.via.is_some() { "a call with x-onto-act-as" } else { "this credential" };
+        return Err(Error::Denied(format!(
+            "{r} is a server reference: {who} may not register env: or file: references (operators can, with a \
+             config token without x-onto-act-as or the CLI)"
+        )));
+    }
+    if action != "connector.add" {
+        if !operator && let Value::Object(m) = input {
+            m.insert("restricted".into(), Value::Bool(true));
+        }
+        return Ok(());
+    }
+    if !credential.is_project() {
         return Ok(());
     }
     let refuse = |why: &str| {
@@ -901,8 +1026,103 @@ pub fn workspace_header(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cause_headers_count_only_from_config_tokens_and_only_upward() {
+        let mut h = HeaderMap::new();
+        h.insert(CAUSE_DEPTH, "2".parse().unwrap());
+        h.insert(CAUSE_RUN, "run_ext-9".parse().unwrap());
+        let c = inbound_cause(&Credential::Config { tenants: vec!["acme".into()] }, &h).unwrap();
+        assert_eq!((c.depth, c.run.as_str(), c.automation.as_str()), (2, "run_ext-9", ""));
+        let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "x".into() };
+        let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
+        for other in [key, console, Credential::Session, Credential::Dev] {
+            assert!(inbound_cause(&other, &h).is_none(), "{other:?}");
+        }
+        for (raw, want) in [("0", None), ("-3", None), ("x", None), ("999", Some(255u8)), (" 3 ", Some(3))] {
+            h.insert(CAUSE_DEPTH, raw.parse().unwrap());
+            assert_eq!(
+                inbound_cause(&Credential::Config { tenants: vec!["acme".into()] }, &h).map(|c| c.depth),
+                want,
+                "{raw}"
+            );
+        }
+        h.remove(CAUSE_DEPTH);
+        assert!(
+            inbound_cause(&Credential::Config { tenants: vec!["acme".into()] }, &h).is_none(),
+            "no header, no cause"
+        );
+    }
     use onto_control::{ControlOptions, KeyRequest, KeyScope};
     use onto_intelli::config::{ConsoleConfig, TokenConfig};
+
+    /// A principal without act-as.
+    fn proj() -> Principal {
+        Principal::admin("user:p")
+    }
+
+    #[tokio::test]
+    async fn only_the_operator_registers_server_references() {
+        // SAFETY: test-only variable that no other test reads.
+        unsafe { std::env::set_var("ONTO_TEST_GUARD_HOOK_SECRET", "s3cr3t-value-never-echoed") };
+        let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "t".into() };
+        let mut acting = Principal::admin("user:7");
+        acting.via = Some("ops-token".into());
+        let add = || {
+            serde_json::json!({ "name": "ops", "url": "https://hooks.example.com/in",
+                "secret": "env:ONTO_TEST_GUARD_HOOK_SECRET", "restricted": false })
+        };
+        for action in REF_ACTIONS {
+            // The operator: a config token without act-as (for every tenant or
+            // some), or development mode.
+            for c in [
+                Credential::Config { tenants: vec!["*".into()] },
+                Credential::Config { tenants: vec!["acme".into()] },
+                Credential::Dev,
+            ] {
+                let mut input = add();
+                guard_call(&c, &proj(), action, &mut input, false).await.unwrap();
+                assert_eq!(input["restricted"], false, "{action}: operators are not restricted");
+            }
+            // An impersonating config token, a session, an API key, a console session.
+            let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
+            for (c, p) in [
+                (Credential::Config { tenants: vec!["*".into()] }, acting.clone()),
+                (Credential::Session, proj()),
+                (key.clone(), proj()),
+                (console, proj()),
+            ] {
+                for input in [add(), serde_json::json!({ "name": "ops", "nested": [{ "path": " FILE:/etc/hook" }] })] {
+                    let mut input = input;
+                    let e = guard_call(&c, &p, action, &mut input, false).await.unwrap_err();
+                    let m = e.to_string();
+                    assert!(matches!(e, Error::Denied(_)), "{action} {c:?}: {m}");
+                    assert!(m.contains("env:ONTO_TEST_GUARD_HOOK_SECRET") || m.contains("FILE:/etc/hook"), "{m}");
+                    assert!(!m.contains("s3cr3t"), "errors never echo a resolved value: {m}");
+                }
+            }
+        }
+        // What anyone but the operator registers is restricted, whatever the
+        // input said: a browser session (minted for an end user, perhaps by an
+        // impersonating token) does not reach the operator's allow rules.
+        let others = [
+            (key.clone(), proj()),
+            (Credential::Session, proj()),
+            (Credential::Config { tenants: vec!["*".into()] }, acting.clone()),
+        ];
+        for action in ["webhook.add", "webhook.update", "writeback.add"] {
+            for (c, p) in &others {
+                let mut input =
+                    serde_json::json!({ "name": "ops", "url": "https://hooks.example.com/in", "restricted": false });
+                guard_call(c, p, action, &mut input, false).await.unwrap();
+                assert_eq!(input["restricted"], true, "{action} {c:?}");
+            }
+        }
+        // Elsewhere an env: string is plain data.
+        let mut input = serde_json::json!({ "text": "env:HOME" });
+        guard_call(&key, &acting, "entity.create", &mut input, false).await.unwrap();
+        assert_eq!(input, serde_json::json!({ "text": "env:HOME" }));
+    }
 
     fn config() -> AuthConfig {
         AuthConfig {
@@ -1407,6 +1627,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nobody_acts_as_a_reserved_service_principal() {
+        let reserved = ["automation:payroll", "webhook:hook1", "connector:crm", "system", "System:x"];
+        // A config token with impersonate.
+        let a = auth();
+        for who in reserved {
+            let err = a
+                .authenticate(&headers(&[
+                    ("authorization", "Bearer svc-secret-0123456789"),
+                    (ACT_AS, who),
+                    (ACT_ROLES, "member"),
+                ]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthError::Forbidden(ref m) if m.contains("reserved")), "{who}: {err}");
+        }
+        // Dev mode, where any other act-as goes.
+        let dev = Auth::from_config(&AuthConfig::default(), true).unwrap();
+        assert!(matches!(
+            dev.authenticate(&headers(&[(ACT_AS, "automation:x")])).await,
+            Err(AuthError::Forbidden(ref m)) if m.contains("reserved")
+        ));
+        assert_eq!(dev.authenticate(&headers(&[(ACT_AS, "user:x")])).await.unwrap().principal.id, "user:x");
+        // An API key with impersonate.
+        let (a, control, s) = with_control().await;
+        let project = s.adopted.iter().find(|p| p.r#ref == "t1").unwrap().clone();
+        let req = KeyRequest {
+            name: "svc".into(),
+            scopes: vec![KeyScope::Read, KeyScope::Write],
+            impersonate: true,
+            impersonate_roles: vec![Role::Viewer, Role::Member],
+            ..Default::default()
+        };
+        let (_, secret) = control.create_key(&project, req, &s.user.id).await.unwrap();
+        let bearer = format!("Bearer {secret}");
+        for who in reserved {
+            let err = a.authenticate(&headers(&[("authorization", &bearer), (ACT_AS, who)])).await.unwrap_err();
+            assert!(matches!(err, AuthError::Forbidden(ref m) if m.contains("reserved")), "{who}: {err}");
+        }
+        assert!(a.authenticate(&headers(&[("authorization", &bearer), (ACT_AS, "user:7")])).await.is_ok());
+        // A configured token cannot carry a reserved id either: a config error at startup.
+        for id in ["system", "automation:nightly", "connector:crm"] {
+            let cfg = AuthConfig {
+                tokens: vec![TokenConfig {
+                    token: Some("reserved-secret-0123456789".into()),
+                    token_env: None,
+                    principal: Principal::admin(id),
+                    impersonate: false,
+                    impersonate_roles: Vec::new(),
+                    tenants: vec!["*".into()],
+                }],
+                ..Default::default()
+            };
+            let err = Auth::from_config(&cfg, false).err().unwrap();
+            assert!(matches!(err, Error::Config(ref m) if m.contains("reserved")), "{id}: {err}");
+        }
+    }
+
+    #[tokio::test]
     async fn project_connectors_to_other_databases_follow_the_same_ssrf_rules() {
         let key = Credential::ApiKey { id: "k".into(), prefix: "p".into(), project: "t".into() };
         let add = |kind: &str, url: &str| serde_json::json!({ "name": "x", "kind": kind, "url": url });
@@ -1426,25 +1704,17 @@ mod tests {
             ),
         ] {
             let mut input = add(kind, public);
-            guard_project_call(&key, "connector.add", &mut input, false).await.unwrap();
+            guard_call(&key, &proj(), "connector.add", &mut input, false).await.unwrap();
             assert_eq!(input["restricted"], true, "{kind}");
             for bad in [private, param, "env:DB_URL"] {
                 let mut input = add(kind, bad);
-                let e = guard_project_call(&key, "connector.add", &mut input, false).await.unwrap_err();
+                let e = guard_call(&key, &proj(), "connector.add", &mut input, false).await.unwrap_err();
                 assert!(matches!(e, Error::Denied(_)), "{kind} {bad}: {e}");
             }
             // Operators are not limited.
             let mut input = add(kind, private);
-            assert!(
-                guard_project_call(
-                    &Credential::Config { tenants: vec!["*".into()] },
-                    "connector.add",
-                    &mut input,
-                    false
-                )
-                .await
-                .is_ok()
-            );
+            let operator = Credential::Config { tenants: vec!["*".into()] };
+            assert!(guard_call(&operator, &proj(), "connector.add", &mut input, false).await.is_ok());
         }
     }
 
@@ -1454,7 +1724,7 @@ mod tests {
         let console = Credential::Console { user: "u".into(), role: OrgRole::Owner, org: "o".into() };
         let guard = |c: &Credential, action: &str, mut input: Value, allow_private: bool| {
             let (c, action) = (c.clone(), action.to_string());
-            async move { guard_project_call(&c, &action, &mut input, allow_private).await.map(|_| input) }
+            async move { guard_call(&c, &proj(), &action, &mut input, allow_private).await.map(|_| input) }
         };
         for c in [&key, &console] {
             // A PostgreSQL URL to a public address is accepted, and marked restricted.
@@ -1519,9 +1789,15 @@ mod tests {
             }
         }
         let env = serde_json::json!({ "name": "x", "url": "env:DATABASE_URL" });
+        // A browser session is not the operator: server references are refused to it
+        // (docs/design/EVENTS.md 6.3), while its other connectors are not restricted.
+        let e = guard(&Credential::Session, "connector.add", env.clone(), false).await.unwrap_err();
+        assert!(matches!(e, Error::Denied(_)), "{e}");
         for c in [Credential::Config { tenants: vec!["*".into()] }, Credential::Dev, Credential::Session] {
-            let out = guard(&c, "connector.add", env.clone(), false).await.expect("operators are not limited");
-            assert!(out.get("restricted").is_none(), "operator connectors are not restricted");
+            if c != Credential::Session {
+                let out = guard(&c, "connector.add", env.clone(), false).await.expect("operators are not limited");
+                assert!(out.get("restricted").is_none(), "operator connectors are not restricted");
+            }
             let local = serde_json::json!({ "name": "x", "kind": "repo", "url": "https://127.0.0.1/r" });
             assert!(guard(&c, "connector.add", local, false).await.is_ok());
             let pg = serde_json::json!({ "name": "x", "url": "postgres://onto@127.0.0.1:5441/onto" });

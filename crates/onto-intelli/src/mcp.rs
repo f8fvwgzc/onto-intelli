@@ -42,7 +42,7 @@ fn schema_change_props() -> Value {
     json!({
         "changes": {
             "type": "array",
-            "description": "Schema changes, each {op, ...}: put_object_type {name, def}, delete_object_type {name}, rename_object_type {from, to}, put_property {object_type, name, def: {type, required?, values?}}, delete_property {object_type, name}, put_link_type {name, def: {from, to, inverse?, cardinality?}}, delete_link_type {name}, rename_link_type {from, to}, put_action_type {name, def}, put_rule {def: {name, chain, infer}}, put_metric {name, def}, put_interface {name, def}, delete_* {name}. Changes that break data in use need migrations.",
+            "description": "Schema changes, each {op, ...}: put_object_type {name, def}, delete_object_type {name}, rename_object_type {from, to}, put_property {object_type, name, def: {type, required?, values?}}, delete_property {object_type, name}, put_link_type {name, def: {from, to, inverse?, cardinality?}}, delete_link_type {name}, rename_link_type {from, to}, put_action_type {name, def}, put_rule {def: {name, chain, infer}}, put_metric {name, def}, put_interface {name, def}, put_shape {name, def}, put_automation {name, def: {run_as, trigger, conditions?, effects}} (defines a change-triggered automation; a person enables it separately), delete_* {name}. Changes that break data in use need migrations.",
             "items": { "type": "object", "properties": { "op": { "type": "string" } }, "required": ["op"] }
         },
         "migrations": {
@@ -217,6 +217,66 @@ fn tools() -> Vec<(&'static str, &'static str, &'static str, Value, bool)> {
             "graph.changes",
             "What changed recently, optionally inside an entity's scope.",
             obj(json!({ "since_days": { "type": "number" }, "within": s("Scope entity id") }), &[]),
+            false,
+        ),
+        (
+            "poll_changes",
+            "changes.poll",
+            "One page of the change feed after a cursor: each record says what one commit changed (op, kind, id, changed fields, old values when you could see them before, the entity after). Pass `next` back as `after` for the following page. `expired` means records were removed: re-read with find_entities (not pinned to a cursor). A `gap` record means state changed without records.",
+            obj(
+                json!({
+                    "after": s("Cursor from a previous page's next (like 42.0)"),
+                    "from": { "type": "string", "enum": ["earliest", "now"], "description": "Without after: earliest (default) or now" },
+                    "limit": { "type": "integer", "description": "Records scanned (default 500, at most 1000)" },
+                    "kinds": arr("Entity kinds or interfaces (links match through either end)"),
+                    "ops": arr("entity.create, entity.update, entity.delete, entity.hidden, link.create, link.update, link.delete, schema.change, gap"),
+                    "workspaces": arr("Workspaces"),
+                    "ids": arr("Entity ids (at most 1000)"),
+                    "rels": arr("Relations (link records only)"),
+                    "props": arr("Updates that changed any of these fields"),
+                    "sources": arr("Globs on the writer's source; !x excludes"),
+                    "fields": { "type": "string", "enum": ["full", "ids"], "description": "ids: no documents or old values" },
+                    "include_migrations": { "type": "boolean", "description": "Records written by schema migrations (default true)" }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "list_automations",
+            "automation.list",
+            "Automations defined in the schema: what each one reacts to (its change trigger), what it does (an action type and webhooks), who it runs as, and whether it is active (or why not). Definitions are visible to everyone who can read the schema; agents change them only through propose_schema_change (put_automation) and never enable them.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        (
+            "automation_runs",
+            "automation.runs",
+            "An automation's runs, newest first: state (succeeded, failed, retry, skipped, refused, would_run, cancelled), the reason, the change that triggered it, and its effects (receipts, outbox ids). Runs of automations you do not cover are counted as hidden.",
+            obj(
+                json!({
+                    "name": s("Automation name (all when omitted)"),
+                    "state": arr("States to list"),
+                    "since": { "type": "integer", "description": "Started at or after (Unix ms)" },
+                    "limit": { "type": "integer", "description": "At most this many (default 50)" },
+                    "id": s("One run")
+                }),
+                &[],
+            ),
+            false,
+        ),
+        (
+            "test_automation",
+            "automation.test",
+            "Dry-run an automation against a change (cursor) or an entity as if it was just updated (id; a trigger with a state guard or props needs a cursor): whether its trigger admits it, its conditions, the action plan and the webhook payloads, rendered as the run principal and you together. Writes nothing.",
+            obj(
+                json!({
+                    "name": s("Automation name"),
+                    "cursor": s("A change cursor (like 42.0)"),
+                    "id": s("An entity id")
+                }),
+                &["name"],
+            ),
             false,
         ),
         (
@@ -581,6 +641,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "metric",
             "history",
             "changes",
+            "poll_changes",
             "experts",
         ],
     ),
@@ -596,6 +657,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "propose_schema_change",
             "list_proposals",
             "get_proposal",
+            "test_automation",
             "list_packs",
             "show_pack",
             "plan_pack",
@@ -645,6 +707,10 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "data_quality",
             "history",
             "changes",
+            "poll_changes",
+            "list_automations",
+            "automation_runs",
+            "test_automation",
         ],
     ),
     (
@@ -659,6 +725,7 @@ const PROFILE_TOOLS: &[(&str, &[&str])] = &[
             "metric",
             "history",
             "changes",
+            "poll_changes",
             "experts",
             "query_inferred",
             "explain_fact",

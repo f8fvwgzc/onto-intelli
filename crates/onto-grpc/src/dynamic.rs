@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status, Streaming};
 use onto_intelli::trace::TraceCtx;
 use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, AuthError, Credential, guard_project_call, workspace_header};
+use crate::auth::{Auth, AuthError, Credential, guard_call, workspace_header};
 use crate::routes::{ASK_STREAM, CALL, Route, RouteTable};
 use crate::template;
 
@@ -207,14 +207,14 @@ impl Handler {
         let (result, trace_id) = if self.route.action == CALL {
             let action = input.get("action").and_then(Value::as_str).unwrap_or_default().to_string();
             let mut inner = input.get("input").cloned().unwrap_or(Value::Null);
-            guard_project_call(&self.credential, &action, &mut inner, self.allow_private)
+            guard_call(&self.credential, &self.principal, &action, &mut inner, self.allow_private)
                 .await
                 .map_err(|e| status_of(&e))?;
             let t = self.intelli.call_traced(&self.principal, &action, inner, self.trace.clone()).await;
             (json!({ "output": t.result.map_err(|e| status_of(&e))? }), t.trace_id)
         } else {
             let mut input = input;
-            guard_project_call(&self.credential, &self.route.action, &mut input, self.allow_private)
+            guard_call(&self.credential, &self.principal, &self.route.action, &mut input, self.allow_private)
                 .await
                 .map_err(|e| status_of(&e))?;
             let t = self.intelli.call_traced(&self.principal, &self.route.action, input, self.trace.clone()).await;

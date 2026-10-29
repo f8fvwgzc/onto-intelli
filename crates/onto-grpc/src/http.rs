@@ -37,6 +37,40 @@
 //! * `POST /v1/packs/{id}/plan` the schema plan of installing a pack
 //! * `POST /v1/packs/{id}/install`  install `{mode?, sample?, workspace?, message?}` (agents propose,
 //!   and write a sample only with `governance.agent_raw_writes`)
+//! * `GET  /v1/changes`         one page of the change feed (`?after=` or `?from=earliest|now`, `limit`,
+//!   comma-separated `kinds`, `ops`, `workspaces`, `ids`, `rels`, `props`, `sources`, `fields`,
+//!   `include_migrations`)
+//! * `GET  /v1/changes/head`    the feed's cursor, head, floor and whether capture is on
+//! * `GET|POST /v1/changes/stream`  the change feed as Server-Sent Events: the filter keys of
+//!   `GET /v1/changes` as a query (GET) or a JSON body (POST), `after` or `from=now|earliest`
+//!   (default now); `Last-Event-ID` wins over `after`. Events `change`, `heartbeat`, then one
+//!   `reset` or `end`.
+//! * `POST /v1/changes/capture` `{on}`: record changes or not (admins of every workspace)
+//! * `GET  /v1/webhooks`        webhook endpoints; `POST` registers one `{name, url, secret?, filter?,
+//!   principal?, disabled?}` (admins who dominate its principal; a generated secret is returned once)
+//! * `PATCH|DELETE /v1/webhooks/{name}`  change or remove an endpoint
+//! * `GET  /v1/webhooks/{name}/deliveries`  its deliveries (`?states=`, `since`, `limit`, `id` for one
+//!   delivery with its attempts)
+//! * `POST /v1/webhooks/{name}/{test|rotate_secret|replay|resume}`  a test delivery, a secret rotation,
+//!   a replay `{ids | since, states?}` (ids kept), or resuming a paused endpoint
+//! * `POST /v1/webhooks/kill`   `{on | off}`: the tenant's webhook kill switch
+//! * `GET  /v1/automations`     automations with their status (readers); `POST /v1/automations/kill`
+//!   `{on | off}` is the tenant's automation kill switch
+//! * `GET  /v1/automations/{name}`  one automation: definition, status, enablement, closure
+//! * `GET  /v1/automations/{name}/runs`  its runs (`?state=`, `since`, `limit`), newest first;
+//!   `GET .../runs/{id}` one run; `POST .../runs/{id}/rerun` runs a skipped or failed one again
+//! * `POST /v1/automations/{name}/{test|enable|disable}`  a dry run `{cursor | id}` (writes nothing),
+//!   enabling (approvers who dominate its run_as; it binds to its closure and expires), disabling.
+//!   A run commits its action, receipt, outbox rows and run row together; webhook effects are
+//!   enqueued once and delivered at least once, and external effects are not reversible.
+//! * `GET  /v1/writeback/targets`  writeback targets; `POST` registers one `{name, base_url,
+//!   routes: {name: path}, workspaces?, secret?, generate_secret?}` (admins of every workspace it
+//!   serves). Writeback is not reversible; action.undo does not undo the external write.
+//! * `DELETE /v1/writeback/targets/{name}`  remove a target; `POST .../{name}/test` `{route?}`
+//!   checks it without sending anything
+//! * `GET  /v1/outbox`          outbound deliveries (`?target=`, `states`, `source`, `receipt`, `run`,
+//!   `since`, `limit`) for targets the caller may manage. Each change is enqueued once per endpoint
+//!   and delivered at least once; receivers dedupe on the event id.
 //! * `POST /v1/auth/session`      mint a short-lived browser session for the caller,
 //!   or (impersonating tokens) for one of its users: `{act_as, roles, workspaces, entity, tenant, ttl_secs}`.
 //!   A session minting a session cannot outlive itself and belongs to the same login (`sid`);
@@ -48,7 +82,8 @@
 //!   with several, the request still names one with `x-onto-tenant`)
 //! * `GET  /v1/auth/whoami`       the caller's principal, tenant and capabilities (and, for
 //!   console sessions, `console: {user, role, org}`)
-//! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory and the limits
+//! * `GET  /v1/admin/tenants`     operators: open tenants, their estimated memory, outbound counters
+//!   (outbox rows per state, change lag, gaps, runs, paused counts) and the limits
 //! * `/v1/traces`, `/v1/metrics`, `/v1/sessions`: observability (see [`crate::observe`])
 //! * `POST /mcp`: MCP over HTTP (see [`crate::mcp_http`])
 //!
@@ -65,13 +100,13 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 
 use onto_intelli::{AskRequest, Error, Hub, Intelli, Principal};
 
-use crate::auth::{Auth, AuthError, Caller, Credential, guard_project_call, workspace_header};
+use crate::auth::{Auth, AuthError, Caller, Credential, guard_call, workspace_header};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -134,6 +169,26 @@ pub fn router(hub: Arc<Hub>, auth: Arc<Auth>) -> axum::Router {
         .route("/v1/packs", get(packs_list))
         .route("/v1/packs/{id}", get(pack_show))
         .route("/v1/packs/{id}/{verb}", post(pack_verb))
+        .route("/v1/changes", get(changes_poll))
+        .route("/v1/changes/head", get(changes_head))
+        .route("/v1/changes/capture", post(changes_capture))
+        .route("/v1/changes/stream", get(changes_stream_get).post(changes_stream_post))
+        .route("/v1/webhooks", get(webhooks_list).post(webhook_add))
+        .route("/v1/webhooks/kill", post(webhook_kill))
+        .route("/v1/webhooks/{name}", patch(webhook_update).delete(webhook_remove))
+        .route("/v1/webhooks/{name}/deliveries", get(webhook_deliveries))
+        .route("/v1/webhooks/{name}/{verb}", post(webhook_verb))
+        .route("/v1/outbox", get(outbox_list))
+        .route("/v1/writeback/targets", get(writeback_list).post(writeback_add))
+        .route("/v1/writeback/targets/{name}", delete(writeback_remove))
+        .route("/v1/writeback/targets/{name}/test", post(writeback_test))
+        .route("/v1/automations", get(automations_list))
+        .route("/v1/automations/kill", get(automation_get_kill).post(automation_kill))
+        .route("/v1/automations/{name}", get(automation_get))
+        .route("/v1/automations/{name}/runs", get(automation_runs))
+        .route("/v1/automations/{name}/runs/{id}", get(automation_run))
+        .route("/v1/automations/{name}/runs/{id}/rerun", post(automation_rerun))
+        .route("/v1/automations/{name}/{verb}", post(automation_verb))
         .merge(crate::observe::routes())
         .merge(crate::mcp_http::routes())
         .with_state(AppState { hub, auth })
@@ -196,7 +251,7 @@ pub(crate) async fn run(state: &AppState, headers: &HeaderMap, action: &str, inp
         Err(r) => return *r,
     };
     let mut input = with_workspace(input, headers);
-    if let Err(e) = guard_project_call(&c.credential, action, &mut input, state.auth.allow_private_urls()).await {
+    if let Err(e) = guard_call(&c.credential, &c.principal, action, &mut input, state.auth.allow_private_urls()).await {
         return error_response(&e);
     }
     let ctx = crate::observe::trace_ctx(headers, &c, "http");
@@ -561,6 +616,8 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
             "approve": gov.can_approve(p),
             "propose": gov.can_propose(p),
             "observe": p.can_observe(),
+            "configure_outbound": p.is_privileged() && !p.is_agent(),
+            "automate": !p.is_agent() && (gov.can_approve(p) || p.is_privileged()),
         },
         "governance": gov,
         "ui": { "title": cfg.ui.title },
@@ -568,24 +625,30 @@ async fn whoami(State(s): State<AppState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
-/// Open tenants with their estimated memory: an operator's view of the
-/// whole process, so project credentials (API keys, console sessions) and
-/// non-admins are refused.
+/// Open tenants with their estimated memory and outbound counters: an
+/// operator's view of the whole process, so only a privileged principal
+/// acting for itself on a credential for every tenant (a config token with
+/// `tenants = ["*"]`, or dev mode) may read it. Tokens limited to some
+/// tenants, sessions bound to one, project credentials (API keys, console
+/// sessions), callers acting for someone else and non-admins are refused.
 async fn admin_tenants(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let c = match s.auth.authenticate(&headers).await {
         Ok(c) => c,
         Err(e) => return auth_error_response(&e),
     };
-    if c.credential.is_project() || !c.principal.is_privileged() {
+    if !c.is_operator() {
         return error_response(&Error::Denied(format!(
-            "{} may not list the server's tenants (operators only)",
+            "{} may not list the server's tenants (operators only: an admin token for every tenant)",
             c.principal.id
         )));
     }
     let e = &s.hub.config().engine;
-    let tenants = s.hub.tenant_stats();
+    // The outbound counters read each tenant's store (several round trips
+    // per tenant), a bounded number of tenants at a time.
+    let tenants = s.hub.tenant_report().await;
     Json(json!({
         "open": tenants.len(),
+        "subscribers_process": onto_intelli::changes::ChangeHub::process_subscribers(),
         "estimated_bytes": tenants.iter().map(|t| t.estimated_bytes).sum::<u64>(),
         "listening_stores": s.hub.listening_stores(),
         "limits": {
@@ -832,6 +895,302 @@ async fn schema_lint(
         input.insert("include_dismissed".into(), json!(matches!(d.as_str(), "true" | "1" | "yes")));
     }
     run(&s, &headers, "schema.lint", Value::Object(input)).await
+}
+
+/// Change feed query parameters as `changes.poll` input: list keys split on
+/// commas, `limit` a number, the migration flags booleans, everything else
+/// (cursors like `42.0` included) a string.
+pub(crate) fn changes_query(q: HashMap<String, String>) -> Value {
+    const LISTS: &[&str] = &["kinds", "ops", "workspaces", "ids", "rels", "props", "sources"];
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            k if LISTS.contains(&k) => {
+                json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            }
+            "limit" => v.trim().parse::<u64>().map(Value::from).unwrap_or(Value::String(v)),
+            "include_migrations" | "exclude_migrations" => match v.trim() {
+                "true" | "1" | "yes" => Value::Bool(true),
+                "false" | "0" | "no" => Value::Bool(false),
+                _ => Value::String(v),
+            },
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    Value::Object(input)
+}
+
+async fn changes_poll(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "changes.poll", changes_query(q)).await
+}
+
+async fn changes_head(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "changes.head", json!({})).await
+}
+
+async fn changes_capture(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "changes.capture", body_or_empty(body)).await
+}
+
+async fn changes_stream_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    changes_stream(s, headers, changes_query(q)).await
+}
+
+async fn changes_stream_post(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    changes_stream(s, headers, body_or_empty(body)).await
+}
+
+/// How long a client waits before reconnecting (the SSE `retry:` field).
+const STREAM_RETRY: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// The change feed as Server-Sent Events. A stream is not an action, so this
+/// does what `run` and `dispatch` do before one: authenticate, guard project
+/// credentials, and `Intelli::admit`. Every `changes.reauth_secs` the stream
+/// authenticates these headers again and ends when the credential is revoked
+/// or the principal changed.
+async fn changes_stream(s: AppState, headers: HeaderMap, input: Value) -> Response {
+    const ACTION: &str = "changes.stream";
+    let (c, intelli) = match caller_full(&s, &headers).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let mut input = input;
+    if let Err(e) = guard_call(&c.credential, &c.principal, ACTION, &mut input, s.auth.allow_private_urls()).await {
+        return error_response(&e);
+    }
+    if let Err(e) = intelli.admit(&c.principal, ACTION, &input) {
+        return error_response(&e);
+    }
+    let last_event_id = headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (filter, start) = match onto_intelli::changes::stream_request(input, last_event_id.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+    let reauth: onto_intelli::changes::Reauth = {
+        let (auth, headers) = (s.auth.clone(), headers.clone());
+        Arc::new(move || {
+            let (auth, headers) = (auth.clone(), headers.clone());
+            Box::pin(async move {
+                use onto_intelli::changes::ReauthError;
+                match auth.authenticate(&headers).await {
+                    Ok(c) => Ok(c.principal),
+                    Err(AuthError::Unauthenticated(m)) => Err(ReauthError::Unauthenticated(m)),
+                    Err(AuthError::Forbidden(m)) => Err(ReauthError::Denied(m)),
+                    Err(AuthError::Unavailable(m)) => Err(ReauthError::Unavailable(m)),
+                }
+            })
+        })
+    };
+    let sub = match intelli.subscribe_changes(c.principal, filter, start, Some(reauth)).await {
+        Ok(sub) => sub,
+        Err(e) => return error_response(&e),
+    };
+    // The stream holds the tenant weakly: an evicted tenant ends it.
+    drop(intelli);
+    let first = futures::stream::once(async { Ok(SseEvent::default().retry(STREAM_RETRY)) });
+    let frames = sub.into_stream().map(|f| {
+        let mut ev = SseEvent::default().event(f.event()).data(f.data().to_string());
+        if let Some(id) = f.id() {
+            ev = ev.id(id.to_string());
+        }
+        Ok::<_, Infallible>(ev)
+    });
+    let events: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
+        Box::pin(first.chain(frames));
+    Sse::new(events).into_response()
+}
+
+/// Outbox query parameters as input: `states` and `ids` split on commas,
+/// `since`, `limit` numbers, everything else a string.
+fn outbox_query(q: HashMap<String, String>) -> Value {
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            "states" | "ids" => json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            "since" | "limit" => v.trim().parse::<i64>().map(Value::from).unwrap_or(Value::String(v)),
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    Value::Object(input)
+}
+
+/// `body` with `name` set from the path.
+fn named(body: Option<Json<Value>>, name: String) -> Value {
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("name".into(), Value::String(name));
+    }
+    input
+}
+
+async fn webhooks_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "webhook.list", json!({})).await
+}
+
+async fn webhook_add(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "webhook.add", body_or_empty(body)).await
+}
+
+async fn webhook_kill(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "webhook.kill", body_or_empty(body)).await
+}
+
+async fn webhook_update(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    run(&s, &headers, "webhook.update", named(body, name)).await
+}
+
+async fn webhook_remove(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "webhook.remove", json!({ "name": name })).await
+}
+
+async fn webhook_deliveries(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut input = outbox_query(q);
+    input["name"] = Value::String(name);
+    run(&s, &headers, "webhook.deliveries", input).await
+}
+
+async fn webhook_verb(
+    State(s): State<AppState>,
+    Path((name, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "test" => "webhook.test",
+        "rotate_secret" => "webhook.rotate_secret",
+        "replay" => "webhook.replay",
+        "resume" => "webhook.resume",
+        other => {
+            return error_response(&Error::not_found(format!(
+                "webhook action '{other}' (test, rotate_secret, replay, resume)"
+            )));
+        }
+    };
+    run(&s, &headers, action, named(body, name)).await
+}
+
+async fn automations_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.list", json!({})).await
+}
+
+async fn automation_get(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.get", json!({ "name": name })).await
+}
+
+/// `GET /v1/automations/kill`: the automation named `kill` (the path's POST is the switch).
+async fn automation_get_kill(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "automation.get", json!({ "name": "kill" })).await
+}
+
+async fn automation_kill(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "automation.kill", body_or_empty(body)).await
+}
+
+async fn automation_runs(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let mut input = serde_json::Map::new();
+    for (k, v) in q {
+        let value = match k.as_str() {
+            "state" | "states" => json!(v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
+            "since" | "limit" => v.trim().parse::<i64>().map(Value::from).unwrap_or(Value::String(v)),
+            _ => Value::String(v),
+        };
+        input.insert(k, value);
+    }
+    input.insert("name".into(), Value::String(name));
+    run(&s, &headers, "automation.runs", Value::Object(input)).await
+}
+
+async fn automation_run(
+    State(s): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    run(&s, &headers, "automation.runs", json!({ "name": name, "id": id })).await
+}
+
+async fn automation_rerun(
+    State(s): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let mut input = body_or_empty(body);
+    if let Value::Object(m) = &mut input {
+        m.insert("id".into(), Value::String(id));
+        m.insert("automation".into(), Value::String(name));
+    }
+    run(&s, &headers, "automation.rerun", input).await
+}
+
+async fn automation_verb(
+    State(s): State<AppState>,
+    Path((name, verb)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let action = match verb.as_str() {
+        "test" => "automation.test",
+        "enable" => "automation.enable",
+        "disable" => "automation.disable",
+        other => {
+            return error_response(&Error::not_found(format!("automation action '{other}' (test, enable, disable)")));
+        }
+    };
+    run(&s, &headers, action, named(body, name)).await
+}
+
+async fn outbox_list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    run(&s, &headers, "outbox.list", outbox_query(q)).await
+}
+
+async fn writeback_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "writeback.list", json!({})).await
+}
+
+async fn writeback_add(State(s): State<AppState>, headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    run(&s, &headers, "writeback.add", body_or_empty(body)).await
+}
+
+async fn writeback_remove(State(s): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    run(&s, &headers, "writeback.remove", json!({ "name": name })).await
+}
+
+async fn writeback_test(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    run(&s, &headers, "writeback.test", named(body, name)).await
 }
 
 async fn packs_list(State(s): State<AppState>, headers: HeaderMap) -> Response {

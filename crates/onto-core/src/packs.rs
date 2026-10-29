@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::action_types::ActionType;
+use crate::automate::Automation;
 use crate::engine::{ActionContext, Extra, entity_id};
 use crate::graph::Graph;
 use crate::live_schema::{SchemaChangeSet, SchemaPlan, SchemaVersionInfo, apply_changes, changes_between};
@@ -166,6 +167,9 @@ pub struct PackCounts {
     pub shapes: usize,
     pub metrics: usize,
     pub action_types: usize,
+    /// Automations the pack defines; installing a pack never enables one.
+    #[serde(default)]
+    pub automations: usize,
     pub glossary_terms: usize,
     pub sample_entities: usize,
 }
@@ -243,6 +247,9 @@ pub struct PackDetail {
     pub shapes: Vec<PackItem>,
     pub metrics: Vec<PackItem>,
     pub action_types: Vec<PackItem>,
+    /// Automations the pack defines (installing the pack never enables them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automations: Vec<PackItem>,
     /// `section.word` → target, for every glossary term.
     pub glossary: BTreeMap<String, String>,
     /// The pack's schema layer as written.
@@ -254,7 +261,8 @@ pub struct PackDetail {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameCollision {
     /// `names` (types, relations, inverses, interfaces, rules, shapes,
-    /// metrics, action types and derived terms share one namespace) or
+    /// metrics, action types, automations and derived terms share one
+    /// namespace) or
     /// `glossary.kinds|relations|dimensions`.
     pub namespace: String,
     pub name: String,
@@ -330,6 +338,8 @@ struct Layer {
     #[serde(default)]
     action_types: BTreeMap<String, ActionType>,
     #[serde(default)]
+    automations: BTreeMap<String, Automation>,
+    #[serde(default)]
     glossary: Glossary,
 }
 
@@ -347,6 +357,7 @@ impl Layer {
             shapes: self.shapes.len(),
             metrics: self.metrics.len(),
             action_types: self.action_types.len(),
+            automations: self.automations.len(),
             glossary_terms: self.glossary.kinds.len() + self.glossary.relations.len() + self.glossary.dimensions.len(),
             sample_entities: 0,
         }
@@ -399,6 +410,7 @@ impl Layer {
         out.extend(self.shapes.keys().cloned());
         out.extend(self.metrics.keys().cloned());
         out.extend(self.action_types.keys().cloned());
+        out.extend(self.automations.keys().cloned());
         let (classes, relations) = self.derived();
         out.extend(classes);
         out.extend(relations);
@@ -618,6 +630,7 @@ pub fn show(id: &str) -> Result<PackDetail> {
         shapes: layer.shapes.iter().map(|(n, s)| item(n, "", &s.description)).collect(),
         metrics: layer.metrics.iter().map(|(n, m)| item(n, "", &m.description)).collect(),
         action_types: layer.action_types.iter().map(|(n, a)| item(n, "", &a.description)).collect(),
+        automations: layer.automations.iter().map(|(n, a)| item(n, "", &a.description)).collect(),
         glossary,
         toml: pack.toml.to_string(),
         means: MEANS.into(),

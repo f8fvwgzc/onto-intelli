@@ -18,7 +18,9 @@
 pub mod action_types;
 pub mod align;
 pub mod authority;
+pub mod automate;
 pub mod catalog;
+pub mod changes;
 pub mod deps;
 pub mod engine;
 pub mod error;
@@ -30,6 +32,7 @@ pub mod export;
 pub mod graph;
 pub mod induce;
 pub mod learn;
+pub mod leases;
 pub mod lint;
 pub mod live_schema;
 pub mod locks;
@@ -38,6 +41,7 @@ pub mod metrics;
 pub mod model;
 pub mod modeling;
 pub mod objects;
+pub mod outbox;
 pub mod packs;
 pub mod policy;
 pub mod profile;
@@ -46,6 +50,7 @@ pub mod quality;
 pub mod query;
 pub mod reason;
 pub mod rules;
+pub mod runs;
 pub mod schema;
 pub mod shape_model;
 pub mod shapes;
@@ -56,6 +61,8 @@ pub mod time;
 pub mod trace;
 
 pub use align::{AlignOptions, AlignReport, AlignSource, CertifyReport, Mapping, MatchPredicate};
+pub use automate::Automation;
+pub use changes::{ChangeFilter, ChangeOp, ChangePage, ChangeRecord, Cursor, FieldMode, RunCause};
 pub use engine::{
     ActionContext, ChangeSet, ChangeSummary, HistoryEntry, MergeResult, OntoStats, Ontology, OntologyOptions,
     SearchHit, SearchMode, SyncReport,
@@ -71,7 +78,7 @@ pub use live_schema::{
 pub use locks::{LockViolation, SchemaLock};
 pub use model::*;
 pub use packs::{InstallMode, PackDetail, PackInfo, PackInstallOptions, PackInstalled, PackMeta};
-pub use policy::{Access, Principal, Role};
+pub use policy::{Access, Principal, Role, ScopePrincipal};
 pub use proposals::{Decision, ProposalInput, ProposalStatus, ProposalView, SchemaProposal};
 pub use reason::{
     Attested, BindingReport, BindingVerdict, Certificate, Closure, ClosureDiff, Derivation, Fact, QueryAnswer,
