@@ -100,6 +100,11 @@ max_summaries_per_subject = 200
 agent_max_sensitivity = "internal"   # public | internal | confidential | restricted
 max_document_chars = 10000000
 
+[signals]
+# External feeds (docs/design/SIGNALS.md): https and public addresses only.
+# Development only: also loopback and private addresses, and plain http.
+allow_private_urls = false
+
 [reasoning]
 # Intents answered straight from the graph (zero LLM tokens) when entities resolve.
 deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",

@@ -189,6 +189,7 @@ enterprise graph and recent arXiv research — see [docs/RESEARCH.md](docs/RESEA
 | **Entity alignment** — duplicate detection and merge with permanent id redirects | `onto dupes` · `onto merge person:kenji person:kenji.t` |
 | **Data quality** — required links, uniqueness, staleness, orphans, dangling provenance, duplicates, low-confidence facts, scored per kind | `onto quality` · `onto ask "Show me stale issues"` |
 | **Knowledge** — documents (text, Markdown, parsed blocks, or passages imported with their embeddings) split into cited passages and searched by BM25 fused with vectors; sensitivity labels with an agent ceiling, document ACLs; not graph nodes ([docs/KNOWLEDGE.md](docs/KNOWLEDGE.md)) | `onto call knowledge.ingest '{"name":"Runbook.md","text":"# Runbook …"}'` · `onto call knowledge.search '{"query":"failover"}'` |
+| **External signals** — RSS and Atom feeds fetched SSRF-safely by admins; items become `signal.item` events and knowledge, never entities; the recommender suggests link types and chain rules from what the items name together, filed only as schema proposals ([docs/design/SIGNALS.md](docs/design/SIGNALS.md)) | `onto call signals.feed_add '{"name":"wire","url":"https://…/rss"}'` · `onto call signals.recommend '{}'` |
 | **Hybrid personalised search** — BM25 in memory + hashed vectors (typo/morphology tolerant) in pgvector, fused and boosted by your graph neighbourhood and recency | `onto call entity.search '{"query":"paymnt timeout"}'` |
 | **Expert finding** with reasons | `onto experts postgres` · `onto ask "Who knows about PostgreSQL?"` |
 | **Clarifying questions** instead of guessing on ambiguous names | `onto ask "What is #182?"` |
@@ -370,7 +371,8 @@ block and server-side refusal fallback (`fallbacks: "default"`, disable with
   `OntologyService`, `IntelliService` (incl. server-streaming `AskStream`),
   `ActionService` (plan/apply/undo governed actions), `AnalyticsService` (metrics,
   history, changes, quality, duplicates/merge, scenarios, experts, profile, export, eval),
-  `MemoryService`, `KnowledgeService` ([docs/KNOWLEDGE.md](docs/KNOWLEDGE.md)),
+  `MemoryService`, `KnowledgeService` ([docs/KNOWLEDGE.md](docs/KNOWLEDGE.md)), `SignalsService`
+  ([docs/design/SIGNALS.md](docs/design/SIGNALS.md)),
   `EventService` (incl. client-streaming `Ingest`), `AdminService`;
 * `SchemaService`: the live schema and proposals ([docs/SCHEMA.md](docs/SCHEMA.md));
 * `AssuranceService`: the reasoner and certificates, shapes, lint, locks, alignment,

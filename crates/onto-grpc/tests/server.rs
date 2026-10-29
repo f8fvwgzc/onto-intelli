@@ -1374,3 +1374,40 @@ async fn knowledge_over_grpc_with_blocks_and_imported_embeddings() {
     let stats = json_of(kb.stats(()).await.unwrap().into_inner());
     assert_eq!((stats["documents"].clone(), stats["embedded"]["m-3"].clone()), (json!(2.0), json!(1.0)));
 }
+
+#[tokio::test]
+async fn signals_over_grpc_register_feeds_and_recommend_read_only() {
+    let srv = start(|_| {}).await;
+    let mut sig = pb::signals_service_client::SignalsServiceClient::new(channel(srv.addr).await);
+    let added = sig
+        .add_feed(pb::SignalsFeedAddRequest {
+            name: "wire".into(),
+            url: "https://news.example.com/rss".into(),
+            events_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let added = json_of(added);
+    assert_eq!(
+        (added["collection"].as_str(), added["knowledge"].as_bool()),
+        (Some("signals:wire"), Some(false)),
+        "{added}"
+    );
+    // Private and metadata addresses are refused when registering.
+    for url in ["https://10.0.0.7/rss", "https://169.254.169.254/latest", "http://news.example.com/rss"] {
+        let r =
+            sig.add_feed(pb::SignalsFeedAddRequest { name: "bad".into(), url: url.into(), ..Default::default() }).await;
+        assert!(r.is_err(), "{url}");
+    }
+    let feeds = json_of(sig.feeds(()).await.unwrap().into_inner());
+    assert_eq!(feeds["feeds"][0]["name"], "wire");
+    assert!(feeds["feeds"][0].get("seen").is_none(), "item hashes are not shown");
+    let rec = sig
+        .recommend(pb::SignalsRecommendRequest { since: 1, min_support: 2, ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(json_of(rec)["suggestions"], json!([]));
+}
