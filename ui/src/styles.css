@@ -204,4 +204,9 @@ body {
     animation-duration: 1ms !important;
     transition-duration: 1ms !important;
   }
+  /* The map moves its nodes every frame while a drag runs: a 1ms transition on
+     each transform would cost a style pass per node per frame. */
+  .graph-canvas * {
+    transition: none !important;
+  }
 }
