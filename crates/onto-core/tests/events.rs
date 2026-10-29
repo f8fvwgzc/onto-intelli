@@ -1,4 +1,4 @@
-//! Events: who reads them. Each test runs on
+//! Events: who reads them, and what an append returns. Each test runs on
 //! the memory store and, when a test database is set, on PostgreSQL.
 
 mod common;
@@ -67,5 +67,35 @@ fn events_about_restricted_entities_follow_the_entity_reads() {
         );
         // Admins read everything in their workspaces.
         assert!(!about(&Principal::admin("x")).is_empty());
+    }
+}
+
+#[test]
+fn append_returns_the_event_it_wrote_however_many_others_are_newer() {
+    for (o, _pg) in stores("events_append") {
+        let ctx = admin();
+        for i in 0..70 {
+            o.record_event(&ctx, EventInput { action: format!("tick.{i}"), ..Default::default() }).unwrap();
+        }
+        // Backdated (an import of history): 70 newer events sort before it,
+        // so reading the newest 64 back never found it on PostgreSQL.
+        let input = EventInput {
+            action: "import.issue".into(),
+            actor: Some("nexc:user-7".into()),
+            target: Some("issue:old-1".into()),
+            ts: Some(1_000),
+            payload: json!({ "source": "nexc" }),
+            ..Default::default()
+        };
+        let ev = o.record_event(&ctx, input).unwrap();
+        assert_eq!((ev.action.as_str(), ev.ts, ev.actor.as_str()), ("import.issue", 1_000, "nexc:user-7"));
+        assert_eq!(ev.payload["recorded_by"], "ann", "{:?}", ev.payload);
+        assert_eq!(ev.workspace, "acme");
+        // What it returned is what the store keeps.
+        let stored = o
+            .events(&Principal::admin("x"), &EventFilter { target: Some("issue:old-1".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(serde_json::to_value(&stored[0]).unwrap(), serde_json::to_value(&ev).unwrap());
     }
 }

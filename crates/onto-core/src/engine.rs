@@ -1233,15 +1233,12 @@ impl Ontology {
         self.apply(ctx, vec![Mutation::Delete(EntityRef { id: id.to_string() })])
     }
 
+    /// Record one event and return it as written. The event comes from the
+    /// committed batch, not a read back: other writers may append any number
+    /// of events at the same time.
     pub fn record_event(&self, ctx: &ActionContext, input: EventInput) -> Result<Event> {
         let res = self.apply(ctx, vec![Mutation::Event(input)])?;
-        let id = res.events.first().cloned().unwrap_or_default();
-        self.inner
-            .store
-            .events(&EventFilter { limit: Some(64), ..Default::default() })?
-            .into_iter()
-            .find(|e| e.id == id)
-            .ok_or_else(|| Error::Storage("event not readable after write".into()))
+        res.written_events.into_iter().next().ok_or_else(|| Error::Other("event.append wrote no event".into()))
     }
 
     /// Merge `dup` into `keep`: links move over, properties and names fill in,
@@ -1594,6 +1591,7 @@ impl Ontology {
             links,
             events: staged.batch.events.iter().map(|e| e.id.clone()).collect(),
             revision,
+            written_events: staged.batch.events,
         })
     }
 
