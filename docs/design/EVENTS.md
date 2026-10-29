@@ -861,7 +861,7 @@ resume`, `webhook.deliveries` (it shows errors and receiver responses), `writeba
 
 ### 6.2 Reserved principal ids
 
-`policy::RESERVED_ID_PREFIXES = ["automation:", "webhook:", "connector:", "system"]` and
+`policy::RESERVED_ID_PREFIXES = ["automation:", "webhook:", "writeback:", "connector:", "system"]` and
 `is_reserved_id(id)`. Refused in: `act_for` (auth.rs:211, before building the principal; covers
 config tokens and API keys with `impersonate`), `[[auth.tokens]]` validation (auth.rs ~296, a config
 error), and the console and OIDC user paths (ids are `user:<id>` and `key:<prefix>` today, so this is

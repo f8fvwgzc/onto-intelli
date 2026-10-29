@@ -240,6 +240,13 @@ impl SecretBox for VaultSecrets {
             .map_err(|_| onto_core::Error::invalid("a sealed secret is base64"))?;
         Ok(Secret::new(self.vault.open_for(purpose, &self.project_id, name, &blob)?))
     }
+
+    fn rewrap(&self, sealed: &str) -> Result<Option<String>> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let blob = b64.decode(sealed.trim()).map_err(|_| onto_core::Error::invalid("a sealed secret is base64"))?;
+        Ok(self.vault.rewrap(&self.project_id, &blob)?.map(|new| b64.encode(new)))
+    }
 }
 
 /// A project's trace settings: `trace_retention_days` (1 to 400) and
@@ -457,5 +464,20 @@ mod tests {
         m.load(&store).await.unwrap();
         assert_eq!(m.month_to_date(), MonthToDate { cost_usd: 1.5, tokens: 125 });
         assert_eq!(m.flush(&store).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn sealed_outbound_secrets_move_to_the_new_master_key() {
+        use crate::vault::Vault;
+        let old = Arc::new(Vault::new(vec![1; 32], None).unwrap());
+        let sealed = VaultSecrets::new(old, "p1").seal("webhook-secret", "crm", b"whsec_x").unwrap();
+        // Rotating: the new key current, the old one previous.
+        let rotating = VaultSecrets::new(Arc::new(Vault::new(vec![2; 32], Some(vec![1; 32])).unwrap()), "p1");
+        let moved = rotating.rewrap(&sealed).unwrap().expect("the old key wrapped it");
+        assert!(rotating.rewrap(&moved).unwrap().is_none(), "already current");
+        // Once the previous key is gone only the rewrapped secret opens.
+        let after = VaultSecrets::new(Arc::new(Vault::new(vec![2; 32], None).unwrap()), "p1");
+        assert_eq!(after.open("webhook-secret", "crm", &moved).unwrap().expose(), b"whsec_x");
+        assert!(after.open("webhook-secret", "crm", &sealed).is_err());
     }
 }

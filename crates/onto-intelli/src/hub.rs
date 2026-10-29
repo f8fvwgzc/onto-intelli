@@ -91,6 +91,12 @@ pub trait SecretBox: Send + Sync {
     fn seal(&self, purpose: &str, name: &str, plain: &[u8]) -> Result<String>;
     /// The plaintext of a value [`seal`](Self::seal) returned for the same purpose and name.
     fn open(&self, purpose: &str, name: &str, sealed: &str) -> Result<Secret>;
+    /// `sealed` with its key wrapped under the current master key, when an
+    /// older one wrapped it (`onto console rotate-master-key`); `None` when
+    /// it already is current, or when this box keeps no master keys.
+    fn rewrap(&self, _sealed: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 impl std::fmt::Debug for TenantSettings {

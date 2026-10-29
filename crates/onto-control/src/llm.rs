@@ -564,6 +564,25 @@ impl Control {
         }
         Ok(report)
     }
+
+    /// Rewrap the sealed webhook and writeback signing secrets of the
+    /// project that tenant `tenant` is, in its ontology `onto`
+    /// ([`onto_intelli::webhooks::rewrap_secrets`]): the second half of
+    /// `onto console rotate-master-key`. `None` for a tenant that is no
+    /// project (nothing of it is sealed with the vault).
+    pub async fn rewrap_tenant_secrets(
+        &self,
+        tenant: &str,
+        onto: &onto_core::Ontology,
+    ) -> Result<Option<onto_intelli::webhooks::RewrapReport>> {
+        let v = self
+            .vault
+            .as_ref()
+            .ok_or_else(|| Error::Config("ONTO_MASTER_KEY is not set: nothing to rotate to".into()))?;
+        let Some(project) = self.store.project_by_ref(tenant).await? else { return Ok(None) };
+        let secrets = crate::hooks::VaultSecrets::new(v.clone(), project.id);
+        onto_intelli::webhooks::rewrap_secrets(onto, &secrets).map(Some)
+    }
 }
 
 /// Settings as the console shows them: never the key.

@@ -607,7 +607,7 @@ maps its identities onto it:
 | API key with `impersonate` acting for a user | the `x-onto-act-as` value, `via = key:<prefix>` | from `x-onto-act-roles`, limited to `impersonate_roles` ⊆ the key's roles | ⊆ the key's |
 | Config token, CLI, dev | unchanged | unchanged | unchanged |
 
-**Reserved service principal ids.** `automation:`, `webhook:`,
+**Reserved service principal ids.** `automation:`, `webhook:`, `writeback:`,
 `connector:` and `system` (`onto_core::policy::RESERVED_ID_PREFIXES`,
 compared case-insensitively) name the engine's own service principals: an
 automation runs as `automation:<name>`, a webhook endpoint's receiver sees
@@ -1031,7 +1031,11 @@ blob = 0x01                              version
   (the secrets themselves are not re-encrypted; each row is replaced only if
   it still holds the blob that was rewrapped) and reports how many rows it
   changed, how many already were current, and the ones that failed to
-  decrypt (then it exits non-zero). Rotation: set the new key as
+  decrypt (then it exits non-zero). That covers the LLM keys and, in every
+  tenant, the sealed signing secrets of webhook endpoints and writeback
+  targets (`secret` and `previous_secret`, written again with a
+  `webhook.secret_rewrap` or `writeback.secret_rewrap` audit event and
+  their version unchanged, so enabled automations stay bound). Rotation: set the new key as
   `ONTO_MASTER_KEY` and the old one as `ONTO_MASTER_KEY_PREVIOUS` on every
   replica, run the command, then remove the previous key.
 * Without `ONTO_MASTER_KEY`, `PUT …/llm` with an `api_key` is refused

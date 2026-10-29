@@ -3277,8 +3277,21 @@ async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
         }
         ConsoleCmd::RotateMasterKey { json: as_json } => {
             let report = control.rotate_master_key().await?;
+            // Webhook and writeback signing secrets live in each tenant.
+            let hub = onto_intelli::Hub::open(cfg.clone()).await?;
+            let mut secrets = onto_intelli::webhooks::RewrapReport::default();
+            for t in hub.known_tenants()? {
+                let intelli = hub.tenant(&t).await?;
+                if let Some(r) = control.rewrap_tenant_secrets(&t, intelli.ontology()).await? {
+                    secrets.rewrapped += r.rewrapped;
+                    secrets.current += r.current;
+                    secrets.failed.extend(r.failed.into_iter().map(|(what, why)| (format!("{t} {what}"), why)));
+                }
+            }
             if *as_json {
-                print_json(&json!(report));
+                let mut out = json!(report);
+                out["secrets"] = json!(secrets);
+                print_json(&out);
             } else {
                 println!(
                     "Rewrapped {} LLM keys under the current ONTO_MASTER_KEY; {} already were.",
@@ -3288,17 +3301,26 @@ async fn console(cli: &Cli, st: &Style, sub: &ConsoleCmd) -> Result<()> {
                 for (project, why) in &report.failed {
                     println!("  {} {project}: {why}", st.red("failed"));
                 }
-                if report.failed.is_empty() && report.rewrapped > 0 {
+                println!(
+                    "Rewrapped {} webhook and writeback secrets; {} already were.",
+                    st.bold(&secrets.rewrapped.to_string()),
+                    secrets.current
+                );
+                for (what, why) in &secrets.failed {
+                    println!("  {} {what}: {why}", st.red("failed"));
+                }
+                if report.failed.is_empty() && secrets.failed.is_empty() && report.rewrapped + secrets.rewrapped > 0 {
                     println!(
                         "{}",
                         st.dim("ONTO_MASTER_KEY_PREVIOUS can be removed once every replica runs on the new key.")
                     );
                 }
             }
-            if report.failed.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::Invalid(format!("{} keys did not decrypt", report.failed.len())))
+            match (report.failed.len(), secrets.failed.len()) {
+                (0, 0) => Ok(()),
+                (keys, secrets) => {
+                    Err(Error::Invalid(format!("{keys} LLM keys and {secrets} outbound secrets were not rewrapped")))
+                }
             }
         }
     }

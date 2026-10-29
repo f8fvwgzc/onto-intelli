@@ -709,6 +709,65 @@ pub(crate) fn system_ctx(onto: &Ontology, workspace: &str) -> ActionContext {
     ActionContext::new(Principal::system(), ws).with_intent("webhook.delivery")
 }
 
+/// What [`rewrap_secrets`] did.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RewrapReport {
+    /// Records written again with their secrets under the current master key.
+    pub rewrapped: usize,
+    /// Records whose sealed secrets already were.
+    pub current: usize,
+    /// Records left as they were, by `<namespace>/<name>`, and why.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Rewrap the sealed signing secrets of webhook endpoints and writeback
+/// targets (`secret`, `previous_secret`) under the current master key, for
+/// `onto console rotate-master-key`: once the previous key is removed, a
+/// secret only it wrapped would never open again. A record is written
+/// again, with its audit event, only when one of its secrets changed; the
+/// secrets themselves are not re-encrypted and versions do not change, so
+/// enabled automations stay bound. A record changed while this runs is left
+/// for the next run.
+pub fn rewrap_secrets(onto: &Ontology, sealer: &dyn SecretBox) -> Result<RewrapReport> {
+    /// Each `sealed:v1:` string of `v`, rewrapped; whether one changed.
+    fn walk(v: &mut Value, sealer: &dyn SecretBox) -> Result<bool> {
+        Ok(match v {
+            Value::String(s) => match s.strip_prefix("sealed:v1:").map(|b| sealer.rewrap(b)).transpose()? {
+                Some(Some(new)) => {
+                    *s = format!("sealed:v1:{new}");
+                    true
+                }
+                _ => false,
+            },
+            Value::Array(a) => a.iter_mut().try_fold(false, |any, v| Ok::<_, Error>(walk(v, sealer)? || any))?,
+            Value::Object(m) => m.values_mut().try_fold(false, |any, v| Ok::<_, Error>(walk(v, sealer)? || any))?,
+            _ => false,
+        })
+    }
+    let ctx = ActionContext::new(Principal::system(), onto.options().default_workspace.clone())
+        .with_intent("rotate-master-key");
+    let mut report = RewrapReport::default();
+    for (ns, kind) in [(NS_ENDPOINT, "webhook"), (crate::writeback::NS_TARGET, "writeback")] {
+        for (name, old) in onto.store().kv_scan(ns, "")? {
+            let mut new = old.clone();
+            match walk(&mut new, sealer) {
+                Ok(false) => report.current += 1,
+                Ok(true) => {
+                    if onto.store().kv_get(ns, &name)?.as_ref() != Some(&old) {
+                        report.failed.push((format!("{ns}/{name}"), "changed while rewrapping: run again".into()));
+                        continue;
+                    }
+                    let event = ConfigEvent::new(format!("{kind}.secret_rewrap"), Some(&name), json!({ "name": name }));
+                    onto.commit_config(&ctx, vec![(ns.to_string(), name.clone(), new)], event)?;
+                    report.rewrapped += 1;
+                }
+                Err(e) => report.failed.push((format!("{ns}/{name}"), e.to_string())),
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(feature = "outbound")]
 pub use deliver::spawn_delivery;
 pub use fanout::{FANOUT_LEASE, spawn_fanout};
@@ -722,6 +781,63 @@ mod registry;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wraps under "new" what "old" wrapped.
+    struct Rotating;
+
+    impl SecretBox for Rotating {
+        fn seal(&self, _: &str, _: &str, _: &[u8]) -> Result<String> {
+            Ok("bmV3".into())
+        }
+        fn open(&self, _: &str, _: &str, _: &str) -> Result<Secret> {
+            Ok(Secret::new(b"s".to_vec()))
+        }
+        fn rewrap(&self, sealed: &str) -> Result<Option<String>> {
+            match sealed {
+                "b2xk" => Ok(Some("bmV3".into())),
+                "bmV3" => Ok(None),
+                _ => Err(Error::invalid("not a version 1 envelope")),
+            }
+        }
+    }
+
+    #[test]
+    fn master_key_rotation_rewraps_endpoint_and_target_secrets() {
+        let onto = Ontology::in_memory(onto_core::Schema::enterprise());
+        let ctx = ActionContext::new(Principal::system(), "default");
+        let kv = vec![
+            (
+                NS_ENDPOINT.to_string(),
+                "crm".to_string(),
+                json!({ "name": "crm", "version": 3, "secret": "sealed:v1:b2xk", "previous_secret": "sealed:v1:bmV3" }),
+            ),
+            (NS_ENDPOINT.to_string(), "ops".to_string(), json!({ "name": "ops", "secret": "env:OPS_SECRET" })),
+            (crate::writeback::NS_TARGET.to_string(), "desk".to_string(), json!({ "secret": "sealed:v1:b2xk" })),
+            (crate::writeback::NS_TARGET.to_string(), "bad".to_string(), json!({ "secret": "sealed:v1:eA==" })),
+        ];
+        onto.commit_config(&ctx, kv, ConfigEvent::new("test.setup", None, Value::Null)).unwrap();
+        let report = rewrap_secrets(&onto, &Rotating).unwrap();
+        assert_eq!((report.rewrapped, report.current), (2, 1), "{report:?}");
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].0.ends_with("/bad"), "{report:?}");
+        let crm = onto.store().kv_get(NS_ENDPOINT, "crm").unwrap().unwrap();
+        assert_eq!(
+            crm,
+            json!({ "name": "crm", "version": 3, "secret": "sealed:v1:bmV3", "previous_secret": "sealed:v1:bmV3" })
+        );
+        let desk = onto.store().kv_get(crate::writeback::NS_TARGET, "desk").unwrap().unwrap();
+        assert_eq!(desk["secret"], "sealed:v1:bmV3");
+        let audited = onto
+            .events(
+                &Principal::admin("a"),
+                &onto_core::EventFilter { action: Some("webhook.secret_rewrap".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(audited.len(), 1);
+        // Nothing left to rewrap.
+        let again = rewrap_secrets(&onto, &Rotating).unwrap();
+        assert_eq!((again.rewrapped, again.current), (0, 3));
+    }
 
     #[cfg(feature = "outbound")]
     #[test]

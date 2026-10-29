@@ -224,7 +224,7 @@ impl Principal {
 /// automation, a webhook or a connector, and read or undo what they wrote.
 /// A prefix ending in `:` reserves every id that starts with it; `system`
 /// reserves `system` itself and `system:<anything>`.
-pub const RESERVED_ID_PREFIXES: &[&str] = &["automation:", "webhook:", "connector:", "system"];
+pub const RESERVED_ID_PREFIXES: &[&str] = &["automation:", "webhook:", "writeback:", "connector:", "system"];
 
 /// Whether `id` is a reserved service principal id ([`RESERVED_ID_PREFIXES`]),
 /// compared case-insensitively and ignoring surrounding whitespace.
@@ -374,6 +374,7 @@ mod tests {
             "automation:payroll",
             "webhook:hook1",
             "connector:crm",
+            "writeback:helpdesk",
             "system",
             "System",
             " SYSTEM ",
