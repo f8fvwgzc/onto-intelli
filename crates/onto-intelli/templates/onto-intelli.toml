@@ -94,6 +94,12 @@ prune_below = 0.4             # consolidated, never-recalled episodes fade out (
 max_episodes_per_subject = 2000
 max_summaries_per_subject = 200
 
+[knowledge]
+# Documents split into passages (docs/KNOWLEDGE.md). Agents never receive
+# passages of documents more sensitive than this, whatever they ask.
+agent_max_sensitivity = "internal"   # public | internal | confidential | restricted
+max_document_chars = 10000000
+
 [reasoning]
 # Intents answered straight from the graph (zero LLM tokens) when entities resolve.
 deterministic_intents = ["lookup", "owner", "assignee", "status", "members", "count", "list",

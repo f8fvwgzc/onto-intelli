@@ -403,6 +403,104 @@ service MemoryService {
   rpc Consolidate(google.protobuf.Empty) returns (google.protobuf.Struct);
 }
 
+// ───────────────────────────── Knowledge ─────────────────────────────
+// Documents split into passages, searched by keywords and meaning
+// (docs/KNOWLEDGE.md). Documents are not entities.
+
+message KnowledgeBlock {
+  string kind = 1;                // heading | text | table
+  uint32 level = 2;               // headings: 1-6
+  string text = 3;
+  uint32 page = 4;
+  repeated KnowledgeRow rows = 5; // tables
+  uint32 header_rows = 6;         // tables: header rows on top (default 1)
+}
+
+message KnowledgeRow {
+  repeated string cells = 1;
+}
+
+message KnowledgePassageInput {
+  string id = 1;                  // kept (an import's chunk id); default <document>#<ordinal>
+  string content = 2;
+  uint32 page = 3;
+  string section_path = 4;
+  string kind = 5;                // text | table
+  repeated float embedding = 6;   // in the space of embedding_model
+}
+
+message KnowledgeIngestRequest {
+  string id = 1;                  // kept; an existing document with it is replaced
+  string name = 2;
+  string workspace = 3;
+  string collection = 4;
+  string sensitivity = 5;         // public | internal (default) | confidential | restricted
+  repeated string acl = 6;        // only these principals or entities (and admins) read it
+  string media_type = 7;
+  string source = 8;
+  google.protobuf.Struct meta = 9;
+  // One of text, blocks or passages.
+  string text = 10;               // plain text or Markdown
+  repeated KnowledgeBlock blocks = 11;
+  uint32 pages = 12;
+  repeated KnowledgePassageInput passages = 13;
+  string embedding_model = 14;
+}
+
+message KnowledgeQueryEmbedding {
+  string model = 1;
+  repeated float vector = 2;
+}
+
+message KnowledgeSearchRequest {
+  string query = 1;
+  string workspace = 2;
+  string collection = 3;
+  repeated string documents = 4;
+  uint32 k = 5;                   // default 5, at most 100
+  string max_sensitivity = 6;
+  KnowledgeQueryEmbedding embedding = 7;
+  uint32 budget_chars = 8;
+  string mode = 9;                // hybrid (default) | lexical | vector
+}
+
+message KnowledgeGetRequest {
+  string id = 1;
+  bool passages = 2;
+}
+
+message KnowledgeListRequest {
+  string workspace = 1;
+  string collection = 2;
+  uint32 limit = 3;
+}
+
+message KnowledgeUpdateRequest {
+  string id = 1;
+  string name = 2;                // empty: unchanged
+  string collection = 3;          // empty: unchanged
+  bool clear_collection = 4;      // take it out of its collection
+  string sensitivity = 5;         // empty: unchanged; lowering it needs an admin
+  repeated string acl = 6;
+  bool set_acl = 7;               // acl replaces the document's (an empty one clears it); admins
+  google.protobuf.Struct meta = 8;
+}
+
+message KnowledgeDocumentRequest {
+  string id = 1;
+}
+
+service KnowledgeService {
+  rpc Ingest(KnowledgeIngestRequest) returns (google.protobuf.Struct);       // knowledge.ingest
+  rpc Search(KnowledgeSearchRequest) returns (google.protobuf.Struct);       // knowledge.search
+  rpc Get(KnowledgeGetRequest) returns (google.protobuf.Struct);             // knowledge.get
+  rpc List(KnowledgeListRequest) returns (google.protobuf.Struct);           // knowledge.list
+  rpc Update(KnowledgeUpdateRequest) returns (google.protobuf.Struct);       // knowledge.update
+  rpc Delete(KnowledgeDocumentRequest) returns (google.protobuf.Struct);     // knowledge.delete
+  rpc Collections(KnowledgeListRequest) returns (google.protobuf.Struct);    // knowledge.collections
+  rpc Stats(google.protobuf.Empty) returns (google.protobuf.Struct);         // knowledge.stats
+}
+
 // ───────────────────────────── Events ─────────────────────────────
 
 message EventInput {

@@ -49,7 +49,7 @@ pub use postgres::{PgOptions, PgShared, PgStore, WakeFn, WakeScanner};
 /// KV namespaces whose standalone writes other processes are told about
 /// (their readers keep them in memory). Everything committed inside a
 /// [`WriteBatch`] is in the commit log anyway.
-pub const REPLICATED_KV: &[&str] = &["memory"];
+pub const REPLICATED_KV: &[&str] = &["memory", "knowledge"];
 
 /// The namespace of the [`StoreNotice::Kv`] a shared store sends when the
 /// tenant's change capture is switched: followers re-read

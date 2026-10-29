@@ -24,6 +24,8 @@ pub struct Config {
     pub context: ContextConfig,
     pub cache: CacheConfig,
     pub memory: MemoryConfig,
+    /// Documents and passages (docs/KNOWLEDGE.md).
+    pub knowledge: KnowledgeConfig,
     pub reasoning: ReasoningConfig,
     pub grpc: GrpcConfig,
     pub auth: AuthConfig,
@@ -347,6 +349,23 @@ pub struct MemoryConfig {
     pub mmr_lambda: f32,
     /// Token overlap coefficient at which a candidate counts as a duplicate of a selected memory.
     pub dup_threshold: f32,
+}
+
+/// `[knowledge]`: documents and their passages (docs/KNOWLEDGE.md).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgeConfig {
+    /// The most sensitive documents agents receive passages of, whatever
+    /// they ask (nexc-engine's `ai_reach`).
+    pub agent_max_sensitivity: crate::knowledge::Sensitivity,
+    /// Characters of text (or of blocks) one document may bring.
+    pub max_document_chars: usize,
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self { agent_max_sensitivity: crate::knowledge::Sensitivity::Internal, max_document_chars: 10_000_000 }
+    }
 }
 
 impl Default for MemoryConfig {

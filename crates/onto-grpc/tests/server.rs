@@ -1288,3 +1288,89 @@ async fn graceful_shutdown_serves_requests_in_flight_and_cuts_the_rest_at_the_de
         Err(_) => panic!("the connection was neither cut nor answered"),
     }
 }
+
+fn json_of(s: prost_types::Struct) -> Value {
+    fn val(v: prost_types::Value) -> Value {
+        use prost_types::value::Kind;
+        match v.kind {
+            None | Some(Kind::NullValue(_)) => Value::Null,
+            Some(Kind::BoolValue(b)) => Value::Bool(b),
+            Some(Kind::NumberValue(n)) => json!(n),
+            Some(Kind::StringValue(s)) => Value::String(s),
+            Some(Kind::ListValue(l)) => Value::Array(l.values.into_iter().map(val).collect()),
+            Some(Kind::StructValue(s)) => json_of(s),
+        }
+    }
+    Value::Object(s.fields.into_iter().map(|(k, v)| (k, val(v))).collect())
+}
+
+#[tokio::test]
+async fn knowledge_over_grpc_with_blocks_and_imported_embeddings() {
+    let srv = start(|_| {}).await;
+    let mut kb = pb::knowledge_service_client::KnowledgeServiceClient::new(channel(srv.addr).await);
+    // Parsed blocks, as a document parser returns them: a heading, text, a table.
+    let block = |kind: &str, text: &str| pb::KnowledgeBlock {
+        kind: kind.into(),
+        text: text.into(),
+        page: 1,
+        ..Default::default()
+    };
+    let row = |cells: &[&str]| pb::KnowledgeRow { cells: cells.iter().map(|c| c.to_string()).collect() };
+    let table = pb::KnowledgeBlock {
+        kind: "table".into(),
+        rows: vec![row(&["Region", "Revenue"]), row(&["EMEA", "12"]), row(&["APAC", "9"])],
+        header_rows: 1,
+        page: 2,
+        ..Default::default()
+    };
+    let doc = kb
+        .ingest(pb::KnowledgeIngestRequest {
+            name: "Report.pdf".into(),
+            blocks: vec![block("heading", "Revenue"), block("text", "Revenue grew in every region."), table],
+            pages: 2,
+            sensitivity: "internal".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let doc = json_of(doc);
+    assert_eq!(doc["document"]["passages"], 2.0, "{doc}");
+    assert_eq!(doc["document"]["pages"], 2.0);
+    let hits = kb
+        .search(pb::KnowledgeSearchRequest { query: "APAC revenue".into(), k: 3, ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
+    let hits = json_of(hits);
+    assert_eq!(hits["passages"][0]["content"], "Region: EMEA; Revenue: 12\nRegion: APAC; Revenue: 9", "{hits}");
+    assert_eq!(hits["passages"][0]["citation"], "Report.pdf, p. 2 › Revenue");
+    // Imported passages with their vectors, found by the query's vector.
+    kb.ingest(pb::KnowledgeIngestRequest {
+        id: "doc-9".into(),
+        name: "Imported.md".into(),
+        embedding_model: "m-3".into(),
+        passages: vec![pb::KnowledgePassageInput {
+            id: "c-1".into(),
+            content: "Lorem ipsum".into(),
+            embedding: vec![0.0, 1.0],
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let by_vector = kb
+        .search(pb::KnowledgeSearchRequest {
+            query: "unrelated words".into(),
+            embedding: Some(pb::KnowledgeQueryEmbedding { model: "m-3".into(), vector: vec![0.1, 0.9] }),
+            mode: "vector".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(json_of(by_vector)["passages"][0]["passage_id"], "c-1");
+    let stats = json_of(kb.stats(()).await.unwrap().into_inner());
+    assert_eq!((stats["documents"].clone(), stats["embedded"]["m-3"].clone()), (json!(2.0), json!(1.0)));
+}

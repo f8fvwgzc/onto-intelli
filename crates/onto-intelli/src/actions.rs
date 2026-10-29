@@ -176,6 +176,26 @@ pub const ACTIONS: &[ActionInfo] = &[
         false,
         "Memory counts and efficiency counters (merged, superseded, pruned, evicted, reinforced, recall tokens).",
     ),
+    a(
+        "knowledge.ingest",
+        true,
+        "Add a document, split into passages (docs/KNOWLEDGE.md). Input: {name, text? | blocks? | passages? (+ embedding_model), id? (replaces), workspace?, collection?, sensitivity? (public|internal|confidential|restricted), acl?, media_type?, source?, meta?}.",
+    ),
+    a(
+        "knowledge.search",
+        false,
+        "Passages that answer a query, with citations (BM25 fused with vectors). Input: {query, workspace?, collection?, documents?, k?, max_sensitivity?, embedding? ({model, vector}), budget_chars?, mode? (hybrid|lexical|vector)}.",
+    ),
+    a("knowledge.get", false, "One document, with its passages if asked. Input: {id, passages?}."),
+    a("knowledge.list", false, "Documents, newest first. Input: {workspace?, collection?, limit?}."),
+    a(
+        "knowledge.update",
+        true,
+        "Rename, regroup or relabel a document (lowering sensitivity or widening acl: admins). Input: {id, name?, collection?, clear_collection?, sensitivity?, acl?, set_acl?, meta?}.",
+    ),
+    a("knowledge.delete", true, "Delete a document and its passages. Input: {id}."),
+    a("knowledge.collections", false, "Collections and what they hold. Input: {workspace?}."),
+    a("knowledge.stats", false, "Documents, passages, and embedded passages by model."),
     a("event.append", true, "Record an event (audit/activity). Input: EventInput."),
     a("event.list", false, "Query events. Input: {workspace?, actor?, target?, action?, since?, until?, limit?}."),
     a("ingest.batch", true, "Ingest records (mutations, entities, GitHub webhooks). Input: {records: [...], async?}."),
@@ -610,6 +630,23 @@ pub const ACTIONS: &[ActionInfo] = &[
     ),
     a("system.actions", false, "This list."),
 ];
+
+#[derive(Deserialize)]
+struct KnowledgeGetIn {
+    id: String,
+    #[serde(default)]
+    passages: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct KnowledgeListIn {
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    collection: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 #[derive(Deserialize)]
 struct IdIn {
@@ -1183,6 +1220,37 @@ impl Intelli {
                 }
                 to_json(&self.memory().consolidate()?)
             }
+            "knowledge.ingest" => {
+                let i: crate::knowledge::IngestInput = parse(action, input)?;
+                to_json(&self.knowledge().ingest(p, self.default_workspace(), i)?)
+            }
+            "knowledge.search" => {
+                let s: crate::knowledge::SearchInput = parse(action, input)?;
+                Ok(json!({ "passages": self.knowledge().search(p, &s)? }))
+            }
+            "knowledge.get" => {
+                let g: KnowledgeGetIn = parse(action, input)?;
+                self.knowledge().get(p, &g.id, g.passages)
+            }
+            "knowledge.list" => {
+                let l: KnowledgeListIn = parse(action, input)?;
+                let docs =
+                    self.knowledge().list(p, l.workspace.as_deref(), l.collection.as_deref(), l.limit.unwrap_or(50));
+                Ok(json!({ "documents": docs }))
+            }
+            "knowledge.update" => {
+                let u: crate::knowledge::UpdateInput = parse(action, input)?;
+                Ok(json!({ "document": self.knowledge().update(p, u)? }))
+            }
+            "knowledge.delete" => {
+                let i: IdIn = parse(action, input)?;
+                Ok(json!({ "deleted": self.knowledge().delete(p, &i.id)? }))
+            }
+            "knowledge.collections" => {
+                let l: KnowledgeListIn = parse(action, input)?;
+                Ok(json!({ "collections": self.knowledge().collections(p, l.workspace.as_deref()) }))
+            }
+            "knowledge.stats" => to_json(&self.knowledge().stats()),
             "event.append" => {
                 let e: EventInput = parse(action, input)?;
                 to_json(&onto.record_event(&self.ctx(p, ws_hint), e)?)
