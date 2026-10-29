@@ -39,6 +39,7 @@ pub mod hub;
 pub mod ingest;
 pub mod intelli;
 pub mod intent;
+pub mod knowledge;
 pub mod lifecycle;
 pub mod limits;
 pub mod llm;

@@ -196,6 +196,8 @@ pub struct Intelli {
     config: Config,
     onto: Ontology,
     memory: Memory,
+    /// Documents and passages (docs/KNOWLEDGE.md).
+    knowledge: crate::knowledge::Knowledge,
     conversations: Conversations,
     /// Swappable: a project's own provider replaces the server's (`set_llm`).
     llm: parking_lot::RwLock<Arc<dyn LlmProvider>>,
@@ -296,6 +298,7 @@ impl Intelli {
             },
         )?;
         let memory = Memory::open(store.clone(), config.memory.clone())?;
+        let knowledge = crate::knowledge::Knowledge::open(store.clone(), config.knowledge.clone())?;
         let conversations = Conversations::new(store);
         let c = &config.cache;
         let prompt = parking_lot::Mutex::new((0, Instant::now(), String::new()));
@@ -353,6 +356,7 @@ impl Intelli {
             prompt,
             conversations,
             memory,
+            knowledge,
             onto,
             llm: parking_lot::RwLock::new(llm),
             limits: parking_lot::RwLock::new(Limits::default()),
@@ -758,6 +762,11 @@ impl Intelli {
 
     pub fn ontology(&self) -> &Ontology {
         &self.onto
+    }
+
+    /// Documents and passages.
+    pub fn knowledge(&self) -> &crate::knowledge::Knowledge {
+        &self.knowledge
     }
 
     pub fn memory(&self) -> &Memory {
