@@ -1120,7 +1120,35 @@ impl Ontology {
         {
             return Err(Error::Denied(format!("{} has no access to workspace {w}", p.id)));
         }
-        Ok(self.inner.store.events(filter)?.into_iter().filter(|e| p.in_workspace(&e.workspace)).collect())
+        let events = self.inner.store.events(filter)?;
+        let mut targets: HashMap<Id, bool> = HashMap::new();
+        for id in events.iter().filter_map(|e| e.target.as_ref()) {
+            if !targets.contains_key(id) {
+                let can = self.event_target_visible(p, id)?;
+                targets.insert(id.clone(), can);
+            }
+        }
+        Ok(events
+            .into_iter()
+            .filter(|e| p.in_workspace(&e.workspace) && e.target.as_ref().is_none_or(|t| targets[t]))
+            .collect())
+    }
+
+    /// Whether `p` may read the events about `id`, by the rule of entity
+    /// reads: the entity as it is now, or, once deleted, as it was last
+    /// written (as `history` reads it). An id that never named an entity
+    /// hides nothing; the event's own workspace still applies.
+    fn event_target_visible(&self, p: &Principal, id: &str) -> Result<bool> {
+        let id = {
+            let g = self.inner.graph.read();
+            let id = self.resolve_in(&g, id);
+            if let Some(e) = g.get(&id) {
+                return Ok(policy::visible(p, e, &g));
+            }
+            id
+        };
+        let last = self.inner.store.versions(&id, 8)?.into_iter().find_map(|v| v.doc);
+        Ok(last.is_none_or(|doc| self.version_visible(p, &doc)))
     }
 
     /// A rough size, in bytes, of what this ontology keeps in memory: the
