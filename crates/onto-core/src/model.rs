@@ -310,6 +310,9 @@ pub struct MutationResult {
     pub links: usize,
     pub events: Vec<String>,
     pub revision: u64,
+    /// The events of `events`, as committed (not serialized).
+    #[serde(skip)]
+    pub written_events: Vec<Event>,
 }
 
 /// Accepts `"x"` or `["x", "y"]`.
