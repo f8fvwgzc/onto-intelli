@@ -26,6 +26,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// Documents and passages (docs/KNOWLEDGE.md).
     pub knowledge: KnowledgeConfig,
+    /// External feeds and pattern recommendations (docs/design/SIGNALS.md).
+    pub signals: SignalsConfig,
     pub reasoning: ReasoningConfig,
     pub grpc: GrpcConfig,
     pub auth: AuthConfig,
@@ -349,6 +351,16 @@ pub struct MemoryConfig {
     pub mmr_lambda: f32,
     /// Token overlap coefficient at which a candidate counts as a duplicate of a selected memory.
     pub dup_threshold: f32,
+}
+
+/// `[signals]`: external feeds (docs/design/SIGNALS.md).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SignalsConfig {
+    /// Development only: feeds may also be fetched from loopback and private
+    /// addresses (and over plain http). Link-local and metadata addresses
+    /// stay refused.
+    pub allow_private_urls: bool,
 }
 
 /// `[knowledge]`: documents and their passages (docs/KNOWLEDGE.md).

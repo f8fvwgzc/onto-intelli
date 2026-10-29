@@ -196,6 +196,28 @@ pub const ACTIONS: &[ActionInfo] = &[
     a("knowledge.delete", true, "Delete a document and its passages. Input: {id}."),
     a("knowledge.collections", false, "Collections and what they hold. Input: {workspace?}."),
     a("knowledge.stats", false, "Documents, passages, and embedded passages by model."),
+    a(
+        "signals.feed_add",
+        true,
+        "Register an RSS or Atom feed (admins; https, public addresses only; docs/design/SIGNALS.md). Input: {name, url, workspace?, collection?, sensitivity?, events_only?}.",
+    ),
+    a("signals.feeds", false, "Feeds of the caller's workspaces, with their last fetch and error."),
+    a("signals.feed_remove", true, "Remove a feed (admins); its items stay. Input: {name}."),
+    a(
+        "signals.fetch",
+        true,
+        "Fetch a feed now (admins): new items become signal.item events and knowledge documents, never entities. Input: {name}.",
+    ),
+    a(
+        "signals.recommend",
+        false,
+        "Link types and chain rules that feed items suggest, with evidence and the change set (reads only). Input: {workspace?, feeds?, since?, min_support?, limit?}.",
+    ),
+    a(
+        "signals.propose",
+        true,
+        "File signals.recommend's suggestions as schema proposals (source signals; never applied here). Input: as signals.recommend.",
+    ),
     a("event.append", true, "Record an event (audit/activity). Input: EventInput."),
     a("event.list", false, "Query events. Input: {workspace?, actor?, target?, action?, since?, until?, limit?}."),
     a("ingest.batch", true, "Ingest records (mutations, entities, GitHub webhooks). Input: {records: [...], async?}."),
@@ -646,6 +668,11 @@ struct KnowledgeListIn {
     collection: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FeedNameIn {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -1251,6 +1278,35 @@ impl Intelli {
                 Ok(json!({ "collections": self.knowledge().collections(p, l.workspace.as_deref()) }))
             }
             "knowledge.stats" => to_json(&self.knowledge().stats()),
+            "signals.feed_add" => {
+                let i: crate::signals::FeedInput = parse(action, input)?;
+                to_json(&self.feed_add(p, i)?)
+            }
+            "signals.feeds" => Ok(json!({ "feeds": self.feeds(p)? })),
+            "signals.feed_remove" => {
+                let i: FeedNameIn = parse(action, input)?;
+                Ok(json!({ "removed": self.feed_remove(p, &i.name)? }))
+            }
+            "signals.fetch" => {
+                let i: FeedNameIn = parse(action, input)?;
+                #[cfg(feature = "outbound")]
+                {
+                    to_json(&self.feed_fetch(p, &i.name).await?)
+                }
+                #[cfg(not(feature = "outbound"))]
+                {
+                    let _ = i;
+                    Err(Error::Unavailable("fetching feeds needs the outbound feature".into()))
+                }
+            }
+            "signals.recommend" => {
+                let r: crate::signals::RecommendInput = parse(action, input)?;
+                Ok(json!({ "suggestions": self.recommend(p, &r)? }))
+            }
+            "signals.propose" => {
+                let r: crate::signals::RecommendInput = parse(action, input)?;
+                self.propose_signals(p, &r)
+            }
             "event.append" => {
                 let e: EventInput = parse(action, input)?;
                 to_json(&onto.record_event(&self.ctx(p, ws_hint), e)?)

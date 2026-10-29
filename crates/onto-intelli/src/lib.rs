@@ -49,6 +49,7 @@ pub mod modeling;
 pub mod net;
 pub mod resolve;
 pub mod seed;
+pub mod signals;
 pub mod token;
 pub mod trace;
 pub mod webhooks;

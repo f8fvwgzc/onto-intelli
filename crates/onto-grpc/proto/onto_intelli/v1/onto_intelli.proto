@@ -501,6 +501,41 @@ service KnowledgeService {
   rpc Stats(google.protobuf.Empty) returns (google.protobuf.Struct);         // knowledge.stats
 }
 
+// ───────────────────────────── Signals ─────────────────────────────
+// External feeds whose items become events and knowledge, never entities,
+// and the link types and rules they suggest, filed only as schema
+// proposals (docs/design/SIGNALS.md).
+
+message SignalsFeedAddRequest {
+  string name = 1;                // [a-z0-9_-], at most 40
+  string url = 2;                 // https, public addresses only
+  string workspace = 3;
+  string collection = 4;          // default signals:<name>
+  string sensitivity = 5;         // of its items' documents (default public)
+  bool events_only = 6;           // no knowledge documents
+}
+
+message SignalsFeedRequest {
+  string name = 1;
+}
+
+message SignalsRecommendRequest {
+  string workspace = 1;
+  repeated string feeds = 2;      // default: every feed
+  int64 since = 3;                // ms: only items stored since
+  uint32 min_support = 4;         // items naming a pair (default 3)
+  uint32 limit = 5;
+}
+
+service SignalsService {
+  rpc AddFeed(SignalsFeedAddRequest) returns (google.protobuf.Struct);       // signals.feed_add
+  rpc Feeds(google.protobuf.Empty) returns (google.protobuf.Struct);         // signals.feeds
+  rpc RemoveFeed(SignalsFeedRequest) returns (google.protobuf.Struct);       // signals.feed_remove
+  rpc Fetch(SignalsFeedRequest) returns (google.protobuf.Struct);            // signals.fetch
+  rpc Recommend(SignalsRecommendRequest) returns (google.protobuf.Struct);   // signals.recommend
+  rpc Propose(SignalsRecommendRequest) returns (google.protobuf.Struct);     // signals.propose
+}
+
 // ───────────────────────────── Events ─────────────────────────────
 
 message EventInput {
