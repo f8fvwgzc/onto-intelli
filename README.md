@@ -635,6 +635,8 @@ make release     # optimized binaries in target/release
 make dist        # tarball for this platform in dist/
 ```
 
+This repo uses [Symposium](https://github.com/symposium-dev/symposium) for the Rust guidance coding agents follow. Set it up once: `cargo install symposium --locked`, then `cargo agents init --add-agent claude`.
+
 Tagging `vX.Y.Z` runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
 binaries for Linux (x86_64, arm64), macOS (arm64, x86_64) and Windows, plus the FFI library,
 attached to a GitHub release with checksums.
