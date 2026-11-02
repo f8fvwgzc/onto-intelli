@@ -64,7 +64,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The channel of rust-toolchain.toml, by the same name: that file outranks `rustup default`, so
+      # a target installed on any other toolchain (`stable`) would not be there for the build.
+      - uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2

@@ -5,7 +5,9 @@
 #   docker build -t onto-intelli .
 #   docker run -p 50051:50051 -e ONTO_DATABASE_URL=postgres://… -e ONTO_TOKEN -v onto-config:/data onto-intelli
 
-FROM rust:1-bookworm AS build
+# The toolchain of rust-toolchain.toml. That file stays out of the build context (.dockerignore):
+# the tag already pins the toolchain, and rustup would fetch its rustfmt and clippy.
+FROM rust:1.99.0-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
