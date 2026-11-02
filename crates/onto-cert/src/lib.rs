@@ -97,11 +97,15 @@ pub struct ReadError {
 
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.file, self.error)
+        write!(f, "could not read {}", self.file)
     }
 }
 
-impl std::error::Error for ReadError {}
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 impl CertFiles {
     /// Reads `rules.tsv`, `asserted.tsv`, `derivations.tsv` and, when it

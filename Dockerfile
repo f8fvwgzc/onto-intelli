@@ -28,6 +28,8 @@ WORKDIR /data
 # The volume holds only configuration (and your protos and schema files);
 # all data lives in PostgreSQL.
 ENV ONTO_CONFIG=/data/onto-intelli.toml
+# A backtrace on a panic, and none captured for an ordinary error.
+ENV RUST_BACKTRACE=1 RUST_LIB_BACKTRACE=0
 EXPOSE 50051
 # First start writes a starter config into the volume; edit it and restart.
 ENTRYPOINT ["/bin/sh", "-c", "[ -f \"$ONTO_CONFIG\" ] || onto init /data >/dev/null; exec onto serve --listen 0.0.0.0:50051"]

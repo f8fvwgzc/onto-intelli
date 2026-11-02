@@ -17,6 +17,15 @@ fn database_url() -> Option<String> {
     ["ONTO_TEST_DATABASE_URL", "DATABASE_URL"].iter().find_map(|v| std::env::var(v).ok().filter(|u| !u.is_empty()))
 }
 
+/// The URL holds the password: what the control store reports leaves it out.
+#[tokio::test]
+async fn a_bad_control_store_url_is_reported_without_its_password() {
+    let url = "postgres://bob:s3cret-pw@db.example:notaport/x";
+    let m = PgControl::connect(url, "control").await.err().expect("the port is no number").to_string();
+    assert!(m.contains("control store: connecting to PostgreSQL"), "{m}");
+    assert!(!m.contains("s3cret-pw"), "{m}");
+}
+
 /// Drops the schema when the test ends, whichever way it ends.
 struct DropSchema {
     url: String,

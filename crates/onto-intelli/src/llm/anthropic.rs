@@ -309,6 +309,24 @@ mod tests {
     use super::*;
     use crate::llm::ChatMessage;
 
+    /// A gateway URL can carry a token: the failure says why, not where.
+    #[tokio::test]
+    async fn a_failed_request_reports_its_cause_and_not_its_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cfg = LlmConfig {
+            provider: "anthropic".into(),
+            base_url: Some(format!("http://127.0.0.1:{port}/gateway/s3cret-token")),
+            api_key: Some(crate::config::Secret::new("test-key")),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let p = AnthropicProvider::new(&cfg).unwrap();
+        let m = p.post(&json!({})).await.unwrap_err().to_string();
+        assert!(m.starts_with("llm: anthropic: error sending request"), "{m}");
+        assert!(m.to_lowercase().contains("connect"), "the cause is reported: {m}");
+        assert!(!m.contains("s3cret-token") && !m.contains("test-key") && !m.contains(&port.to_string()), "{m}");
+    }
+
     #[test]
     fn request_body_has_cache_control_and_no_sampling() {
         let cfg = LlmConfig {
