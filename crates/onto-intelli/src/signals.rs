@@ -215,10 +215,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedItem>> {
     let mut field: Option<String> = None;
     let mut text = String::new();
     let mut saw_feed = false;
-    let local = |name: &[u8]| -> String {
-        let n = String::from_utf8_lossy(name);
-        n.rsplit(':').next().unwrap_or_default().to_ascii_lowercase()
-    };
+    let local = |name: &str| -> String { name.rsplit(':').next().unwrap_or_default().to_ascii_lowercase() };
     loop {
         match reader.read_event() {
             Err(e) => return Err(Error::invalid(format!("feed: not well-formed XML: {e}"))),
@@ -259,19 +256,18 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedItem>> {
             }
             Ok(Event::Text(t)) => {
                 if field.is_some() {
-                    let s = t.decode().map_err(|e| Error::invalid(format!("feed: {e}")))?;
-                    text.push_str(&quick_xml::escape::unescape(&s).map(|c| c.into_owned()).unwrap_or(s.into_owned()));
+                    let s: &str = &t;
+                    text.push_str(&quick_xml::escape::unescape(s).unwrap_or(s.into()));
                 }
             }
             Ok(Event::CData(t)) => {
                 if field.is_some() {
-                    text.push_str(&String::from_utf8_lossy(&t));
+                    text.push_str(&t);
                 }
             }
             Ok(Event::GeneralRef(r)) => {
                 if field.is_some() {
-                    let name = String::from_utf8_lossy(&r).into_owned();
-                    text.push_str(&entity(&name));
+                    text.push_str(&entity(&r));
                 }
             }
             Ok(Event::End(e)) => {
@@ -327,8 +323,8 @@ fn atom_link(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
     for a in e.attributes().flatten() {
         let v = a.normalized_value(quick_xml::XmlVersion::default()).ok()?.into_owned();
         match a.key.as_ref() {
-            b"href" => href = Some(v),
-            b"rel" => rel = Some(v),
+            "href" => href = Some(v),
+            "rel" => rel = Some(v),
             _ => {}
         }
     }
@@ -1054,6 +1050,18 @@ mod tests {
         assert_eq!(atom[0].published, onto_core::time::parse_ts("2025-06-11T08:30:00Z"));
         assert!(parse_feed("<html><body>not a feed</body></html>").is_err());
         assert!(parse_feed("<rss><channel><item><title>x</item></rss>").is_err(), "not well-formed");
+    }
+
+    /// `fetch_url` has already turned the bytes into text, so the parser
+    /// neither follows a declared encoding nor refuses it, and a BOM (kept
+    /// by the lossy decode) is no reason to reject the document.
+    #[test]
+    fn a_declared_encoding_or_a_bom_changes_nothing() {
+        let body = r#"<rss version="2.0"><channel><item><guid>1</guid><title>Caf&#233; &amp; bar</title></item></channel></rss>"#;
+        for head in [r#"<?xml version="1.0" encoding="ISO-8859-1"?>"#, "\u{feff}<?xml version=\"1.0\"?>", "\u{feff}"] {
+            let items = parse_feed(&format!("{head}{body}")).unwrap_or_else(|e| panic!("{head}: {e}"));
+            assert_eq!(items[0].title, "Café & bar", "{head}");
+        }
     }
 
     #[test]
