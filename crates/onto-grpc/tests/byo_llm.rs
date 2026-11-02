@@ -383,6 +383,11 @@ async fn ssrf_guard_and_master_key() {
         put(json!({ "provider": "ollama", "base_url": format!("http://127.0.0.1:{}/v1", addr.port()) })).await;
     assert_eq!(st, 400, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("https"), "{v}");
+    // Credentials in a refused URL are not echoed (a 400, like every refusal here).
+    let (st, v) = put(json!({ "provider": "ollama", "base_url": "http://user:s3cret@llm.example.com/v1" })).await;
+    assert_eq!(st, 400, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("may not carry credentials"), "{v}");
+    assert!(!v.to_string().contains("s3cret"), "{v}");
     let (st, v) =
         put(json!({ "provider": "ollama", "base_url": format!("https://127.0.0.1:{}/v1", addr.port()) })).await;
     assert_eq!(st, 400, "{v}");
