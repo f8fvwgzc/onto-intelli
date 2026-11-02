@@ -8,7 +8,20 @@ use onto_cert::{BUILTIN_RULES, CertFiles, Reason, Verdict, check};
 
 fn fixture(name: &str) -> CertFiles {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
-    CertFiles::from_dir(&dir).unwrap_or_else(|e| panic!("{name}: {e}"))
+    CertFiles::from_dir(&dir).unwrap_or_else(|e| panic!("{name}: {e}: {}", e.error))
+}
+
+/// `Display` names the file and `source()` holds the cause, so a reporter that
+/// walks the chain prints each of them once.
+#[test]
+fn an_unreadable_certificate_reports_the_file_and_then_the_cause() {
+    use std::error::Error;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/no-such-certificate");
+    let e = CertFiles::from_dir(&dir).expect_err("the directory does not exist");
+    assert_eq!(e.to_string(), "could not read rules.tsv");
+    let cause = e.source().expect("the cause is the source").to_string();
+    assert_eq!(cause, e.error.to_string());
+    assert!(!e.to_string().contains(&cause), "{e}");
 }
 
 #[test]
