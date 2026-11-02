@@ -1040,4 +1040,18 @@ mod tests {
         let (e, refused) = send_error(tls, false, true, None);
         assert!(!refused && e.contains("certificate not valid"));
     }
+
+    /// What an attempt records (and the API shows) keeps the cause and leaves
+    /// out the URL, which can hold a password or a signed token.
+    #[tokio::test]
+    async fn the_error_chain_has_the_cause_and_not_the_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://hook:s3cret-pw@127.0.0.1:{port}/hooks/s3cret-token?sig=s3cret-sig");
+        let e = reqwest::Client::new().post(url).send().await.unwrap_err();
+        assert!(e.to_string().contains("s3cret-token"), "reqwest prints the URL itself: {e}");
+        let chain = chain(&e);
+        assert!(chain.starts_with("error sending request"), "{chain}");
+        assert!(chain.to_lowercase().contains("connect"), "the cause is kept: {chain}");
+        assert!(!chain.contains("s3cret"), "{chain}");
+    }
 }

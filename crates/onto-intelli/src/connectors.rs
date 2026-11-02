@@ -1901,4 +1901,30 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// A connector's URL holds its password, and a crawl stores and shows the
+    /// text of its error: neither path to the driver may quote the URL.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_bad_connector_url_is_reported_without_its_password() {
+        let c = postgres::PgConnector::new(false);
+        let req = RowRequest {
+            table: "public.orders".into(),
+            key: vec!["id".into()],
+            columns: vec!["id".into()],
+            after: None,
+            limit: 1,
+        };
+        for url in
+            ["postgres://ro:s3cret-pw@db.example:notaport/wh", "postgres://ro:s3cret-pw@db.example/wh?sslmode=no"]
+        {
+            let spec: ConnectorSpec = serde_json::from_value(json!({ "name": "wh", "url": url })).unwrap();
+            for e in [c.snapshot(&spec).await.expect_err(url), c.rows(&spec, &req).await.expect_err(url)] {
+                let m = e.to_string();
+                // From the connector's own reporting, not an earlier refusal.
+                assert!(m.contains("connector wh"), "{m}");
+                assert!(!m.contains("s3cret-pw"), "{m}");
+            }
+        }
+    }
 }

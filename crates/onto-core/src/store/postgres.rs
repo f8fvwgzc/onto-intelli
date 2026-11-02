@@ -3390,6 +3390,32 @@ mod tests {
         assert!(tenant_schema("onto_", "").is_err());
     }
 
+    /// What a reporter that walks `source()` prints for `e`.
+    fn walked(e: &(dyn std::error::Error + 'static)) -> String {
+        std::iter::successors(Some(e), |e| e.source()).map(ToString::to_string).collect::<Vec<_>>().join(": ")
+    }
+
+    /// A connection URL holds the password, so no error about one may quote
+    /// it: not what the store reports, and not the driver's chain of sources.
+    #[test]
+    fn a_bad_connection_url_is_reported_without_its_password() {
+        use super::{PgOptions, PgShared};
+        use crate::sqlx::postgres::PgPoolOptions;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for url in [
+            "postgres://bob:s3cret-pw@db.example:notaport/x",
+            "postgres://bob:s3cret-pw@[db.example/x",
+            "postgres://bob:s3cret-pw@db.example/x?sslmode=nonsense",
+        ] {
+            let reported = PgShared::connect(url, &PgOptions::default()).err().expect(url).to_string();
+            // The parser refused it: no connection was tried.
+            assert!(reported.contains("error with configuration"), "{reported}");
+            assert!(!reported.contains("s3cret-pw"), "{reported}");
+            let e = rt.block_on(PgPoolOptions::new().connect(url)).unwrap_err();
+            assert!(!walked(&e).contains("s3cret-pw"), "{e}");
+        }
+    }
+
     #[test]
     fn sqlx_errors_map_to_conflict_unavailable_or_storage() {
         use super::{ErrorClass, sql, sqlstate_class};
@@ -3429,6 +3455,25 @@ mod tests {
                 .unwrap();
             let e = sqlx::raw_sql(sql("INSERT INTO dup VALUES (1)".into())).execute(&mut *c).await.unwrap_err();
             assert!(matches!(Error::from(e), Error::Conflict(ref m) if m.contains("duplicate")));
+            // The server's DETAIL quotes the row. It stays out of what is
+            // reported, also for a reporter that walks the sources.
+            sqlx::raw_sql(sql(
+                "CREATE TEMP TABLE person (email TEXT PRIMARY KEY); INSERT INTO person VALUES ('ada@example.com')"
+                    .into(),
+            ))
+            .execute(&mut *c)
+            .await
+            .unwrap();
+            let e = sqlx::raw_sql(sql("INSERT INTO person VALUES ('ada@example.com')".into()))
+                .execute(&mut *c)
+                .await
+                .unwrap_err();
+            let db = e.as_database_error().unwrap().downcast_ref::<sqlx::postgres::PgDatabaseError>();
+            assert!(db.detail().is_some_and(|d| d.contains("ada@example.com")), "{db:?}");
+            let chain = walked(&e);
+            assert!(chain.contains("duplicate") && !chain.contains("ada@example.com"), "{chain}");
+            let reported = Error::from(e).to_string();
+            assert!(reported.contains("duplicate") && !reported.contains("ada@example.com"), "{reported}");
             // The only connection is held, so the pool times out.
             let e = pool.acquire().await.unwrap_err();
             assert!(matches!(Error::from(e), Error::Unavailable(_)));
