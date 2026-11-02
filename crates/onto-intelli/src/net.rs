@@ -464,27 +464,29 @@ mod outbound {
     /// `allow_private`), a host, no credentials, query or fragment, and an
     /// IP literal host only when public (or `allow_private`). Returns it
     /// without a trailing `/`.
+    ///
+    /// No error quotes `raw` or any piece of it: a refused value may hold a
+    /// password, even one that does not parse, and errors reach traces and
+    /// logs. Only an IP address the URL parsed to is named.
     pub fn check_url(raw: &str, allow_private: bool) -> Result<String> {
         let raw = raw.trim();
-        let url = url::Url::parse(raw).map_err(|e| Error::invalid(format!("base_url '{raw}': {e}")))?;
+        let url = url::Url::parse(raw).map_err(|e| Error::invalid(format!("base_url is not a URL: {e}")))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::invalid("base_url may not carry credentials; use the api_key field"));
+        }
         match url.scheme() {
             "https" => {}
             "http" if allow_private => {}
             "http" => {
-                return Err(Error::invalid(format!(
-                    "base_url '{raw}' must be https:// (http:// needs console.allow_private_urls)"
-                )));
+                return Err(Error::invalid("base_url must be https:// (http:// needs console.allow_private_urls)"));
             }
-            other => return Err(Error::invalid(format!("base_url '{raw}': scheme {other} is not http(s)"))),
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(Error::invalid("base_url may not carry credentials; use the api_key field"));
+            _ => return Err(Error::invalid("base_url: its scheme is not http(s)")),
         }
         if url.query().is_some() || url.fragment().is_some() {
             return Err(Error::invalid("base_url may not have a query or a fragment"));
         }
         let ip = match url.host() {
-            None => return Err(Error::invalid(format!("base_url '{raw}' has no host"))),
+            None => return Err(Error::invalid("base_url has no host")),
             Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
             Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
             Some(url::Host::Domain(_)) => None,
@@ -494,7 +496,7 @@ mod outbound {
             && !public_ip(ip)
         {
             return Err(Error::invalid(format!(
-                "base_url '{raw}': {ip} is not a public address (console.allow_private_urls is off)"
+                "base_url: {ip} is not a public address (console.allow_private_urls is off)"
             )));
         }
         Ok(raw.trim_end_matches('/').to_string())
@@ -721,6 +723,50 @@ mod tests {
         }
         let e = check_target_url("http://hooks.example.com/x", "the URL in env:HOOK_URL", &reach).unwrap_err();
         assert!(e.to_string().contains("env:HOOK_URL") && !e.to_string().contains("hooks.example.com"), "{e}");
+    }
+
+    /// A refused base URL may hold a password, so no error quotes it: every
+    /// path of `check_url`, with the password wherever that path can meet it.
+    /// "has no host" is not here: an http(s) URL without a host does not parse.
+    #[cfg(feature = "outbound")]
+    #[test]
+    fn base_url_errors_do_not_quote_the_value() {
+        const CREDENTIALS: &str = "may not carry credentials";
+        const SCHEME: &str = "its scheme is not http(s)";
+        for (raw, allow_private, expected) in [
+            // Does not parse, so nothing can say where the password is.
+            ("user s3cret@api.example.com", false, "is not a URL"),
+            ("//user:s3cret@api.example.com/v1", false, "is not a URL"),
+            ("https://user:s3cret@api.example.com:port/v1", false, "is not a URL"),
+            ("https://user:s3cret@[::1/v1", false, "is not a URL"),
+            ("https://:s3cret@/v1", false, "is not a URL"),
+            // Credentials are refused before any rule that looks at the rest.
+            ("http://user:s3cret@host/v1", false, CREDENTIALS),
+            ("http://user:s3cret@127.0.0.1/v1", true, CREDENTIALS),
+            ("https://user:s3cret@api.example.com/v1", false, CREDENTIALS),
+            ("https://:s3cret@api.example.com/v1", false, CREDENTIALS),
+            ("https://user:s3cret@10.0.0.1/v1", false, CREDENTIALS),
+            ("https://user:s3cret@api.example.com/v1?x=1", false, CREDENTIALS),
+            ("ftp://user:s3cret@api.example.com/", false, CREDENTIALS),
+            // Not https.
+            ("http://api.example.com/s3cret/v1", false, "must be https://"),
+            // Another scheme. Without `//` a URL has no userinfo, and what is
+            // before the first colon is the scheme, so that is not printed either.
+            ("ftp://api.example.com/s3cret", true, SCHEME),
+            ("user:s3cret@api.example.com/v1", false, SCHEME),
+            ("s3cret:user@api.example.com/v1", false, SCHEME),
+            // A query or a fragment.
+            ("https://api.example.com/v1?key=s3cret", false, "a query or a fragment"),
+            ("https://api.example.com/v1#s3cret", false, "a query or a fragment"),
+            // An address that is not public; the address itself is still named.
+            ("https://10.0.0.1/s3cret/v1", false, "10.0.0.1 is not a public address"),
+        ] {
+            let e = check_url(raw, allow_private).unwrap_err();
+            assert!(matches!(e, Error::Invalid(_)), "{raw}: {e:?}");
+            let e = e.to_string();
+            assert!(e.contains(expected), "{raw}: {e}");
+            assert!(!e.contains("s3cret"), "{raw}: {e}");
+        }
     }
 
     #[test]
