@@ -42,6 +42,15 @@ jobs:
       # linker dies with SIGBUS); line tables keep backtraces readable.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # Even with line tables only, the workspace's test binaries outgrow the free space
+      # on ubuntu-latest (ld dies with SIGBUS, or the runner loses its log). Drop the
+      # preinstalled SDKs this job never uses, before anything is built.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
@@ -54,7 +63,9 @@ jobs:
 
   # The MySQL/MariaDB, SQL Server and MongoDB connectors against real servers.
   connectors:
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: MongoDB refuses to start on Linux 6.19 and newer
+    # (SERVER-121912), the kernel of the Ubuntu 26 images that label now points to.
+    runs-on: ubuntu-24.04
     services:
       mysql:
         image: mysql:8.4
@@ -94,6 +105,13 @@ jobs:
       ONTO_TEST_MONGODB_URL: mongodb://127.0.0.1:27017/{db}
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # Four database images share the disk with the build; see test-postgres.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
