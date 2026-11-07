@@ -952,7 +952,9 @@ mod tests {
     fn secret_refs() {
         assert_eq!(SecretRef::parse("env:HOOK_SECRET").unwrap(), SecretRef::Env("HOOK_SECRET".into()));
         assert_eq!(SecretRef::parse(" ENV:X ").unwrap().stored(), "env:X");
-        assert_eq!(SecretRef::parse("file:/run/secrets/hook").unwrap().stored(), "file:/run/secrets/hook");
+        // Absolute is the platform's own: `/run/...` is rooted but drive-relative on Windows.
+        let abs = if cfg!(windows) { r"C:\run\secrets\hook" } else { "/run/secrets/hook" };
+        assert_eq!(SecretRef::parse(&format!("file:{abs}")).unwrap().stored(), format!("file:{abs}"));
         assert!(SecretRef::parse("file:relative").is_err());
         assert!(SecretRef::parse("env:").is_err());
         assert!(SecretRef::parse("whsec_abc").is_err(), "plaintext is never stored");
